@@ -4,6 +4,7 @@
 #define _BRIEFS_JOURNAL_H
 
 #include "briefs.h"
+#include <linux/blkdev.h>
 
 /* Journal constants */
 #define JOURNAL_BLOCK_SIZE 4096
