@@ -1,0 +1,5 @@
+- First and foremost, finish the basic header definitions and get filesystem
+  creation working.
+- Take the partial spell for xiafs dev, get the sharing directories with a
+  libvirt guest working so the module and kernel sources don't need to be
+  downloaded repeatedly, and make it available for both.
