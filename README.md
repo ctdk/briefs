@@ -15,7 +15,7 @@ Finally, and most importantly of all, the mental image of a pelican wearing brie
 AI Usage
 --------
 
-Since trying out AI assisted coding was part of the reason for this in the first place, it follows that an AI was used for some tasks. The AI was used for suggestions, however, rather than writing code directly itself; I would take its suggestions, evaluate them, and depending on that evaluation implement them myself rather than allowing it to write code without oversight.
+Since trying out AI assisted coding was part of the reason for this in the first place, it follows that an AI was used. It was not allowed to write code willy-nilly, however; I would review its proposals or changes and adjust them as needed rather than blindly trusting what it produced.
 
 BUGS
 ----
