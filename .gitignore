@@ -1,2 +1,7 @@
 .*.sw?
 **/.*.sw?
+
+# ignore object files and other build artifacts
+*.o
+*.mod
+*.mod.cmd
