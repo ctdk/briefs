@@ -5,24 +5,35 @@
 
 #include "briefs.h"
 
+/* Journal constants */
+#define JOURNAL_BLOCK_SIZE 4096
+#define JRN_RECORD_MAX_SIZE 320  /* max record size (JRN_DIR_UPDATE) */
+
 /* Journal context */
 struct briefs_journal {
 	struct briefs_superblock *sb;     /* superblock pointer */
+	struct block_device *bdev;        /* block device */
 	struct journal_block *cur_block;  /* current journal block buffer */
-	__u64 write_pos;                  /* current write position in journal */
-	__u64 journal_start;              /* first journal block */
-	__u64 journal_end;                /* last journal block */
-	__u64 checkpoint_block;           /* checkpoint area (last journal block) */
-	__u64 checkpoint_seq;             /* current checkpoint sequence */
+	u64 write_pos;                    /* current write position in journal */
+	u64 journal_start;                /* first journal block */
+	u64 journal_end;                  /* last journal block */
+	u64 checkpoint_block;             /* checkpoint area (last journal block) */
+	u64 checkpoint_seq;               /* current checkpoint sequence */
 	bool dirty;                       /* has uncommitted changes */
 };
 
 /* Initialize journal from superblock */
 int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb);
 
+/* Read a journal block from disk */
+int briefs_journal_read_block(struct briefs_journal *j, u64 block_offset, struct journal_block *block);
+
+/* Write a journal block to disk */
+int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, struct journal_block *block);
+
 /* Write a record to the journal */
 int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_type type,
-                                 void *data, __u32 data_len);
+                                 void *data, u32 data_len);
 
 /* Write a checkpoint */
 int briefs_journal_checkpoint(struct briefs_journal *j);
@@ -33,10 +44,16 @@ int briefs_journal_replay(struct briefs_journal *j);
 /* Cleanup journal */
 void briefs_journal_cleanup(struct briefs_journal *j);
 
+/* Open journal with block device */
+int briefs_journal_open(struct briefs_journal *j, struct briefs_superblock *sb, struct block_device *bdev);
+
+/* Sync dirty journal block to disk */
+int briefs_journal_sync(struct briefs_journal *j);
+
 /* Get next journal block */
-__u64 briefs_journal_next_block(struct briefs_journal *j, __u64 cur);
+u64 briefs_journal_next_block(struct briefs_journal *j, u64 cur);
 
 /* Get previous journal block (for wrapping) */
-__u64 briefs_journal_prev_block(struct briefs_journal *j, __u64 cur);
+u64 briefs_journal_prev_block(struct briefs_journal *j, u64 cur);
 
 #endif /* _BRIEFS_JOURNAL_H */

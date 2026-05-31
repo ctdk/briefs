@@ -6,12 +6,14 @@
 #include <linux/errno.h>
 #include <linux/stddef.h>
 #include <linux/types.h>
+#include <linux/blkdev.h>
 
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
 
 #define JOURNAL_BLOCK_SIZE 4096
+#define JRN_RECORD_MAX_SIZE 320  /* max record size (JRN_DIR_UPDATE) */
 
 /*
  * Initialize journal from superblock
@@ -32,11 +34,22 @@ int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb) 
 	j->cur_block = kzalloc(sizeof(struct journal_block), GFP_KERNEL);
 	if (!j->cur_block) return -ENOMEM;
 
-	/* Load current block from disk if not at start */
-	if (j->write_pos != j->journal_start) {
-		/* TODO: read block from disk into j->cur_block */
-	}
+	/* TODO: load current block from disk if not at start */
+	/* TODO: read_block(j, j->write_pos, j->cur_block); */
 
+	return 0;
+}
+
+/*
+ * Open journal with block device
+ */
+int briefs_journal_open(struct briefs_journal *j, struct briefs_superblock *sb, struct block_device *bdev) {
+	int ret;
+
+	ret = briefs_journal_init(j, sb);
+	if (ret) return ret;
+
+	j->bdev = bdev;
 	return 0;
 }
 
@@ -59,6 +72,54 @@ u64 briefs_journal_prev_block(struct briefs_journal *j, u64 cur) {
 		return j->journal_end - 1;  /* wrap around */
 	}
 	return cur - 1;
+}
+
+/*
+ * Read a journal block from disk
+ */
+int briefs_journal_read_block(struct briefs_journal *j, u64 block_offset, struct journal_block *block) {
+	if (!j || !j->bdev || !block) return -EINVAL;
+
+	struct bio *bio;
+	int ret;
+
+	bio = bio_alloc(j->bdev, 1, REQ_OP_READ, GFP_KERNEL);
+	if (!bio) return -ENOMEM;
+
+	if (!bio_add_page(bio, virt_to_page(block), JOURNAL_BLOCK_SIZE, 0)) {
+		bio_put(bio);
+		return -EIO;
+	}
+
+	bio->bi_iter.bi_sector = block_offset * (JOURNAL_BLOCK_SIZE / 512);
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+
+	return ret;
+}
+
+/*
+ * Write a journal block to disk
+ */
+int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, struct journal_block *block) {
+	if (!j || !j->bdev || !block) return -EINVAL;
+
+	struct bio *bio;
+	int ret;
+
+	bio = bio_alloc(j->bdev, 1, REQ_OP_WRITE, GFP_KERNEL);
+	if (!bio) return -ENOMEM;
+
+	if (!bio_add_page(bio, virt_to_page(block), JOURNAL_BLOCK_SIZE, 0)) {
+		bio_put(bio);
+		return -EIO;
+	}
+
+	bio->bi_iter.bi_sector = block_offset * (JOURNAL_BLOCK_SIZE / 512);
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+
+	return ret;
 }
 
 /*
@@ -124,7 +185,8 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
 	if (ret) return ret;
 
 	/* Write checkpoint block to disk */
-	/* TODO: write j->cur_block to j->checkpoint_block */
+	ret = briefs_journal_write_block(j, j->checkpoint_block, j->cur_block);
+	if (ret) return ret;
 
 	/* Update superblock */
 	j->sb->checkpoint_seq = j->checkpoint_seq;
@@ -144,9 +206,6 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
 int briefs_journal_replay(struct briefs_journal *j) {
 	if (!j) return -EINVAL;
 
-	/* Read checkpoint from checkpoint block */
-	/* For now, simplified: assume checkpoint is valid */
-
 	/* Check if journal is empty */
 	if (j->sb->journal_log_start == j->sb->journal_log_end) {
 		/* Journal is clean */
@@ -156,16 +215,17 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	/* Walk journal from log_start to log_end */
 	u64 cur = j->sb->journal_log_start;
 	u64 end = j->sb->journal_log_end;
+	struct journal_block block;
 
 	while (cur != end) {
 		/* Read journal block from disk */
-		/* struct journal_block block; */
-		/* read_block(cur, &block); */
+		int ret = briefs_journal_read_block(j, cur, &block);
+		if (ret) return ret;
 
 		/* For each record in block: */
-		for (u32 i = 0; i < j->cur_block->header.record_count; i++) {
-			struct journal_record_hdr *hdr = (struct journal_record_hdr *)j->cur_block->records;
-			hdr = (struct journal_record_hdr *)((unsigned char *)hdr + i * 320);  /* max record size */
+		for (u32 i = 0; i < block.header.record_count; i++) {
+			struct journal_record_hdr *hdr = (struct journal_record_hdr *)block.records;
+			hdr = (struct journal_record_hdr *)((unsigned char *)hdr + i * JRN_RECORD_MAX_SIZE);
 
 			/* Validate checksum */
 			/* if (hdr->checksum != compute_checksum(...)) return -EIO; */
@@ -237,7 +297,8 @@ int briefs_journal_sync(struct briefs_journal *j) {
 	if (!j || !j->dirty) return 0;
 
 	/* Write current block to disk */
-	/* TODO: write j->cur_block to j->write_pos */
+	int ret = briefs_journal_write_block(j, j->write_pos, j->cur_block);
+	if (ret) return ret;
 
 	j->dirty = false;
 	return 0;
