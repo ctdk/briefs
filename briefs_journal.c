@@ -1,39 +1,17 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
-#include <stdint.h>
-#include <stdbool.h>
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/errno.h>
+#include <linux/stddef.h>
+#include <linux/types.h>
 
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
 
 #define JOURNAL_BLOCK_SIZE 4096
-#define JRN_RECORD_MAX_SIZE 320  /* max record size (JRN_DIR_UPDATE) */
-
-/*
- * Journal block structure (includes header + records)
- */
-struct journal_block {
-	struct journal_block_header header;
-	u8 records[JOURNAL_BLOCK_SIZE - sizeof(struct journal_block_header)];
-};
-
-/*
- * Journal context
- */
-struct briefs_journal {
-	struct briefs_superblock *sb;
-	struct journal_block *cur_block;   /* current journal block buffer */
-	u64 write_pos;                      /* current write position in journal */
-	u64 journal_start;                  /* first journal block */
-	u64 journal_end;                    /* last journal block */
-	u64 checkpoint_block;               /* checkpoint area (last journal block) */
-	u64 checkpoint_seq;                 /* current checkpoint sequence */
-	bool dirty;                         /* has uncommitted changes */
-};
 
 /*
  * Initialize journal from superblock
@@ -51,7 +29,7 @@ int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb) 
 	j->dirty = false;
 
 	/* Allocate current block buffer */
-	j->cur_block = calloc(1, sizeof(struct journal_block));
+	j->cur_block = kzalloc(sizeof(struct journal_block), GFP_KERNEL);
 	if (!j->cur_block) return -ENOMEM;
 
 	/* Load current block from disk if not at start */
@@ -116,7 +94,7 @@ int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_ty
 	hdr->checksum = compute_record_checksum(type, 0, data_len, data);
 
 	/* Copy record data after header */
-	memcpy((u8 *)hdr + sizeof(*hdr), data, data_len);
+	memcpy((unsigned char *)hdr + sizeof(*hdr), data, data_len);
 
 	/* Update block header */
 	j->cur_block->header.record_count++;
@@ -187,7 +165,7 @@ int briefs_journal_replay(struct briefs_journal *j) {
 		/* For each record in block: */
 		for (u32 i = 0; i < j->cur_block->header.record_count; i++) {
 			struct journal_record_hdr *hdr = (struct journal_record_hdr *)j->cur_block->records;
-			hdr = (struct journal_record_hdr *)((u8 *)hdr + i * JRN_RECORD_MAX_SIZE);
+			hdr = (struct journal_record_hdr *)((unsigned char *)hdr + i * 320);  /* max record size */
 
 			/* Validate checksum */
 			/* if (hdr->checksum != compute_checksum(...)) return -EIO; */
@@ -195,27 +173,27 @@ int briefs_journal_replay(struct briefs_journal *j) {
 			/* Replay based on record type */
 			switch (hdr->type) {
 			case JRN_EXTENT_ALLOC: {
-				struct jrn_extent_alloc *rec = (struct jrn_extent_alloc *)(((u8 *)hdr) + sizeof(*hdr));
+				struct jrn_extent_alloc *rec = (struct jrn_extent_alloc *)(((unsigned char *)hdr) + sizeof(*hdr));
 				/* Update trie and inode */
 				break;
 			}
 			case JRN_EXTENT_FREE: {
-				struct jrn_extent_free *rec = (struct jrn_extent_free *)(((u8 *)hdr) + sizeof(*hdr));
+				struct jrn_extent_free *rec = (struct jrn_extent_free *)(((unsigned char *)hdr) + sizeof(*hdr));
 				/* Update trie */
 				break;
 			}
 			case JRN_INODE_UPDATE: {
-				struct jrn_inode_update *rec = (struct jrn_inode_update *)(((u8 *)hdr) + sizeof(*hdr));
+				struct jrn_inode_update *rec = (struct jrn_inode_update *)(((unsigned char *)hdr) + sizeof(*hdr));
 				/* Update inode */
 				break;
 			}
 			case JRN_INODE_ALLOC: {
-				struct jrn_inode_alloc *rec = (struct jrn_inode_alloc *)(((u8 *)hdr) + sizeof(*hdr));
+				struct jrn_inode_alloc *rec = (struct jrn_inode_alloc *)(((unsigned char *)hdr) + sizeof(*hdr));
 				/* Allocate inode */
 				break;
 			}
 			case JRN_INODE_FREE: {
-				struct jrn_inode_free *rec = (struct jrn_inode_free *)(((u8 *)hdr) + sizeof(*hdr));
+				struct jrn_inode_free *rec = (struct jrn_inode_free *)(((unsigned char *)hdr) + sizeof(*hdr));
 				/* Free inode */
 				break;
 			}
@@ -245,7 +223,7 @@ void briefs_journal_cleanup(struct briefs_journal *j) {
 	if (!j) return;
 
 	if (j->cur_block) {
-		free(j->cur_block);
+		kfree(j->cur_block);
 		j->cur_block = NULL;
 	}
 

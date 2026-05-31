@@ -2,10 +2,10 @@
 # later on.
 #
 
-obj-m += briefs.o
+obj-m += briefs_fs.o
 
 # Add C files as they appear.
-briefs-objs := briefs_alloc.o briefs_journal.o crc32c.o
+briefs_fs-objs := briefs_mod.o briefs.o briefs_alloc.o briefs_journal.o crc32c.o
 
 # Kernel build directory (change as needed)
 KDIR ?= /lib/modules/$(shell uname -r)/build

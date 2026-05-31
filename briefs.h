@@ -5,8 +5,7 @@
 
 #include <linux/fs.h>
 #include <linux/types.h>
-#include <stddef.h>
-#include <stdbool.h>
+#include <linux/stddef.h>
 
 /* BrieFS magic number */
 #define _BRIEFS_SUPER_MAGIC 0x50656c6963616e62 /* "Pelicanb" */

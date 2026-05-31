@@ -1,49 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 
-#include <stdlib.h>
-#include <stdbool.h>
-#include <string.h>
-#include <errno.h>
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/errno.h>
+#include <linux/stddef.h>
+#include <linux/types.h>
 
 #include "briefs.h"
 #include "briefs_alloc.h"
-
-/*
- * Helper: round up to next power of 2
- */
-static u64 round_up_power_of_2(u64 x) {
-	if (x == 0) return 1;
-	x--;
-	x |= x >> 1;
-	x |= x >> 2;
-	x |= x >> 4;
-	x |= x >> 8;
-	x |= x >> 16;
-	x |= x >> 32;
-	x++;
-	return x;
-}
-
-/*
- * Helper: round down to previous power of 2
- */
-static u64 round_down_power_of_2(u64 x) {
-	if (x == 0) return 0;
-	x |= x >> 1;
-	x |= x >> 2;
-	x |= x >> 4;
-	x |= x >> 8;
-	x |= x >> 16;
-	x |= x >> 32;
-	return x - (x >> 1);
-}
-
-/*
- * Helper: check if a value is a power of 2
- */
-static bool is_power_of_2(u64 x) {
-	return x && !(x & (x - 1));
-}
 
 /*
  * Initialize allocator from superblock
@@ -56,7 +21,7 @@ int briefs_alloc_init(struct briefs_alloc *alloc, struct briefs_superblock *sb) 
 
 	/* TODO: load root node from disk into alloc->root_node */
 	/* For now, allocate in-memory */
-	alloc->root_node = calloc(1, sizeof(struct trie_node));
+	alloc->root_node = kzalloc(sizeof(struct trie_node), GFP_KERNEL);
 	if (!alloc->root_node) return -ENOMEM;
 
 	/* Initialize root to cover entire data region */
@@ -248,7 +213,7 @@ u64 briefs_count_trailing_free(struct trie_node *node) {
 			/* Right child is fully free */
 			return right->range_len;
 		}
-		/* Could be partially free — need recursive count */
+		/* Could be partially free - need recursive count */
 	}
 
 	return 0;
@@ -268,7 +233,7 @@ u64 briefs_count_leading_free(struct trie_node *node) {
 			/* Left child is fully free */
 			return left->range_len;
 		}
-		/* Could be partially free — need recursive count */
+		/* Could be partially free - need recursive count */
 	}
 
 	return 0;
@@ -323,7 +288,7 @@ void briefs_alloc_cleanup(struct briefs_alloc *alloc) {
 	if (!alloc) return;
 
 	if (alloc->root_node) {
-		free(alloc->root_node);
+		kfree(alloc->root_node);
 		alloc->root_node = NULL;
 	}
 

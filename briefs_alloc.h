@@ -5,7 +5,7 @@
 
 #include "briefs.h"
 
-/* Allocator context — tracks the in-memory trie state */
+/* Allocator context - tracks the in-memory trie state */
 struct briefs_alloc {
 	struct briefs_superblock *sb;   /* on-disk superblock pointer */
 	struct trie_node *root_node;    /* in-memory copy of trie root */
