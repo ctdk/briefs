@@ -5,4 +5,4 @@
 #include <linux/module.h>
 #include "briefs.h"
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("Dual MIT/GPL");
