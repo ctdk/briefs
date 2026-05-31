@@ -4,4 +4,8 @@
 # ignore object files and other build artifacts
 *.o
 *.mod
-*.mod.cmd
+*.cmd
+*.mod.c
+Module.symvers
+modules.order
+*.ko
