@@ -4,148 +4,301 @@
 #define _BRIEFS_H
 
 #include <linux/fs.h>
+#include <linux/types.h>
+#include <stddef.h>
+#include <stdbool.h>
 
 /* BrieFS magic number */
 #define _BRIEFS_SUPER_MAGIC 0x50656c6963616e62 /* "Pelicanb" */
 
 /* Define the number of reserved/padding bytes in the superblock */
-#define _BRIEFS_SUPER_RESERVED 3784
+#define _BRIEFS_SUPER_RESERVED 3712
 
 /* Semantic versioning, yo */
 #define _BRIEFS_MAJOR_VER 0
 #define _BRIEFS_MINOR_VER 0
 #define _BRIEFS_PATCH_VER 1
 
-/* TODO: Take endianness into account. Default to little endian, or include a
- * test for what endianness the fs was originally created on and flip if
- * necessary?
- */
+/* Journal magic */
+#define JOURNAL_MAGIC 0x4A4E4C5A  /* "JNLZ" */
+#define CHECKPOINT_MAGIC 0x43485053  /* "CHPS" */
 
+/* Journal record types */
+enum journal_record_type {
+	JRN_NONE = 0,
+	JRN_EXTENT_ALLOC,
+	JRN_EXTENT_FREE,
+	JRN_INODE_UPDATE,
+	JRN_INODE_ALLOC,
+	JRN_INODE_FREE,
+	JRN_BITMAP_UPDATE,
+	JRN_TRIE_UPDATE,
+	JRN_DIR_UPDATE,
+	JRN_SBBLOCK_UPDATE,
+	JRN_CHECKPOINT,
+	JRN_END,
+};
+
+/* Journal record header (16 bytes) */
+struct journal_record_hdr {
+	__u32 type;           /* enum journal_record_type */
+	__u32 flags;          /* JRN_FLAG_* */
+	__u32 data_len;       /* bytes of data following header */
+	__u32 checksum;       /* crc32c of type + flags + data_len + data */
+};
+
+/* Record data structures */
+
+/* JRN_EXTENT_ALLOC */
+struct jrn_extent_alloc {
+	__u64 ino;            /* inode being modified */
+	__u64 offset;         /* logical block offset */
+	__u64 length;         /* number of blocks allocated */
+	__u64 phys_start;     /* starting physical block */
+	__u32 extent_index;   /* which extent slot this affects */
+	__u8 reserved[44];    /* padding to 64 bytes */
+};
+
+/* JRN_EXTENT_FREE */
+struct jrn_extent_free {
+	__u64 ino;            /* inode being modified */
+	__u64 offset;         /* logical block offset */
+	__u64 length;         /* number of blocks freed */
+	__u8 reserved[56];    /* padding */
+};
+
+/* JRN_INODE_UPDATE */
+struct jrn_inode_update {
+	__u64 ino;            /* inode being modified */
+	__u32 mode;
+	__u32 nlink;
+	__u32 uid;
+	__u32 gid;
+	__u64 size;
+	__u64 atime_sec;
+	__u64 atime_nsec;
+	__u64 mtime_sec;
+	__u64 mtime_nsec;
+	__u64 ctime_sec;
+	__u64 ctime_nsec;
+	__u32 flags;
+	__u32 reserved;
+};
+
+/* JRN_INODE_ALLOC */
+struct jrn_inode_alloc {
+	__u64 ino;            /* inode number being allocated */
+	__u32 mode;
+	__u32 nlink;
+	__u32 uid;
+	__u32 gid;
+	__u32 reserved1;
+	__u64 reserved2;
+};
+
+/* JRN_INODE_FREE */
+struct jrn_inode_free {
+	__u64 ino;            /* inode being freed */
+	__u32 reserved[3];
+	__u64 reserved2;
+};
+
+/* JRN_BITMAP_UPDATE */
+struct jrn_bitmap_update {
+	__u32 bitmap_type;    /* 0 = free data, 1 = free inode */
+	__u32 reserved1;
+	__u64 offset;         /* bit offset in bitmap */
+	__u64 count;          /* number of consecutive bits */
+	__u8 flip_to;         /* 0 = mark free, 1 = mark allocated */
+	__u8 reserved2[39];   /* padding to 64 bytes */
+};
+
+/* JRN_TRIE_UPDATE */
+struct jrn_trie_update {
+	__u64 node_offset;    /* block offset of trie node */
+	__u32 range_start;
+	__u32 range_len;
+	__u32 free_count;
+	__u64 left_child;
+	__u64 right_child;
+	__u32 flags;
+	__u32 reserved;
+};
+
+/* JRN_DIR_UPDATE */
+struct jrn_dir_update {
+	__u64 parent_ino;
+	__u64 child_ino;
+	__u32 name_len;
+	__u8 name[251];
+	__u8 op;              /* 0 = add, 1 = delete */
+	__u8 reserved[6];
+};
+
+/* JRN_CHECKPOINT */
+struct jrn_checkpoint {
+	__u64 checkpoint_seq;
+	__u32 record_count;
+	__u32 reserved1;
+	__u64 log_sequence_end;
+	__u64 trie_root_node;
+	__u64 free_data_count;
+	__u64 free_inode_count;
+	__u64 reserved2;
+};
+
+/* Journal record sizes */
+#define JRN_EXTENT_ALLOC_SIZE 64
+#define JRN_EXTENT_FREE_SIZE 32
+#define JRN_INODE_UPDATE_SIZE 80
+#define JRN_INODE_ALLOC_SIZE 40
+#define JRN_INODE_FREE_SIZE 24
+#define JRN_BITMAP_UPDATE_SIZE 64
+#define JRN_TRIE_UPDATE_SIZE 64
+#define JRN_DIR_UPDATE_SIZE 320
+#define JRN_CHECKPOINT_SIZE 80
+
+/* Journal block header (16 bytes) */
+struct journal_block_header {
+	__u32 magic;          /* JOURNAL_MAGIC */
+	__u32 block_seq;      /* monotonically increasing */
+	__u32 record_count;   /* number of records in this block */
+	__u32 reserved;
+};
+
+/* Journal block (one block on disk, includes header + records) */
+struct journal_block {
+	struct journal_block_header header;
+	unsigned char records[];
+};
+
+/* Bitwise trie node definition */
+struct trie_node {
+	__u64 range_start; /* starting block of this node's range */
+	__u32 range_len;   /* number of blocks covered (power of 2) */
+	__u32 free_count;  /* how many blocks in this range are free */
+	__u64 left_child;  /* block offset of left child node */
+	__u64 right_child; /* block offset of right child node */
+}; /* 32 bytes */
+
+/* Bitwise trie helper macros */
+#define TRIE_IS_LEAF(node) ((node)->range_len == 1)
+#define TRIE_IS_FREE(node) (TRIE_IS_LEAF(node) && (node)->free_count == 1)
+#define TRIE_IS_ALLOCATED(node) (TRIE_IS_LEAF(node) && (node)->free_count == 0)
+
+/* Trie node flags */
+#define TRIE_FLAG_ROOT    0x00000001
+#define TRIE_FLAG_NEW     0x00000002
+#define TRIE_FLAG_DIRTY   0x00000004
+
+/* Superblock - block 0, 4096 bytes */
 struct briefs_superblock {
-	_u64 magic; 					/* 0 offset */
+	__u64 magic; 					/* 0 offset */
 
 	/* 8 byte version numbers is a bit ridiculous, but it makes memory
 	 * alignment a lot easier. At least there's tons of extra space in the
 	 * superblock for it.
 	 */
-	_u64 major_version; 				/* 8 */
-	_u64 minor_version; 				/* 16 */
-	_u64 patch_version; 				/* 24 */
+	__u64 major_version; 				/* 8 */
+	__u64 minor_version; 				/* 16 */
+	__u64 patch_version; 				/* 24 */
 
-	_u64 total_blocks;  				/* 32 */
-	_u64 data_blocks; 				/* 40 */
-	_u64 block_size; 				/* 48 */
-	_u64 inode_size; 				/* 56 */
-	_u64 blocks_per_group; 				/* 64 */
-	_u64 inodes_per_group; 				/* 72 */
-	_u64 fs_created;				/* 80 */
-	_u64 fs_last_mounted; 				/* 88 */
-	_u64 fs_last_checkpoint; 			/* 96 */
-	_u64 free_inodes; 				/* 104 */
-	_u64 root_inode_number; 			/* 112 */
-	_u64 feature_compat; 				/* 120 */
-	_u64 feature_ro_compat; 			/* 128 */
-	_u64 feature_incompat; 				/* 136 */
+	__u64 total_blocks;  				/* 32 */
+	__u64 data_blocks; 				/* 40 */
+	__u64 block_size; 				/* 48 */
+	__u64 inode_size; 				/* 56 */
+	__u64 blocks_per_group; 				/* 64 */
+	__u64 inodes_per_group; 				/* 72 */
+	__u64 fs_created;				/* 80 */
+	__u64 fs_last_mounted; 				/* 88 */
+	__u64 fs_last_checkpoint; 			/* 96 */
+	/* tracked by trie root free_count */
+	__u64 free_data_blocks; 				/* 104 */
+	__u64 free_inodes; 				/* 112 */
+	__u64 root_inode_number; 			/* 120 */
+	__u64 feature_compat; 				/* 128 */
+	__u64 feature_ro_compat; 			/* 136 */
+	__u64 feature_incompat; 				/* 144 */
 	
 	/* 128-bit uuid for this volume */
-	_u8 uuid[16]; 					/* 144 */
+	__u8 uuid[16]; 					/* 152 */
 
 	/* The below is particularly subject to change */
-	_u64 eat_offset; 				/* 168 */
-	_u64 eat_blocks; 				/* 176 */
-	_u64 trie_root_block; 				/* 184 */
-	_u64 trie_blocks_used; 				/* 192 */
-	_u64 trie_node_pool_start; 			/* 200 */
-	_u64 trie_node_pool_size; 			/* 208 */
-	_u64 inode_bitmap_offset; 			/* 216 */
-	_u64 inode_bitmap_blocks; 			/* 224 */
-	_u64 data_bitmap_offset; 			/* 232 */
-	_u64 data_bitmap_blocks; 			/* 240 */
+	__u64 eat_offset; 				/* 176 */
+	__u64 eat_blocks; 				/* 184 */
+	__u64 trie_root_block; 				/* 192 */
+	__u64 trie_blocks_used; 				/* 200 */
+	__u64 trie_node_pool_start; 			/* 208 */
+	__u64 trie_node_pool_size; 			/* 216 */
+	__u64 inode_bitmap_offset; 			/* 224 */
+	__u64 inode_bitmap_blocks; 			/* 232 */
+	__u64 data_bitmap_offset; 			/* 240 */
+	__u64 data_bitmap_blocks; 			/* 248 */
+	__u64 journal_offset; 				/* 256 */
+	__u64 journal_blocks; 				/* 264 */
+	__u64 checkpoint_seq; 				/* 272 */
+	__u64 journal_log_start; 			/* 280 */
+	__u64 journal_log_end; 				/* 288 */
+	__u64 reserved_journal[4]; 			/* 296 */
 
 	/* utf8, null padded */
-	u_char label[64]; 				/* 248 */
+	unsigned char label[64]; 			/* 320 */
 
-	/* Currently we start padding the superblock at block 312. With basic
-	 * arithmetic, 4096 - 312 means _BRIEFS_SUPER_RESERVED should be
-	 * 3784. */
-	u_char reserved[_BRIEFS_SUPER_RESERVED];	/* 312 */
-
-	/* TODO: consider putting a superblock checksum at the end. Having
-	 * occasional backup superblocks on the FS might not be a terrible idea
-	 * either? */
-
-	/* Also to consider, since we have the space for it:
-	 * - creator OS
-	 * - last mounted location
-	 * - mount count?
-	 * - creation time?
-	 * - more as they come up
-	 */
+	/* Superblock padding */
+	unsigned char reserved[_BRIEFS_SUPER_RESERVED];	/* 384 */
 }; /* 4096 bytes */
 
-struct briefs_inode {
-	_u64 inode_number;
-	_u64 magic;
-	_u32 filemode;
-	_u32 uid;
-	_u32 gid;
-	_u64 filesize;
-	_u64 ctime_sec;
-	_u64 ctime_nsec;
-	_u64 atime_sec;
-	_u64 atime_nsec;
-	_u64 mtime_sec;
-	_u64 mtime_nsec;
-	_u32 nlinks;
-	_u32 num_extents_inline;
-	_u64 extent_inline_base;
-	_u64 num_extents_total; /* inline + overflow */
-	briefs_extent inline_extents[8];
-	_u64 xattr_offset;
-	_u64 xattr_size;
-	_u64 parent_inode;
-	_u32 link_count; /* same as nlinks? */
-	_u32 flags;
-	_u8 reserved[XXX]; /* zero padded as needed to give 512 byte inodes */
-};
-
+/* Extent entry - 32 bytes */
 struct briefs_extent {
-	_u64 offset
-	_u64 phys
-	_u64 len
-	_u64 flags
+	__u64 offset;
+	__u64 phys;
+	__u64 len;
+	__u64 flags;
 };
 
+/* Inode - 512 bytes */
+struct briefs_inode {
+	__u64 inode_number;
+	__u64 magic;
+	__u32 filemode;
+	__u32 uid;
+	__u32 gid;
+	__u64 filesize;
+	__u64 ctime_sec;
+	__u64 ctime_nsec;
+	__u64 atime_sec;
+	__u64 atime_nsec;
+	__u64 mtime_sec;
+	__u64 mtime_nsec;
+	__u32 nlinks;
+	__u32 num_extents_inline;
+	__u64 extent_inline_base;
+	__u64 num_extents_total; /* inline + overflow */
+	struct briefs_extent inline_extents[8];
+	__u64 xattr_offset;
+	__u64 xattr_size;
+	__u64 parent_inode;
+	__u32 link_count; /* same as nlinks? */
+	__u32 flags;
+	__u8 reserved[116]; /* zero padded to 512 bytes */
+};
+
+/* Extent chain for overflow - 256 extents + header = 272 bytes */
 struct briefs_extent_chain {
-	_u64 next_overflow_block;
-	_u32 num_extents_in_block;
-	_u32 pad;
-	briefs_extent extents[256];
-	_u64 checksum;
+	__u64 next_overflow_block;
+	__u32 num_extents_in_block;
+	__u32 pad;
+	struct briefs_extent extents[256];
+	__u64 checksum;
 };
-
-/* Bitwise trie node definition */
-struct trie_node {
-	_u64 range_start; /* starting block of this node's range */
-	_u32 range_len;   /* number of blocks covered (power of 2) */
-	_u32 free_count;  /* how many blocks in this range are free */
-
-	/* Leaf (range_len == 1):
-	 *   free_count == 0 → allocated
-	 *   free_count == 1 → free
-
-	 * Internal node:
-	 *   left child covers range_start, range_len / 2
-	 *   right child covers range_start + range_len/2, range_len / 2
-	 */
-
-	_u64 left_child;  /* block offset of left child node */
-	_u64 right_child; /* block offset of right child node */
-}; /* 32 bytes */
 
 /* Function headers and the like */
+
+/* Compute CRC32 checksum for journal record */
+__u32 briefs_crc32c(__u32 crc, const void *data, size_t len);
+
 #ifdef __KERNEL__
 
 #endif /* __KERNEL__ */
 
-#endif /* _BRIEFS_H */extent_inline_base
+#endif /* _BRIEFS_H */
