@@ -11,7 +11,7 @@
 #define _BRIEFS_SUPER_MAGIC 0x50656c6963616e62 /* "Pelicanb" */
 
 /* Define the number of reserved/padding bytes in the superblock */
-#define _BRIEFS_SUPER_RESERVED 3712
+#define _BRIEFS_SUPER_RESERVED 384
 
 /* Default values */
 #define BRIEFS_BLOCK_SIZE 4096
@@ -251,7 +251,7 @@ struct briefs_superblock {
 
 	/* Superblock padding */
 	unsigned char reserved[_BRIEFS_SUPER_RESERVED];	/* 384 */
-}; /* 4096 bytes */
+}; /* 1024 bytes */
 
 /* Extent entry - 32 bytes */
 struct briefs_extent {
