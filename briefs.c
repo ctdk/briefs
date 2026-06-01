@@ -42,5 +42,6 @@ static void __exit briefs_exit(void) {
 module_init(briefs_init);
 module_exit(briefs_exit);
 
-MODULE_DESCRIPTION("BrieFS filesystem.");
+MODULE_AUTHOR("Jeremy Bingham");
+MODULE_DESCRIPTION("BrieFS - extend-only, trie-based filesystem.");
 MODULE_LICENSE("Dual MIT/GPL");

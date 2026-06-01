@@ -127,7 +127,3 @@ const struct super_operations briefs_super_ops = {
 	.put_super = briefs_put_super,
 	.statfs = briefs_statfs,
 };
-
-MODULE_AUTHOR("Jeremy");
-MODULE_DESCRIPTION("BrieFS - extent-only filesystem");
-MODULE_LICENSE("GPL v2");
