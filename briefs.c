@@ -7,7 +7,7 @@
 #include <linux/slab.h>
 #include "briefs.h"
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("Dual MIT/GPL");
 
 /* Filesystem type structure */
 static struct file_system_type briefs_fs_type = {
