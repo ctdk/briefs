@@ -13,6 +13,7 @@ static struct file_system_type briefs_fs_type = {
 	.name = "briefs",
 	.fs_flags = FS_REQUIRES_DEV,
 	.mount = briefs_mount,
+	.kill_sb = briefs_kill_sb,
 };
 
 /* Module init */

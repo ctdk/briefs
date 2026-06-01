@@ -343,6 +343,7 @@ struct briefs_inode_info {
 struct inode *briefs_iget(struct super_block *sb, u64 ino);
 int briefs_write_inode(struct inode *inode, struct writeback_control *wbc);
 void briefs_evict_inode(struct inode *inode);
+void briefs_umount_begin(struct super_block *sb);
 
 /* Inode operations */
 int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl);
@@ -364,6 +365,7 @@ int briefs_readdir(struct file *file, struct dir_context *ctx);
 /* Superblock operations */
 int briefs_statfs(struct dentry *dentry, struct kstatfs *buf);
 void briefs_put_super(struct super_block *sb);
+void briefs_kill_sb(struct super_block *sb);
 
 #endif /* __KERNEL__ */
 

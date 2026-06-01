@@ -46,6 +46,8 @@ const struct file_operations briefs_file_operations = {
 const struct super_operations briefs_super_ops = {
 	.put_super = briefs_put_super,
 	.statfs = briefs_statfs,
+	.evict_inode = briefs_evict_inode,
+	.umount_begin = briefs_umount_begin,
 };
 
 /* Create */
@@ -125,6 +127,7 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 	int ret = -EINVAL;
 
 	pr_info("briefs: fill_super enter\n");
+	pr_info("briefs: sb=%p, blocksize=%d\n", sb, sb->s_blocksize);
 
 	bsi = kzalloc(sizeof(struct briefs_sb_info), GFP_KERNEL);
 	if (!bsi) {
@@ -258,7 +261,16 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 	return inode;
 }
 
-/* briefs_put_super - cleanup superblock */
+
+/* briefs_evict_inode - cleanup inode on eviction */
+void briefs_evict_inode(struct inode *inode) {
+	pr_debug("briefs: evict_inode inode %lu\n", inode->i_ino);
+	truncate_inode_pages_final(&inode->i_data);
+	clear_inode(inode);
+}
+
+
+
 void briefs_put_super(struct super_block *sb) {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
 
@@ -273,11 +285,26 @@ void briefs_put_super(struct super_block *sb) {
 	pr_info("briefs: put_super\n");
 }
 
+/* briefs_umount_begin - called before unmount */
+void briefs_umount_begin(struct super_block *sb) {
+	pr_info("briefs: umount_begin\n");
+}
+
 /* briefs_statfs - filesystem statistics */
 int briefs_statfs(struct dentry *dentry, struct kstatfs *buf) {
 	pr_info("briefs: statfs\n");
 	return -EROFS;
 }
+
+/* briefs_kill_sb - called when sb is being destroyed */
+void briefs_kill_sb(struct super_block *sb) {
+	pr_info("briefs: kill_sb\n");
+	if (sb) {
+		pr_info("briefs: killing sb %p\n", sb);
+	}
+	kill_block_super(sb);
+}
+
 
 /* briefs_mount - mount callback */
 struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
@@ -285,3 +312,5 @@ struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
 	pr_info("briefs: mount callback\n");
 	return mount_bdev(fs_type, flags, dev_name, data, briefs_fill_super);
 }
+
+
