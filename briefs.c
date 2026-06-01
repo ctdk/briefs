@@ -7,7 +7,6 @@
 #include <linux/slab.h>
 #include "briefs.h"
 
-MODULE_LICENSE("Dual MIT/GPL");
 
 /* Filesystem type structure */
 static struct file_system_type briefs_fs_type = {
@@ -43,3 +42,6 @@ static void __exit briefs_exit(void) {
 
 module_init(briefs_init);
 module_exit(briefs_exit);
+
+MODULE_DESCRIPTION("BrieFS filesystem.");
+MODULE_LICENSE("Dual MIT/GPL");
