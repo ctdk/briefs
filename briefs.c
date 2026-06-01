@@ -7,7 +7,6 @@
 #include <linux/slab.h>
 #include "briefs.h"
 
-
 /* Filesystem type structure */
 static struct file_system_type briefs_fs_type = {
 	.owner = THIS_MODULE,
