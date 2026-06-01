@@ -13,6 +13,12 @@
 /* Define the number of reserved/padding bytes in the superblock */
 #define _BRIEFS_SUPER_RESERVED 3712
 
+/* Default values */
+#define BRIEFS_BLOCK_SIZE 4096
+#define BRIEFS_INODE_SIZE 512
+#define BRIEFS_MAX_LINKS 65535
+#define BRIEFS_NAME_LEN 255
+
 /* Semantic versioning, yo */
 #define _BRIEFS_MAJOR_VER 0
 #define _BRIEFS_MINOR_VER 0
@@ -297,6 +303,60 @@ struct briefs_extent_chain {
 __u32 briefs_crc32c(__u32 crc, const void *data, size_t len);
 
 #ifdef __KERNEL__
+
+/* Inode operations */
+extern const struct inode_operations briefs_dir_inode_ops;
+extern const struct inode_operations briefs_file_inode_ops;
+extern const struct inode_operations briefs_symlink_inode_ops;
+
+/* File operations */
+extern const struct file_operations briefs_dir_operations;
+extern const struct file_operations briefs_file_operations;
+
+/* super_operations */
+extern const struct super_operations briefs_super_ops;
+
+/* Fill superblock - entry point for mount */
+int briefs_fill_super(struct super_block *sb, void *data, int flags);
+
+/* VFS structures */
+struct briefs_sb_info {
+	struct briefs_superblock *sb;
+	struct block_device *bdev;
+};
+
+/* briefs_inode_info - our inode info */
+struct briefs_inode_info {
+	struct inode vfs_inode;
+	struct briefs_inode disk_inode;
+	u64 inode_number;
+};
+
+/* Inode operation prototypes */
+struct inode *briefs_iget(struct super_block *sb, u64 ino);
+int briefs_write_inode(struct inode *inode, struct writeback_control *wbc);
+void briefs_evict_inode(struct inode *inode);
+
+/* Inode operations */
+int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl);
+struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
+int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode);
+int briefs_unlink(struct inode *dir, struct dentry *dentry);
+int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
+                  struct inode *new_dir, struct dentry *new_dentry, unsigned int flags);
+
+/* File operations */
+ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to);
+ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from);
+int briefs_open(struct inode *inode, struct file *file);
+int briefs_release(struct inode *inode, struct file *file);
+
+/* Directory operations */
+int briefs_readdir(struct file *file, struct dir_context *ctx);
+
+/* Superblock operations */
+int briefs_statfs(struct dentry *dentry, struct kstatfs *buf);
+void briefs_put_super(struct super_block *sb);
 
 #endif /* __KERNEL__ */
 
