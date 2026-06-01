@@ -12,6 +12,7 @@ static struct file_system_type briefs_fs_type = {
 	.owner = THIS_MODULE,
 	.name = "briefs",
 	.fs_flags = FS_REQUIRES_DEV,
+	.mount = briefs_mount,
 };
 
 /* Module init */

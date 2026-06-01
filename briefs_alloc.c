@@ -6,28 +6,114 @@
 #include <linux/errno.h>
 #include <linux/stddef.h>
 #include <linux/types.h>
+#include <linux/buffer_head.h>
 
 #include "briefs.h"
 #include "briefs_alloc.h"
 
+/* Read a trie node from disk */
+static struct trie_node *briefs_read_trie_node(struct super_block *sb, u64 block)
+{
+	struct buffer_head *bh;
+	struct trie_node *node;
+
+	bh = sb_bread(sb, block);
+	if (!bh)
+		return ERR_PTR(-EIO);
+
+	node = kmalloc(sizeof(struct trie_node), GFP_KERNEL);
+	if (!node) {
+		brelse(bh);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	memcpy(node, bh->b_data, sizeof(struct trie_node));
+	brelse(bh);
+
+	return node;
+}
+
+/* Recursively load trie nodes from disk */
+static int briefs_load_trie_recursive(struct super_block *sb, struct trie_node **node_ptr, u64 node_block)
+{
+	struct trie_node *node;
+	int ret;
+
+	if (node_block == 0) {
+		*node_ptr = NULL;
+		return 0;
+	}
+
+	node = briefs_read_trie_node(sb, node_block);
+	if (IS_ERR(node))
+		return PTR_ERR(node);
+
+	/* Load children recursively */
+	if (node->left_child) {
+		ret = briefs_load_trie_recursive(sb, (struct trie_node **)&node->left_child, node->left_child);
+		if (ret) {
+			kfree(node);
+			return ret;
+		}
+	}
+
+	if (node->right_child) {
+		ret = briefs_load_trie_recursive(sb, (struct trie_node **)&node->right_child, node->right_child);
+		if (ret) {
+			/* Cleanup left child */
+			if (node->left_child)
+					kfree((struct trie_node *)node->left_child);
+			kfree(node);
+			return ret;
+		}
+	}
+
+	*node_ptr = node;
+	return 0;
+}
+
+/* Recursively free trie nodes */
+static void briefs_free_trie_recursive(struct trie_node *node)
+{
+	if (!node)
+		return;
+
+	if (node->left_child)
+		briefs_free_trie_recursive((struct trie_node *)node->left_child);
+	if (node->right_child)
+		briefs_free_trie_recursive((struct trie_node *)node->right_child);
+
+	kfree(node);
+}
+
 /*
  * Initialize allocator from superblock
  */
-int briefs_alloc_init(struct briefs_alloc *alloc, struct briefs_superblock *sb) {
-	if (!alloc || !sb) return -EINVAL;
+int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb, struct briefs_superblock *sb_disk)
+{
+	int ret;
 
-	alloc->sb = sb;
-	alloc->root_node = NULL;
+	if (!alloc || !sb || !sb_disk)
+		return -EINVAL;
 
-	/* TODO: load root node from disk into alloc->root_node */
-	/* For now, allocate in-memory */
-	alloc->root_node = kzalloc(sizeof(struct trie_node), GFP_KERNEL);
-	if (!alloc->root_node) return -ENOMEM;
+	alloc->sb = sb_disk;
 
-	/* Initialize root to cover entire data region */
-	alloc->root_node->range_start = 0;
-	alloc->root_node->range_len = sb->data_blocks;
-	alloc->root_node->free_count = sb->data_blocks;
+	/* Load trie from disk */
+	ret = briefs_load_trie_recursive(sb, &alloc->root_node, sb_disk->trie_root_block);
+	if (ret)
+		return ret;
+
+	/* If no trie on disk, create initial root */
+	if (!alloc->root_node) {
+		alloc->root_node = kzalloc(sizeof(struct trie_node), GFP_KERNEL);
+		if (!alloc->root_node)
+			return -ENOMEM;
+
+		/* Initialize root to cover entire data region */
+		alloc->root_node->range_start = 0;
+		alloc->root_node->range_len = sb_disk->data_blocks;
+		alloc->root_node->free_count = sb_disk->data_blocks;
+	}
 
 	return 0;
 }
@@ -36,9 +122,11 @@ int briefs_alloc_init(struct briefs_alloc *alloc, struct briefs_superblock *sb) 
  * Find leftmost contiguous range of free blocks
  * Returns the starting block, sets *out_len to the length found
  */
-u64 briefs_find_leftmost_contiguous(struct briefs_alloc *alloc, u64 needed, u64 *out_len) {
+u64 briefs_find_leftmost_contiguous(struct briefs_alloc *alloc, u64 needed, u64 *out_len)
+{
 	if (!alloc || !alloc->root_node || !out_len || needed == 0) {
-		if (out_len) *out_len = 0;
+		if (out_len)
+			*out_len = 0;
 		return 0;
 	}
 
@@ -58,8 +146,10 @@ u64 briefs_find_leftmost_contiguous(struct briefs_alloc *alloc, u64 needed, u64 
  * Find and allocate N contiguous free blocks
  * Returns starting physical block, or 0 on failure
  */
-u64 briefs_alloc_contiguous(struct briefs_alloc *alloc, u64 nblocks) {
-	if (!alloc || nblocks == 0) return 0;
+u64 briefs_alloc_contiguous(struct briefs_alloc *alloc, u64 nblocks)
+{
+	if (!alloc || nblocks == 0)
+		return 0;
 
 	/* Check if we have enough total free blocks */
 	if (alloc->root_node && alloc->root_node->free_count < nblocks) {
@@ -85,15 +175,18 @@ u64 briefs_alloc_contiguous(struct briefs_alloc *alloc, u64 nblocks) {
 /*
  * Allocate a single free block
  */
-u64 briefs_alloc_block(struct briefs_alloc *alloc) {
+u64 briefs_alloc_block(struct briefs_alloc *alloc)
+{
 	return briefs_alloc_contiguous(alloc, 1);
 }
 
 /*
  * Free N contiguous blocks
  */
-void briefs_free_contiguous(struct briefs_alloc *alloc, u64 phys_block, u64 nblocks) {
-	if (!alloc || nblocks == 0) return;
+void briefs_free_contiguous(struct briefs_alloc *alloc, u64 phys_block, u64 nblocks)
+{
+	if (!alloc || nblocks == 0)
+		return;
 
 	/* Mark the range as free */
 	if (alloc->root_node) {
@@ -104,15 +197,18 @@ void briefs_free_contiguous(struct briefs_alloc *alloc, u64 phys_block, u64 nblo
 /*
  * Free a single block
  */
-void briefs_free_block(struct briefs_alloc *alloc, u64 phys_block) {
+void briefs_free_block(struct briefs_alloc *alloc, u64 phys_block)
+{
 	briefs_free_contiguous(alloc, phys_block, 1);
 }
 
 /*
  * Mark a range as allocated in the trie
  */
-void briefs_mark_allocated(struct trie_node *node, u64 offset, u64 count) {
-	if (!node || count == 0) return;
+void briefs_mark_allocated(struct trie_node *node, u64 offset, u64 count)
+{
+	if (!node || count == 0)
+		return;
 
 	/* Base case: leaf node */
 	if (node->range_len == 1) {
@@ -143,8 +239,10 @@ void briefs_mark_allocated(struct trie_node *node, u64 offset, u64 count) {
 /*
  * Mark a range as free in the trie
  */
-void briefs_mark_free(struct trie_node *node, u64 offset, u64 count) {
-	if (!node || count == 0) return;
+void briefs_mark_free(struct trie_node *node, u64 offset, u64 count)
+{
+	if (!node || count == 0)
+		return;
 
 	/* Base case: leaf node */
 	if (node->range_len == 1) {
@@ -175,8 +273,10 @@ void briefs_mark_free(struct trie_node *node, u64 offset, u64 count) {
 /*
  * Rebuild free_count from children
  */
-void briefs_recount(struct trie_node *node) {
-	if (!node) return;
+void briefs_recount(struct trie_node *node)
+{
+	if (!node)
+		return;
 
 	if (node->range_len == 1) {
 		/* Leaf node - free_count is already correct */
@@ -202,9 +302,12 @@ void briefs_recount(struct trie_node *node) {
 /*
  * Count trailing free blocks (rightmost free blocks in a node's range)
  */
-u64 briefs_count_trailing_free(struct trie_node *node) {
-	if (!node || node->free_count == 0) return 0;
-	if (node->range_len == 1) return node->free_count;
+u64 briefs_count_trailing_free(struct trie_node *node)
+{
+	if (!node || node->free_count == 0)
+		return 0;
+	if (node->range_len == 1)
+		return node->free_count;
 
 	/* Check right child first */
 	if (node->right_child) {
@@ -222,9 +325,12 @@ u64 briefs_count_trailing_free(struct trie_node *node) {
 /*
  * Count leading free blocks (leftmost free blocks in a node's range)
  */
-u64 briefs_count_leading_free(struct trie_node *node) {
-	if (!node || node->free_count == 0) return 0;
-	if (node->range_len == 1) return node->free_count;
+u64 briefs_count_leading_free(struct trie_node *node)
+{
+	if (!node || node->free_count == 0)
+		return 0;
+	if (node->range_len == 1)
+		return node->free_count;
 
 	/* Check left child first */
 	if (node->left_child) {
@@ -242,9 +348,12 @@ u64 briefs_count_leading_free(struct trie_node *node) {
 /*
  * Check if a range is entirely free
  */
-bool briefs_range_is_free(struct trie_node *node, u64 offset, u64 count) {
-	if (!node) return false;
-	if (count == 0) return true;
+bool briefs_range_is_free(struct trie_node *node, u64 offset, u64 count)
+{
+	if (!node)
+		return false;
+	if (count == 0)
+		return true;
 
 	/* Leaf node: check if range_len == count and free_count == count */
 	if (node->range_len == 1) {
@@ -284,11 +393,13 @@ bool briefs_range_is_free(struct trie_node *node, u64 offset, u64 count) {
 /*
  * Cleanup allocator
  */
-void briefs_alloc_cleanup(struct briefs_alloc *alloc) {
-	if (!alloc) return;
+void briefs_alloc_cleanup(struct briefs_alloc *alloc)
+{
+	if (!alloc)
+		return;
 
 	if (alloc->root_node) {
-		kfree(alloc->root_node);
+		briefs_free_trie_recursive(alloc->root_node);
 		alloc->root_node = NULL;
 	}
 

@@ -12,7 +12,7 @@ struct briefs_alloc {
 };
 
 /* Initialize allocator from superblock */
-int briefs_alloc_init(struct briefs_alloc *alloc, struct briefs_superblock *sb);
+int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb, struct briefs_superblock *sb_disk);
 
 /* Find and allocate N contiguous free blocks */
 u64 briefs_alloc_contiguous(struct briefs_alloc *alloc, u64 nblocks);

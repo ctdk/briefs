@@ -6,7 +6,9 @@
 #include <linux/fs.h>
 #include <linux/statfs.h>
 #include <linux/slab.h>
+#include <linux/buffer_head.h>
 #include "briefs.h"
+#include "briefs_alloc.h"
 
 /* Inode operations for directories */
 const struct inode_operations briefs_dir_inode_ops = {
@@ -117,45 +119,62 @@ int briefs_release(struct inode *inode, struct file *file) {
  * since it's reasonably simple but gets the job done. */
 int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 	struct buffer_head *bh;
-	struct buffer_head **map;
 	struct briefs_superblock *bsb;
 	struct inode *root_inode;
 	struct briefs_sb_info *bsi;
 	int ret = -EINVAL;
 
-	sbi = kzalloc(sizeof(struct briefs_sb_info), GFP_KERNEL);
-	if (!sbi)
+	pr_info("briefs: fill_super enter\n");
+
+	bsi = kzalloc(sizeof(struct briefs_sb_info), GFP_KERNEL);
+	if (!bsi) {
+		pr_err("briefs: failed to allocate sb_info\n");
 		return -ENOMEM;
-	sb->s_fs_info = sbi;
+	}
+	sb->s_fs_info = bsi;
 
 	/* Keeping the same gotos like xiafs, at least for now. JUMP! */
-	if (!sb_set_blocksize(sb, BLOCK_SIZE))
+	if (!sb_set_blocksize(sb, 4096)) {
+		pr_err("briefs: blocksize too small\n");
 		goto out_bad_hblock;
+	}
 
 	/* Read the superblock from the first block for now. Subject to change,
 	 * though, because of possible conflicts with old-timey disks. */
-	if (!(bh = sb_bread(sb, 0)))
+	if (!(bh = sb_bread(sb, 0))) {
+		pr_err("briefs: unable to read superblock\n");
 		goto out_bad_sb;
+	}
 
 	bsb = (struct briefs_superblock *) bh->b_data;
 
 	sb->s_magic = bsb->magic;
 
+	pr_info("briefs: magic=0x%016llx\n", sb->s_magic);
+
 	if (sb->s_magic != _BRIEFS_SUPER_MAGIC) {
+		pr_err("briefs: invalid magic\n");
 		sb->s_dev = 0;
 		ret = -EINVAL;
 		goto out_no_fs;
 	}
 
-	/* Setup sbi now. Since there's not a lot in that struct yet, there's
+	/* Setup bsi now. Since there's not a lot in that struct yet, there's
 	 * not much here. Fill in relevant fields as they become available. */
-	sbi->briefs_superblock = bsb;
+	bsi->sb = bsb;
+
+	/* Initialize allocator with trie */
+	ret = briefs_alloc_init(&bsi->alloc, sb, bsb);
+	if (ret) {
+		pr_err("briefs: failed to initialize allocator: %d\n", ret);
+		goto out_no_root;
+	}
 
 	sb->s_op = &briefs_super_ops;
 
 	root_inode = briefs_iget(sb, _BRIEFS_ROOT_INO);
 	if (IS_ERR(root_inode)) {
-		printk("BrieFS: error getting root inode.\n");
+		pr_err("BrieFS: error getting root inode.\n");
 		ret = PTR_ERR(root_inode);
 		goto out_no_root;
 	}
@@ -163,48 +182,94 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 	ret = -ENOMEM;
 
 	sb->s_root = d_make_root(root_inode);
-	if (!sb->root)
+	if (!sb->s_root) {
+		pr_err("briefs: d_make_root failed\n");
 		goto out_iput;
+	}
 
-	if (!sb_readonly(sb))
+	pr_info("briefs: superblock loaded, mounting successful\n");
+
+	if (!sb_rdonly(sb))
 		mark_buffer_dirty(bh);
 
 	return 0;
 
 	/* Error labels below */
 out_no_root:
-	printk("BrieFS: get root inode failed.\n");
-	/* Once the various tries are being set up in memory, goto that label
-	 * and *then* goto out_release. */
+	pr_err("briefs: get root inode failed.\n");
 	goto out_release;
 
 out_iput:
-	/* Same as above */
 	iput(root_inode);
 	goto out_release;
 
 out_no_fs:
-	printk("VFS: Can't find a BrieFS filesystem on device %s.\n", sb->s_id);
+	pr_err("VFS: Can't find a BrieFS filesystem on device %s.\n", sb->s_id);
 
 out_release:
 	brelse(bh);
 	goto out;
 
 out_bad_hblock:
-	printk("BrieFS: blocksize too small for device.\n");
+	pr_err("BrieFS: blocksize too small for device.\n");
 	goto out;
 
 out_bad_sb:
-	printk("BrieFS: unable to read superblock.\n");
+	pr_err("BrieFS: unable to read superblock.\n");
 
 out:
 	sb->s_fs_info = NULL;
-	kfree(sbi);
+	kfree(bsi);
+	pr_info("briefs: fill_super returning %d\n", ret);
 	return ret;
+}
+
+/* briefs_iget - get an inode by number */
+struct inode *briefs_iget(struct super_block *sb, u64 ino) {
+	struct inode *inode;
+
+	pr_debug("briefs: iget inode %llu\n", ino);
+
+	inode = iget_locked(sb, ino);
+	if (!inode) {
+		pr_err("briefs: iget_locked failed\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	if (inode->i_state & I_NEW) {
+		/* For now, just set basic defaults */
+		if (ino == _BRIEFS_ROOT_INO) {
+			inode->i_mode = S_IFDIR | 0755;
+			inode->i_uid = current_fsuid();
+			inode->i_gid = current_fsgid();
+			inode->i_size = 0;
+			inode->i_blocks = 0;
+			set_nlink(inode, 2);
+		} else {
+			/* For other inodes, just return -ENOENT for now */
+			unlock_new_inode(inode);
+			iput(inode);
+			return ERR_PTR(-ENOENT);
+		}
+
+		unlock_new_inode(inode);
+	}
+
+	return inode;
 }
 
 /* briefs_put_super - cleanup superblock */
 void briefs_put_super(struct super_block *sb) {
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+
+	pr_info("briefs: put_super enter\n");
+
+	if (bsi) {
+		pr_info("briefs: calling alloc_cleanup\n");
+		briefs_alloc_cleanup(&bsi->alloc);
+		pr_info("briefs: alloc_cleanup done\n");
+	}
+
 	pr_info("briefs: put_super\n");
 }
 
@@ -212,4 +277,11 @@ void briefs_put_super(struct super_block *sb) {
 int briefs_statfs(struct dentry *dentry, struct kstatfs *buf) {
 	pr_info("briefs: statfs\n");
 	return -EROFS;
+}
+
+/* briefs_mount - mount callback */
+struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
+                           const char *dev_name, void *data) {
+	pr_info("briefs: mount callback\n");
+	return mount_bdev(fs_type, flags, dev_name, data, briefs_fill_super);
 }

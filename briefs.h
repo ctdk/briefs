@@ -6,6 +6,7 @@
 #include <linux/fs.h>
 #include <linux/types.h>
 #include <linux/stddef.h>
+#include "briefs_alloc.h"
 
 /* BrieFS magic number */
 #define _BRIEFS_SUPER_MAGIC 0x50656c6963616e62 /* "Pelicanb" */
@@ -321,11 +322,14 @@ extern const struct super_operations briefs_super_ops;
 
 /* Fill superblock - entry point for mount */
 int briefs_fill_super(struct super_block *sb, void *data, int flags);
+struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
+                          const char *dev_name, void *data);
 
 /* VFS structures */
 struct briefs_sb_info {
 	struct briefs_superblock *sb;
 	struct block_device *bdev;
+	struct briefs_alloc alloc;
 };
 
 /* briefs_inode_info - our inode info */
