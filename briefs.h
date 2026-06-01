@@ -13,6 +13,9 @@
 /* Define the number of reserved/padding bytes in the superblock */
 #define _BRIEFS_SUPER_RESERVED 384
 
+#define _BRIEFS_ROOT_INO 1
+#define _BRIEFS_BAD_INO  2
+
 /* Default values */
 #define BRIEFS_BLOCK_SIZE 4096
 #define BRIEFS_INODE_SIZE 512

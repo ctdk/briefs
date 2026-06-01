@@ -40,6 +40,12 @@ const struct file_operations briefs_file_operations = {
 	.mmap = generic_file_mmap,
 };
 
+/* Superblock operations */
+const struct super_operations briefs_super_ops = {
+	.put_super = briefs_put_super,
+	.statfs = briefs_statfs,
+};
+
 /* Create */
 int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl) {
 	pr_debug("briefs: create %pd (mode=%o)\n", dentry, mode);
@@ -106,10 +112,95 @@ int briefs_release(struct inode *inode, struct file *file) {
 	return 0;
 }
 
-/* briefs_fill_super - entry point for mount (not implemented yet) */
+/* briefs_fill_super - entry point for mount */
+/* Keeping things simple, at least at first. Cribbing off of xiafs_fill_super
+ * since it's reasonably simple but gets the job done. */
 int briefs_fill_super(struct super_block *sb, void *data, int flags) {
-	pr_info("briefs: mount not implemented yet\n");
-	return -EROFS;
+	struct buffer_head *bh;
+	struct buffer_head **map;
+	struct briefs_superblock *bsb;
+	struct inode *root_inode;
+	struct briefs_sb_info *bsi;
+	int ret = -EINVAL;
+
+	sbi = kzalloc(sizeof(struct briefs_sb_info), GFP_KERNEL);
+	if (!sbi)
+		return -ENOMEM;
+	sb->s_fs_info = sbi;
+
+	/* Keeping the same gotos like xiafs, at least for now. JUMP! */
+	if (!sb_set_blocksize(sb, BLOCK_SIZE))
+		goto out_bad_hblock;
+
+	/* Read the superblock from the first block for now. Subject to change,
+	 * though, because of possible conflicts with old-timey disks. */
+	if (!(bh = sb_bread(sb, 0)))
+		goto out_bad_sb;
+
+	bsb = (struct briefs_superblock *) bh->b_data;
+
+	sb->s_magic = bsb->magic;
+
+	if (sb->s_magic != _BRIEFS_SUPER_MAGIC) {
+		sb->s_dev = 0;
+		ret = -EINVAL;
+		goto out_no_fs;
+	}
+
+	/* Setup sbi now. Since there's not a lot in that struct yet, there's
+	 * not much here. Fill in relevant fields as they become available. */
+	sbi->briefs_superblock = bsb;
+
+	sb->s_op = &briefs_super_ops;
+
+	root_inode = briefs_iget(sb, _BRIEFS_ROOT_INO);
+	if (IS_ERR(root_inode)) {
+		printk("BrieFS: error getting root inode.\n");
+		ret = PTR_ERR(root_inode);
+		goto out_no_root;
+	}
+
+	ret = -ENOMEM;
+
+	sb->s_root = d_make_root(root_inode);
+	if (!sb->root)
+		goto out_iput;
+
+	if (!sb_readonly(sb))
+		mark_buffer_dirty(bh);
+
+	return 0;
+
+	/* Error labels below */
+out_no_root:
+	printk("BrieFS: get root inode failed.\n");
+	/* Once the various tries are being set up in memory, goto that label
+	 * and *then* goto out_release. */
+	goto out_release;
+
+out_iput:
+	/* Same as above */
+	iput(root_inode);
+	goto out_release;
+
+out_no_fs:
+	printk("VFS: Can't find a BrieFS filesystem on device %s.\n", sb->s_id);
+
+out_release:
+	brelse(bh);
+	goto out;
+
+out_bad_hblock:
+	printk("BrieFS: blocksize too small for device.\n");
+	goto out;
+
+out_bad_sb:
+	printk("BrieFS: unable to read superblock.\n");
+
+out:
+	sb->s_fs_info = NULL;
+	kfree(sbi);
+	return ret;
 }
 
 /* briefs_put_super - cleanup superblock */
@@ -122,8 +213,3 @@ int briefs_statfs(struct dentry *dentry, struct kstatfs *buf) {
 	pr_info("briefs: statfs\n");
 	return -EROFS;
 }
-
-const struct super_operations briefs_super_ops = {
-	.put_super = briefs_put_super,
-	.statfs = briefs_statfs,
-};
