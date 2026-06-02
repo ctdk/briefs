@@ -303,6 +303,47 @@ struct briefs_extent_chain {
 
 /* Function headers and the like */
 
+/* Trie node types */
+#define NODE_TYPE_FILE      0x01
+#define NODE_TYPE_DIR       0x02
+#define NODE_TYPE_INTERM    0x03
+
+#define NODE_FLAG_DELETED   0x00000004
+#define NODE_FLAG_ROOT      0x00000008
+
+/* Trie node - 32 bytes, one per block */
+struct briefs_trie_node {
+	__u32 magic;              /* "TRN " - 0x54524E20 */
+	__u32 node_index;         /* unique index in trie */
+	__u64 parent_node;        /* parent trie node index */
+	__u64 first_child;        /* first child node index */
+	__u32 child_count;        /* number of children */
+	__u8 depth;               /* depth in trie (0 = root) */
+	__u8 node_type;           /* NODE_TYPE_* */
+	__u8 reserved[5];
+	__u64 flags;              /* NODE_FLAG_* */
+	
+	/* Entry data (if leaf) */
+	__u64 inode;              /* inode number (0 if intermediate) */
+	__u16 name_len;
+	__u16 name_offset;        /* offset to name in block */
+};
+
+/* Trie root block - first block in trie node pool */
+struct briefs_trie_root {
+	__u32 magic;              /* "TRIE" - 0x54524945 */
+	__u32 version;            /* 1 */
+	__u64 root_node;          /* first trie node block */
+	__u64 free_list;          /* next free trie node block */
+	__u32 node_count;         /* total trie nodes in use */
+	__u32 reserved[7];
+};
+
+/* Trie operations */
+struct briefs_trie_node *briefs_alloc_trie_node(struct super_block *sb);
+void briefs_free_trie_node(struct super_block *sb, struct briefs_trie_node *node);
+void briefs_init_trie_root(struct briefs_trie_node *root);
+
 /* Compute CRC32 checksum for journal record */
 __u32 briefs_crc32c(__u32 crc, const void *data, size_t len);
 

@@ -127,29 +127,25 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 	int ret = -EINVAL;
 
 	pr_info("briefs: fill_super enter\n");
-	pr_info("briefs: sb=%p, blocksize=%d\n", sb, sb->s_blocksize);
 
 	bsi = kzalloc(sizeof(struct briefs_sb_info), GFP_KERNEL);
-	if (!bsi) {
-		pr_err("briefs: failed to allocate sb_info\n");
+	if (!bsi)
 		return -ENOMEM;
-	}
 	sb->s_fs_info = bsi;
 
-	/* Keeping the same gotos like xiafs, at least for now. JUMP! */
 	if (!sb_set_blocksize(sb, 4096)) {
 		pr_err("briefs: blocksize too small\n");
 		goto out_bad_hblock;
 	}
 
-	/* Read the superblock from the first block for now. Subject to change,
-	 * though, because of possible conflicts with old-timey disks. */
 	if (!(bh = sb_bread(sb, 0))) {
 		pr_err("briefs: unable to read superblock\n");
 		goto out_bad_sb;
 	}
 
 	bsb = (struct briefs_superblock *) bh->b_data;
+
+	pr_info("briefs: superblock magic=0x%016llx, data_bitmap_offset=%d, data_bitmap_blocks=%d\n", bsb->magic, bsb->data_bitmap_offset, bsb->data_bitmap_blocks);
 
 	sb->s_magic = bsb->magic;
 
@@ -162,8 +158,6 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 		goto out_no_fs;
 	}
 
-	/* Setup bsi now. Since there's not a lot in that struct yet, there's
-	 * not much here. Fill in relevant fields as they become available. */
 	bsi->sb = bsb;
 
 	/* Initialize allocator with trie */
@@ -197,7 +191,6 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 
 	return 0;
 
-	/* Error labels below */
 out_no_root:
 	pr_err("briefs: get root inode failed.\n");
 	goto out_release;
@@ -230,8 +223,32 @@ out:
 /* briefs_iget - get an inode by number */
 struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 	struct inode *inode;
+	struct briefs_inode_info *binfo;
+	struct buffer_head *bh;
+	struct briefs_inode *disk_inode;
+	struct briefs_sb_info *bsi;
+	u64 inodeTableBlock;
+	u64 inodeBlock;
+	u64 inodeOffset;
 
 	pr_debug("briefs: iget inode %llu\n", ino);
+
+	bsi = sb->s_fs_info;
+	if (!bsi || !bsi->sb) {
+		pr_err("briefs: no sb_info for ino %llu\n", ino);
+		return ERR_PTR(-EIO);
+	}
+
+	/* Calculate inode location: inode table follows data bitmap */
+	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+	/* Inode table starts at inodeTableBlock, each block has 8 inodes (512 bytes each)
+	 * Inode 1 (root) is at the first slot of inodeTableBlock (block 3)
+	 * Inode index = (inodeTableBlock * 8) + (ino - 1)
+	 * File offset = inode_index * 512
+	 */
+	u64 inodeIndex = (inodeTableBlock * (sb->s_blocksize / 512)) + (ino - 1);
+	inodeBlock = 0;
+	inodeOffset = (inodeIndex % 8) * 512;
 
 	inode = iget_locked(sb, ino);
 	if (!inode) {
@@ -240,37 +257,56 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 	}
 
 	if (inode->i_state & I_NEW) {
-		/* For now, just set basic defaults */
-		if (ino == _BRIEFS_ROOT_INO) {
-			inode->i_mode = S_IFDIR | 0755;
-			inode->i_uid = current_fsuid();
-			inode->i_gid = current_fsgid();
-			inode->i_size = 0;
-			inode->i_blocks = 0;
-			set_nlink(inode, 2);
-		} else {
-			/* For other inodes, just return -ENOENT for now */
+		u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+		u64 inodeIndex = (inodeTableBlock * (sb->s_blocksize / 512)) + (ino - 1);
+		inodeBlock = 0;
+		inodeOffset = (inodeIndex % 8) * 512;
+		pr_info("briefs: data_bitmap_offset=%d, data_bitmap_blocks=%d, inodeTableBlock=%d, inodeIndex=%d, inodeBlock=%d, inodeOffset=%d\n", bsi->sb->data_bitmap_offset, bsi->sb->data_bitmap_blocks, inodeTableBlock, inodeIndex, inodeBlock, inodeOffset);
+	pr_info("briefs: reading inode %llu from block %d (inodeTableBlock=%d, inodeBlock=%d)\n", ino, inodeTableBlock + inodeBlock, inodeTableBlock, inodeBlock);
+		/* Read inode from disk */
+		bh = sb_bread(sb, inodeTableBlock + inodeBlock);
+		if (!bh) {
+			pr_err("briefs: unable to read inode block for ino %llu\n", ino);
 			unlock_new_inode(inode);
 			iput(inode);
-			return ERR_PTR(-ENOENT);
+			return ERR_PTR(-EIO);
 		}
 
+		disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
+
+		if (disk_inode->magic != 0x494E4F44) {
+			pr_err("briefs: invalid inode magic for ino %llu: 0x%08x\n", ino, disk_inode->magic);
+			brelse(bh);
+			unlock_new_inode(inode);
+			iput(inode);
+			return ERR_PTR(-EINVAL);
+		}
+
+		/* Copy disk inode to VFS inode */
+		binfo = (struct briefs_inode_info *)inode;
+		memcpy(&binfo->disk_inode, disk_inode, sizeof(struct briefs_inode));
+		binfo->inode_number = ino;
+
+		/* Set VFS inode fields from disk inode */
+		inode->i_mode = disk_inode->filemode;
+		inode->i_uid = make_kuid(&init_user_ns, disk_inode->uid);
+		inode->i_gid = make_kgid(&init_user_ns, disk_inode->gid);
+		inode->i_size = disk_inode->filesize;
+		inode->i_blocks = 0;
+		set_nlink(inode, disk_inode->nlinks);
+
+		pr_info("briefs: inode %llu: mode=0x%04x, uid=%u, gid=%u, size=%llu, nlink=%u\n",
+			ino, inode->i_mode, from_kuid(&init_user_ns, inode->i_uid),
+			from_kgid(&init_user_ns, inode->i_gid), inode->i_size, inode->i_nlink);
+
+		brelse(bh);
 		unlock_new_inode(inode);
 	}
 
 	return inode;
 }
 
-
-/* briefs_evict_inode - cleanup inode on eviction */
-void briefs_evict_inode(struct inode *inode) {
-	pr_debug("briefs: evict_inode inode %lu\n", inode->i_ino);
-	truncate_inode_pages_final(&inode->i_data);
-	clear_inode(inode);
-}
-
-
-
+/* briefs_put_super - cleanup superblock */
 void briefs_put_super(struct super_block *sb) {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
 
@@ -285,15 +321,22 @@ void briefs_put_super(struct super_block *sb) {
 	pr_info("briefs: put_super\n");
 }
 
-/* briefs_umount_begin - called before unmount */
-void briefs_umount_begin(struct super_block *sb) {
-	pr_info("briefs: umount_begin\n");
-}
-
 /* briefs_statfs - filesystem statistics */
 int briefs_statfs(struct dentry *dentry, struct kstatfs *buf) {
 	pr_info("briefs: statfs\n");
 	return -EROFS;
+}
+
+/* briefs_evict_inode - cleanup inode on eviction */
+void briefs_evict_inode(struct inode *inode) {
+	pr_debug("briefs: evict_inode inode %lu\n", inode->i_ino);
+	truncate_inode_pages_final(&inode->i_data);
+	clear_inode(inode);
+}
+
+/* briefs_umount_begin - called before unmount */
+void briefs_umount_begin(struct super_block *sb) {
+	pr_info("briefs: umount_begin\n");
 }
 
 /* briefs_kill_sb - called when sb is being destroyed */
@@ -305,7 +348,6 @@ void briefs_kill_sb(struct super_block *sb) {
 	kill_block_super(sb);
 }
 
-
 /* briefs_mount - mount callback */
 struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
                            const char *dev_name, void *data) {
@@ -313,4 +355,46 @@ struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
 	return mount_bdev(fs_type, flags, dev_name, data, briefs_fill_super);
 }
 
+/* briefs_alloc_trie_node - allocate a trie node block */
+struct briefs_trie_node *briefs_alloc_trie_node(struct super_block *sb) {
+	struct briefs_trie_node *node;
+	struct buffer_head *bh;
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	u64 block;
 
+	if (!bsi || !bsi->sb)
+		return ERR_PTR(-EINVAL);
+
+	/* Allocate from trie node pool */
+	block = bsi->sb->trie_node_pool_start + bsi->sb->trie_blocks_used;
+
+	bh = sb_getblk(sb, block);
+	if (!bh)
+		return ERR_PTR(-ENOMEM);
+
+	node = (struct briefs_trie_node *)bh->b_data;
+	memset(node, 0, sizeof(struct briefs_trie_node));
+
+	/* Initialize node */
+	node->magic = 0x54524E20;  /* "TRN " */
+	node->node_index = bsi->sb->trie_blocks_used++;
+
+	mark_buffer_dirty(bh);
+	brelse(bh);
+
+	return node;
+}
+
+/* briefs_free_trie_node - free a trie node block */
+void briefs_free_trie_node(struct super_block *sb, struct briefs_trie_node *node) {
+	/* TODO: implement free list */
+	kfree(node);
+}
+
+/* briefs_init_trie_root - initialize trie root node */
+void briefs_init_trie_root(struct briefs_trie_node *root) {
+	memset(root, 0, sizeof(struct briefs_trie_node));
+	root->magic = 0x54524E20;  /* "TRN " */
+	root->flags = NODE_FLAG_ROOT;
+	root->node_type = NODE_TYPE_INTERM;
+}
