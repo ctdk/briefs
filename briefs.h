@@ -280,6 +280,8 @@ struct briefs_inode {
 	__u64 atime_nsec;
 	__u64 mtime_sec;
 	__u64 mtime_nsec;
+	__u64 creation_time_sec;
+	__u64 creation_time_nsec;
 	__u32 nlinks;
 	__u32 num_extents_inline;
 	__u64 extent_inline_base;
@@ -290,7 +292,7 @@ struct briefs_inode {
 	__u64 parent_inode;
 	__u32 link_count; /* same as nlinks? */
 	__u32 flags;
-	__u8 reserved[112]; /* zero padded to 512 bytes */
+	__u8 reserved[96]; /* zero padded to 512 bytes */
 };
 
 /* Extent chain for overflow - 256 extents + header = 272 bytes */
