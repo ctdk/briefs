@@ -272,6 +272,7 @@ struct briefs_inode {
 	__u32 filemode;
 	__u32 uid;
 	__u32 gid;
+	__u32 _pad0;               /* explicit padding for u64 alignment */
 	__u64 filesize;
 	__u64 ctime_sec;
 	__u64 ctime_nsec;
@@ -289,7 +290,7 @@ struct briefs_inode {
 	__u64 parent_inode;
 	__u32 link_count; /* same as nlinks? */
 	__u32 flags;
-	__u8 reserved[116]; /* zero padded to 512 bytes */
+	__u8 reserved[112]; /* zero padded to 512 bytes */
 };
 
 /* Extent chain for overflow - 256 extents + header = 272 bytes */

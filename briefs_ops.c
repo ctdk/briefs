@@ -290,6 +290,15 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 		inode->i_blocks = 0;
 		set_nlink(inode, disk_inode->nlinks);
 
+		/* Set VFS operations based on inode type */
+		if (S_ISDIR(inode->i_mode)) {
+			inode->i_op = &briefs_dir_inode_ops;
+			inode->i_fop = &briefs_dir_operations;
+		} else if (S_ISREG(inode->i_mode)) {
+			inode->i_op = &briefs_file_inode_ops;
+			inode->i_fop = &briefs_file_operations;
+		}
+
 		pr_info("briefs: inode %llu: mode=0x%04x, uid=%u, gid=%u, size=%llu, nlink=%u\n",
 			ino, inode->i_mode, from_kuid(&init_user_ns, inode->i_uid),
 			from_kgid(&init_user_ns, inode->i_gid), inode->i_size, inode->i_nlink);
