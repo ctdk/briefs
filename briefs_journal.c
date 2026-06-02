@@ -345,6 +345,28 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	return 0;
 }
 
+/* briefs_journal_dir_update - log a directory entry change */
+int briefs_journal_dir_update(struct briefs_journal *j, u64 parent_ino, u64 child_ino,
+                              const char *name, size_t name_len, u8 op)
+{
+	struct jrn_dir_update rec;
+
+	if (!j || !name || name_len == 0 || name_len > 251)
+		return -EINVAL;
+
+	if (op > 1)
+		return -EINVAL;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.parent_ino = parent_ino;
+	rec.child_ino = child_ino;
+	rec.name_len = (u32)name_len;
+	memcpy(rec.name, name, name_len);
+	rec.op = op;
+
+	return briefs_journal_write_record(j, JRN_DIR_UPDATE, &rec, sizeof(rec));
+}
+
 /*
  * Cleanup journal
  */

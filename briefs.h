@@ -409,6 +409,7 @@ struct briefs_sb_info {
 	struct briefs_superblock *sb;
 	struct block_device *bdev;
 	struct briefs_alloc alloc;
+	struct briefs_journal *journal;  /* transaction journal (dynamically allocated) */
 };
 
 /* briefs_inode_info - our inode info */

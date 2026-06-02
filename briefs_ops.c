@@ -9,6 +9,7 @@
 #include <linux/buffer_head.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
+#include "briefs_journal.h"
 
 /* Inode operations for directories */
 const struct inode_operations briefs_dir_inode_ops = {
@@ -137,6 +138,26 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 		goto out_no_root;
 	}
 
+	/* Initialize journal */
+	bsi->journal = kzalloc(sizeof(struct briefs_journal), GFP_KERNEL);
+	if (!bsi->journal) {
+		ret = -ENOMEM;
+		goto out_no_journal;
+	}
+
+	ret = briefs_journal_open(bsi->journal, bsb, sb->s_bdev);
+	if (ret) {
+		pr_err("briefs: failed to initialize journal: %d\n", ret);
+		goto out_no_journal;
+	}
+
+	/* Replay journal on mount (if not clean) */
+	ret = briefs_journal_replay(bsi->journal);
+	if (ret) {
+		pr_err("briefs: journal replay failed: %d\n", ret);
+		goto out_no_journal;
+	}
+
 	sb->s_op = &briefs_super_ops;
 
 	root_inode = briefs_iget(sb, _BRIEFS_ROOT_INO);
@@ -160,6 +181,10 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 		mark_buffer_dirty(bh);
 
 	return 0;
+
+	out_no_journal:
+	pr_err("briefs: journal init failed.\n");
+	goto out_release;
 
 out_no_root:
 	pr_err("briefs: get root inode failed.\n");
@@ -283,6 +308,18 @@ void briefs_put_super(struct super_block *sb) {
 	pr_info("briefs: put_super enter\n");
 
 	if (bsi) {
+		/* Sync journal before unmount */
+		if (bsi->journal && bsi->journal->dirty) {
+			briefs_journal_checkpoint(bsi->journal);
+		}
+
+		pr_info("briefs: cleaning up journal\n");
+		if (bsi->journal) {
+			briefs_journal_cleanup(bsi->journal);
+			kfree(bsi->journal);
+			bsi->journal = NULL;
+		}
+
 		pr_info("briefs: calling alloc_cleanup\n");
 		briefs_alloc_cleanup(&bsi->alloc);
 		pr_info("briefs: alloc_cleanup done\n");
@@ -432,6 +469,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	struct briefs_superblock *sbk;
 	struct inode *inode;
 	u64 ino;
+	int ret;
 	
 	pr_debug("briefs: create %pd (mode=%o) in dir %lu\n", dentry, mode, dir->i_ino);
 	
@@ -442,6 +480,24 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	ino = briefs_alloc_inode(dir->i_sb);
 	if (ino == 0) {
 		return -ENOSPC;
+	}
+	
+	/* Log inode allocation */
+	if (bsi->journal) {
+		struct jrn_inode_alloc irec;
+		memset(&irec, 0, sizeof(irec));
+		irec.ino = ino;
+		irec.mode = mode & 07777;
+		irec.nlink = 1;
+		ret = briefs_journal_write_record(bsi->journal, JRN_INODE_ALLOC, &irec, sizeof(irec));
+		if (ret) return ret;
+	}
+	
+	/* Log directory entry */
+	if (bsi->journal) {
+		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, ino,
+						dentry->d_name.name, dentry->d_name.len, 0);
+		if (ret) return ret;
 	}
 	
 	/* Create new inode */
@@ -461,9 +517,12 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	inode->i_mtime_sec = inode->i_ctime_sec = ktime_get_real_seconds();
 	inode->i_mtime_nsec = inode->i_ctime_nsec = 0;
 	
-	/* Unlock the inode - briefs_iget already did this */
-	/* unlock_new_inode(inode); */
 	iput(inode);
+	
+	/* Sync journal if we have pending writes */
+	if (bsi->journal && bsi->journal->dirty) {
+		briefs_journal_sync(bsi->journal);
+	}
 	
 	pr_debug("briefs: created inode %llu\n", ino);
 	return 0;
@@ -477,13 +536,60 @@ int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dent
 
 /* briefs_unlink - remove a directory entry */
 int briefs_unlink(struct inode *dir, struct dentry *dentry) {
+	struct briefs_sb_info *bsi;
+	int ret;
+	
 	pr_debug("briefs: unlink %pd\n", dentry);
-	return -EROFS;  /* TODO: implement */
+	
+	bsi = dir->i_sb->s_fs_info;
+	
+	/* Log directory entry deletion */
+	if (bsi->journal) {
+		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, 0,
+						dentry->d_name.name, dentry->d_name.len, 1);
+		if (ret) return ret;
+	}
+	
+	/* Sync journal */
+	if (bsi->journal && bsi->journal->dirty) {
+		briefs_journal_sync(bsi->journal);
+	}
+	
+	return -EROFS;  /* TODO: implement actual unlink after dir entry tree is ready */
 }
 
 /* briefs_rename - rename a directory entry */
 int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
                   struct inode *new_dir, struct dentry *new_dentry, unsigned int flags) {
+	struct briefs_sb_info *bsi;
+	int ret;
+	
 	pr_debug("briefs: rename %pd -> %pd\n", old_dentry, new_dentry);
-	return -EROFS;  /* TODO: implement */
+	
+	bsi = old_dir->i_sb->s_fs_info;
+	
+	/* Log old entry deletion */
+	if (bsi->journal) {
+		ret = briefs_journal_dir_update(bsi->journal, old_dir->i_ino, 0,
+						old_dentry->d_name.name, old_dentry->d_name.len, 1);
+		if (ret) return ret;
+	}
+	
+	/* Log new entry creation */
+	if (bsi->journal) {
+		struct dentry *child = d_find_alias(new_dir);
+		u64 child_ino = child ? child->d_inode->i_ino : 0;
+		dput(child);
+		
+		ret = briefs_journal_dir_update(bsi->journal, new_dir->i_ino, child_ino,
+						new_dentry->d_name.name, new_dentry->d_name.len, 0);
+		if (ret) return ret;
+	}
+	
+	/* Sync journal */
+	if (bsi->journal && bsi->journal->dirty) {
+		briefs_journal_sync(bsi->journal);
+	}
+	
+	return -EROFS;  /* TODO: implement actual rename */
 }

@@ -57,4 +57,8 @@ u64 briefs_journal_next_block(struct briefs_journal *j, u64 cur);
 /* Get previous journal block (for wrapping) */
 u64 briefs_journal_prev_block(struct briefs_journal *j, u64 cur);
 
+/* Write directory update to journal */
+int briefs_journal_dir_update(struct briefs_journal *j, u64 parent_ino, u64 child_ino,
+                              const char *name, size_t name_len, u8 op);
+
 #endif /* _BRIEFS_JOURNAL_H */
