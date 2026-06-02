@@ -51,36 +51,6 @@ const struct super_operations briefs_super_ops = {
 };
 
 /* Create */
-int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl) {
-	pr_debug("briefs: create %pd (mode=%o)\n", dentry, mode);
-	return -EROFS;
-}
-
-/* Lookup */
-struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags) {
-	pr_debug("briefs: lookup %pd\n", dentry);
-	return ERR_PTR(-ENOENT);
-}
-
-/* Mkdir */
-int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode) {
-	pr_debug("briefs: mkdir %pd\n", dentry);
-	return -EROFS;
-}
-
-/* Unlink */
-int briefs_unlink(struct inode *dir, struct dentry *dentry) {
-	pr_debug("briefs: unlink %pd\n", dentry);
-	return -EROFS;
-}
-
-/* Rename */
-int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
-                  struct inode *new_dir, struct dentry *new_dentry, unsigned int flags) {
-	pr_debug("briefs: rename %pd -> %pd\n", old_dentry, new_dentry);
-	return -EROFS;
-}
-
 /* Readdir */
 int briefs_readdir(struct file *file, struct dir_context *ctx) {
 	pr_debug("briefs: readdir offset=%llu\n", ctx->pos);
@@ -397,4 +367,123 @@ void briefs_init_trie_root(struct briefs_trie_node *root) {
 	root->magic = 0x54524E20;  /* "TRN " */
 	root->flags = NODE_FLAG_ROOT;
 	root->node_type = NODE_TYPE_INTERM;
+}
+
+/* briefs_alloc_inode - allocate a new inode number */
+static u64 briefs_alloc_inode(struct super_block *sb) {
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct briefs_superblock *sbk = bsi->sb;
+	
+	/* Find first free inode by checking free_inodes bitmap */
+	/* For now, return the next available inode number */
+	u64 ino = sbk->free_inodes + 1;  /* Inode 1 is root */
+	if (ino >= 0xFFFFFFFF) {
+		return 0;  /* No more inodes available */
+	}
+	return ino;
+}
+
+/* briefs_lookup - find inode by name in directory */
+struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags) {
+	struct briefs_sb_info *bsi;
+	struct briefs_superblock *sbk;
+	const char *name;
+	size_t name_len;
+	
+	if (!dir || !S_ISDIR(dir->i_mode)) {
+		return ERR_PTR(-ENOTDIR);
+	}
+	
+	bsi = dir->i_sb->s_fs_info;
+	sbk = bsi->sb;
+	
+	pr_debug("briefs: lookup for %pd in dir inode %lu\n", dentry, dir->i_ino);
+	
+	name = dentry->d_name.name;
+	name_len = dentry->d_name.len;
+	
+	/* Check for . and .. */
+	if (name_len <= 2) {
+		if (name[0] == '.' && name_len == 1) {
+			/* . - return current directory */
+			igrab(dir);
+			return d_splice_alias(dir, dentry);
+		}
+		if (name[0] == '.' && name[1] == '.' && name_len == 2) {
+			/* .. - return parent directory (root has no parent) */
+			if (dir->i_ino == _BRIEFS_ROOT_INO) {
+				igrab(dir);
+			} else {
+				return ERR_PTR(-EIO);  /* TODO: store parent in inode */
+			}
+			return d_splice_alias(dir, dentry);
+		}
+	}
+	
+	pr_debug("briefs: lookup - name not found: %.*s\n", (int)name_len, name);
+	return ERR_PTR(-ENOENT);
+}
+
+/* briefs_readdir - enumerate directory contents */
+
+/* briefs_create - create a new file */
+int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl) {
+	struct briefs_sb_info *bsi;
+	struct briefs_superblock *sbk;
+	struct inode *inode;
+	u64 ino;
+	
+	pr_debug("briefs: create %pd (mode=%o) in dir %lu\n", dentry, mode, dir->i_ino);
+	
+	bsi = dir->i_sb->s_fs_info;
+	sbk = bsi->sb;
+	
+	/* Allocate new inode */
+	ino = briefs_alloc_inode(dir->i_sb);
+	if (ino == 0) {
+		return -ENOSPC;
+	}
+	
+	/* Create new inode */
+	inode = briefs_iget(dir->i_sb, ino);
+	if (IS_ERR(inode)) {
+		return PTR_ERR(inode);
+	}
+	
+	/* Initialize inode */
+	inode->i_mode = mode;
+	inode->i_uid = current_fsuid();
+	inode->i_gid = current_fsgid();
+	inode->i_size = 0;
+	inode->i_blocks = 0;
+	
+	/* Set times */
+	inode->i_mtime_sec = inode->i_ctime_sec = ktime_get_real_seconds();
+	inode->i_mtime_nsec = inode->i_ctime_nsec = 0;
+	
+	/* Unlock the inode - briefs_iget already did this */
+	/* unlock_new_inode(inode); */
+	iput(inode);
+	
+	pr_debug("briefs: created inode %llu\n", ino);
+	return 0;
+}
+
+/* briefs_mkdir - create a new directory */
+int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode) {
+	pr_debug("briefs: mkdir %pd\n", dentry);
+	return briefs_create(idmap, dir, dentry, (mode & ~07777) | S_IFDIR, false);
+}
+
+/* briefs_unlink - remove a directory entry */
+int briefs_unlink(struct inode *dir, struct dentry *dentry) {
+	pr_debug("briefs: unlink %pd\n", dentry);
+	return -EROFS;  /* TODO: implement */
+}
+
+/* briefs_rename - rename a directory entry */
+int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
+                  struct inode *new_dir, struct dentry *new_dentry, unsigned int flags) {
+	pr_debug("briefs: rename %pd -> %pd\n", old_dentry, new_dentry);
+	return -EROFS;  /* TODO: implement */
 }

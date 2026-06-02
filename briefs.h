@@ -347,6 +347,44 @@ void briefs_init_trie_root(struct briefs_trie_node *root);
 /* Compute CRC32 checksum for journal record */
 __u32 briefs_crc32c(__u32 crc, const void *data, size_t len);
 
+/* Directory entry structure - 80 bytes */
+struct briefs_dir_entry {
+	__u64 inode;              /* inode number */
+	__u32 name_len;           /* length of name */
+	__u32 type;               /* file type (S_IFMT bits) */
+	__u8 name[64];            /* null-terminated name */
+};
+
+/* Directory block - one block for directory data */
+struct briefs_dir_block {
+	__u32 magic;              /* "DRYR" - 0x44525952 */
+	__u32 entry_count;        /* number of entries in this block */
+	__u32 flags;              /* directory flags */
+	__u32 reserved;
+	struct briefs_dir_entry entries[4];  /* 4 entries per block (80 bytes each) */
+};
+
+/* Magic numbers for directory structures */
+#define BRIEFS_DIR_MAGIC 0x44525952  /* "DRYR" */
+
+/* VFS inode type macros */
+#define BRIEFS_S_IFMT   0170000  /* type of file */
+#define BRIEFS_S_IFSOCK 0140000  /* socket */
+#define BRIEFS_S_IFLNK  0120000  /* symbolic link */
+#define BRIEFS_S_IFREG  0100000  /* regular file */
+#define BRIEFS_S_IFBLK  0060000  /* block device */
+#define BRIEFS_S_IFDIR  0040000  /* directory */
+#define BRIEFS_S_IFCHR  0020000  /* character device */
+#define BRIEFS_S_IFIFO  0010000  /* FIFO */
+
+#define BRIEFS_S_ISOCK(m)  (((m) & BRIEFS_S_IFMT) == BRIEFS_S_IFSOCK)
+#define BRIEFS_S_ISLNK(m)  (((m) & BRIEFS_S_IFMT) == BRIEFS_S_IFLNK)
+#define BRIEFS_S_ISREG(m)  (((m) & BRIEFS_S_IFMT) == BRIEFS_S_IFREG)
+#define BRIEFS_S_ISBLK(m)  (((m) & BRIEFS_S_IFMT) == BRIEFS_S_IFBLK)
+#define BRIEFS_S_ISDIR(m)  (((m) & BRIEFS_S_IFMT) == BRIEFS_S_IFDIR)
+#define BRIEFS_S_ISCHR(m)  (((m) & BRIEFS_S_IFMT) == BRIEFS_S_IFCHR)
+#define BRIEFS_S_ISFIFO(m) (((m) & BRIEFS_S_IFMT) == BRIEFS_S_IFIFO)
+
 #ifdef __KERNEL__
 
 /* Inode operations */
