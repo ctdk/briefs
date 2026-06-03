@@ -73,6 +73,6 @@ Vagrant.configure(2) do |config|
   # documentation for more information about their specific syntax and use.
   config.vm.provision "shell", inline: <<-SHELL
     sudo apt-get update
-    # sudo DEBIAN_FRONTEND=noninteractive apt-get install git fakeroot linux-headers-amd64 hexedit hexer linux-source debhelper-compat libdw-dev zstd -y
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install git fakeroot linux-headers-amd64 hexedit hexer linux-source debhelper-compat libdw-dev zstd -y
   SHELL
 end
