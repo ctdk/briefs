@@ -202,59 +202,59 @@ struct trie_node {
 
 /* Superblock - block 0, 4096 bytes */
 struct briefs_superblock {
-	__u64 magic; 					/* 0 offset */
+	__u64 magic;
 
 	/* 8 byte version numbers is a bit ridiculous, but it makes memory
 	 * alignment a lot easier. At least there's tons of extra space in the
 	 * superblock for it.
 	 */
-	__u64 major_version; 				/* 8 */
-	__u64 minor_version; 				/* 16 */
-	__u64 patch_version; 				/* 24 */
+	__u64 major_version;
+	__u64 minor_version;
+	__u64 patch_version;
 
-	__u64 total_blocks;  				/* 32 */
-	__u64 data_blocks; 				/* 40 */
-	__u64 block_size; 				/* 48 */
-	__u64 inode_size; 				/* 56 */
-	__u64 blocks_per_group; 				/* 64 */
-	__u64 inodes_per_group; 				/* 72 */
-	__u64 fs_created;				/* 80 */
-	__u64 fs_last_mounted; 				/* 88 */
-	__u64 fs_last_checkpoint; 			/* 96 */
+	__u64 total_blocks;
+	__u64 data_blocks;
+	__u64 block_size;
+	__u64 inode_size;
+	__u64 blocks_per_group;
+	__u64 inodes_per_group;
+	__u64 fs_created;
+	__u64 fs_last_mounted;
+	__u64 fs_last_checkpoint;
 	/* tracked by trie root free_count */
-	__u64 free_data_blocks; 				/* 104 */
-	__u64 free_inodes; 				/* 112 */
-	__u64 root_inode_number; 			/* 120 */
-	__u64 feature_compat; 				/* 128 */
-	__u64 feature_ro_compat; 			/* 136 */
-	__u64 feature_incompat; 				/* 144 */
+	__u64 free_data_blocks;
+	__u64 free_inodes;
+	__u64 root_inode_number;
+	__u64 feature_compat;
+	__u64 feature_ro_compat;
+	__u64 feature_incompat;
 	
 	/* 128-bit uuid for this volume */
-	__u8 uuid[16]; 					/* 152 */
+	__u8 uuid[16];
 
 	/* The below is particularly subject to change */
-	__u64 eat_offset; 				/* 176 */
-	__u64 eat_blocks; 				/* 184 */
-	__u64 trie_root_block; 				/* 192 */
-	__u64 trie_blocks_used; 				/* 200 */
-	__u64 trie_node_pool_start; 			/* 208 */
-	__u64 trie_node_pool_size; 			/* 216 */
-	__u64 inode_bitmap_offset; 			/* 224 */
-	__u64 inode_bitmap_blocks; 			/* 232 */
-	__u64 data_bitmap_offset; 			/* 240 */
-	__u64 data_bitmap_blocks; 			/* 248 */
-	__u64 journal_offset; 				/* 256 */
-	__u64 journal_blocks; 				/* 264 */
-	__u64 checkpoint_seq; 				/* 272 */
-	__u64 journal_log_start; 			/* 280 */
-	__u64 journal_log_end; 				/* 288 */
-	__u64 reserved_journal[4]; 			/* 296 */
+	__u64 eat_offset;
+	__u64 eat_blocks;
+	__u64 trie_root_block;
+	__u64 trie_blocks_used;
+	__u64 trie_node_pool_start;
+	__u64 trie_node_pool_size;
+	__u64 inode_bitmap_offset;
+	__u64 inode_bitmap_blocks;
+	__u64 data_bitmap_offset;
+	__u64 data_bitmap_blocks;
+	__u64 journal_offset;
+	__u64 journal_blocks;
+	__u64 checkpoint_seq;
+	__u64 journal_log_start;
+	__u64 journal_log_end;
+	__u64 reserved_journal[4];
 
 	/* utf8, null padded */
-	unsigned char label[64]; 			/* 320 */
+	unsigned char label[64];
 
 	/* Superblock padding */
-	unsigned char reserved[_BRIEFS_SUPER_RESERVED];	/* 384 */
+	unsigned char reserved[_BRIEFS_SUPER_RESERVED];
 }; /* 1024 bytes */
 
 /* Extent entry - 32 bytes */
