@@ -3,6 +3,11 @@ BrieFS!
 
 TODO: put something here
 
+RELATED
+-------
+
+* github.com/ctdk/briefs-utils: The briefs utilities, written in Golang, comprised of `mkfs.briefs` and `fsck.briefs`. These are unsurprisingly in progress, but `mkfs.briefs` creates very basic BrieFS volumes while `fsck.briefs` doesn't do anything yet.
+
 RATIONALE
 ---------
 
@@ -20,7 +25,18 @@ Since trying out AI assisted coding was part of the reason for this in the first
 BUGS
 ----
 
-Not even the headers are finished yet, so yeah. It doesn't actually do anything.
+It's not even entirely finished, so yeah. It doesn't actually do much yet. A list of what *does* work would be more informative.
+
+WORKS
+-----
+
+* Kernel module loading
+* Mounting (read-only) a filesystem created by `mkfs.briefs`.
+* Listing the root directory.
+* inode map created
+* data map created
+* extent allocation table created
+* journal should be being created
 
 LICENSE
 -------
