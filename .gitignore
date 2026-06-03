@@ -1,6 +1,9 @@
 .*.sw?
 **/.*.sw?
 
+# ignore vagrant bits
+.vagrant/
+
 # ignore object files and other build artifacts
 *.o
 *.mod
