@@ -12,7 +12,7 @@
 #define _BRIEFS_SUPER_MAGIC 0x50656c6963616e62 /* "Pelicanb" */
 
 /* Define the number of reserved/padding bytes in the superblock */
-#define _BRIEFS_SUPER_RESERVED 384
+#define _BRIEFS_SUPER_RESERVED 640
 
 #define _BRIEFS_ROOT_INO 1
 #define _BRIEFS_BAD_INO  2
