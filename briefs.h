@@ -367,9 +367,10 @@ struct briefs_dir_entry {
 	__u64 inode;              /* inode number */
 	__u8  type;               /* file type (S_IFMT bits) */
 	__u8  flags;              /* flags */
+	__u8  reserved[2];        /* padding to 16-byte alignment */
 	__u16 name_len;           /* name length (1..BRIEFS_NAME_LEN) */
 	__u16 name_off;           /* offset from block end into name region */
-} __attribute__((packed));    /* 12 bytes total */
+};                            /* 16 bytes total */
 
 /*
  * Directory block header (16 bytes). Followed by a variable-length
