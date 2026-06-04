@@ -427,6 +427,10 @@ struct briefs_dir_block {
 
 /* VFS structures */
 struct briefs_sb_info {
+	__u64 data_blocks;
+	__u64 free_data_blocks;
+	__u64 num_inodes;
+	__u64 free_inodes;
 	struct briefs_superblock *sb;
 	struct block_device *bdev;
 	struct briefs_alloc alloc;

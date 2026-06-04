@@ -237,6 +237,14 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 		goto out_iput;
 	}
 
+	/* Load up sb_info as best we can right now. Some of these will either
+	 * need to be calculated here rather than taken from the sb info or
+	 * taken from somewhere else. */
+	bsi->data_blocks = bsb->data_blocks;
+	bsi->free_data_blocks = bsb->free_data_blocks;
+	bsi->num_inodes = 0; /* Unsure where to find this at the moment. */
+	bsi->free_inodes = bsb->free_inodes;
+
 	pr_info("briefs: superblock loaded, mounting successful\n");
 
 	if (!sb_rdonly(sb))
@@ -410,7 +418,11 @@ int briefs_statfs(struct dentry *dentry, struct kstatfs *buf) {
 	u64 id = huge_encode_dev(sb->s_bdev->bd_dev);
 	buf->f_type = sb->s_magic;
 	buf->f_bsize = sb->s_blocksize;
-
+	buf->f_blocks = sbi->data_blocks;
+	buf->f_bfree = sbi->free_data_blocks;
+	buf->f_bavail = sbi->free_data_blocks;
+	buf->f_files = sbi->num_inodes;
+	buf->f_ffree = sbi->free_inodes;
 	buf->f_namelen = BRIEFS_NAME_LEN;
 	buf->f_fsid.val[0] = (u32)id;
 	buf->f_fsid.val[1] = (u32)(id >> 32);
