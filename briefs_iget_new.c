@@ -18,9 +18,15 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 	}
 
 	/* Calculate inode location: inode table follows data bitmap */
-	inodeTableBlock = bsi->sb->DSBMOffset + bsi->sb->DSBMBlocks;
-	inodeBlock = (ino * 512) / 4096;  /* 512 bytes per inode, 4096 per block */
-	inodeOffset = (ino * 512) % 4096;
+	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+	/* Inode table starts at inodeTableBlock. Each block holds 8 inodes (512 bytes each).
+	 * inodeIndex is the 0-based index into the inode table.
+	 * inodeBlock is the block offset within the inode table.
+	 * inodeOffset is the byte offset within that block.
+	 */
+	u64 inodeIndex = ino - 1;
+	inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
+	inodeOffset = (inodeIndex % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
 
 	inode = iget_locked(sb, ino);
 	if (!inode) {

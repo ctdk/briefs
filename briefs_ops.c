@@ -236,14 +236,14 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 
 	/* Calculate inode location: inode table follows data bitmap */
 	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
-	/* Inode table starts at inodeTableBlock, each block has 8 inodes (512 bytes each)
-	 * Inode 1 (root) is at the first slot of inodeTableBlock (block 3)
-	 * Inode index = (inodeTableBlock * 8) + (ino - 1)
-	 * File offset = inode_index * 512
+	/* Inode table starts at inodeTableBlock. Each block holds 8 inodes (512 bytes each).
+	 * inodeIndex is the 0-based index into the inode table.
+	 * inodeBlock is the block offset within the inode table.
+	 * inodeOffset is the byte offset within that block.
 	 */
-	u64 inodeIndex = (inodeTableBlock * (sb->s_blocksize / 512)) + (ino - 1);
-	inodeBlock = 0;
-	inodeOffset = (inodeIndex % 8) * 512;
+	u64 inodeIndex = ino - 1;
+	inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
+	inodeOffset = (inodeIndex % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
 
 	inode = iget_locked(sb, ino);
 	if (!inode) {
@@ -252,12 +252,15 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 	}
 
 	if (inode->i_state & I_NEW) {
+		/* Recompute inode location inside the locked block */
 		u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
-		u64 inodeIndex = (inodeTableBlock * (sb->s_blocksize / 512)) + (ino - 1);
-		inodeBlock = 0;
-		inodeOffset = (inodeIndex % 8) * 512;
-		pr_info("briefs: data_bitmap_offset=%d, data_bitmap_blocks=%d, inodeTableBlock=%d, inodeIndex=%d, inodeBlock=%d, inodeOffset=%d\n", bsi->sb->data_bitmap_offset, bsi->sb->data_bitmap_blocks, inodeTableBlock, inodeIndex, inodeBlock, inodeOffset);
-	pr_info("briefs: reading inode %llu from block %d (inodeTableBlock=%d, inodeBlock=%d)\n", ino, inodeTableBlock + inodeBlock, inodeTableBlock, inodeBlock);
+		u64 inodeIndex = ino - 1;
+		inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
+		inodeOffset = (inodeIndex % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+		pr_info("briefs: data_bitmap_offset=%llu, data_bitmap_blocks=%llu, inodeTableBlock=%llu, inodeIndex=%llu, inodeBlock=%llu, inodeOffset=%llu\n",
+			bsi->sb->data_bitmap_offset, bsi->sb->data_bitmap_blocks, inodeTableBlock, inodeIndex, inodeBlock, inodeOffset);
+		pr_info("briefs: reading inode %llu from block %llu (inodeTableBlock=%llu, inodeBlock=%llu)\n",
+			ino, inodeTableBlock + inodeBlock, inodeTableBlock, inodeBlock);
 		/* Read inode from disk */
 		bh = sb_bread(sb, inodeTableBlock + inodeBlock);
 		if (!bh) {
