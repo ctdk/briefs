@@ -444,41 +444,85 @@ static u64 briefs_alloc_inode(struct super_block *sb) {
 /* briefs_lookup - find inode by name in directory */
 struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags) {
 	struct briefs_sb_info *bsi;
-	struct briefs_superblock *sbk;
+	struct briefs_inode_info *binfo;
+	struct buffer_head *bh;
+	struct briefs_dir_block *dir_block;
+	struct briefs_dir_entry *entry;
 	const char *name;
-	size_t name_len;
+	unsigned int name_len;
+	u64 dir_block_num;
+	int i;
 	
 	if (!dir || !S_ISDIR(dir->i_mode)) {
 		return ERR_PTR(-ENOTDIR);
 	}
 	
 	bsi = dir->i_sb->s_fs_info;
-	sbk = bsi->sb;
-	
-	pr_debug("briefs: lookup for %pd in dir inode %lu\n", dentry, dir->i_ino);
-	
 	name = dentry->d_name.name;
 	name_len = dentry->d_name.len;
 	
+	pr_debug("briefs: lookup for %pd in dir inode %lu\n", dentry, dir->i_ino);
+	
 	/* Check for . and .. */
-	if (name_len <= 2) {
-		if (name[0] == '.' && name_len == 1) {
-			/* . - return current directory */
+	if (name_len == 1 && name[0] == '.') {
+		igrab(dir);
+		return d_splice_alias(dir, dentry);
+	}
+	if (name_len == 2 && name[0] == '.' && name[1] == '.') {
+		if (dir->i_ino == _BRIEFS_ROOT_INO) {
 			igrab(dir);
 			return d_splice_alias(dir, dentry);
 		}
-		if (name[0] == '.' && name[1] == '.' && name_len == 2) {
-			/* .. - return parent directory (root has no parent) */
-			if (dir->i_ino == _BRIEFS_ROOT_INO) {
-				igrab(dir);
-			} else {
-				return ERR_PTR(-EIO);  /* TODO: store parent in inode */
+		/* TODO: look up parent inode from dir inode */
+		return ERR_PTR(-EIO);
+	}
+	
+	/* Get directory data block from inline extent */
+	binfo = briefs_i(dir);
+	if (binfo->disk_inode.num_extents_inline == 0) {
+		return ERR_PTR(-ENOENT);
+	}
+	
+	/* First inline extent points to the directory block */
+	dir_block_num = binfo->disk_inode.inline_extents[0].phys;
+	
+	bh = sb_bread(dir->i_sb, dir_block_num);
+	if (!bh) {
+		pr_err("briefs: failed to read dir block %llu\n", dir_block_num);
+		return ERR_PTR(-EIO);
+	}
+	
+	dir_block = (struct briefs_dir_block *)bh->b_data;
+	if (dir_block->magic != BRIEFS_DIR_MAGIC) {
+		pr_err("briefs: invalid dir block magic: 0x%08x\n", dir_block->magic);
+		brelse(bh);
+		return ERR_PTR(-EIO);
+	}
+	
+	/* Scan entries */
+	for (i = 0; i < dir_block->num_entries; i++) {
+		entry = (struct briefs_dir_entry *)(bh->b_data + sizeof(struct briefs_dir_block) +
+			                                    i * sizeof(struct briefs_dir_entry));
+		
+		if (entry->name_len != name_len)
+			continue;
+		
+		/* Compare name */
+		if (entry->name_off > 0 && entry->name_off <= BRIEFS_BLOCK_SIZE) {
+			char *entry_name = bh->b_data + BRIEFS_BLOCK_SIZE - entry->name_off + 2;
+			if (memcmp(entry_name, name, name_len) == 0) {
+				/* Found it */
+				struct inode *inode = briefs_iget(dir->i_sb, entry->inode);
+				brelse(bh);
+				if (IS_ERR(inode))
+					return ERR_CAST(inode);
+				return d_splice_alias(inode, dentry);
 			}
-			return d_splice_alias(dir, dentry);
 		}
 	}
 	
-	pr_debug("briefs: lookup - name not found: %.*s\n", (int)name_len, name);
+	brelse(bh);
+	/* Name not found - return negative dentry */
 	return ERR_PTR(-ENOENT);
 }
 
