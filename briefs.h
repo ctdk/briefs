@@ -405,7 +405,7 @@ struct briefs_dir_block {
 };
 
 /* Max entries per directory block (rough estimate for safety) */
-#define BRIEFS_DIR_MAX_ENTRIENTRIES 300
+#define BRIEFS_DIR_MAX_ENTRIES 300
 
 /* VFS inode type macros */
 #define BRIEFS_S_IFMT   0170000  /* type of file */
