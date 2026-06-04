@@ -388,6 +388,21 @@ struct briefs_dir_block {
 #define BRIEFS_S_ISCHR(m)  (((m) & BRIEFS_S_IFMT) == BRIEFS_S_IFCHR)
 #define BRIEFS_S_ISFIFO(m) (((m) & BRIEFS_S_IFMT) == BRIEFS_S_IFIFO)
 
+/* VFS structures */
+struct briefs_sb_info {
+	struct briefs_superblock *sb;
+	struct block_device *bdev;
+	struct briefs_alloc alloc;
+	struct briefs_journal *journal;  /* transaction journal (dynamically allocated) */
+};
+
+/* briefs_inode_info - our inode info */
+struct briefs_inode_info {
+	struct inode vfs_inode;
+	struct briefs_inode disk_inode;
+	u64 inode_number;
+};
+
 #ifdef __KERNEL__
 
 /* Inode operations */
@@ -406,21 +421,6 @@ extern const struct super_operations briefs_super_ops;
 int briefs_fill_super(struct super_block *sb, void *data, int flags);
 struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
                           const char *dev_name, void *data);
-
-/* VFS structures */
-struct briefs_sb_info {
-	struct briefs_superblock *sb;
-	struct block_device *bdev;
-	struct briefs_alloc alloc;
-	struct briefs_journal *journal;  /* transaction journal (dynamically allocated) */
-};
-
-/* briefs_inode_info - our inode info */
-struct briefs_inode_info {
-	struct inode vfs_inode;
-	struct briefs_inode disk_inode;
-	u64 inode_number;
-};
 
 /* Inode operation prototypes */
 struct inode *briefs_iget(struct super_block *sb, u64 ino);
