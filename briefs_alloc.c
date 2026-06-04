@@ -16,6 +16,10 @@
  * Block 0 of the pool is the trie root header.
  * Node data blocks start at pool_start + 1.
  * Each block holds 128 nodes (4096 / 32 = 128).
+ *
+ * node_index 0 is valid (the first node in the first data block).
+ * The caller (briefs_load_trie_recursive) treats 0 as "no child"
+ * only when passed as a child pointer, not when loading the root.
  */
 static struct trie_node *briefs_read_trie_node(struct super_block *sb, struct briefs_superblock *sb_disk, u64 node_index)
 {
@@ -25,13 +29,9 @@ static struct trie_node *briefs_read_trie_node(struct super_block *sb, struct br
 	u64 block_offset;
 	u64 byte_offset;
 
-	/* Node index 0 is invalid (reserved for "no child") */
-	if (node_index == 0)
-		return NULL;
-
 	/* Convert node index to block number and byte offset within the pool */
-	block_offset = sb_disk->trie_node_pool_start + 1 + ((node_index - 1) / nodes_per_block);
-	byte_offset = ((node_index - 1) % nodes_per_block) * sizeof(struct trie_node);
+	block_offset = sb_disk->trie_node_pool_start + 1 + (node_index / nodes_per_block);
+	byte_offset = (node_index % nodes_per_block) * sizeof(struct trie_node);
 
 	bh = sb_bread(sb, block_offset);
 	if (!bh)
@@ -49,16 +49,16 @@ static struct trie_node *briefs_read_trie_node(struct super_block *sb, struct br
 	return node;
 }
 
-/* Recursively load trie nodes from disk by node index */
+/* Recursively load trie nodes from disk by node index.
+ * Returns 0 on success with *node_ptr set, or -errno on error.
+ * A node_index of 0 is a valid node (it is the first node in
+ * the trie data blocks). The caller guards against no-child
+ * sentinels by checking left_child/right_child before calling.
+ */
 static int briefs_load_trie_recursive(struct super_block *sb, struct briefs_superblock *sb_disk, struct trie_node **node_ptr, u64 node_index)
 {
 	struct trie_node *node;
 	int ret;
-
-	if (node_index == 0) {
-		*node_ptr = NULL;
-		return 0;
-	}
 
 	node = briefs_read_trie_node(sb, sb_disk, node_index);
 	if (IS_ERR(node))
