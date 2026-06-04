@@ -778,7 +778,7 @@ struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned 
 	return ERR_PTR(-ENOENT);
 }
 
-/* briefs_create - create a new file */
+/* briefs_create - create a new file or directory */
 int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl) {
 	struct briefs_sb_info *bsi;
 	struct briefs_superblock *sbk;
@@ -788,6 +788,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	u64 ino;
 	u64 inodeTableBlock, inodeBlock, inodeOffset, inodeIndex;
 	int ret;
+	bool is_dir = S_ISDIR(mode);
 
 	pr_debug("briefs: create %pd (mode=%o) in dir %lu\n", dentry, mode, dir->i_ino);
 
@@ -805,7 +806,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 		memset(&irec, 0, sizeof(irec));
 		irec.ino = ino;
 		irec.mode = mode & 07777;
-		irec.nlink = 1;
+		irec.nlink = is_dir ? 2 : 1;
 		ret = briefs_journal_write_record(bsi->journal, JRN_INODE_ALLOC, &irec, sizeof(irec));
 		if (ret) return ret;
 	}
@@ -828,7 +829,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	inode->i_gid = current_fsgid();
 	inode->i_size = 0;
 	inode->i_blocks = 0;
-	set_nlink(inode, 1);
+	set_nlink(inode, is_dir ? 2 : 1);
 
 	inode->i_atime_sec = inode->i_mtime_sec = inode->i_ctime_sec = 12345; // placeholder
 
@@ -840,9 +841,90 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
 	binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);
 	binfo->disk_inode.filesize = 0;
-	binfo->disk_inode.nlinks = 1;
+	binfo->disk_inode.nlinks = is_dir ? 2 : 1;
 	binfo->disk_inode.num_extents_inline = 0;
 	binfo->disk_inode.num_extents_total = 0;
+
+	/* For directories: allocate a data block and write . and .. entries */
+	if (is_dir) {
+		u64 dir_block = briefs_alloc_block(&bsi->alloc);
+		if (dir_block == 0) {
+			pr_err("briefs: no free blocks for new dir\n");
+			iput(inode);
+			return -ENOSPC;
+		}
+
+		/* Build directory block with . and .. entries */
+		struct buffer_head *dbh = sb_getblk(dir->i_sb, dir_block);
+		if (!dbh) {
+			pr_err("briefs: failed to get dir block %llu\n", dir_block);
+			iput(inode);
+			return -EIO;
+		}
+
+		struct briefs_dir_block *dblk = (struct briefs_dir_block *)dbh->b_data;
+		memset(dblk, 0, BRIEFS_BLOCK_SIZE);
+		dblk->magic = BRIEFS_DIR_MAGIC;
+		dblk->num_entries = 2;
+
+		/* Entry 0: "." */
+		struct briefs_dir_entry *de = (struct briefs_dir_entry *)(dbh->b_data + sizeof(struct briefs_dir_block));
+		memset(de, 0, sizeof(*de));
+		de->inode = ino;
+		de->type = 4; /* S_IFDIR >> 12 */
+		de->name_len = 1;
+		de->name_off = 3; /* 2 bytes len + 1 byte name from block end */
+
+		/* Entry 1: ".." */
+		de = (struct briefs_dir_entry *)(dbh->b_data + sizeof(struct briefs_dir_block) + sizeof(struct briefs_dir_entry));
+		memset(de, 0, sizeof(*de));
+		de->inode = dir->i_ino;
+		de->type = 4;
+		de->name_len = 2;
+		de->name_off = 7; /* 2 bytes len + 2 bytes name from block end */
+
+		/* Pack names at end of block */
+		u32 name_pos = BRIEFS_BLOCK_SIZE;
+		/* ".." first (written second, closest to end) */
+		name_pos -= 4;
+		*(__u16 *)(dbh->b_data + name_pos) = 2;
+		memcpy(dbh->b_data + name_pos + 2, "..", 2);
+		/* "." second (written first, further from end) */
+		name_pos -= 3;
+		*(__u16 *)(dbh->b_data + name_pos) = 1;
+		memcpy(dbh->b_data + name_pos + 2, ".", 1);
+
+		dblk->data_size = sizeof(struct briefs_dir_block) + 2 * sizeof(struct briefs_dir_entry);
+		dblk->names_size = 7;
+
+		mark_buffer_dirty(dbh);
+		sync_dirty_buffer(dbh);
+		brelse(dbh);
+
+		/* Set up the new inode's extent to point to this dir block */
+		binfo->disk_inode.num_extents_inline = 1;
+		binfo->disk_inode.num_extents_total = 1;
+		binfo->disk_inode.inline_extents[0].offset = 0;
+		binfo->disk_inode.inline_extents[0].phys = dir_block;
+		binfo->disk_inode.inline_extents[0].len = 1;
+		binfo->disk_inode.inline_extents[0].flags = 0;
+
+		inode->i_size = dblk->data_size + dblk->names_size;
+		binfo->disk_inode.filesize = inode->i_size;
+
+		/* Mark data block allocated in bitmap */
+		u64 bm_block = bsi->sb->data_bitmap_offset + (dir_block / (BRIEFS_BLOCK_SIZE * 8));
+		u64 bm_byte = (dir_block % (BRIEFS_BLOCK_SIZE * 8)) / 8;
+		u64 bm_bit = dir_block % 8;
+		struct buffer_head *bm_bh = sb_bread(dir->i_sb, bm_block);
+		if (bm_bh) {
+			bm_bh->b_data[bm_byte] |= (1 << bm_bit);
+			mark_buffer_dirty(bm_bh);
+			brelse(bm_bh);
+		}
+
+		pr_debug("briefs: allocated dir block %llu for inode %llu\n", dir_block, ino);
+	}
 
 	/* Write the inode to disk */
 	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
@@ -873,8 +955,9 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	}
 
 	/* Update parent inode */
+	if (is_dir)
+		inc_nlink(dir);
 	dir->i_size += sizeof(struct briefs_dir_entry) + 2 + dentry->d_name.len;
-	inc_nlink(dir);
 	binfo = briefs_i(dir);
 	binfo->disk_inode.filesize = dir->i_size;
 	binfo->disk_inode.nlinks = dir->i_nlink;
@@ -895,7 +978,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	}}
 
 	/* Setup VFS operations */
-	if (S_ISDIR(mode)) {
+	if (is_dir) {
 		inode->i_op = &briefs_dir_inode_ops;
 		inode->i_fop = &briefs_dir_operations;
 	} else {
@@ -921,7 +1004,6 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 /* briefs_mkdir - create a new directory */
 int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode) {
 	pr_debug("briefs: mkdir %pd\n", dentry);
-	/* TODO: allocate a directory block with . and .. entries */
 	return briefs_create(idmap, dir, dentry, (mode & ~07777) | S_IFDIR, false);
 }
 
