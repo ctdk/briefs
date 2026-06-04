@@ -350,25 +350,61 @@ void briefs_init_trie_root(struct briefs_trie_node *root);
 /* Compute CRC32 checksum for journal record */
 __u32 briefs_crc32c(__u32 crc, const void *data, size_t len);
 
-/* Directory entry structure - 80 bytes */
+/* Directory block magic */
+#define BRIEFS_DIR_MAGIC 0x44525952  /* "DRYR" */
+
+/*
+ * Directory entry — compact, variable-length name.
+ * Names are packed into the trailing name region of the directory block
+ * (growing downward from block end). Each DirEntry has a name_len and
+ * name_off that points into the name region.
+ *
+ * A name_off of 0 means "no name" (used for empty/deleted slots).
+ * name_off is the byte offset FROM THE END of the block:
+ *   name_ptr = block + block_size - name_off
+ */
 struct briefs_dir_entry {
 	__u64 inode;              /* inode number */
-	__u32 name_len;           /* length of name */
-	__u32 type;               /* file type (S_IFMT bits) */
-	__u8 name[64];            /* null-terminated name */
-};
+	__u8  type;               /* file type (S_IFMT bits) */
+	__u8  flags;              /* flags */
+	__u16 name_len;           /* name length (1..BRIEFS_NAME_LEN) */
+	__u16 name_off;           /* offset from block end into name region */
+} __attribute__((packed));    /* 12 bytes total */
 
-/* Directory block - one block for directory data */
+/*
+ * Directory block header (16 bytes). Followed by a variable-length
+ * array of DirEntry structs, then a packed name region that grows
+ * downward from block_size.
+ *
+ *          +----------------+  block_start
+ *          | DirBlockHeader |  16 bytes
+ *          +----------------+
+ *          | DirEntry[0]    |  12 bytes
+ *          | DirEntry[1]    |  12 bytes
+ *          | ...            |
+ *          +----------------+  data_end = sizeof(header) + num_entries * sizeof(DirEntry)
+ *          |    unused      |
+ *          +----------------+
+ *          | name_N  ...    |  names_size bytes
+ *          | name_1  ...    |
+ *          | name_0  ...    |
+ *          +----------------+  block_start + block_size
+ *
+ * Names are stored with a 2-byte length prefix for forward scanning:
+ *   [len:2][name bytes...]
+ * The region grows downward, so the newest name is closest to block end.
+ * name_off = offset from block end to the start of the name entry
+ *            (including the 2-byte length prefix).
+ */
 struct briefs_dir_block {
-	__u32 magic;              /* "DRYR" - 0x44525952 */
-	__u32 entry_count;        /* number of entries in this block */
-	__u32 flags;              /* directory flags */
-	__u32 reserved;
-	struct briefs_dir_entry entries[4];  /* 4 entries per block (80 bytes each) */
+	__u32 magic;              /* BRIEFS_DIR_MAGIC */
+	__u32 num_entries;        /* number of entries in this block */
+	__u32 data_size;          /* bytes used by entries (header + entries) */
+	__u32 names_size;         /* bytes used by packed name region */
 };
 
-/* Magic numbers for directory structures */
-#define BRIEFS_DIR_MAGIC 0x44525952  /* "DRYR" */
+/* Max entries per directory block (rough estimate for safety) */
+#define BRIEFS_DIR_MAX_ENTRIENTRIES 300
 
 /* VFS inode type macros */
 #define BRIEFS_S_IFMT   0170000  /* type of file */
