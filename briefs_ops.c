@@ -47,6 +47,7 @@ const struct file_operations briefs_file_operations = {
 const struct super_operations briefs_super_ops = {
 	.put_super = briefs_put_super,
 	.statfs = briefs_statfs,
+	.write_inode = briefs_write_inode,
 	.evict_inode = briefs_evict_inode,
 	.umount_begin = briefs_umount_begin,
 };
@@ -146,6 +147,150 @@ int briefs_open(struct inode *inode, struct file *file) {
 /* Release file */
 int briefs_release(struct inode *inode, struct file *file) {
 	pr_debug("briefs: release inode %lu\n", inode->i_ino);
+	return 0;
+}
+
+/* briefs_write_inode - persist VFS inode to disk */
+int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
+	struct briefs_sb_info *bsi;
+	struct briefs_inode_info *binfo;
+	struct buffer_head *bh;
+	struct briefs_inode *disk_inode;
+	u64 inodeTableBlock, inodeBlock, inodeOffset, inodeIndex;
+
+	if (!inode)
+		return -EINVAL;
+
+	bsi = inode->i_sb->s_fs_info;
+	binfo = briefs_i(inode);
+
+	pr_debug("briefs: write_inode %lu\n", inode->i_ino);
+
+	/* Calculate inode location */
+	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+	inodeIndex = inode->i_ino - 1;
+	inodeBlock = inodeIndex / (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
+	inodeOffset = (inodeIndex % (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+
+	/* Read the block containing this inode */
+	bh = sb_bread(inode->i_sb, inodeTableBlock + inodeBlock);
+	if (!bh) {
+		pr_err("briefs: failed to read inode block for write_inode %lu\n", inode->i_ino);
+		return -EIO;
+	}
+
+	disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
+
+	/* Copy in-memory disk_inode (already updated by caller) */
+	memcpy(disk_inode, &binfo->disk_inode, sizeof(struct briefs_inode));
+
+	/* Update VFS-derived fields */
+	disk_inode->filemode = inode->i_mode;
+	disk_inode->uid = from_kuid(&init_user_ns, inode->i_uid);
+	disk_inode->gid = from_kgid(&init_user_ns, inode->i_gid);
+	disk_inode->filesize = inode->i_size;
+	disk_inode->nlinks = inode->i_nlink;
+
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+
+	return 0;
+}
+
+/*
+ * briefs_add_dir_entry - append a directory entry to a parent directory.
+ *
+ * Reads the directory's data block, appends a new DirEntry, and packs the
+ * name into the trailing name region.
+ */
+int briefs_add_dir_entry(struct inode *dir, const char *name, size_t name_len, u64 child_ino, u8 type) {
+	struct briefs_inode_info *binfo;
+	struct buffer_head *bh;
+	struct briefs_dir_block *dir_block;
+	struct briefs_dir_entry *entry;
+	u64 dir_block_num;
+	int i, entry_off;
+	u32 entry_name_len = (u32)name_len;
+	u32 hdr_size = sizeof(struct briefs_dir_block);
+	u32 entry_sz = sizeof(struct briefs_dir_entry);
+
+	if (!dir || !name || name_len < 1 || name_len > BRIEFS_NAME_LEN)
+		return -EINVAL;
+
+	binfo = briefs_i(dir);
+
+	if (binfo->disk_inode.num_extents_inline == 0) {
+		pr_err("briefs: dir inode %lu has no extents\n", dir->i_ino);
+		return -EIO;
+	}
+
+	dir_block_num = binfo->disk_inode.inline_extents[0].phys;
+
+	bh = sb_bread(dir->i_sb, dir_block_num);
+	if (!bh) {
+		pr_err("briefs: failed to read dir block %llu\n", dir_block_num);
+		return -EIO;
+	}
+
+	dir_block = (struct briefs_dir_block *)bh->b_data;
+	if (dir_block->magic != BRIEFS_DIR_MAGIC) {
+		pr_err("briefs: invalid dir block magic: 0x%08x\n", dir_block->magic);
+		brelse(bh);
+		return -EIO;
+	}
+
+	/* Check if entry already exists */
+	for (i = 0; i < dir_block->num_entries; i++) {
+		entry = (struct briefs_dir_entry *)(bh->b_data + hdr_size + i * entry_sz);
+		if (entry->name_len == entry_name_len && entry->name_off > 0 &&
+		    entry->name_off <= BRIEFS_BLOCK_SIZE) {
+			char *ename = bh->b_data + BRIEFS_BLOCK_SIZE - entry->name_off + 2;
+			if (memcmp(ename, name, entry_name_len) == 0) {
+				/* Already exists - update inode */
+				entry->inode = child_ino;
+				entry->type = type;
+				mark_buffer_dirty(bh);
+				brelse(bh);
+				return 0;
+			}
+		}
+	}
+
+	/* Calculate position for new entry */
+	i = dir_block->num_entries;
+	entry_off = hdr_size + i * entry_sz;
+
+	/* Name region grows downward from block end */
+	u32 name_region_start = BRIEFS_BLOCK_SIZE - dir_block->names_size;
+	u32 new_name_start = name_region_start - (2 + entry_name_len);
+
+	if (entry_off + entry_sz > new_name_start) {
+		brelse(bh);
+		pr_err("briefs: dir block full for ino %lu\n", dir->i_ino);
+		return -ENOSPC;
+	}
+
+	/* Write name entry (length prefix + name bytes) */
+	*(__u16 *)(bh->b_data + new_name_start) = (__u16)entry_name_len;
+	memcpy(bh->b_data + new_name_start + 2, name, entry_name_len);
+
+	/* Write DirEntry */
+	entry = (struct briefs_dir_entry *)(bh->b_data + entry_off);
+	memset(entry, 0, entry_sz);
+	entry->inode = child_ino;
+	entry->type = type;
+	entry->name_len = (__u16)entry_name_len;
+	entry->name_off = (__u16)(BRIEFS_BLOCK_SIZE - new_name_start);
+
+	/* Update header */
+	dir_block->num_entries++;
+	dir_block->data_size = entry_off + entry_sz;
+	dir_block->names_size += (2 + entry_name_len);
+
+	mark_buffer_dirty(bh);
+	brelse(bh);
+
 	return 0;
 }
 
@@ -505,14 +650,47 @@ void briefs_init_trie_root(struct briefs_trie_node *root) {
 static u64 briefs_alloc_inode(struct super_block *sb) {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
 	struct briefs_superblock *sbk = bsi->sb;
-	
-	/* Find first free inode by checking free_inodes bitmap */
-	/* For now, return the next available inode number */
-	u64 ino = sbk->free_inodes + 1;  /* Inode 1 is root */
-	if (ino >= 0xFFFFFFFF) {
-		return 0;  /* No more inodes available */
+	struct buffer_head *bh;
+	u8 *bitmap;
+	u64 ino;
+	int bi, bj;
+
+	/* Scan inode bitmap for first zero bit */
+	for (bi = 0; bi < sbk->inode_bitmap_blocks; bi++) {
+		bh = sb_bread(sb, sbk->inode_bitmap_offset + bi);
+		if (!bh) {
+			pr_err("briefs: failed to read inode bitmap block %d\n", bi);
+			return 0;
+		}
+
+		bitmap = bh->b_data;
+		for (bj = 0; bj < sb->s_blocksize; bj++) {
+			if (bitmap[bj] != 0xFF) {
+				/* Found a byte with a free bit */
+				int bit;
+				for (bit = 0; bit < 8; bit++) {
+					if (!(bitmap[bj] & (1 << bit))) {
+						ino = (bi * sb->s_blocksize * 8) + (bj * 8) + bit + 1;
+
+						/* Mark inode as allocated */
+						bitmap[bj] |= (1 << bit);
+						mark_buffer_dirty(bh);
+						brelse(bh);
+
+						/* Update sb free count */
+						sbk->free_inodes--;
+
+						pr_debug("briefs: allocated inode %llu\n", ino);
+						return ino;
+					}
+				}
+			}
+		}
+		brelse(bh);
 	}
-	return ino;
+
+	pr_err("briefs: no free inodes\n");
+	return 0;
 }
 
 /* briefs_lookup - find inode by name in directory */
@@ -605,20 +783,22 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	struct briefs_sb_info *bsi;
 	struct briefs_superblock *sbk;
 	struct inode *inode;
+	struct buffer_head *bh;
+	struct briefs_inode *disk_inode;
 	u64 ino;
+	u64 inodeTableBlock, inodeBlock, inodeOffset, inodeIndex;
 	int ret;
-	
+
 	pr_debug("briefs: create %pd (mode=%o) in dir %lu\n", dentry, mode, dir->i_ino);
-	
+
 	bsi = dir->i_sb->s_fs_info;
 	sbk = bsi->sb;
-	
+
 	/* Allocate new inode */
 	ino = briefs_alloc_inode(dir->i_sb);
-	if (ino == 0) {
+	if (ino == 0)
 		return -ENOSPC;
-	}
-	
+
 	/* Log inode allocation */
 	if (bsi->journal) {
 		struct jrn_inode_alloc irec;
@@ -629,45 +809,119 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 		ret = briefs_journal_write_record(bsi->journal, JRN_INODE_ALLOC, &irec, sizeof(irec));
 		if (ret) return ret;
 	}
-	
+
 	/* Log directory entry */
 	if (bsi->journal) {
 		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, ino,
 						dentry->d_name.name, dentry->d_name.len, 0);
 		if (ret) return ret;
 	}
-	
+
 	/* Create new inode */
 	inode = briefs_iget(dir->i_sb, ino);
-	if (IS_ERR(inode)) {
+	if (IS_ERR(inode))
 		return PTR_ERR(inode);
-	}
-	
+
 	/* Initialize inode */
 	inode->i_mode = mode;
 	inode->i_uid = current_fsuid();
 	inode->i_gid = current_fsgid();
 	inode->i_size = 0;
 	inode->i_blocks = 0;
-	
-	/* Set times */
-	inode->i_mtime_sec = inode->i_ctime_sec = ktime_get_real_seconds();
-	inode->i_mtime_nsec = inode->i_ctime_nsec = 0;
-	
-	iput(inode);
-	
-	/* Sync journal if we have pending writes */
-	if (bsi->journal && bsi->journal->dirty) {
-		briefs_journal_sync(bsi->journal);
+	set_nlink(inode, 1);
+
+	inode->i_atime_sec = inode->i_mtime_sec = inode->i_ctime_sec = 12345; // placeholder
+
+	/* Set up briefs_inode fields */
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	binfo->disk_inode.inode_number = ino;
+	binfo->disk_inode.magic = 0x494E4F44;
+	binfo->disk_inode.filemode = mode;
+	binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
+	binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);
+	binfo->disk_inode.filesize = 0;
+	binfo->disk_inode.nlinks = 1;
+	binfo->disk_inode.num_extents_inline = 0;
+	binfo->disk_inode.num_extents_total = 0;
+
+	/* Write the inode to disk */
+	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+	inodeIndex = ino - 1;
+	inodeBlock = inodeIndex / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
+	inodeOffset = (inodeIndex % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+
+	bh = sb_bread(dir->i_sb, inodeTableBlock + inodeBlock);
+	if (!bh) {
+		pr_err("briefs: failed to read inode block for create %llu\n", ino);
+		iput(inode);
+		return -EIO;
 	}
-	
-	pr_debug("briefs: created inode %llu\n", ino);
+
+	disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
+	memcpy(disk_inode, &binfo->disk_inode, sizeof(struct briefs_inode));
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+
+	/* Add directory entry to parent */
+	u8 ftype = (mode & S_IFMT) >> 12;
+	ret = briefs_add_dir_entry(dir, dentry->d_name.name, dentry->d_name.len, ino, ftype);
+	if (ret) {
+		pr_err("briefs: failed to add dir entry %pd: %d\n", dentry, ret);
+		iput(inode);
+		return ret;
+	}
+
+	/* Update parent inode */
+	dir->i_size += sizeof(struct briefs_dir_entry) + 2 + dentry->d_name.len;
+	inc_nlink(dir);
+	binfo = briefs_i(dir);
+	binfo->disk_inode.filesize = dir->i_size;
+	binfo->disk_inode.nlinks = dir->i_nlink;
+
+	/* Write parent inode */
+	{u64 pIno = dir->i_ino;
+	u64 pIdx = pIno - 1;
+	u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
+	u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+	struct buffer_head *pbh = sb_bread(dir->i_sb, inodeTableBlock + pBlk);
+	if (pbh) {
+		struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + pOff);
+		pdi->filesize = dir->i_size;
+		pdi->nlinks = dir->i_nlink;
+		mark_buffer_dirty(pbh);
+		sync_dirty_buffer(pbh);
+		brelse(pbh);
+	}}
+
+	/* Setup VFS operations */
+	if (S_ISDIR(mode)) {
+		inode->i_op = &briefs_dir_inode_ops;
+		inode->i_fop = &briefs_dir_operations;
+	} else {
+		inode->i_op = &briefs_file_inode_ops;
+		inode->i_fop = &briefs_file_operations;
+	}
+
+	/* Sync journal */
+	if (bsi->journal && bsi->journal->dirty) {
+		ret = briefs_journal_sync(bsi->journal);
+		if (ret) {
+			iput(inode);
+			return ret;
+		}
+	}
+
+	d_instantiate(dentry, inode);
+
+	pr_debug("briefs: created inode %llu, added to dir\n", ino);
 	return 0;
 }
 
 /* briefs_mkdir - create a new directory */
 int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode) {
 	pr_debug("briefs: mkdir %pd\n", dentry);
+	/* TODO: allocate a directory block with . and .. entries */
 	return briefs_create(idmap, dir, dentry, (mode & ~07777) | S_IFDIR, false);
 }
 

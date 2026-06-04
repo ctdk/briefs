@@ -475,6 +475,9 @@ struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
 /* Inode operation prototypes */
 struct inode *briefs_iget(struct super_block *sb, u64 ino);
 int briefs_write_inode(struct inode *inode, struct writeback_control *wbc);
+
+/* Add a directory entry to a parent directory */
+int briefs_add_dir_entry(struct inode *dir, const char *name, size_t name_len, u64 child_ino, u8 type);
 void briefs_evict_inode(struct inode *inode);
 void briefs_umount_begin(struct super_block *sb);
 
