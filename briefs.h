@@ -403,6 +403,15 @@ struct briefs_inode_info {
 	u64 inode_number;
 };
 
+/* yanked from the xiafs module, which in turn was yanked from minix */
+static inline struct briefs_sb_info *briefs_sb(struct super_block *sb) {
+	return sb->s_fs_info;
+}
+
+static inline struct briefs_inode_info *briefs_i(struct inode *inode) {
+	return list_entry(inode, struct briefs_inode_info, vfs_inode);
+}
+
 #ifdef __KERNEL__
 
 /* Inode operations */
