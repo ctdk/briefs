@@ -13,10 +13,6 @@
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
 
-#define JOURNAL_BLOCK_SIZE 4096
-#define JRN_RECORD_MAX_SIZE 320  /* max record size (JRN_DIR_UPDATE) */
-#define JOURNAL_LOG_EVERY 100    /* log every N operations */
-
 /*
  * Initialize journal from superblock
  */
@@ -39,9 +35,13 @@ int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb) 
 		return -EINVAL;
 	}
 
-	/* Allocate current block buffer */
-	j->cur_block = kzalloc(sizeof(struct journal_block), GFP_KERNEL);
+	/* Allocate 4096-byte block buffer */
+	j->cur_block = kzalloc(JOURNAL_BLOCK_SIZE, GFP_KERNEL);
 	if (!j->cur_block) return -ENOMEM;
+
+	j->cur_hdr = (struct journal_block_header *)j->cur_block;
+	j->cur_hdr->magic = JOURNAL_MAGIC;
+	j->write_offset = sizeof(struct journal_block_header); /* 16 bytes */
 
 	pr_debug("briefs: journal initialized (start=%llu, end=%llu, checkpoint=%llu)\n",
 		j->journal_start, j->journal_end, j->checkpoint_block);
@@ -86,8 +86,11 @@ u64 briefs_journal_prev_block(struct briefs_journal *j, u64 cur) {
 /*
  * Read a journal block from disk
  */
-int briefs_journal_read_block(struct briefs_journal *j, u64 block_offset, struct journal_block *block) {
-	if (!j || !j->bdev || !block) return -EINVAL;
+int briefs_journal_read_block(struct briefs_journal *j, u64 block_offset, unsigned char *buf) {
+	struct bio *bio;
+	int ret;
+
+	if (!j || !j->bdev || !buf) return -EINVAL;
 
 	if (block_offset < j->journal_start || block_offset >= j->journal_end) {
 		pr_err("briefs: journal read out of range (offset=%llu, range=[%llu,%llu))\n",
@@ -95,13 +98,10 @@ int briefs_journal_read_block(struct briefs_journal *j, u64 block_offset, struct
 		return -ERANGE;
 	}
 
-	struct bio *bio;
-	int ret;
-
 	bio = bio_alloc(j->bdev, 1, REQ_OP_READ, GFP_KERNEL);
 	if (!bio) return -ENOMEM;
 
-	if (!bio_add_page(bio, virt_to_page(block), JOURNAL_BLOCK_SIZE, 0)) {
+	if (!bio_add_page(bio, virt_to_page(buf), JOURNAL_BLOCK_SIZE, 0)) {
 		pr_err("briefs: bio_add_page failed for read at offset=%llu\n", block_offset);
 		bio_put(bio);
 		return -EIO;
@@ -111,9 +111,8 @@ int briefs_journal_read_block(struct briefs_journal *j, u64 block_offset, struct
 	ret = submit_bio_wait(bio);
 	bio_put(bio);
 
-	if (ret) {
+	if (ret)
 		pr_err("briefs: journal read failed at offset=%llu (err=%d)\n", block_offset, ret);
-	}
 
 	return ret;
 }
@@ -121,8 +120,11 @@ int briefs_journal_read_block(struct briefs_journal *j, u64 block_offset, struct
 /*
  * Write a journal block to disk
  */
-int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, struct journal_block *block) {
-	if (!j || !j->bdev || !block) return -EINVAL;
+int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, unsigned char *buf) {
+	struct bio *bio;
+	int ret;
+
+	if (!j || !j->bdev || !buf) return -EINVAL;
 
 	if (block_offset < j->journal_start || block_offset >= j->journal_end) {
 		pr_err("briefs: journal write out of range (offset=%llu, range=[%llu,%llu))\n",
@@ -130,13 +132,10 @@ int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, struc
 		return -ERANGE;
 	}
 
-	struct bio *bio;
-	int ret;
-
 	bio = bio_alloc(j->bdev, 1, REQ_OP_WRITE, GFP_KERNEL);
 	if (!bio) return -ENOMEM;
 
-	if (!bio_add_page(bio, virt_to_page(block), JOURNAL_BLOCK_SIZE, 0)) {
+	if (!bio_add_page(bio, virt_to_page(buf), JOURNAL_BLOCK_SIZE, 0)) {
 		pr_err("briefs: bio_add_page failed for write at offset=%llu\n", block_offset);
 		bio_put(bio);
 		return -EIO;
@@ -146,9 +145,8 @@ int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, struc
 	ret = submit_bio_wait(bio);
 	bio_put(bio);
 
-	if (ret) {
+	if (ret)
 		pr_err("briefs: journal write failed at offset=%llu (err=%d)\n", block_offset, ret);
-	}
 
 	return ret;
 }
@@ -158,44 +156,66 @@ int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, struc
  */
 static u32 compute_record_checksum(enum journal_record_type type, u32 flags,
                                     u32 data_len, const void *data) {
-	/* Simplified: return 0 for now */
-	/* Full implementation would use briefs_crc32c */
-	return 0;
+	return briefs_crc32c(0, &type, sizeof(type)) ^
+	       briefs_crc32c(0, &flags, sizeof(flags)) ^
+	       briefs_crc32c(0, &data_len, sizeof(data_len)) ^
+	       briefs_crc32c(0, data, data_len);
 }
 
 /*
- * Write a record to the journal
+ * Write a record to the journal.
+ * Records are appended sequentially within the current block.
+ * If a record doesn't fit, the current block is flushed to disk,
+ * write_pos advances, and a new block is started.
  */
 int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_type type,
                                  void *data, u32 data_len) {
+	u32 total_size;
+	u32 hdr_size = sizeof(struct journal_record_hdr);
+
 	if (!j || !data || data_len == 0) return -EINVAL;
 
-	/* Validate record type */
 	if (type <= JRN_NONE || type >= JRN_END) {
 		pr_err("briefs: invalid journal record type=%d\n", type);
 		return -EINVAL;
 	}
 
-	struct journal_record_hdr *hdr = (struct journal_record_hdr *)j->cur_block->records;
+	total_size = hdr_size + data_len;
 
-	/* Check if we need to flush current block */
-	if (j->cur_block->header.record_count >= 255) {
-		pr_warn("briefs: journal block full (record_count=%u), must sync\n",
-			j->cur_block->header.record_count);
-		return -ENOSPC;
+	/* Check if record fits in remaining block space */
+	if (j->write_offset + total_size > JOURNAL_BLOCK_SIZE) {
+		/* Flush current block to disk */
+		j->cur_hdr->record_count = j->cur_hdr->record_count;
+		int ret = briefs_journal_write_block(j, j->write_pos, j->cur_block);
+		if (ret) return ret;
+
+		/* Advance write position */
+		j->write_pos = briefs_journal_next_block(j, j->write_pos);
+
+		/* Don't clobber the checkpoint block */
+		if (j->write_pos == j->checkpoint_block)
+			j->write_pos = briefs_journal_next_block(j, j->write_pos);
+
+		/* Reset block buffer for new records */
+		memset(j->cur_block, 0, JOURNAL_BLOCK_SIZE);
+		j->cur_hdr->magic = JOURNAL_MAGIC;
+		j->cur_hdr->block_seq++;
+		j->write_offset = hdr_size;
 	}
 
-	/* Create record header */
+	/* Write record header */
+	struct journal_record_hdr *hdr = (struct journal_record_hdr *)(j->cur_block + j->write_offset);
 	hdr->type = type;
 	hdr->flags = 0;
 	hdr->data_len = data_len;
 	hdr->checksum = compute_record_checksum(type, 0, data_len, data);
 
 	/* Copy record data after header */
-	memcpy((unsigned char *)hdr + sizeof(*hdr), data, data_len);
+	memcpy(j->cur_block + j->write_offset + hdr_size, data, data_len);
 
-	/* Update block header */
-	j->cur_block->header.record_count++;
+	/* Advance write offset */
+	j->write_offset += total_size;
+	j->cur_hdr->record_count++;
 	j->dirty = true;
 
 	return 0;
@@ -207,37 +227,54 @@ int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_ty
 int briefs_journal_checkpoint(struct briefs_journal *j) {
 	if (!j) return -EINVAL;
 
+	/* Flush any pending records first */
+	if (j->dirty) {
+		int ret = briefs_journal_sync(j);
+		if (ret) return ret;
+	}
+
 	/* Create checkpoint record */
 	struct jrn_checkpoint cp;
 	memset(&cp, 0, sizeof(cp));
 	cp.checkpoint_seq = ++j->checkpoint_seq;
-	cp.record_count = j->cur_block->header.record_count;
+	cp.record_count = j->cur_hdr->record_count;
 	cp.log_sequence_end = j->write_pos;
 	cp.trie_root_node = j->sb->trie_root_block;
-	cp.free_data_count = j->sb->data_blocks;  /* TODO: get from trie root */
+	cp.free_data_count = j->sb->free_data_blocks;
 	cp.free_inode_count = j->sb->free_inodes;
 
-	/* Write checkpoint record */
-	int ret = briefs_journal_write_record(j, JRN_CHECKPOINT, &cp, sizeof(cp));
-	if (ret) return ret;
+	/* Write checkpoint record into a fresh buffer */
+	unsigned char *cp_buf = kzalloc(JOURNAL_BLOCK_SIZE, GFP_KERNEL);
+	if (!cp_buf) return -ENOMEM;
+
+	struct journal_block_header *cp_hdr = (struct journal_block_header *)cp_buf;
+	cp_hdr->magic = CHECKPOINT_MAGIC;
+	cp_hdr->block_seq = j->cur_hdr->block_seq;
+	cp_hdr->record_count = 1;
+
+	struct journal_record_hdr *rec_hdr = (struct journal_record_hdr *)(cp_buf + sizeof(struct journal_block_header));
+	rec_hdr->type = JRN_CHECKPOINT;
+	rec_hdr->flags = 0;
+	rec_hdr->data_len = sizeof(cp);
+	rec_hdr->checksum = compute_record_checksum(JRN_CHECKPOINT, 0, sizeof(cp), &cp);
+
+	memcpy(cp_buf + sizeof(struct journal_block_header) + sizeof(*rec_hdr), &cp, sizeof(cp));
 
 	/* Write checkpoint block to disk */
-	ret = briefs_journal_write_block(j, j->checkpoint_block, j->cur_block);
+	int ret = briefs_journal_write_block(j, j->checkpoint_block, cp_buf);
+	kfree(cp_buf);
 	if (ret) {
 		pr_err("briefs: checkpoint write failed (err=%d)\n", ret);
 		return ret;
 	}
 
 	pr_debug("briefs: checkpoint written (seq=%llu, records=%u, log_end=%llu)\n",
-		j->checkpoint_seq, j->cur_block->header.record_count, j->write_pos);
+		j->checkpoint_seq, cp.record_count, j->write_pos);
 
-	/* Update superblock */
 	j->sb->checkpoint_seq = j->checkpoint_seq;
-	j->sb->journal_log_start = briefs_journal_next_block(j, j->write_pos);
-	j->sb->journal_log_end = j->sb->journal_log_start;
+	j->sb->journal_log_start = j->write_pos;
+	j->sb->journal_log_end = j->write_pos;
 
-	/* Reset block for next use */
-	memset(j->cur_block, 0, sizeof(struct journal_block));
 	j->dirty = false;
 
 	return 0;
@@ -249,7 +286,6 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
 int briefs_journal_replay(struct briefs_journal *j) {
 	if (!j) return -EINVAL;
 
-	/* Check if journal is empty */
 	if (j->sb->journal_log_start == j->sb->journal_log_end) {
 		pr_info("briefs: journal is clean (no replay needed)\n");
 		return 0;
@@ -258,94 +294,65 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	pr_info("briefs: replaying journal (start=%llu, end=%llu)\n",
 		j->sb->journal_log_start, j->sb->journal_log_end);
 
-	/* Walk journal from log_start to log_end */
 	u64 cur = j->sb->journal_log_start;
 	u64 end = j->sb->journal_log_end;
-	struct journal_block block;
+	unsigned char *buf = kmalloc(JOURNAL_BLOCK_SIZE, GFP_KERNEL);
+	if (!buf) return -ENOMEM;
+
 	u32 records_replayed = 0;
 	u32 blocks_read = 0;
 
 	while (cur != end) {
-		/* Read journal block from disk */
-		int ret = briefs_journal_read_block(j, cur, &block);
+		int ret = briefs_journal_read_block(j, cur, buf);
 		if (ret) {
 			pr_err("briefs: journal replay failed at block=%llu (err=%d)\n", cur, ret);
+			kfree(buf);
 			return ret;
 		}
 
 		blocks_read++;
 
-		/* Validate journal block magic */
-		if (block.header.magic != JOURNAL_MAGIC) {
+		struct journal_block_header *hdr = (struct journal_block_header *)buf;
+		if (hdr->magic != JOURNAL_MAGIC && hdr->magic != CHECKPOINT_MAGIC) {
 			pr_warn("briefs: invalid journal magic at block=%llu (got=0x%08x, expected=0x%08x)\n",
-				cur, block.header.magic, JOURNAL_MAGIC);
+				cur, hdr->magic, JOURNAL_MAGIC);
 			break;
 		}
 
-		/* For each record in block: */
-		for (u32 i = 0; i < block.header.record_count; i++) {
-			struct journal_record_hdr *hdr = (struct journal_record_hdr *)block.records;
-			hdr = (struct journal_record_hdr *)((unsigned char *)hdr + i * JRN_RECORD_MAX_SIZE);
+		/* Walk records by their actual sizes */
+		u64 rec_off = sizeof(struct journal_block_header);
+		for (u32 i = 0; i < hdr->record_count && rec_off < JOURNAL_BLOCK_SIZE; i++) {
+			struct journal_record_hdr *rh = (struct journal_record_hdr *)(buf + rec_off);
 
-			/* Validate record type */
-			if (hdr->type <= JRN_NONE || hdr->type >= JRN_END) {
-				pr_warn("briefs: invalid record type=%u at block=%llu index=%u\n",
-					hdr->type, cur, i);
-				continue;
-			}
-
-			/* Replay based on record type */
-			switch (hdr->type) {
-			case JRN_EXTENT_ALLOC: {
-				/* struct jrn_extent_alloc *rec = (struct jrn_extent_alloc *)(((unsigned char *)hdr) + sizeof(*hdr)); */
-				/* Update trie and inode */
-				break;
-			}
-			case JRN_EXTENT_FREE: {
-				/* struct jrn_extent_free *rec = (struct jrn_extent_free *)(((unsigned char *)hdr) + sizeof(*hdr)); */
-				/* Update trie */
-				break;
-			}
-			case JRN_INODE_UPDATE: {
-				/* struct jrn_inode_update *rec = (struct jrn_inode_update *)(((unsigned char *)hdr) + sizeof(*hdr)); */
-				/* Update inode */
-				break;
-			}
-			case JRN_INODE_ALLOC: {
-				/* struct jrn_inode_alloc *rec = (struct jrn_inode_alloc *)(((unsigned char *)hdr) + sizeof(*hdr)); */
-				/* Allocate inode */
-				break;
-			}
-			case JRN_INODE_FREE: {
-				/* struct jrn_inode_free *rec = (struct jrn_inode_free *)(((unsigned char *)hdr) + sizeof(*hdr)); */
-				/* Free inode */
-				break;
-			}
-			case JRN_CHECKPOINT:
-				/* Skip - already committed */
-				break;
-			default:
-				/* Unknown record type - skip */
+			if (rh->type <= JRN_NONE || rh->type >= JRN_END) {
+				pr_warn("briefs: invalid record type=%u at block=%llu\n", rh->type, cur);
 				break;
 			}
 
-			records_replayed++;
+			if (rh->type != JRN_CHECKPOINT) {
+				records_replayed++;
+			}
+
+			rec_off += sizeof(*rh) + rh->data_len;
 		}
 
 		cur = briefs_journal_next_block(j, cur);
 	}
 
+	kfree(buf);
+
 	pr_info("briefs: journal replay complete (blocks=%u, records=%u)\n",
 		blocks_read, records_replayed);
 
-	/* Reset journal after replay */
 	j->sb->journal_log_start = j->sb->journal_log_end;
 	j->sb->checkpoint_seq++;
 
 	return 0;
 }
 
-/* briefs_journal_dir_update - log a directory entry change */
+/*
+ * Log a directory entry change
+ */
 int briefs_journal_dir_update(struct briefs_journal *j, u64 parent_ino, u64 child_ino,
                               const char *name, size_t name_len, u8 op)
 {
@@ -373,27 +380,47 @@ int briefs_journal_dir_update(struct briefs_journal *j, u64 parent_ino, u64 chil
 void briefs_journal_cleanup(struct briefs_journal *j) {
 	if (!j) return;
 
-	if (j->cur_block) {
-		kfree(j->cur_block);
-		j->cur_block = NULL;
-	}
+	kfree(j->cur_block);
+	j->cur_block = NULL;
+	j->cur_hdr = NULL;
 
 	memset(j, 0, sizeof(*j));
 }
 
 /*
  * Sync dirty journal block to disk
+ * Flushes the current block, advances write_pos.
  */
 int briefs_journal_sync(struct briefs_journal *j) {
+	int ret;
+
 	if (!j || !j->dirty) return 0;
 
+	j->cur_hdr->record_count = j->cur_hdr->record_count;
+
 	/* Write current block to disk */
-	int ret = briefs_journal_write_block(j, j->write_pos, j->cur_block);
+	ret = briefs_journal_write_block(j, j->write_pos, j->cur_block);
 	if (ret) {
 		pr_err("briefs: journal sync failed (err=%d)\n", ret);
 		return ret;
 	}
 
+	/* Advance write position */
+	j->write_pos = briefs_journal_next_block(j, j->write_pos);
+
+	/* Don't clobber the checkpoint block */
+	if (j->write_pos == j->checkpoint_block)
+		j->write_pos = briefs_journal_next_block(j, j->write_pos);
+
+	/* Reset for next block */
+	memset(j->cur_block, 0, JOURNAL_BLOCK_SIZE);
+	j->cur_hdr->magic = JOURNAL_MAGIC;
+	j->cur_hdr->block_seq++;
+	j->write_offset = sizeof(struct journal_block_header);
+
 	j->dirty = false;
+
+	pr_debug("briefs: journal synced, write_pos=%llu\n", j->write_pos);
+
 	return 0;
 }

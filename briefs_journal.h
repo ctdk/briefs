@@ -14,8 +14,10 @@
 struct briefs_journal {
 	struct briefs_superblock *sb;     /* superblock pointer */
 	struct block_device *bdev;        /* block device */
-	struct journal_block *cur_block;  /* current journal block buffer */
-	u64 write_pos;                    /* current write position in journal */
+	unsigned char *cur_block;         /* current journal block buffer (4096 bytes) */
+	struct journal_block_header *cur_hdr; /* cast to block header */
+	u64 write_offset;                 /* byte offset for next record in cur_block */
+	u64 write_pos;                    /* current journal block number on disk */
 	u64 journal_start;                /* first journal block */
 	u64 journal_end;                  /* last journal block */
 	u64 checkpoint_block;             /* checkpoint area (last journal block) */
@@ -27,10 +29,10 @@ struct briefs_journal {
 int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb);
 
 /* Read a journal block from disk */
-int briefs_journal_read_block(struct briefs_journal *j, u64 block_offset, struct journal_block *block);
+int briefs_journal_read_block(struct briefs_journal *j, u64 block_offset, unsigned char *buf);
 
 /* Write a journal block to disk */
-int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, struct journal_block *block);
+int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, unsigned char *buf);
 
 /* Write a record to the journal */
 int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_type type,
