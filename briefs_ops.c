@@ -126,16 +126,232 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 	return 0;
 }
 
+/*
+ * briefs_find_block - resolve file block offset to physical block
+ * via inline extents. Returns 0 if unmapped (hole).
+ */
+static u64 briefs_find_block(struct inode *inode, u64 file_block)
+{
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	int i;
+
+	for (i = 0; i < binfo->disk_inode.num_extents_inline; i++) {
+		struct briefs_extent *ext = &binfo->disk_inode.inline_extents[i];
+		if (file_block >= ext->offset && file_block < ext->offset + ext->len)
+			return ext->phys + (file_block - ext->offset);
+	}
+	return 0;
+}
+
+/*
+ * briefs_find_or_create_block - like find_block, but allocates a new
+ * physical block if none is mapped and appends a new extent.
+ */
+static u64 briefs_find_or_create_block(struct inode *inode, u64 file_block)
+{
+	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct briefs_extent *ext;
+	int i;
+
+	/* Check existing extents */
+	for (i = 0; i < binfo->disk_inode.num_extents_inline; i++) {
+		ext = &binfo->disk_inode.inline_extents[i];
+		if (file_block >= ext->offset && file_block < ext->offset + ext->len)
+			return ext->phys + (file_block - ext->offset);
+	}
+
+	/* Check if we can extend the last extent */
+	if (binfo->disk_inode.num_extents_inline > 0) {
+		ext = &binfo->disk_inode.inline_extents[binfo->disk_inode.num_extents_inline - 1];
+		if (file_block == ext->offset + ext->len) {
+			u64 nb = briefs_alloc_block(&bsi->alloc);
+			if (nb == 0)
+				return 0;
+			if (nb == ext->phys + ext->len && ext->len < 0xFFFFFFFF) {
+				/* Physically contiguous — extend */
+				ext->len++;
+				return nb;
+			}
+			/* Not contiguous — start a new extent */
+			if (binfo->disk_inode.num_extents_inline < 8) {
+				int n = binfo->disk_inode.num_extents_inline;
+				binfo->disk_inode.inline_extents[n].offset = file_block;
+				binfo->disk_inode.inline_extents[n].phys = nb;
+				binfo->disk_inode.inline_extents[n].len = 1;
+				binfo->disk_inode.num_extents_inline++;
+				binfo->disk_inode.num_extents_total++;
+				return nb;
+			}
+			return 0;
+		}
+	}
+
+	/* Need a brand new extent */
+	if (binfo->disk_inode.num_extents_inline >= 8)
+		return 0; /* overflow not yet supported */
+
+	u64 nb = briefs_alloc_block(&bsi->alloc);
+	if (nb == 0)
+		return 0;
+
+	int n = binfo->disk_inode.num_extents_inline;
+	binfo->disk_inode.inline_extents[n].offset = file_block;
+	binfo->disk_inode.inline_extents[n].phys = nb;
+	binfo->disk_inode.inline_extents[n].len = 1;
+	binfo->disk_inode.inline_extents[n].flags = 0;
+	binfo->disk_inode.num_extents_inline++;
+	binfo->disk_inode.num_extents_total++;
+	return nb;
+}
+
 /* Read file */
 ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to) {
-	pr_debug("briefs: read_iter size=%zu\n", iov_iter_count(to));
-	return 0;
+	struct inode *inode = file_inode(iocb->ki_filp);
+	loff_t pos = iocb->ki_pos;
+	size_t count = iov_iter_count(to);
+	size_t done = 0;
+	ssize_t ret = 0;
+
+	pr_debug("briefs: read_iter pos=%lld count=%zu\n", pos, count);
+
+	if (pos < 0)
+		return -EINVAL;
+	if (pos >= inode->i_size)
+		return 0;
+	if (pos + count > inode->i_size)
+		count = inode->i_size - pos;
+
+	while (count > 0) {
+		u64 file_block = pos / BRIEFS_BLOCK_SIZE;
+		u64 offset_in_block = pos % BRIEFS_BLOCK_SIZE;
+		u64 phys_block = briefs_find_block(inode, file_block);
+
+		if (phys_block == 0) {
+			/* Hole — fill with zeros */
+			size_t hole = min(count, BRIEFS_BLOCK_SIZE - offset_in_block);
+			if (!iov_iter_zero(hole, to)) {
+				ret = -EFAULT;
+				break;
+			}
+			done += hole;
+			pos += hole;
+			count -= hole;
+			continue;
+		}
+
+		struct buffer_head *bh = sb_bread(inode->i_sb, phys_block);
+		if (!bh) {
+			ret = -EIO;
+			break;
+		}
+
+		size_t chunk = min(count, BRIEFS_BLOCK_SIZE - offset_in_block);
+		size_t copied = copy_to_iter(bh->b_data + offset_in_block, chunk, to);
+		brelse(bh);
+
+		if (copied == 0) {
+			ret = -EFAULT;
+			break;
+		}
+
+		done += copied;
+		pos += copied;
+		count -= copied;
+	}
+
+	if (done > 0) {
+		iocb->ki_pos = pos;
+		ret = done;
+	}
+
+	return ret;
 }
 
 /* Write file */
 ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from) {
-	pr_debug("briefs: write_iter size=%zu\n", iov_iter_count(from));
-	return -EROFS;
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	loff_t pos = iocb->ki_pos;
+	size_t count = iov_iter_count(from);
+	size_t done = 0;
+	ssize_t ret = 0;
+	loff_t new_size = max_t(loff_t, inode->i_size, pos + count);
+
+	pr_debug("briefs: write_iter pos=%lld count=%zu\n", pos, count);
+
+	if (pos < 0)
+		return -EINVAL;
+
+	while (count > 0) {
+		u64 file_block = pos / BRIEFS_BLOCK_SIZE;
+		u64 offset_in_block = pos % BRIEFS_BLOCK_SIZE;
+		u64 phys_block = briefs_find_or_create_block(inode, file_block);
+
+		if (phys_block == 0) {
+			pr_err("briefs: write_iter: no free block for file_block %llu\n", file_block);
+			ret = -ENOSPC;
+			break;
+		}
+
+		struct buffer_head *bh = sb_bread(inode->i_sb, phys_block);
+		if (!bh) {
+			ret = -EIO;
+			break;
+		}
+
+		size_t chunk = min(count, BRIEFS_BLOCK_SIZE - offset_in_block);
+		size_t copied = copy_from_iter(bh->b_data + offset_in_block, chunk, from);
+		if (copied == 0) {
+			brelse(bh);
+			ret = -EFAULT;
+			break;
+		}
+
+		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);
+		brelse(bh);
+
+		done += copied;
+		pos += copied;
+		count -= copied;
+	}
+
+	if (done > 0) {
+		iocb->ki_pos = pos;
+
+		if (pos > inode->i_size) {
+			inode->i_size = pos;
+			binfo->disk_inode.filesize = pos;
+		}
+
+		inode->i_blocks = 0; /* TODO: compute from extents */
+		inode->i_mtime_sec = ktime_get_real_seconds();
+		binfo->disk_inode.mtime_sec = inode->i_mtime_sec;
+
+		/* Persist inode */
+		{
+			u64 ino = inode->i_ino;
+			u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+			u64 idx = ino - 1;
+			u64 blk = idx / (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
+			u64 off = (idx % (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+			struct buffer_head *ibh = sb_bread(inode->i_sb, inodeTableBlock + blk);
+			if (ibh) {
+				struct briefs_inode *di = (struct briefs_inode *)(ibh->b_data + off);
+				memcpy(di, &binfo->disk_inode, sizeof(struct briefs_inode));
+				mark_buffer_dirty(ibh);
+				sync_dirty_buffer(ibh);
+				brelse(ibh);
+			}
+		}
+
+		ret = done;
+	}
+
+	pr_debug("briefs: write_iter done=%zu\n", done);
+	return ret;
 }
 
 /* Open file */
