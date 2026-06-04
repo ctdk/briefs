@@ -51,15 +51,77 @@ const struct super_operations briefs_super_ops = {
 	.umount_begin = briefs_umount_begin,
 };
 
-/* Create */
-/* Readdir */
+/* briefs_readdir - enumerate directory contents */
 int briefs_readdir(struct file *file, struct dir_context *ctx) {
+	struct inode *dir = file_inode(file);
+	struct briefs_inode_info *binfo;
+	struct buffer_head *bh;
+	struct briefs_dir_block *dir_block;
+	struct briefs_dir_entry *entry;
+	u64 dir_block_num;
+	int i;
+	
 	pr_debug("briefs: readdir offset=%llu\n", ctx->pos);
-	if (ctx->pos >= 2) return 0;
-
-	if (!dir_emit_dots(file, ctx)) return -EIO;
-
-	ctx->pos = 2;
+	
+	if (!S_ISDIR(dir->i_mode))
+		return -ENOTDIR;
+	
+	/* Emit . and .. */
+	if (ctx->pos == 0) {
+		if (!dir_emit_dot(file, ctx))
+			return -EIO;
+		ctx->pos = 1;
+	}
+	if (ctx->pos == 1) {
+		if (!dir_emit_dots(file, ctx))
+			return -EIO;
+		ctx->pos = 2;
+	}
+	
+	/* Get directory data block from inline extent */
+	binfo = briefs_i(dir);
+	if (binfo->disk_inode.num_extents_inline == 0)
+		return 0;
+	
+	dir_block_num = binfo->disk_inode.inline_extents[0].phys;
+	
+	bh = sb_bread(dir->i_sb, dir_block_num);
+	if (!bh) {
+		pr_err("briefs: failed to read dir block %llu for readdir\n", dir_block_num);
+		return 0;
+	}
+	
+	dir_block = (struct briefs_dir_block *)bh->b_data;
+	if (dir_block->magic != BRIEFS_DIR_MAGIC) {
+		pr_err("briefs: invalid dir block magic in readdir: 0x%08x\n", dir_block->magic);
+		brelse(bh);
+		return 0;
+	}
+	
+	/* Scan entries starting from ctx->pos - 2 (account for . and ..) */
+	for (i = ctx->pos - 2; i < dir_block->num_entries; i++) {
+		entry = (struct briefs_dir_entry *)(bh->b_data + sizeof(struct briefs_dir_block) +
+			                                    i * sizeof(struct briefs_dir_entry));
+		
+		if (entry->name_len == 0 || entry->name_off == 0)
+			continue;
+		
+		if (entry->name_off > BRIEFS_BLOCK_SIZE)
+			continue;
+		
+		char *entry_name = bh->b_data + BRIEFS_BLOCK_SIZE - entry->name_off + 2;
+		unsigned int file_type = (entry->type << 12) & S_IFMT;
+		
+		if (!dir_emit(ctx, entry_name, entry->name_len,
+		              entry->inode, fs_umode_to_dtype(file_type))) {
+			brelse(bh);
+			return 0;
+		}
+		
+		ctx->pos++;
+	}
+	
+	brelse(bh);
 	return 0;
 }
 
@@ -525,8 +587,6 @@ struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned 
 	/* Name not found - return negative dentry */
 	return ERR_PTR(-ENOENT);
 }
-
-/* briefs_readdir - enumerate directory contents */
 
 /* briefs_create - create a new file */
 int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl) {

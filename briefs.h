@@ -380,8 +380,8 @@ struct briefs_dir_entry {
  *          +----------------+  block_start
  *          | DirBlockHeader |  16 bytes
  *          +----------------+
- *          | DirEntry[0]    |  12 bytes
- *          | DirEntry[1]    |  12 bytes
+ *          | DirEntry[0]    |  16 bytes
+ *          | DirEntry[1]    |  16 bytes
  *          | ...            |
  *          +----------------+  data_end = sizeof(header) + num_entries * sizeof(DirEntry)
  *          |    unused      |
