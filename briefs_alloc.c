@@ -108,85 +108,152 @@ static void briefs_free_trie_recursive(struct trie_node *node)
 /*
  * Initialize allocator from superblock
  *
- * The on-disk trie is written by mkfs and used for validation/fsck, but
- * for mount we build a fresh in-memory trie from the superblock metadata.
- * This avoids loading potentially millions of nodes (the trie is 2*N-1
- * nodes for N data blocks, padded to next power of 2).
+ * Loads the on-disk allocation trie written by mkfs into memory.
+ * The trie is a complete binary trie where leaves represent single
+ * data blocks and internal nodes track free_count for their range.
+ * Each node is 32 bytes, stored at 128 nodes per 4096-byte block
+ * in the trie node pool.
  */
 int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb, struct briefs_superblock *sb_disk)
 {
+	struct buffer_head *bh;
+	struct briefs_trie_root *root_hdr;
+	u64 root_node_index;
+	int ret;
+
 	if (!alloc || !sb || !sb_disk)
 		return -EINVAL;
 
 	alloc->sb = sb_disk;
 
-	/* Create a fresh in-memory root node covering the entire data region */
-	alloc->root_node = kzalloc(sizeof(struct trie_node), GFP_KERNEL);
-	if (!alloc->root_node)
-		return -ENOMEM;
+	/* Read trie root header block to get the root node index */
+	bh = sb_bread(sb, sb_disk->trie_root_block);
+	if (!bh) {
+		pr_err("briefs: failed to read trie root header block %llu\n",
+			sb_disk->trie_root_block);
+		return -EIO;
+	}
 
-	alloc->root_node->range_start = 0;
-	alloc->root_node->range_len = sb_disk->data_blocks;
-	alloc->root_node->free_count = sb_disk->free_data_blocks;
-	alloc->root_node->left_child = 0;
-	alloc->root_node->right_child = 0;
+	root_hdr = (struct briefs_trie_root *)bh->b_data;
+	if (root_hdr->magic != 0x54524945) {
+		pr_err("briefs: invalid trie root magic: 0x%08x\n", root_hdr->magic);
+		brelse(bh);
+		return -EINVAL;
+	}
 
-	pr_debug("briefs: allocator initialized (data_blocks=%llu, free=%llu)\n",
-		sb_disk->data_blocks, sb_disk->free_data_blocks);
+	root_node_index = root_hdr->root_node;
+	pr_debug("briefs: trie root header: magic=0x%08x, version=%u, root_node=%llu, node_count=%u\n",
+		root_hdr->magic, root_hdr->version, root_node_index, root_hdr->node_count);
+	brelse(bh);
+
+	/* Recursively load the entire trie from disk */
+	ret = briefs_load_trie_recursive(sb, sb_disk, &alloc->root_node, root_node_index);
+	if (ret) {
+		pr_err("briefs: failed to load allocation trie (err=%d)\n", ret);
+		return ret;
+	}
+
+	if (!alloc->root_node) {
+		pr_err("briefs: no root node loaded from trie\n");
+		return -EIO;
+	}
+
+	pr_info("briefs: allocator initialized from on-disk trie (data_blocks=%llu, free=%llu)\n",
+		sb_disk->data_blocks, alloc->root_node->free_count);
 
 	return 0;
 }
 
 /*
- * Find leftmost contiguous range of free blocks
- * Returns the starting block, sets *out_len to the length found
+ * Find the leftmost range of contiguous free blocks in the trie.
+ * Returns the starting block, sets *out_len to the size of the found range
+ * (which may be less than needed if no contiguous range of needed size exists).
  */
-u64 briefs_find_leftmost_contiguous(struct briefs_alloc *alloc, u64 needed, u64 *out_len)
+u64 briefs_find_leftmost_contiguous(struct trie_node *node, u64 needed, u64 *out_len)
 {
-	if (!alloc || !alloc->root_node || !out_len || needed == 0) {
+	if (!node || !out_len || node->free_count == 0 || needed == 0) {
 		if (out_len)
 			*out_len = 0;
 		return 0;
 	}
 
-	/* If root can't satisfy, return 0 */
-	if (alloc->root_node->free_count < needed) {
+	/* Leaf node: return this block if free */
+	if (node->range_len == 1) {
+		if (node->free_count > 0) {
+			*out_len = 1;
+			return node->range_start;
+		}
 		*out_len = 0;
 		return 0;
 	}
 
-	/* For now, simplified: just return 0 as the leftmost range */
-	/* Full implementation needs to walk the trie recursively */
-	*out_len = needed;
+	/* Internal node: try left child first for leftmost allocation */
+	if (node->left_child) {
+		struct trie_node *left = (struct trie_node *)node->left_child;
+
+		if (left->free_count > 0) {
+			/* Find the leftmost free range within the left child */
+			u64 left_len = 0;
+			u64 result = briefs_find_leftmost_contiguous(left, min(needed, left->free_count), &left_len);
+
+			if (left_len >= needed) {
+				*out_len = needed;
+				return result;
+			}
+
+			/* Not enough in left alone — see if it spans into right */
+			if (left_len > 0 && result + left_len == left->range_start + left->range_len) {
+				/* The free range abuts the right boundary */
+				if (node->right_child) {
+					u64 right_len = 0;
+					briefs_find_leftmost_contiguous((struct trie_node *)node->right_child, needed - left_len, &right_len);
+					if (right_len > 0) {
+						*out_len = left_len + right_len;
+						return result;
+					}
+				}
+			}
+
+			*out_len = left_len;
+			return result;
+		}
+	}
+
+	/* Left had nothing, try right */
+	if (node->right_child) {
+		struct trie_node *right = (struct trie_node *)node->right_child;
+		if (right->free_count > 0)
+			return briefs_find_leftmost_contiguous(right, needed, out_len);
+	}
+
+	*out_len = 0;
 	return 0;
 }
 
 /*
- * Find and allocate N contiguous free blocks
- * Returns starting physical block, or 0 on failure
+ * Find and allocate N contiguous free blocks.
+ * Returns starting physical block, or 0 on failure.
  */
 u64 briefs_alloc_contiguous(struct briefs_alloc *alloc, u64 nblocks)
 {
+	u64 len = 0;
+	u64 start;
+
 	if (!alloc || nblocks == 0)
 		return 0;
 
 	/* Check if we have enough total free blocks */
-	if (alloc->root_node && alloc->root_node->free_count < nblocks) {
+	if (!alloc->root_node || alloc->root_node->free_count < nblocks)
 		return 0;
-	}
 
 	/* Find leftmost contiguous range */
-	u64 len = 0;
-	u64 start = briefs_find_leftmost_contiguous(alloc, nblocks, &len);
+	start = briefs_find_leftmost_contiguous(alloc->root_node, nblocks, &len);
 
-	if (len < nblocks) {
-		return 0;  /* Not enough contiguous blocks */
-	}
+	if (len < nblocks)
+		return 0;
 
 	/* Mark the range as allocated */
-	if (alloc->root_node) {
-		briefs_mark_allocated(alloc->root_node, start, nblocks);
-	}
+	briefs_mark_allocated(alloc->root_node, start, nblocks);
 
 	return start;
 }
@@ -222,7 +289,8 @@ void briefs_free_block(struct briefs_alloc *alloc, u64 phys_block)
 }
 
 /*
- * Mark a range as allocated in the trie
+ * Mark a range as allocated in the trie.
+ * Handles ranges that span both children.
  */
 void briefs_mark_allocated(struct trie_node *node, u64 offset, u64 count)
 {
@@ -238,25 +306,36 @@ void briefs_mark_allocated(struct trie_node *node, u64 offset, u64 count)
 	/* Recursive case: internal node */
 	u64 half = node->range_len / 2;
 
-	if (offset < half) {
-		/* Go left */
-		if (node->left_child) {
+	/* Entirely in left child */
+	if (offset + count <= half) {
+		if (node->left_child)
 			briefs_mark_allocated((struct trie_node *)node->left_child, offset, count);
-		}
-	} else {
-		/* Go right */
-		u64 right_offset = offset - half;
-		if (node->right_child) {
-			briefs_mark_allocated((struct trie_node *)node->right_child, right_offset, count);
-		}
+		goto recount;
 	}
 
-	/* Recount from children after recursive calls */
+	/* Entirely in right child */
+	if (offset >= half) {
+		if (node->right_child)
+			briefs_mark_allocated((struct trie_node *)node->right_child, offset - half, count);
+		goto recount;
+	}
+
+	/* Spans both children */
+	u64 left_count = half - offset;
+	u64 right_count = count - left_count;
+
+	if (node->left_child)
+		briefs_mark_allocated((struct trie_node *)node->left_child, offset, left_count);
+	if (node->right_child)
+		briefs_mark_allocated((struct trie_node *)node->right_child, 0, right_count);
+
+recount:
 	briefs_recount(node);
 }
 
 /*
- * Mark a range as free in the trie
+ * Mark a range as free in the trie.
+ * Handles ranges that span both children.
  */
 void briefs_mark_free(struct trie_node *node, u64 offset, u64 count)
 {
@@ -272,20 +351,30 @@ void briefs_mark_free(struct trie_node *node, u64 offset, u64 count)
 	/* Recursive case: internal node */
 	u64 half = node->range_len / 2;
 
-	if (offset < half) {
-		/* Go left */
-		if (node->left_child) {
+	/* Entirely in left child */
+	if (offset + count <= half) {
+		if (node->left_child)
 			briefs_mark_free((struct trie_node *)node->left_child, offset, count);
-		}
-	} else {
-		/* Go right */
-		u64 right_offset = offset - half;
-		if (node->right_child) {
-			briefs_mark_free((struct trie_node *)node->right_child, right_offset, count);
-		}
+		goto recount;
 	}
 
-	/* Recount from children after recursive calls */
+	/* Entirely in right child */
+	if (offset >= half) {
+		if (node->right_child)
+			briefs_mark_free((struct trie_node *)node->right_child, offset - half, count);
+		goto recount;
+	}
+
+	/* Spans both children */
+	u64 left_count = half - offset;
+	u64 right_count = count - left_count;
+
+	if (node->left_child)
+		briefs_mark_free((struct trie_node *)node->left_child, offset, left_count);
+	if (node->right_child)
+		briefs_mark_free((struct trie_node *)node->right_child, 0, right_count);
+
+recount:
 	briefs_recount(node);
 }
 

@@ -29,8 +29,8 @@ void briefs_free_block(struct briefs_alloc *alloc, u64 phys_block);
 /* Cleanup allocator */
 void briefs_alloc_cleanup(struct briefs_alloc *alloc);
 
-/* Find leftmost contiguous range of free blocks */
-u64 briefs_find_leftmost_contiguous(struct briefs_alloc *alloc, u64 needed, u64 *out_len);
+/* Find leftmost contiguous range of free blocks starting from node */
+u64 briefs_find_leftmost_contiguous(struct trie_node *node, u64 needed, u64 *out_len);
 
 /* Count trailing free blocks in a node (for spanning check) */
 u64 briefs_count_trailing_free(struct trie_node *node);
