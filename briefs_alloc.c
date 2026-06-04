@@ -11,13 +11,29 @@
 #include "briefs.h"
 #include "briefs_alloc.h"
 
-/* Read a trie node from disk */
-static struct trie_node *briefs_read_trie_node(struct super_block *sb, u64 block)
+/* Read a trie node from disk by node index within the trie pool.
+ * The trie pool starts at sb_disk->trie_node_pool_start.
+ * Block 0 of the pool is the trie root header.
+ * Node data blocks start at pool_start + 1.
+ * Each block holds 128 nodes (4096 / 32 = 128).
+ */
+static struct trie_node *briefs_read_trie_node(struct super_block *sb, struct briefs_superblock *sb_disk, u64 node_index)
 {
 	struct buffer_head *bh;
 	struct trie_node *node;
+	u64 nodes_per_block = sb->s_blocksize / sizeof(struct trie_node);
+	u64 block_offset;
+	u64 byte_offset;
 
-	bh = sb_bread(sb, block);
+	/* Node index 0 is invalid (reserved for "no child") */
+	if (node_index == 0)
+		return NULL;
+
+	/* Convert node index to block number and byte offset within the pool */
+	block_offset = sb_disk->trie_node_pool_start + 1 + ((node_index - 1) / nodes_per_block);
+	byte_offset = ((node_index - 1) % nodes_per_block) * sizeof(struct trie_node);
+
+	bh = sb_bread(sb, block_offset);
 	if (!bh)
 		return ERR_PTR(-EIO);
 
@@ -27,30 +43,34 @@ static struct trie_node *briefs_read_trie_node(struct super_block *sb, u64 block
 		return ERR_PTR(-ENOMEM);
 	}
 
-	memcpy(node, bh->b_data, sizeof(struct trie_node));
+	memcpy(node, bh->b_data + byte_offset, sizeof(struct trie_node));
 	brelse(bh);
 
 	return node;
 }
 
-/* Recursively load trie nodes from disk */
-static int briefs_load_trie_recursive(struct super_block *sb, struct trie_node **node_ptr, u64 node_block)
+/* Recursively load trie nodes from disk by node index */
+static int briefs_load_trie_recursive(struct super_block *sb, struct briefs_superblock *sb_disk, struct trie_node **node_ptr, u64 node_index)
 {
 	struct trie_node *node;
 	int ret;
 
-	if (node_block == 0) {
+	if (node_index == 0) {
 		*node_ptr = NULL;
 		return 0;
 	}
 
-	node = briefs_read_trie_node(sb, node_block);
+	node = briefs_read_trie_node(sb, sb_disk, node_index);
 	if (IS_ERR(node))
 		return PTR_ERR(node);
+	if (!node) {
+		*node_ptr = NULL;
+		return 0;
+	}
 
-	/* Load children recursively */
+	/* Load children recursively (children are stored as node indices) */
 	if (node->left_child) {
-		ret = briefs_load_trie_recursive(sb, (struct trie_node **)&node->left_child, node->left_child);
+		ret = briefs_load_trie_recursive(sb, sb_disk, (struct trie_node **)&node->left_child, node->left_child);
 		if (ret) {
 			kfree(node);
 			return ret;
@@ -58,11 +78,10 @@ static int briefs_load_trie_recursive(struct super_block *sb, struct trie_node *
 	}
 
 	if (node->right_child) {
-		ret = briefs_load_trie_recursive(sb, (struct trie_node **)&node->right_child, node->right_child);
+		ret = briefs_load_trie_recursive(sb, sb_disk, (struct trie_node **)&node->right_child, node->right_child);
 		if (ret) {
-			/* Cleanup left child */
 			if (node->left_child)
-					kfree((struct trie_node *)node->left_child);
+				kfree((struct trie_node *)node->left_child);
 			kfree(node);
 			return ret;
 		}
@@ -88,32 +107,32 @@ static void briefs_free_trie_recursive(struct trie_node *node)
 
 /*
  * Initialize allocator from superblock
+ *
+ * The on-disk trie is written by mkfs and used for validation/fsck, but
+ * for mount we build a fresh in-memory trie from the superblock metadata.
+ * This avoids loading potentially millions of nodes (the trie is 2*N-1
+ * nodes for N data blocks, padded to next power of 2).
  */
 int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb, struct briefs_superblock *sb_disk)
 {
-	int ret;
-
 	if (!alloc || !sb || !sb_disk)
 		return -EINVAL;
 
 	alloc->sb = sb_disk;
 
-	/* Load trie from disk */
-	ret = briefs_load_trie_recursive(sb, &alloc->root_node, sb_disk->trie_root_block);
-	if (ret)
-		return ret;
+	/* Create a fresh in-memory root node covering the entire data region */
+	alloc->root_node = kzalloc(sizeof(struct trie_node), GFP_KERNEL);
+	if (!alloc->root_node)
+		return -ENOMEM;
 
-	/* If no trie on disk, create initial root */
-	if (!alloc->root_node) {
-		alloc->root_node = kzalloc(sizeof(struct trie_node), GFP_KERNEL);
-		if (!alloc->root_node)
-			return -ENOMEM;
+	alloc->root_node->range_start = 0;
+	alloc->root_node->range_len = sb_disk->data_blocks;
+	alloc->root_node->free_count = sb_disk->free_data_blocks;
+	alloc->root_node->left_child = 0;
+	alloc->root_node->right_child = 0;
 
-		/* Initialize root to cover entire data region */
-		alloc->root_node->range_start = 0;
-		alloc->root_node->range_len = sb_disk->data_blocks;
-		alloc->root_node->free_count = sb_disk->data_blocks;
-	}
+	pr_debug("briefs: allocator initialized (data_blocks=%llu, free=%llu)\n",
+		sb_disk->data_blocks, sb_disk->free_data_blocks);
 
 	return 0;
 }
