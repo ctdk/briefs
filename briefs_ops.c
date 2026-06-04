@@ -510,6 +510,69 @@ int briefs_add_dir_entry(struct inode *dir, const char *name, size_t name_len, u
 	return 0;
 }
 
+/*
+ * briefs_remove_dir_entry - remove a directory entry by name.
+ * Marks the entry as deleted (zeroes name_len/name_off).
+ */
+int briefs_remove_dir_entry(struct inode *dir, const char *name, size_t name_len)
+{
+	struct briefs_inode_info *binfo;
+	struct buffer_head *bh;
+	struct briefs_dir_block *dir_block;
+	struct briefs_dir_entry *entry;
+	u64 dir_block_num;
+	int i;
+	u32 hdr_size = sizeof(struct briefs_dir_block);
+	u32 entry_sz = sizeof(struct briefs_dir_entry);
+
+	if (!dir || !name || name_len < 1 || name_len > BRIEFS_NAME_LEN)
+		return -EINVAL;
+
+	binfo = briefs_i(dir);
+
+	if (binfo->disk_inode.num_extents_inline == 0)
+		return -ENOENT;
+
+	dir_block_num = binfo->disk_inode.inline_extents[0].phys;
+
+	bh = sb_bread(dir->i_sb, dir_block_num);
+	if (!bh)
+		return -EIO;
+
+	dir_block = (struct briefs_dir_block *)bh->b_data;
+	if (dir_block->magic != BRIEFS_DIR_MAGIC) {
+		brelse(bh);
+		return -EIO;
+	}
+
+	for (i = 0; i < dir_block->num_entries; i++) {
+		entry = (struct briefs_dir_entry *)(bh->b_data + hdr_size + i * entry_sz);
+
+		if (entry->name_len == 0 || entry->name_off == 0)
+			continue;
+
+		if (entry->name_len != name_len)
+			continue;
+
+		if (entry->name_off > 0 && entry->name_off <= BRIEFS_BLOCK_SIZE) {
+			char *ename = bh->b_data + BRIEFS_BLOCK_SIZE - entry->name_off + 2;
+			if (memcmp(ename, name, name_len) == 0) {
+				/* Found it — mark as deleted */
+				entry->name_len = 0;
+				entry->name_off = 0;
+				entry->inode = 0;
+				mark_buffer_dirty(bh);
+				sync_dirty_buffer(bh);
+				brelse(bh);
+				return 0;
+			}
+		}
+	}
+
+	brelse(bh);
+	return -ENOENT;
+}
+
 /* briefs_fill_super - entry point for mount */
 /* Keeping things simple, at least at first. Cribbing off of xiafs_fill_super
  * since it's reasonably simple but gets the job done. */
@@ -941,8 +1004,15 @@ struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned 
 			igrab(dir);
 			return d_splice_alias(dir, dentry);
 		}
-		/* TODO: look up parent inode from dir inode */
-		return ERR_PTR(-EIO);
+		/* Look up parent inode from dir inode's parent_inode field */
+		struct briefs_inode_info *dinfo = briefs_i(dir);
+		u64 parent_ino = dinfo->disk_inode.parent_inode;
+		if (parent_ino == 0)
+			return ERR_PTR(-EIO);
+		struct inode *parent = briefs_iget(dir->i_sb, parent_ino);
+		if (IS_ERR(parent))
+			return ERR_CAST(parent);
+		return d_splice_alias(parent, dentry);
 	}
 	
 	/* Get directory data block from inline extent */
@@ -1226,59 +1296,152 @@ int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dent
 /* briefs_unlink - remove a directory entry */
 int briefs_unlink(struct inode *dir, struct dentry *dentry) {
 	struct briefs_sb_info *bsi;
+	struct inode *inode = d_inode(dentry);
 	int ret;
-	
+
 	pr_debug("briefs: unlink %pd\n", dentry);
-	
+
+	if (!inode)
+		return -ENOENT;
+
 	bsi = dir->i_sb->s_fs_info;
-	
+
 	/* Log directory entry deletion */
 	if (bsi->journal) {
 		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, 0,
 						dentry->d_name.name, dentry->d_name.len, 1);
 		if (ret) return ret;
 	}
-	
+
+	/* Remove the directory entry */
+	ret = briefs_remove_dir_entry(dir, dentry->d_name.name, dentry->d_name.len);
+	if (ret)
+		return ret;
+
+	/* Drop nlink on the inode */
+	drop_nlink(inode);
+
+	/* If directory, also drop parent's nlink (.. reference) */
+	if (S_ISDIR(inode->i_mode))
+		drop_nlink(dir);
+
+	/* Update parent inode on disk */
+	{
+		struct briefs_inode_info *binfo = briefs_i(dir);
+		u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+		u64 pIdx = dir->i_ino - 1;
+		u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
+		u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+		struct buffer_head *pbh = sb_bread(dir->i_sb, inodeTableBlock + pBlk);
+		if (pbh) {
+			struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + pOff);
+			pdi->nlinks = dir->i_nlink;
+			mark_buffer_dirty(pbh);
+			sync_dirty_buffer(pbh);
+			brelse(pbh);
+		}
+	}
+
 	/* Sync journal */
 	if (bsi->journal && bsi->journal->dirty) {
-		briefs_journal_sync(bsi->journal);
+		ret = briefs_journal_sync(bsi->journal);
+		if (ret) return ret;
 	}
-	
-	return -EROFS;  /* TODO: implement actual unlink after dir entry tree is ready */
+
+	pr_debug("briefs: unlinked %pd\n", dentry);
+	return 0;
 }
 
 /* briefs_rename - rename a directory entry */
 int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
                   struct inode *new_dir, struct dentry *new_dentry, unsigned int flags) {
 	struct briefs_sb_info *bsi;
+	struct inode *inode = d_inode(old_dentry);
 	int ret;
-	
+
 	pr_debug("briefs: rename %pd -> %pd\n", old_dentry, new_dentry);
-	
+
+	if (!inode)
+		return -ENOENT;
+
 	bsi = old_dir->i_sb->s_fs_info;
-	
+
 	/* Log old entry deletion */
 	if (bsi->journal) {
 		ret = briefs_journal_dir_update(bsi->journal, old_dir->i_ino, 0,
 						old_dentry->d_name.name, old_dentry->d_name.len, 1);
 		if (ret) return ret;
 	}
-	
+
 	/* Log new entry creation */
 	if (bsi->journal) {
-		struct dentry *child = d_find_alias(new_dir);
-		u64 child_ino = child ? child->d_inode->i_ino : 0;
-		dput(child);
-		
-		ret = briefs_journal_dir_update(bsi->journal, new_dir->i_ino, child_ino,
+		ret = briefs_journal_dir_update(bsi->journal, new_dir->i_ino, inode->i_ino,
 						new_dentry->d_name.name, new_dentry->d_name.len, 0);
 		if (ret) return ret;
 	}
-	
+
+	/* Remove old entry */
+	ret = briefs_remove_dir_entry(old_dir, old_dentry->d_name.name, old_dentry->d_name.len);
+	if (ret)
+		return ret;
+
+	/* Add new entry */
+	u8 ftype = (inode->i_mode & S_IFMT) >> 12;
+	ret = briefs_add_dir_entry(new_dir, new_dentry->d_name.name, new_dentry->d_name.len,
+				   inode->i_ino, ftype);
+	if (ret)
+		return ret;
+
+	/* Handle cross-directory rename: update nlink */
+	if (old_dir != new_dir) {
+		if (S_ISDIR(inode->i_mode)) {
+			drop_nlink(old_dir);
+			inc_nlink(new_dir);
+		}
+	}
+
+	/* Update parent inodes on disk */
+	{
+		u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+		u64 inodes_per_block = old_dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE;
+
+		/* Write old_dir */
+		{
+			u64 idx = old_dir->i_ino - 1;
+			u64 blk = idx / inodes_per_block;
+			u64 off = (idx % inodes_per_block) * BRIEFS_INODE_SIZE;
+			struct buffer_head *pbh = sb_bread(old_dir->i_sb, inodeTableBlock + blk);
+			if (pbh) {
+				struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + off);
+				pdi->nlinks = old_dir->i_nlink;
+				mark_buffer_dirty(pbh);
+				sync_dirty_buffer(pbh);
+				brelse(pbh);
+			}
+		}
+
+		/* Write new_dir if different */
+		if (old_dir != new_dir) {
+			u64 idx = new_dir->i_ino - 1;
+			u64 blk = idx / inodes_per_block;
+			u64 off = (idx % inodes_per_block) * BRIEFS_INODE_SIZE;
+			struct buffer_head *pbh = sb_bread(new_dir->i_sb, inodeTableBlock + blk);
+			if (pbh) {
+				struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + off);
+				pdi->nlinks = new_dir->i_nlink;
+				mark_buffer_dirty(pbh);
+				sync_dirty_buffer(pbh);
+				brelse(pbh);
+			}
+		}
+	}
+
 	/* Sync journal */
 	if (bsi->journal && bsi->journal->dirty) {
-		briefs_journal_sync(bsi->journal);
+		ret = briefs_journal_sync(bsi->journal);
+		if (ret) return ret;
 	}
-	
-	return -EROFS;  /* TODO: implement actual rename */
+
+	pr_debug("briefs: renamed %pd -> %pd\n", old_dentry, new_dentry);
+	return 0;
 }

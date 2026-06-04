@@ -478,6 +478,9 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc);
 
 /* Add a directory entry to a parent directory */
 int briefs_add_dir_entry(struct inode *dir, const char *name, size_t name_len, u64 child_ino, u8 type);
+
+/* Remove a directory entry from a parent directory */
+int briefs_remove_dir_entry(struct inode *dir, const char *name, size_t name_len);
 void briefs_evict_inode(struct inode *inode);
 void briefs_umount_begin(struct super_block *sb);
 
