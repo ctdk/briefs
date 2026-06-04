@@ -338,9 +338,18 @@ void briefs_put_super(struct super_block *sb) {
 }
 
 /* briefs_statfs - filesystem statistics */
+/* shamelessly yoinking from xiafs - incomplete */
 int briefs_statfs(struct dentry *dentry, struct kstatfs *buf) {
-	pr_info("briefs: statfs\n");
-	return -EROFS;
+	struct super_block *sb = dentry->d_sb;
+	struct briefs_sb_info *sbi = briefs_sb(sb);
+	u64 id = huge_encode_dev(sb->s_bdev->bd_dev);
+	buf->f_type = sb->s_magic;
+	buf->f_bsize = sb->s_blocksize;
+
+	buf->f_namelen = BRIEFS_NAME_LEN;
+	buf->f_fsid.val[0] = (u32)id;
+	buf->f_fsid.val[1] = (u32)(id >> 32);
+	return 0;
 }
 
 /* briefs_evict_inode - cleanup inode on eviction */
