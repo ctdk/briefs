@@ -681,7 +681,15 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 	 * taken from somewhere else. */
 	bsi->data_blocks = bsb->data_blocks;
 	bsi->free_data_blocks = bsb->free_data_blocks;
-	bsi->num_inodes = 0; /* Unsure where to find this at the moment. */
+	/* It would be better to calculate this from the inode blocks, but since
+	 * those are hiding at the moment we'll calculate this from the inode
+	 * bitmap. Something for the future, though: we should be able to add
+	 * inode blocks & expand the inode bitmap to different parts of the disk
+	 * in case, say, there's plenty of disk space but free inodes are
+ 	 * running low. */
+	/* Recklessly assuming that bytes have 8 bits. PDP-10 compatibility may
+	 * be affected. */
+	bsi->num_inodes = bsb->block_size * bsb->inode_bitmap_blocks * 8;
 	bsi->free_inodes = bsb->free_inodes;
 
 	pr_info("briefs: superblock loaded, mounting successful\n");
