@@ -11,6 +11,22 @@
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
 
+/*
+ * Data region start: the allocator trie uses data-relative block numbers
+ * with block 0 being the first data block on disk.  Convert to absolute
+ * block numbers for sb_bread/sb_getblk using this helper.
+ */
+static inline u64 data_region_start(struct briefs_superblock *sb)
+{
+	return sb->trie_node_pool_start + sb->trie_blocks_used;
+}
+
+/* Convert a data-relative block to an absolute block number */
+static inline u64 data_to_abs(struct briefs_superblock *sb, u64 rel_block)
+{
+	return data_region_start(sb) + rel_block;
+}
+
 /* Inode operations for directories */
 const struct inode_operations briefs_dir_inode_ops = {
 	.create = briefs_create,
@@ -143,6 +159,7 @@ static u64 briefs_find_block(struct inode *inode, u64 file_block)
 /*
  * briefs_find_or_create_block - like find_block, but allocates a new
  * physical block if none is mapped and appends a new extent.
+ * Returns the ABSOLUTE block number, or 0 on failure.
  */
 static u64 briefs_find_or_create_block(struct inode *inode, u64 file_block)
 {
@@ -151,7 +168,7 @@ static u64 briefs_find_or_create_block(struct inode *inode, u64 file_block)
 	struct briefs_extent *ext;
 	int i;
 
-	/* Check existing extents */
+	/* Check existing extents (extent phys values are absolute) */
 	for (i = 0; i < binfo->disk_inode.num_extents_inline; i++) {
 		ext = &binfo->disk_inode.inline_extents[i];
 		if (file_block >= ext->offset && file_block < ext->offset + ext->len)
@@ -162,23 +179,24 @@ static u64 briefs_find_or_create_block(struct inode *inode, u64 file_block)
 	if (binfo->disk_inode.num_extents_inline > 0) {
 		ext = &binfo->disk_inode.inline_extents[binfo->disk_inode.num_extents_inline - 1];
 		if (file_block == ext->offset + ext->len) {
-			u64 nb = briefs_alloc_block(&bsi->alloc);
-			if (nb == 0)
+			u64 rel = briefs_alloc_block(&bsi->alloc);
+			if (rel == 0)
 				return 0;
-			if (nb == ext->phys + ext->len && ext->len < 0xFFFFFFFF) {
+			u64 abs = data_to_abs(bsi->sb, rel);
+			if (abs == ext->phys + ext->len && ext->len < 0xFFFFFFFF) {
 				/* Physically contiguous — extend */
 				ext->len++;
-				return nb;
+				return abs;
 			}
 			/* Not contiguous — start a new extent */
 			if (binfo->disk_inode.num_extents_inline < 8) {
 				int n = binfo->disk_inode.num_extents_inline;
 				binfo->disk_inode.inline_extents[n].offset = file_block;
-				binfo->disk_inode.inline_extents[n].phys = nb;
+				binfo->disk_inode.inline_extents[n].phys = abs;
 				binfo->disk_inode.inline_extents[n].len = 1;
 				binfo->disk_inode.num_extents_inline++;
 				binfo->disk_inode.num_extents_total++;
-				return nb;
+				return abs;
 			}
 			return 0;
 		}
@@ -188,18 +206,19 @@ static u64 briefs_find_or_create_block(struct inode *inode, u64 file_block)
 	if (binfo->disk_inode.num_extents_inline >= 8)
 		return 0; /* overflow not yet supported */
 
-	u64 nb = briefs_alloc_block(&bsi->alloc);
-	if (nb == 0)
+	u64 rel = briefs_alloc_block(&bsi->alloc);
+	if (rel == 0)
 		return 0;
+	u64 abs_block = data_to_abs(bsi->sb, rel);
 
 	int n = binfo->disk_inode.num_extents_inline;
 	binfo->disk_inode.inline_extents[n].offset = file_block;
-	binfo->disk_inode.inline_extents[n].phys = nb;
+	binfo->disk_inode.inline_extents[n].phys = abs_block;
 	binfo->disk_inode.inline_extents[n].len = 1;
 	binfo->disk_inode.inline_extents[n].flags = 0;
 	binfo->disk_inode.num_extents_inline++;
 	binfo->disk_inode.num_extents_total++;
-	return nb;
+	return abs_block;
 }
 
 /* Read file */
@@ -274,7 +293,6 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from) {
 	size_t count = iov_iter_count(from);
 	size_t done = 0;
 	ssize_t ret = 0;
-	loff_t new_size = max_t(loff_t, inode->i_size, pos + count);
 
 	pr_debug("briefs: write_iter pos=%lld count=%zu\n", pos, count);
 
@@ -1015,7 +1033,7 @@ struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned 
 	/* Get directory data block from inline extent */
 	binfo = briefs_i(dir);
 	if (binfo->disk_inode.num_extents_inline == 0) {
-		return ERR_PTR(-ENOENT);
+		return NULL;
 	}
 	
 	/* First inline extent points to the directory block */
@@ -1057,8 +1075,8 @@ struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned 
 	}
 	
 	brelse(bh);
-	/* Name not found - return negative dentry */
-	return ERR_PTR(-ENOENT);
+	/* Name not found - return NULL for negative dentry */
+	return NULL;
 }
 
 /* briefs_create - create a new file or directory */
@@ -1150,12 +1168,13 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	/* For directories: allocate a data block and write . and .. entries */
 	if (is_dir) {
 		struct briefs_inode_info *binfo = briefs_i(inode);
-		u64 dir_block = briefs_alloc_block(&bsi->alloc);
-		if (dir_block == 0) {
+		u64 rel_block = briefs_alloc_block(&bsi->alloc);
+		if (rel_block == 0) {
 			pr_err("briefs: no free blocks for new dir\n");
 			iput(inode);
 			return -ENOSPC;
 		}
+		u64 dir_block = data_to_abs(bsi->sb, rel_block);
 
 		/* Build directory block with . and .. entries */
 		struct buffer_head *dbh = sb_getblk(dir->i_sb, dir_block);
@@ -1188,14 +1207,14 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 
 		/* Pack names at end of block */
 		u32 name_pos = BRIEFS_BLOCK_SIZE;
-		/* ".." first (written second, closest to end) */
-		name_pos -= 4;
-		*(__u16 *)(dbh->b_data + name_pos) = 2;
-		memcpy(dbh->b_data + name_pos + 2, "..", 2);
-		/* "." second (written first, further from end) */
+		/* "." first (closest to end) — matches Go mkfs NewDirBlock layout */
 		name_pos -= 3;
 		*(__u16 *)(dbh->b_data + name_pos) = 1;
 		memcpy(dbh->b_data + name_pos + 2, ".", 1);
+		/* ".." second (further from end) */
+		name_pos -= 4;
+		*(__u16 *)(dbh->b_data + name_pos) = 2;
+		memcpy(dbh->b_data + name_pos + 2, "..", 2);
 
 		dblk->data_size = sizeof(struct briefs_dir_block) + 2 * sizeof(struct briefs_dir_entry);
 		dblk->names_size = 7;
@@ -1215,18 +1234,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 		inode->i_size = dblk->data_size + dblk->names_size;
 		binfo->disk_inode.filesize = inode->i_size;
 
-		/* Mark data block allocated in bitmap */
-		u64 bm_block = bsi->sb->data_bitmap_offset + (dir_block / (BRIEFS_BLOCK_SIZE * 8));
-		u64 bm_byte = (dir_block % (BRIEFS_BLOCK_SIZE * 8)) / 8;
-		u64 bm_bit = dir_block % 8;
-		struct buffer_head *bm_bh = sb_bread(dir->i_sb, bm_block);
-		if (bm_bh) {
-			bm_bh->b_data[bm_byte] |= (1 << bm_bit);
-			mark_buffer_dirty(bm_bh);
-			brelse(bm_bh);
-		}
-
-		pr_debug("briefs: allocated dir block %llu for inode %llu\n", dir_block, ino);
+		pr_debug("briefs: allocated dir block abs=%llu (rel=%llu) for inode %llu\n", dir_block, rel_block, ino);
 	}
 
 	/* Write the inode to disk */
@@ -1299,8 +1307,8 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 
 /* briefs_mkdir - create a new directory */
 int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode) {
-	pr_debug("briefs: mkdir %pd\n", dentry);
-	return briefs_create(idmap, dir, dentry, (mode & ~07777) | S_IFDIR, false);
+	pr_debug("briefs: mkdir %pd (mode=%o)\n", dentry, mode);
+	return briefs_create(idmap, dir, dentry, mode, false);
 }
 
 /* briefs_unlink - remove a directory entry */
@@ -1337,7 +1345,6 @@ int briefs_unlink(struct inode *dir, struct dentry *dentry) {
 
 	/* Update parent inode on disk */
 	{
-		struct briefs_inode_info *binfo = briefs_i(dir);
 		u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
 		u64 pIdx = dir->i_ino - 1;
 		u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
