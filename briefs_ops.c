@@ -94,8 +94,10 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 		return 0;
 	}
 	
-	/* Scan entries starting from ctx->pos - 2 (account for . and ..) */
-	for (i = ctx->pos - 2; i < dir_block->num_entries; i++) {
+	/* Scan entries starting from ctx->pos (account for . and .. emitted above) */
+	/* Entries 0 and 1 are always . and .. — skip them */
+	u64 start_idx = ctx->pos > 2 ? ctx->pos : 2;
+	for (i = start_idx; i < dir_block->num_entries; i++) {
 		entry = (struct briefs_dir_entry *)(bh->b_data + sizeof(struct briefs_dir_block) +
 			                                    i * sizeof(struct briefs_dir_entry));
 		
