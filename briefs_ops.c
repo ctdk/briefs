@@ -1016,50 +1016,6 @@ struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
 	return mount_bdev(fs_type, flags, dev_name, data, briefs_fill_super);
 }
 
-/* briefs_alloc_trie_node - allocate a trie node block */
-struct briefs_trie_node *briefs_alloc_trie_node(struct super_block *sb) {
-	struct briefs_trie_node *node;
-	struct buffer_head *bh;
-	struct briefs_sb_info *bsi = sb->s_fs_info;
-	u64 block;
-
-	if (!bsi || !bsi->sb)
-		return ERR_PTR(-EINVAL);
-
-	/* Allocate from trie node pool */
-	block = bsi->sb->trie_node_pool_start + bsi->sb->trie_blocks_used;
-
-	bh = sb_getblk(sb, block);
-	if (!bh)
-		return ERR_PTR(-ENOMEM);
-
-	node = (struct briefs_trie_node *)bh->b_data;
-	memset(node, 0, sizeof(struct briefs_trie_node));
-
-	/* Initialize node */
-	node->magic = 0x54524E20;  /* "TRN " */
-	node->node_index = bsi->sb->trie_blocks_used++;
-
-	mark_buffer_dirty(bh);
-	brelse(bh);
-
-	return node;
-}
-
-/* briefs_free_trie_node - free a trie node block */
-void briefs_free_trie_node(struct super_block *sb, struct briefs_trie_node *node) {
-	/* TODO: implement free list */
-	kfree(node);
-}
-
-/* briefs_init_trie_root - initialize trie root node */
-void briefs_init_trie_root(struct briefs_trie_node *root) {
-	memset(root, 0, sizeof(struct briefs_trie_node));
-	root->magic = 0x54524E20;  /* "TRN " */
-	root->flags = NODE_FLAG_ROOT;
-	root->node_type = NODE_TYPE_INTERM;
-}
-
 /* briefs_alloc_inode - allocate a new inode number using the bitmap pyramid */
 static u64 briefs_alloc_inode(struct super_block *sb) {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
