@@ -973,11 +973,11 @@ int briefs_statfs(struct dentry *dentry, struct kstatfs *buf) {
 	u64 id = huge_encode_dev(sb->s_bdev->bd_dev);
 	buf->f_type = sb->s_magic;
 	buf->f_bsize = sb->s_blocksize;
-	buf->f_blocks = sbi->data_blocks;
-	buf->f_bfree = sbi->free_data_blocks;
-	buf->f_bavail = sbi->free_data_blocks;
-	buf->f_files = sbi->num_inodes;
-	buf->f_ffree = sbi->free_inodes;
+	buf->f_blocks = sbi->alloc.block_count;
+	buf->f_bfree = sbi->alloc.free_count;
+	buf->f_bavail = sbi->alloc.free_count;
+	buf->f_files = sbi->inode_alloc.block_count;
+	buf->f_ffree = sbi->inode_alloc.free_count;
 	buf->f_namelen = BRIEFS_NAME_LEN;
 	buf->f_fsid.val[0] = (u32)id;
 	buf->f_fsid.val[1] = (u32)(id >> 32);
