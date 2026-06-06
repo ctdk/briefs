@@ -56,6 +56,7 @@ DEFINITELY MISSING
 * External extents aren't implemented yet, so reading and writing to files is brittle to say the least.
 * Reusing inodes
 * FUSE implementation (requires less commitment than the kernel module)
+* Proper tests
 
 LICENSE
 -------
