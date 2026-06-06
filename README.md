@@ -3,7 +3,9 @@ BrieFS!
 
 _"If you want a picture of the future, imagine a pelican standing on a human head -- for ever."_
 
-TODO: put something here
+TODO: put a detailed explanation here
+
+**NB:** This filesystem is experimental and may totally flip out, make your machine hang and stop responding, corrupt your data, corrupt your children, annoy you greatly, or just up and crash. Caution is advised. I must state that I've warned you about potential issues and that I'm not responsible if anything bad happens because you were messing around with this. Also, no warranty as per the LICENSE files.
 
 RELATED
 -------
@@ -24,6 +26,11 @@ AI Usage
 --------
 
 Since trying out AI assisted coding was part of the reason for this in the first place, it follows that an AI was used. It was not allowed to write code willy-nilly, however; I would review its proposals or changes and adjust them as needed rather than blindly trusting what it produced.
+
+SUPPORTED KERNEL VERSIONS
+-------------------------
+
+For certain values of "support", anyway. As of this writing, all BrieFS development is being done using the Debian Linux kernel version 6.12.48. Once it gets far enough along, it will jump up to track the current `linux` git repo. Other kernel versions and specific distro kernels may come as time and interest permit and dictate.
 
 BUGS
 ----
