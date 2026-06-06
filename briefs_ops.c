@@ -22,6 +22,8 @@ static inline u64 data_region_start(struct briefs_superblock *sb)
 }
 
 /* Convert a data-relative block to an absolute block number */
+
+/* Convert a data-relative block to an absolute block number */
 static inline u64 data_to_abs(struct briefs_superblock *sb, u64 rel_block)
 {
 	return data_region_start(sb) + rel_block;
@@ -879,14 +881,14 @@ void briefs_put_super(struct super_block *sb) {
 		/* Sync allocation trie to disk */
 		if (!sb_rdonly(sb)) {
 			pr_info("briefs: syncing allocation trie\n");
-			briefs_alloc_sync(&bsi->alloc, sb);
+			briefs_alloc_sync(&bsi->alloc);
 
 			/* Update superblock free counts on disk */
-			if (bsi->alloc.root_node) {
+			{
 				struct buffer_head *sbh = sb_bread(sb, 0);
 				if (sbh) {
 					struct briefs_superblock *bsb = (struct briefs_superblock *)sbh->b_data;
-					bsb->free_data_blocks = bsi->alloc.root_node->free_count;
+					bsb->free_data_blocks = bsi->alloc.free_count;
 					mark_buffer_dirty(sbh);
 					sync_dirty_buffer(sbh);
 					brelse(sbh);

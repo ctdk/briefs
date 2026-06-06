@@ -3,56 +3,68 @@
 #ifndef _BRIEFS_ALLOC_H
 #define _BRIEFS_ALLOC_H
 
-#include "briefs.h"
+#include <linux/types.h>
 
-/* Allocator context - tracks the in-memory trie state */
-struct briefs_alloc {
-	struct briefs_superblock *sb;   /* on-disk superblock pointer */
-	struct trie_node *root_node;    /* in-memory copy of trie root */
-	struct trie_node **node_by_index; /* array of node pointers indexed by node index */
-	u64 node_count;                 /* total nodes in the trie */
+/* Forward declarations - defined in briefs.h */
+struct briefs_superblock;
+struct super_block;
+
+/* Allocator pool header (first block of the pool) */
+#define ALLOC_MAGIC 0x4249544D /* "BITM" */
+
+struct alloc_pool_header {
+	__u32 magic;           /* ALLOC_MAGIC */
+	__u32 version;         /* 1 */
+	__u64 l0_words;        /* number of u64 words in level 0 */
+	__u64 l1_words;        /* number of u64 words in level 1 */
+	__u64 l2_words;        /* number of u64 words in level 2 */
+	__u64 block_count;     /* total data blocks tracked */
+	__u64 free_count;      /* total free blocks */
+	__u64 reserved[6];
 };
 
-/* Initialize allocator from superblock */
-int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb, struct briefs_superblock *sb_disk);
+/* Allocator context - 3-level bitmap pyramid */
+struct briefs_alloc {
+	struct super_block *sb;         /* VFS superblock for buffer cache I/O */
+	__u64 *l0;                      /* level 0 summary words (vmalloc'd) */
+	__u64 *l1;                      /* level 1 summary words */
+	__u64 *l2;                      /* level 2 block bitmaps */
+	__u64 l0_words;                 /* word count for level 0 */
+	__u64 l1_words;                 /* word count for level 1 */
+	__u64 l2_words;                 /* word count for level 2 */
+	__u64 block_count;              /* total data blocks tracked */
+	__u64 free_count;               /* total free blocks */
+	u64 alloc_pool_start;           /* first block of allocator pool on disk */
+};
 
-/* Find and allocate N contiguous free blocks */
-u64 briefs_alloc_contiguous(struct briefs_alloc *alloc, u64 nblocks);
+/* Initialize allocator from superblock (loads the 3-level bitmap from disk) */
+int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb,
+                      struct briefs_superblock *sb_disk);
 
-/* Free N blocks starting at physical block offset */
-void briefs_free_contiguous(struct briefs_alloc *alloc, u64 phys_block, u64 nblocks);
-
-/* Allocate a single free block */
+/* Allocate a single free block (returns data-relative block number, or 0 on ENOSPC) */
 u64 briefs_alloc_block(struct briefs_alloc *alloc);
 
-/* Free a single block */
-void briefs_free_block(struct briefs_alloc *alloc, u64 phys_block);
+/* Free a single block (data-relative block number) */
+void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block);
 
-/* Sync the in-memory trie (free_count values) back to disk */
-int briefs_alloc_sync(struct briefs_alloc *alloc, struct super_block *sb);
+/* Sync the in-memory bitmap back to disk */
+int briefs_alloc_sync(struct briefs_alloc *alloc);
 
-/* Cleanup allocator */
+/* Cleanup allocator (free vmalloc'd arrays) */
 void briefs_alloc_cleanup(struct briefs_alloc *alloc);
 
-/* Find leftmost contiguous range of free blocks starting from node */
-u64 briefs_find_leftmost_contiguous(struct trie_node *node, u64 needed, u64 *out_len);
-
-/* Count trailing free blocks in a node (for spanning check) */
-u64 briefs_count_trailing_free(struct trie_node *node);
-
-/* Count leading free blocks in a node (for spanning check) */
-u64 briefs_count_leading_free(struct trie_node *node);
-
-/* Mark a range as allocated in the trie */
-void briefs_mark_allocated(struct trie_node *node, u64 offset, u64 count);
-
-/* Mark a range as free in the trie */
-void briefs_mark_free(struct trie_node *node, u64 offset, u64 count);
-
-/* Rebuild free_count from children (after allocation/deallocation) */
-void briefs_recount(struct trie_node *node);
-
-/* Check if a range is entirely free */
-bool briefs_range_is_free(struct trie_node *node, u64 offset, u64 count);
+/* Compute allocator level word counts for a given number of data blocks */
+static inline void alloc_compute_levels(u64 data_blocks, u64 *l0w, u64 *l1w, u64 *l2w)
+{
+	u64 l2 = (data_blocks + 63) / 64;
+	u64 l1 = (l2 + 63) / 64;
+	u64 l0 = (l1 + 63) / 64;
+	if (l0 < 1) l0 = 1;
+	if (l1 < 1) l1 = 1;
+	if (l2 < 1) l2 = 1;
+	if (l0w) *l0w = l0;
+	if (l1w) *l1w = l1;
+	if (l2w) *l2w = l2;
+}
 
 #endif /* _BRIEFS_ALLOC_H */

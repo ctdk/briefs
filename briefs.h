@@ -181,21 +181,13 @@ struct journal_block {
 	unsigned char records[];
 };
 
-/* Bitwise trie node definition */
-struct trie_node {
-	__u64 range_start; /* starting block of this node's range */
-	__u32 range_len;   /* number of blocks covered (power of 2) */
-	__u32 free_count;  /* how many blocks in this range are free */
-	__u64 left_child;  /* block offset of left child node */
-	__u64 right_child; /* block offset of right child node */
-}; /* 32 bytes */
-
-/* Bitwise trie helper macros */
+/* Bitwise trie helper macros - kept for reference, the allocator now uses a
+ * 3-level bitmap pyramid (see briefs_alloc.h) */
 #define TRIE_IS_LEAF(node) ((node)->range_len == 1)
 #define TRIE_IS_FREE(node) (TRIE_IS_LEAF(node) && (node)->free_count == 1)
 #define TRIE_IS_ALLOCATED(node) (TRIE_IS_LEAF(node) && (node)->free_count == 0)
 
-/* Trie node flags */
+/* Trie node flags (kept for reference, used by directory entry trie) */
 #define TRIE_FLAG_ROOT    0x00000001
 #define TRIE_FLAG_NEW     0x00000002
 #define TRIE_FLAG_DIRTY   0x00000004
