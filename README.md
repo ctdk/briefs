@@ -3,15 +3,16 @@ BrieFS!
 
 _"If you want a picture of the future, imagine a pelican standing on a human head -- for ever."_
 
-TODO: put a detailed explanation here
+BrieFS: A Linux filesystem that solely uses [extents](https://en.wikipedia.org/wiki/Extent_(file_systems)) for file data, [tries](https://en.wikipedia.org/wiki/Trie) for storing directory contents, and [bitmap tries](https://en.wikipedia.org/wiki/Bitwise_trie_with_bitmap) for inode and block allocation.
+
 
 **NB:** This filesystem is experimental and may totally flip out, make your machine hang and stop responding, corrupt your data, corrupt your children, annoy you greatly, or just up and crash. Caution is advised. I must state that I've warned you about potential issues and that I'm not responsible if anything bad happens because you were messing around with this. Also, no warranty as per the LICENSE files.
 
 RELATED
 -------
 
-* github.com/ctdk/briefs-utils: The briefs utilities, written in Golang, comprised of `mkfs.briefs` and `fsck.briefs`. These are unsurprisingly in progress, but `mkfs.briefs` creates very basic BrieFS volumes while `fsck.briefs` doesn't do anything yet.
-* github.com/ctdk/modern-xiafs: Computer filesystem archaeology. A port of an ancient Linux filesystem to modern kernels, updated as I get around to it.
+* [github.com/ctdk/briefs-utils](github.com/ctdk/briefs-utils): The briefs utilities, written in Golang, comprised of `mkfs.briefs` and `fsck.briefs`. These are unsurprisingly in progress, but `mkfs.briefs` creates BrieFS volumes while `fsck.briefs` doesn't do anything yet.
+* [github.com/ctdk/modern-xiafs](github.com/ctdk/modern-xiafs): Computer filesystem archaeology. A port of an ancient Linux filesystem to modern kernels, updated as I get around to it.
 
 RATIONALE
 ---------
