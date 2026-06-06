@@ -58,9 +58,11 @@ WORKS
 * journal replay on mount
 * truncate
 
-DEFINITELY MISSING
-------------------
+DEFINITELY MISSING OR BROKEN
+----------------------------
 
+* Can't execute ELF binaries from a briefs filesystem right now.
+* Normally creating files, writing files, making directories, that sort of thing work fine. However, a test run of untarring the linux kernel sources in a directory on a briefs filesystem had a very impressive kablooie. Be gentle for now until that's sorted.
 * Creating things that aren't either regular files or directories (meaning, no symlinks, device files, named pipes, or so on).
 * Reusing inodes
 * FUSE implementation (requires less commitment than the kernel module)
