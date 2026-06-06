@@ -659,11 +659,11 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 
 	bsb = (struct briefs_superblock *) bh->b_data;
 
-	pr_info("briefs: superblock magic=0x%016llx, data_bitmap_offset=%d, data_bitmap_blocks=%d\n", bsb->magic, bsb->data_bitmap_offset, bsb->data_bitmap_blocks);
+	pr_info("briefs: superblock magic=0x%016llx, data_bitmap_offset=%llu, data_bitmap_blocks=%llu\n", bsb->magic, bsb->data_bitmap_offset, bsb->data_bitmap_blocks);
 
 	sb->s_magic = bsb->magic;
 
-	pr_info("briefs: magic=0x%016llx\n", sb->s_magic);
+	pr_info("briefs: magic=0x%08lx\n", sb->s_magic);
 
 	if (sb->s_magic != _BRIEFS_SUPER_MAGIC) {
 		pr_err("briefs: invalid magic\n");
@@ -868,7 +868,7 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 		disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
 
 		if (disk_inode->magic != 0x494E4F44) {
-			pr_err("briefs: invalid inode magic for ino %llu: 0x%08x\n", ino, disk_inode->magic);
+			pr_err("briefs: invalid inode magic for ino %llu: 0x%08llx\n", ino, disk_inode->magic);
 			brelse(bh);
 			unlock_new_inode(inode);
 			iput(inode);
