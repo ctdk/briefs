@@ -693,23 +693,22 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 
 		/* Push children onto stack for later processing */
 		if (node->first_child) {
-			/* Collect siblings */
+			/* Walk sibling chain, pushing each onto the stack.
+			 * Entries will be processed in reverse-sibling order
+			 * (last sibling first), but BrieFS does not guarantee
+			 * readdir ordering. */
 			u64 child = node->first_child;
-			u64 children[256];
-			int nchild = 0;
 
-			while (child && nchild < 256) {
-				children[nchild++] = child;
-				struct buffer_head *cbh = sb_bread(sb, child);
+			while (child && iter->sp < 256) {
+				struct buffer_head *cbh;
+				struct briefs_trie_node *cn;
+
+				iter->stack[iter->sp++] = child;
+				cbh = sb_bread(sb, child);
 				if (!cbh) break;
-				struct briefs_trie_node *cn = (struct briefs_trie_node *)cbh->b_data;
+				cn = (struct briefs_trie_node *)cbh->b_data;
 				child = cn->next_sibling;
 				brelse(cbh);
-			}
-			/* Push in reverse order so first sibling is processed first */
-			while (nchild > 0 && iter->sp < 256) {
-				nchild--;
-				iter->stack[iter->sp++] = children[nchild];
 			}
 		}
 

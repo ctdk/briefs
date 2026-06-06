@@ -98,12 +98,16 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 
 	/* Iterate the directory trie starting from ctx->pos */
 	{
-		struct trie_iter iter;
+		struct trie_iter *iter;
 		int trie_idx = ctx->pos > 2 ? ctx->pos - 2 : 0;
 		int target_idx = 0;
 
+		iter = kmalloc(sizeof(struct trie_iter), GFP_KERNEL);
+		if (!iter)
+			return -ENOMEM;
+
 		binfo = briefs_i(dir);
-		briefs_trie_iter_init(&iter, &binfo->disk_inode);
+		briefs_trie_iter_init(iter, &binfo->disk_inode);
 
 		while (1) {
 			char entry_name_buf[BRIEFS_NAME_LEN + 1];
@@ -111,7 +115,7 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 			u64 entry_ino;
 			u8 entry_type;
 
-			if (briefs_trie_iter_next(dir->i_sb, &iter, &entry_ino, &entry_type,
+			if (briefs_trie_iter_next(dir->i_sb, iter, &entry_ino, &entry_type,
 			                         entry_name_buf, &entry_name_len) != 0)
 				break;
 
@@ -125,12 +129,15 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 
 			if (!dir_emit(ctx, entry_name_buf, entry_name_len,
 			              entry_ino, fs_umode_to_dtype(file_type))) {
+				kfree(iter);
 				return 0;
 			}
 
 			ctx->pos++;
 			target_idx++;
 		}
+
+		kfree(iter);
 	}
 
 	return 0;
