@@ -28,19 +28,28 @@
 int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb,
                       struct briefs_superblock *sb_disk)
 {
+	return briefs_alloc_init_at(alloc, sb, sb_disk->trie_node_pool_start);
+}
+
+/*
+ * Initialize allocator from an explicit on-disk pool block offset.
+ */
+int briefs_alloc_init_at(struct briefs_alloc *alloc, struct super_block *sb,
+                          u64 pool_block)
+{
 	struct buffer_head *bh;
 	struct alloc_pool_header *hdr;
 	u64 pool_start, l0_blocks, l1_blocks, l2_blocks;
 	u64 pos, i, w;
 
-	if (!alloc || !sb || !sb_disk)
+	if (!alloc || !sb)
 		return -EINVAL;
 
 	memset(alloc, 0, sizeof(*alloc));
 	alloc->sb = sb;
-	alloc->alloc_pool_start = sb_disk->trie_node_pool_start;
+	alloc->alloc_pool_start = pool_block;
 
-	pool_start = sb_disk->trie_node_pool_start;
+	pool_start = pool_block;
 
 	/* Read header block */
 	bh = sb_bread(sb, pool_start);
@@ -65,8 +74,8 @@ int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb,
 
 	brelse(bh);
 
-	pr_info("briefs: allocator: l0=%llu words, l1=%llu words, l2=%llu words, blocks=%llu, free=%llu\n",
-		alloc->l0_words, alloc->l1_words, alloc->l2_words,
+	pr_info("briefs: allocator at block %llu: l0=%llu words, l1=%llu words, l2=%llu words, entries=%llu, free=%llu\n",
+		pool_block, alloc->l0_words, alloc->l1_words, alloc->l2_words,
 		alloc->block_count, alloc->free_count);
 
 	/* Allocate arrays */
@@ -155,8 +164,8 @@ int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb,
 		w += n;
 	}
 
-	pr_info("briefs: allocator initialized from disk (%llu data blocks, %llu free)\n",
-		alloc->block_count, alloc->free_count);
+	pr_info("briefs: allocator at block %llu initialized from disk (%llu entries, %llu free)\n",
+		pool_block, alloc->block_count, alloc->free_count);
 
 	return 0;
 }

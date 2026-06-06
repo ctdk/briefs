@@ -29,6 +29,9 @@ static inline u64 data_to_abs(struct briefs_superblock *sb, u64 rel_block)
 	return data_region_start(sb) + rel_block;
 }
 
+/* Forward declaration */
+static void briefs_free_inode_num(struct super_block *sb, u64 ino);
+
 /* Inode operations for directories */
 const struct inode_operations briefs_dir_inode_ops = {
 	.create = briefs_create,
@@ -116,19 +119,28 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 		return 0;
 	}
 	
-	/* Scan entries starting from ctx->pos (account for . and .. emitted above) */
-	/* Entries 0 and 1 are always . and .. — skip them */
+	/*
+	 * Scan directory entries, mapping ctx->pos to on-disk array index.
+	 *
+	 * ctx->pos 0-1 are . and .. handled by dir_emit_dots above.
+	 * ctx->pos 2 -> on-disk entry index 0 (first real entry after . and ..)
+	 * ctx->pos 3 -> on-disk entry index 1, etc.
+	 *
+	 * ctx->pos advances monotonically even for deleted entries so the VFS
+	 * can seek() back to the right position after revalidating.
+	 */
 	u64 start_idx = ctx->pos > 2 ? ctx->pos : 2;
 	for (i = start_idx; i < dir_block->num_entries; i++) {
 		entry = (struct briefs_dir_entry *)(bh->b_data + sizeof(struct briefs_dir_block) +
 			                                    i * sizeof(struct briefs_dir_entry));
-		
-		if (entry->name_len == 0 || entry->name_off == 0)
+
+		/* Skip deleted entries but advance ctx->pos so accounting doesn't break */
+		if (entry->name_len == 0 || entry->name_off == 0 ||
+		    entry->name_off > BRIEFS_BLOCK_SIZE) {
+			ctx->pos++;
 			continue;
-		
-		if (entry->name_off > BRIEFS_BLOCK_SIZE)
-			continue;
-		
+		}
+
 		char *entry_name = bh->b_data + BRIEFS_BLOCK_SIZE - entry->name_off + 2;
 		unsigned int file_type = (entry->type << 12) & S_IFMT;
 		
@@ -662,10 +674,17 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 
 	bsi->sb = bsb;
 
-	/* Initialize allocator with trie */
+	/* Initialize data block allocator */
 	ret = briefs_alloc_init(&bsi->alloc, sb, bsb);
 	if (ret) {
-		pr_err("briefs: failed to initialize allocator: %d\n", ret);
+		pr_err("briefs: failed to initialize data block allocator: %d\n", ret);
+		goto out_no_root;
+	}
+
+	/* Initialize inode allocator */
+	ret = briefs_alloc_init_at(&bsi->inode_alloc, sb, bsb->inode_bitmap_offset);
+	if (ret) {
+		pr_err("briefs: failed to initialize inode allocator: %d\n", ret);
 		goto out_no_root;
 	}
 
@@ -706,21 +725,11 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 		goto out_iput;
 	}
 
-	/* Load up sb_info as best we can right now. Some of these will either
-	 * need to be calculated here rather than taken from the sb info or
-	 * taken from somewhere else. */
 	bsi->data_blocks = bsb->data_blocks;
 	bsi->free_data_blocks = bsb->free_data_blocks;
-	/* It would be better to calculate this from the inode blocks, but since
-	 * those are hiding at the moment we'll calculate this from the inode
-	 * bitmap. Something for the future, though: we should be able to add
-	 * inode blocks & expand the inode bitmap to different parts of the disk
-	 * in case, say, there's plenty of disk space but free inodes are
- 	 * running low. */
-	/* Recklessly assuming that bytes have 8 bits. PDP-10 compatibility may
-	 * be affected. */
-	bsi->num_inodes = bsb->block_size * bsb->inode_bitmap_blocks * 8;
-	bsi->free_inodes = bsb->free_inodes;
+	/* Compute inode counts from the inode allocator pyramid */
+	bsi->num_inodes = bsi->inode_alloc.block_count;
+	bsi->free_inodes = bsi->inode_alloc.free_count;
 
 	pr_info("briefs: superblock loaded, mounting successful\n");
 
@@ -771,6 +780,13 @@ out_bad_sb:
 	pr_err("BrieFS: unable to read superblock.\n");
 
 out:
+	/* Clean up allocators if initialized */
+	if (bsi) {
+		if (bsi->alloc.l0)
+			briefs_alloc_cleanup(&bsi->alloc);
+		if (bsi->inode_alloc.l0)
+			briefs_alloc_cleanup(&bsi->inode_alloc);
+	}
 	sb->s_fs_info = NULL;
 	kfree(bsi);
 	pr_info("briefs: fill_super returning %d\n", ret);
@@ -922,6 +938,7 @@ void briefs_put_super(struct super_block *sb) {
 				if (sbh) {
 					struct briefs_superblock *bsb = (struct briefs_superblock *)sbh->b_data;
 					bsb->free_data_blocks = bsi->alloc.free_count;
+					bsb->free_inodes = bsi->inode_alloc.free_count;
 					mark_buffer_dirty(sbh);
 					sync_dirty_buffer(sbh);
 					brelse(sbh);
@@ -936,8 +953,12 @@ void briefs_put_super(struct super_block *sb) {
 			bsi->journal = NULL;
 		}
 
+		pr_info("briefs: syncing inode allocator\n");
+		briefs_alloc_sync(&bsi->inode_alloc);
+
 		pr_info("briefs: calling alloc_cleanup\n");
 		briefs_alloc_cleanup(&bsi->alloc);
+		briefs_alloc_cleanup(&bsi->inode_alloc);
 		pr_info("briefs: alloc_cleanup done\n");
 	}
 
@@ -966,6 +987,10 @@ int briefs_statfs(struct dentry *dentry, struct kstatfs *buf) {
 /* briefs_evict_inode - cleanup inode on eviction */
 void briefs_evict_inode(struct inode *inode) {
 	pr_debug("briefs: evict_inode inode %lu\n", inode->i_ino);
+	/* Free the inode number back to the allocator when nlink drops to 0 */
+	if (inode->i_nlink == 0) {
+		briefs_free_inode_num(inode->i_sb, inode->i_ino);
+	}
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
 }
@@ -1035,51 +1060,26 @@ void briefs_init_trie_root(struct briefs_trie_node *root) {
 	root->node_type = NODE_TYPE_INTERM;
 }
 
-/* briefs_alloc_inode - allocate a new inode number */
+/* briefs_alloc_inode - allocate a new inode number using the bitmap pyramid */
 static u64 briefs_alloc_inode(struct super_block *sb) {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
-	struct briefs_superblock *sbk = bsi->sb;
-	struct buffer_head *bh;
-	u8 *bitmap;
-	u64 ino;
-	int bi, bj;
-
-	/* Scan inode bitmap for first zero bit */
-	for (bi = 0; bi < sbk->inode_bitmap_blocks; bi++) {
-		bh = sb_bread(sb, sbk->inode_bitmap_offset + bi);
-		if (!bh) {
-			pr_err("briefs: failed to read inode bitmap block %d\n", bi);
-			return 0;
-		}
-
-		bitmap = bh->b_data;
-		for (bj = 0; bj < sb->s_blocksize; bj++) {
-			if (bitmap[bj] != 0xFF) {
-				/* Found a byte with a free bit */
-				int bit;
-				for (bit = 0; bit < 8; bit++) {
-					if (!(bitmap[bj] & (1 << bit))) {
-						ino = (bi * sb->s_blocksize * 8) + (bj * 8) + bit + 1;
-
-						/* Mark inode as allocated */
-						bitmap[bj] |= (1 << bit);
-						mark_buffer_dirty(bh);
-						brelse(bh);
-
-						/* Update sb free count */
-						sbk->free_inodes--;
-
-						pr_debug("briefs: allocated inode %llu\n", ino);
-						return ino;
-					}
-				}
-			}
-		}
-		brelse(bh);
+	u64 inum = briefs_alloc_block(&bsi->inode_alloc);
+	if (inum == 0) {
+		pr_err("briefs: no free inodes\n");
+		return 0;
 	}
+	/* inum is 0-based index, convert to 1-based inode number */
+	u64 ino = inum + 1;
+	pr_debug("briefs: allocated inode %llu\n", ino);
+	return ino;
+}
 
-	pr_err("briefs: no free inodes\n");
-	return 0;
+static void briefs_free_inode_num(struct super_block *sb, u64 ino) {
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	if (ino == 0)
+		return;
+	briefs_free_block(&bsi->inode_alloc, ino - 1);
+	pr_debug("briefs: freed inode %llu\n", ino);
 }
 
 /* briefs_lookup - find inode by name in directory */

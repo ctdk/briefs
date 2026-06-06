@@ -425,7 +425,8 @@ struct briefs_sb_info {
 	__u64 free_inodes;
 	struct briefs_superblock *sb;
 	struct block_device *bdev;
-	struct briefs_alloc alloc;
+	struct briefs_alloc alloc;          /* data block allocator (3-level bitmap pyramid) */
+	struct briefs_alloc inode_alloc;    /* inode allocator (3-level bitmap pyramid) */
 	struct briefs_journal *journal;  /* transaction journal (dynamically allocated) */
 };
 

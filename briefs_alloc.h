@@ -23,7 +23,8 @@ struct alloc_pool_header {
 	__u64 reserved[6];
 };
 
-/* Allocator context - 3-level bitmap pyramid */
+/* Allocator context - 3-level bitmap pyramid.
+ * Used for both data block allocation and inode allocation. */
 struct briefs_alloc {
 	struct super_block *sb;         /* VFS superblock for buffer cache I/O */
 	__u64 *l0;                      /* level 0 summary words (vmalloc'd) */
@@ -37,7 +38,11 @@ struct briefs_alloc {
 	u64 alloc_pool_start;           /* first block of allocator pool on disk */
 };
 
-/* Initialize allocator from superblock (loads the 3-level bitmap from disk) */
+/* Initialize data block allocator from superblock */
+/* Initialize allocator from an explicit pool start offset (used for inode allocator) */
+int briefs_alloc_init_at(struct briefs_alloc *alloc, struct super_block *sb,
+                          u64 pool_block);
+
 int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb,
                       struct briefs_superblock *sb_disk);
 
@@ -53,7 +58,7 @@ int briefs_alloc_sync(struct briefs_alloc *alloc);
 /* Cleanup allocator (free vmalloc'd arrays) */
 void briefs_alloc_cleanup(struct briefs_alloc *alloc);
 
-/* Compute allocator level word counts for a given number of data blocks */
+/* Compute allocator level word counts for a given number of tracked entries */
 static inline void alloc_compute_levels(u64 data_blocks, u64 *l0w, u64 *l1w, u64 *l2w)
 {
 	u64 l2 = (data_blocks + 63) / 64;
@@ -67,4 +72,15 @@ static inline void alloc_compute_levels(u64 data_blocks, u64 *l0w, u64 *l1w, u64
 	if (l2w) *l2w = l2;
 }
 
+
+/* Compute total pool blocks: 1 header + ceil(words/512) per level */
+static inline u64 alloc_pool_blocks(u64 l0w, u64 l1w, u64 l2w)
+{
+	u64 wpb = 512;
+	u64 blk = 1;
+	blk += (l0w + wpb - 1) / wpb;
+	blk += (l1w + wpb - 1) / wpb;
+	blk += (l2w + wpb - 1) / wpb;
+	return blk;
+}
 #endif /* _BRIEFS_ALLOC_H */
