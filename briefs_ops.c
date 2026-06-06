@@ -49,6 +49,7 @@ const struct file_operations briefs_dir_operations = {
 	.llseek = generic_file_llseek,
 	.iterate_shared = briefs_readdir,
 	.release = NULL,
+	.fsync = briefs_fsync,
 };
 
 /* File operations for regular files */
@@ -59,6 +60,7 @@ const struct file_operations briefs_file_operations = {
 	.open = briefs_open,
 	.release = briefs_release,
 	.mmap = generic_file_mmap,
+	.fsync = briefs_fsync,
 };
 
 /* Superblock operations */
@@ -375,6 +377,18 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from) {
 
 	pr_debug("briefs: write_iter done=%zu\n", done);
 	return ret;
+}
+
+/* briefs_fsync - sync file data and metadata to disk */
+int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
+	struct inode *inode = file->f_mapping->host;
+	int ret;
+
+	ret = file_write_and_wait_range(file, start, end);
+	if (ret)
+		return ret;
+
+	return sync_inode_metadata(inode, 1);
 }
 
 /* Open file */

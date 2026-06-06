@@ -492,6 +492,7 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 /* File operations */
 ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to);
 ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from);
+int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync);
 int briefs_open(struct inode *inode, struct file *file);
 int briefs_release(struct inode *inode, struct file *file);
 
