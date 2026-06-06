@@ -1,2 +1,5 @@
-- First and foremost, finish the basic header definitions and get filesystem
-  creation working.
+- Finish getting basic functionality working.
+- Create fsck.briefs.
+- FUSE for BrieFS once fsck.briefs is more than a stub.
+- Make list of desired functionality that still needs implementing.
+- Proper tests
