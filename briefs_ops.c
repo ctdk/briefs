@@ -29,6 +29,12 @@ static inline u64 data_to_abs(struct briefs_superblock *sb, u64 rel_block)
 	return data_region_start(sb) + rel_block;
 }
 
+/* Convert an absolute block number back to data-relative (inverse of data_to_abs) */
+static inline u64 abs_to_data(struct briefs_superblock *sb, u64 abs_block)
+{
+	return abs_block - data_region_start(sb);
+}
+
 /* Forward declaration */
 static void briefs_free_inode_num(struct super_block *sb, u64 ino);
 
@@ -38,6 +44,7 @@ const struct inode_operations briefs_dir_inode_ops = {
 	.lookup = briefs_lookup,
 	.mkdir = briefs_mkdir,
 	.unlink = briefs_unlink,
+	.rmdir = briefs_unlink,
 	.rename = briefs_rename,
 };
 
@@ -984,11 +991,33 @@ int briefs_statfs(struct dentry *dentry, struct kstatfs *buf) {
 	return 0;
 }
 
+/* briefs_free_inode_data - free all data blocks owned by an inode */
+static void briefs_free_inode_data(struct inode *inode)
+{
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
+	int i;
+	u64 b;
+
+	for (i = 0; i < binfo->disk_inode.num_extents_inline; i++) {
+		struct briefs_extent *ext = &binfo->disk_inode.inline_extents[i];
+		for (b = 0; b < ext->len; b++) {
+			u64 abs_block = ext->phys + b;
+			u64 rel_block = abs_to_data(bsi->sb, abs_block);
+			briefs_free_block(&bsi->alloc, rel_block);
+		}
+	}
+	binfo->disk_inode.num_extents_inline = 0;
+	binfo->disk_inode.num_extents_total = 0;
+	memset(binfo->disk_inode.inline_extents, 0, sizeof(binfo->disk_inode.inline_extents));
+}
+
 /* briefs_evict_inode - cleanup inode on eviction */
 void briefs_evict_inode(struct inode *inode) {
 	pr_debug("briefs: evict_inode inode %lu\n", inode->i_ino);
-	/* Free the inode number back to the allocator when nlink drops to 0 */
+	/* When nlink drops to 0, free allocated blocks and the inode number */
 	if (inode->i_nlink == 0) {
+		briefs_free_inode_data(inode);
 		briefs_free_inode_num(inode->i_sb, inode->i_ino);
 	}
 	truncate_inode_pages_final(&inode->i_data);
@@ -1406,7 +1435,12 @@ int briefs_unlink(struct inode *dir, struct dentry *dentry) {
 		return ret;
 
 	/* Drop nlink on the inode */
-	drop_nlink(inode);
+	if (S_ISDIR(inode->i_mode)) {
+		/* Directory: clear nlink completely (2 -> 0) */
+		clear_nlink(inode);
+	} else {
+		drop_nlink(inode);
+	}
 
 	/* If directory, also drop parent's nlink (.. reference) */
 	if (S_ISDIR(inode->i_mode))
