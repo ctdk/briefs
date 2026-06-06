@@ -30,16 +30,18 @@ static inline u64 data_to_abs(struct briefs_superblock *sb, u64 rel_block)
 }
 
 /* Convert an absolute block number back to data-relative (inverse of data_to_abs) */
+/*
+ * briefs_compute_i_blocks - compute number of 512-byte sectors used
+ * by the inline extents in an inode. This only covers inline extents;
+ * chain blocks are handled by briefs_getattr which has sb context.
+ */
 static inline u64 briefs_compute_i_blocks(struct briefs_inode *di)
 {
 	u64 blocks = 0;
 	int i;
 	for (i = 0; i < di->num_extents_inline; i++)
 		blocks += di->inline_extents[i].len;
-	u64 result = blocks * (BRIEFS_BLOCK_SIZE / 512);
-	pr_debug("briefs: compute_i_blocks: %llu extents, %llu blocks, result=%llu\n",
-		(u64)di->num_extents_inline, blocks, result);
-	return result;
+	return blocks * (BRIEFS_BLOCK_SIZE / 512);
 }
 
 static inline u64 abs_to_data(struct briefs_superblock *sb, u64 abs_block)
@@ -176,19 +178,177 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 	return 0;
 }
 
+/* Extents per chain block (see struct briefs_extent_chain) */
+#define CHAIN_EXTENTS 256
+
+/*
+ * briefs_read_extent - read an extent by logical index from inline extents,
+ * walking chain blocks as needed. Returns the extent data in *ext.
+ * Returns 0 on success, -ENOENT if index >= num_extents_total.
+ */
+static int briefs_read_extent(struct super_block *sb, struct briefs_inode *di,
+                               int idx, struct briefs_extent *ext)
+{
+	struct buffer_head *bh;
+	struct briefs_extent_chain *chain;
+	int chain_idx;
+	u64 chain_block;
+
+	if (idx < 0 || idx >= di->num_extents_total)
+		return -ENOENT;
+
+	/* Check if the extent is inline */
+	if (idx < di->num_extents_inline) {
+		*ext = di->inline_extents[idx];
+		return 0;
+	}
+
+	/* Walk chain blocks */
+	chain_block = di->extent_inline_base;
+	if (chain_block == 0)
+		return -ENOENT;
+
+	chain_idx = idx - di->num_extents_inline;
+
+	while (chain_block) {
+		bh = sb_bread(sb, chain_block);
+		if (!bh) {
+			pr_err("briefs: failed to read chain block %llu\n", chain_block);
+			return -EIO;
+		}
+		chain = (struct briefs_extent_chain *)bh->b_data;
+
+		if (chain_idx < chain->num_extents_in_block) {
+			*ext = chain->extents[chain_idx];
+			brelse(bh);
+			return 0;
+		}
+
+		chain_idx -= chain->num_extents_in_block;
+		chain_block = chain->next_overflow_block;
+		brelse(bh);
+	}
+
+	return -ENOENT;
+}
+
+/*
+ * briefs_append_extent - append an extent to the extent list, creating
+ * chain blocks if the 8 inline slots are full.
+ * Returns 0 on success, -ENOSPC if no blocks available for chain.
+ */
+static int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
+                                 struct briefs_extent *ext)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct buffer_head *bh;
+	struct briefs_extent_chain *chain;
+	u64 rel, chain_block;
+	int slot;
+
+	if (di->num_extents_inline < 8) {
+		/* Still fits inline */
+		int n = di->num_extents_inline;
+		di->inline_extents[n] = *ext;
+		di->num_extents_inline++;
+		di->num_extents_total++;
+		return 0;
+	}
+
+	/* Inline is full - append to chain blocks */
+
+	/* Allocate first chain block if needed */
+	chain_block = di->extent_inline_base;
+	if (chain_block == 0) {
+		rel = briefs_alloc_block(&bsi->alloc);
+		if (rel == 0)
+			return -ENOSPC;
+		chain_block = data_to_abs(bsi->sb, rel);
+		di->extent_inline_base = chain_block;
+
+		bh = sb_getblk(sb, chain_block);
+		if (!bh) {
+			briefs_free_block(&bsi->alloc, rel);
+			return -EIO;
+		}
+		memset(bh->b_data, 0, sb->s_blocksize);
+		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);
+		brelse(bh);
+	}
+
+	/* Walk to the last chain block */
+	while (1) {
+		bh = sb_bread(sb, chain_block);
+		if (!bh)
+			return -EIO;
+		chain = (struct briefs_extent_chain *)bh->b_data;
+
+		if (chain->num_extents_in_block < CHAIN_EXTENTS) {
+			/* Room in this block */
+			slot = chain->num_extents_in_block;
+			chain->extents[slot] = *ext;
+			chain->num_extents_in_block++;
+			mark_buffer_dirty(bh);
+			sync_dirty_buffer(bh);
+			brelse(bh);
+			di->num_extents_total++;
+			return 0;
+		}
+
+		/* Chain block full - follow or allocate next */
+		if (chain->next_overflow_block) {
+			chain_block = chain->next_overflow_block;
+			brelse(bh);
+			continue;
+		}
+
+		/* Allocate a new chain block */
+		rel = briefs_alloc_block(&bsi->alloc);
+		if (rel == 0) {
+			brelse(bh);
+			return -ENOSPC;
+		}
+		u64 new_block = data_to_abs(bsi->sb, rel);
+		chain->next_overflow_block = new_block;
+		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);
+		brelse(bh);
+
+		/* Set up new chain block */
+		bh = sb_getblk(sb, new_block);
+		if (!bh) {
+			briefs_free_block(&bsi->alloc, rel);
+			return -EIO;
+		}
+		memset(bh->b_data, 0, sb->s_blocksize);
+		chain = (struct briefs_extent_chain *)bh->b_data;
+		chain->extents[0] = *ext;
+		chain->num_extents_in_block = 1;
+		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);
+		brelse(bh);
+		di->num_extents_total++;
+		return 0;
+	}
+}
+
+
 /*
  * briefs_find_block - resolve file block offset to physical block
- * via inline extents. Returns 0 if unmapped (hole).
+ * via inline extents and extent chain blocks. Returns 0 if unmapped (hole).
  */
 static u64 briefs_find_block(struct inode *inode, u64 file_block)
 {
 	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct briefs_extent ext;
 	int i;
 
-	for (i = 0; i < binfo->disk_inode.num_extents_inline; i++) {
-		struct briefs_extent *ext = &binfo->disk_inode.inline_extents[i];
-		if (file_block >= ext->offset && file_block < ext->offset + ext->len)
-			return ext->phys + (file_block - ext->offset);
+	for (i = 0; i < binfo->disk_inode.num_extents_total; i++) {
+		if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext) != 0)
+			break;
+		if (file_block >= ext.offset && file_block < ext.offset + ext.len)
+			return ext.phys + (file_block - ext.offset);
 	}
 	return 0;
 }
@@ -197,64 +357,90 @@ static u64 briefs_find_block(struct inode *inode, u64 file_block)
  * briefs_find_or_create_block - like find_block, but allocates a new
  * physical block if none is mapped and appends a new extent.
  * Returns the ABSOLUTE block number, or 0 on failure.
+ * Supports extent chain blocks for overflow beyond 8 inline extents.
  */
 static u64 briefs_find_or_create_block(struct inode *inode, u64 file_block)
 {
 	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
 	struct briefs_inode_info *binfo = briefs_i(inode);
-	struct briefs_extent *ext;
-	int i;
+	struct briefs_extent ext;
+	struct briefs_extent new_ext;
+	u64 rel, abs_block;
+	int i, ret;
 
-	/* Check existing extents (extent phys values are absolute) */
-	for (i = 0; i < binfo->disk_inode.num_extents_inline; i++) {
-		ext = &binfo->disk_inode.inline_extents[i];
-		if (file_block >= ext->offset && file_block < ext->offset + ext->len)
-			return ext->phys + (file_block - ext->offset);
+	/* Check existing extents via read_extent (handles inline + chain) */
+	for (i = 0; i < binfo->disk_inode.num_extents_total; i++) {
+		if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext) != 0)
+			break;
+		if (file_block >= ext.offset && file_block < ext.offset + ext.len)
+			return ext.phys + (file_block - ext.offset);
 	}
 
 	/* Check if we can extend the last extent */
-	if (binfo->disk_inode.num_extents_inline > 0) {
-		ext = &binfo->disk_inode.inline_extents[binfo->disk_inode.num_extents_inline - 1];
-		if (file_block == ext->offset + ext->len) {
-			u64 rel = briefs_alloc_block(&bsi->alloc);
+	if (binfo->disk_inode.num_extents_total > 0) {
+		ret = briefs_read_extent(inode->i_sb, &binfo->disk_inode,
+		                         binfo->disk_inode.num_extents_total - 1, &ext);
+		if (ret == 0 && file_block == ext.offset + ext.len) {
+			rel = briefs_alloc_block(&bsi->alloc);
 			if (rel == 0)
 				return 0;
-			u64 abs = data_to_abs(bsi->sb, rel);
-			if (abs == ext->phys + ext->len && ext->len < 0xFFFFFFFF) {
-				/* Physically contiguous — extend */
-				ext->len++;
-				return abs;
+			abs_block = data_to_abs(bsi->sb, rel);
+			if (abs_block == ext.phys + ext.len && ext.len < 0xFFFFFFFF) {
+				/* Physically contiguous - extend last extent */
+				struct buffer_head *cbh;
+				struct briefs_extent_chain *chain;
+				u64 chain_block;
+				int ci;
+
+				if (binfo->disk_inode.num_extents_total <= binfo->disk_inode.num_extents_inline) {
+					/* Last extent is inline */
+					int n = binfo->disk_inode.num_extents_inline - 1;
+					binfo->disk_inode.inline_extents[n].len++;
+				} else {
+					/* Last extent is in a chain block */
+					chain_block = binfo->disk_inode.extent_inline_base;
+					ci = binfo->disk_inode.num_extents_total - 1 - binfo->disk_inode.num_extents_inline;
+					while (chain_block) {
+						cbh = sb_bread(inode->i_sb, chain_block);
+						if (!cbh) break;
+						chain = (struct briefs_extent_chain *)cbh->b_data;
+						if (ci < chain->num_extents_in_block) {
+							chain->extents[ci].len++;
+							mark_buffer_dirty(cbh);
+							sync_dirty_buffer(cbh);
+							brelse(cbh);
+							break;
+						}
+						ci -= chain->num_extents_in_block;
+						chain_block = chain->next_overflow_block;
+						brelse(cbh);
+					}
+				}
+				return abs_block;
 			}
-			/* Not contiguous — start a new extent */
-			if (binfo->disk_inode.num_extents_inline < 8) {
-				int n = binfo->disk_inode.num_extents_inline;
-				binfo->disk_inode.inline_extents[n].offset = file_block;
-				binfo->disk_inode.inline_extents[n].phys = abs;
-				binfo->disk_inode.inline_extents[n].len = 1;
-				binfo->disk_inode.num_extents_inline++;
-				binfo->disk_inode.num_extents_total++;
-				return abs;
-			}
-			return 0;
+			/* Not contiguous - start a new extent */
+			new_ext.offset = file_block;
+			new_ext.phys = abs_block;
+			new_ext.len = 1;
+			new_ext.flags = 0;
+			ret = briefs_append_extent(inode->i_sb, &binfo->disk_inode, &new_ext);
+			if (ret != 0) return 0;
+			return abs_block;
 		}
 	}
 
 	/* Need a brand new extent */
-	if (binfo->disk_inode.num_extents_inline >= 8)
-		return 0; /* overflow not yet supported */
-
-	u64 rel = briefs_alloc_block(&bsi->alloc);
+	rel = briefs_alloc_block(&bsi->alloc);
 	if (rel == 0)
 		return 0;
-	u64 abs_block = data_to_abs(bsi->sb, rel);
+	abs_block = data_to_abs(bsi->sb, rel);
 
-	int n = binfo->disk_inode.num_extents_inline;
-	binfo->disk_inode.inline_extents[n].offset = file_block;
-	binfo->disk_inode.inline_extents[n].phys = abs_block;
-	binfo->disk_inode.inline_extents[n].len = 1;
-	binfo->disk_inode.inline_extents[n].flags = 0;
-	binfo->disk_inode.num_extents_inline++;
-	binfo->disk_inode.num_extents_total++;
+	new_ext.offset = file_block;
+	new_ext.phys = abs_block;
+	new_ext.len = 1;
+	new_ext.flags = 0;
+	ret = briefs_append_extent(inode->i_sb, &binfo->disk_inode, &new_ext);
+	if (ret != 0) return 0;
 	return abs_block;
 }
 
@@ -379,7 +565,17 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from) {
 			binfo->disk_inode.filesize = pos;
 		}
 
-		inode->i_blocks = briefs_compute_i_blocks(&binfo->disk_inode);
+		/* Compute i_blocks from all extents (inline + chain) */
+		{
+			struct briefs_extent ext;
+			u64 total_blocks = 0;
+			int j;
+			for (j = 0; j < binfo->disk_inode.num_extents_total; j++) {
+				if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, j, &ext) == 0)
+					total_blocks += ext.len;
+			}
+			inode->i_blocks = total_blocks * (BRIEFS_BLOCK_SIZE / 512);
+		}
 
 		ktime_get_real_ts64(&now);
 		inode->i_mtime_sec = now.tv_sec;
@@ -1016,8 +1212,17 @@ int briefs_getattr(struct mnt_idmap *idmap, const struct path *path,
 
 	generic_fillattr(idmap, request_mask, inode, stat);
 
-	/* Recompute i_blocks from extents to ensure accuracy */
-	i_blocks = briefs_compute_i_blocks(&binfo->disk_inode);
+	/* Recompute i_blocks from all extents (inline + chain) */
+	{
+		struct briefs_extent ext;
+		u64 total_blocks = 0;
+		int j;
+		for (j = 0; j < binfo->disk_inode.num_extents_total; j++) {
+			if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, j, &ext) == 0)
+				total_blocks += ext.len;
+		}
+		i_blocks = total_blocks * (BRIEFS_BLOCK_SIZE / 512);
+	}
 	inode->i_blocks = i_blocks;
 	stat->blocks = i_blocks;
 	pr_debug("briefs: getattr ino=%lu i_blocks=%llu\n", inode->i_ino, i_blocks);
@@ -1029,19 +1234,39 @@ static void briefs_free_inode_data(struct inode *inode)
 {
 	struct briefs_inode_info *binfo = briefs_i(inode);
 	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
+	struct buffer_head *bh;
+	struct briefs_extent_chain *chain;
+	struct briefs_extent ext;
+	u64 chain_block, next_chain;
 	int i;
 	u64 b;
 
-	for (i = 0; i < binfo->disk_inode.num_extents_inline; i++) {
-		struct briefs_extent *ext = &binfo->disk_inode.inline_extents[i];
-		for (b = 0; b < ext->len; b++) {
-			u64 abs_block = ext->phys + b;
+	/* Walk all extents (inline + chain) */
+	for (i = 0; i < binfo->disk_inode.num_extents_total; i++) {
+		if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext) != 0)
+			break;
+		for (b = 0; b < ext.len; b++) {
+			u64 abs_block = ext.phys + b;
 			u64 rel_block = abs_to_data(bsi->sb, abs_block);
 			briefs_free_block(&bsi->alloc, rel_block);
 		}
 	}
+
+	/* Free chain blocks */
+	chain_block = binfo->disk_inode.extent_inline_base;
+	while (chain_block) {
+		bh = sb_bread(inode->i_sb, chain_block);
+		if (!bh) break;
+		chain = (struct briefs_extent_chain *)bh->b_data;
+		next_chain = chain->next_overflow_block;
+		brelse(bh);
+		briefs_free_block(&bsi->alloc, abs_to_data(bsi->sb, chain_block));
+		chain_block = next_chain;
+	}
+
 	binfo->disk_inode.num_extents_inline = 0;
 	binfo->disk_inode.num_extents_total = 0;
+	binfo->disk_inode.extent_inline_base = 0;
 	memset(binfo->disk_inode.inline_extents, 0, sizeof(binfo->disk_inode.inline_extents));
 }
 
