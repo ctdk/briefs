@@ -41,19 +41,19 @@ WORKS
 * touching files
 * mkdir creates directories
 * file lookup (the exact implementation is subject to change)
-* reading and writing files works within the inline extents (external extents aren't implemented yet)
+* reading and writing files works with both inline and external extents
 * unlink and rename work
 * chown and chmod work
 * fsync implemented
 * bitmap pyramids for data block and inode allocation
 * statfs
 * journal replay on mount
+* truncate
 
 DEFINITELY MISSING
 ------------------
 
 * Creating things that aren't either regular files or directories (meaning, no symlinks, device files, named pipes, or so on).
-* External extents aren't implemented yet, so reading and writing to files is brittle to say the least.
 * Reusing inodes
 * FUSE implementation (requires less commitment than the kernel module)
 * Proper tests
