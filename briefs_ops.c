@@ -64,7 +64,7 @@ const struct inode_operations briefs_dir_inode_ops = {
 
 /* Inode operations for files */
 const struct inode_operations briefs_file_inode_ops = {
-	.setattr = simple_setattr,
+	.setattr = briefs_setattr,
 	.getattr = briefs_getattr,
 };
 
@@ -1202,8 +1202,184 @@ int briefs_statfs(struct dentry *dentry, struct kstatfs *buf) {
 	return 0;
 }
 
+/* briefs_setattr - set file attributes (truncate support).
+ * Frees data blocks on truncation, updates the inode on disk.
+ */
+int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+                   struct iattr *attr)
+{
+	struct inode *inode = d_inode(dentry);
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
+	struct briefs_extent ext;
+	u64 new_size, old_size, trunc_block;
+	int i, ret;
+	struct buffer_head *bh;
+	struct briefs_extent_chain *chain;
+	u64 chain_block;
+	int ci;
+	
+
+	/* Only handle truncation (i_attr_valid & ATTR_SIZE, new size < old) */
+	if (!(attr->ia_valid & ATTR_SIZE))
+		goto out_copy;
+
+	new_size = attr->ia_size;
+	old_size = inode->i_size;
+
+	if (new_size >= old_size)
+		goto out_copy;
+
+	pr_debug("briefs: setattr truncate ino=%lu %llu -> %llu\n",
+		inode->i_ino, old_size, new_size);
+
+	trunc_block = (new_size + BRIEFS_BLOCK_SIZE - 1) / BRIEFS_BLOCK_SIZE;
+
+	/* Iterate extents in reverse; trunc_block may fall inside an extent
+	 * or before it. Remove or shorten affected extents. */
+	for (i = binfo->disk_inode.num_extents_total - 1; i >= 0; i--) {
+		ret = briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext);
+		if (ret != 0)
+			break;
+
+		u64 ext_start = ext.offset;
+		u64 ext_end = ext.offset + ext.len;
+
+		if (trunc_block >= ext_end) {
+			/* Extent is entirely before truncation point - keep */
+			continue;
+		}
+
+		if (trunc_block > ext_start && trunc_block < ext_end) {
+			/* Truncation falls inside this extent - shorten it */
+			u64 blocks_to_free = ext_end - trunc_block;
+			u64 b;
+
+			for (b = 0; b < blocks_to_free; b++) {
+				u64 abs = ext.phys + ext.len - blocks_to_free + b;
+				u64 rel = abs_to_data(bsi->sb, abs);
+				briefs_free_block(&bsi->alloc, rel);
+			}
+
+			ext.len -= blocks_to_free;
+
+			/* Update the extent in place (inline or chain) */
+			if (i < binfo->disk_inode.num_extents_inline) {
+				binfo->disk_inode.inline_extents[i] = ext;
+			} else {
+				ci = i - binfo->disk_inode.num_extents_inline;
+				chain_block = binfo->disk_inode.extent_inline_base;
+				while (chain_block && ci >= 0) {
+					bh = sb_bread(inode->i_sb, chain_block);
+					if (!bh) break;
+					chain = (struct briefs_extent_chain *)bh->b_data;
+					if (ci < chain->num_extents_in_block) {
+						chain->extents[ci] = ext;
+						mark_buffer_dirty(bh);
+						sync_dirty_buffer(bh);
+						brelse(bh);
+						break;
+					}
+					ci -= chain->num_extents_in_block;
+					chain_block = chain->next_overflow_block;
+					brelse(bh);
+				}
+			}
+			/* Done - all later extents already removed */
+			break;
+		}
+
+		/* trunc_block <= ext_start - free the entire extent */
+		{
+			u64 b;
+			for (b = 0; b < ext.len; b++) {
+				u64 abs = ext.phys + b;
+				u64 rel = abs_to_data(bsi->sb, abs);
+				briefs_free_block(&bsi->alloc, rel);
+			}
+		}
+
+		/* Remove the extent: shift remaining extents down */
+		if (i < binfo->disk_inode.num_extents_inline) {
+			/* Extent is inline - remove it */
+			int j;
+			for (j = i; j < binfo->disk_inode.num_extents_inline - 1; j++)
+				binfo->disk_inode.inline_extents[j] = binfo->disk_inode.inline_extents[j + 1];
+			binfo->disk_inode.num_extents_inline--;
+		} else {
+			/* Extent is in a chain block - we'll rebuild later */
+		}
+
+		binfo->disk_inode.num_extents_total--;
+	}
+
+	/* If trunc_block is 0 (truncate to empty), use the full cleanup path */
+	if (new_size == 0) {
+		/* Free all remaining extents (they're all before trunc_block=0) and chain blocks */
+		chain_block = binfo->disk_inode.extent_inline_base;
+		while (chain_block) {
+			bh = sb_bread(inode->i_sb, chain_block);
+			if (!bh) break;
+			chain = (struct briefs_extent_chain *)bh->b_data;
+			u64 next = chain->next_overflow_block;
+			brelse(bh);
+			briefs_free_block(&bsi->alloc, abs_to_data(bsi->sb, chain_block));
+			chain_block = next;
+		}
+		binfo->disk_inode.extent_inline_base = 0;
+		binfo->disk_inode.num_extents_inline = 0;
+		binfo->disk_inode.num_extents_total = 0;
+		memset(binfo->disk_inode.inline_extents, 0, sizeof(binfo->disk_inode.inline_extents));
+	}
+
+	/* Update inode metadata */
+	inode->i_size = new_size;
+	binfo->disk_inode.filesize = new_size;
+
+	/* Recompute i_blocks */
+	{
+		u64 total_blocks = 0;
+		struct briefs_extent ee;
+		int j;
+		for (j = 0; j < binfo->disk_inode.num_extents_total; j++) {
+			if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, j, &ee) == 0)
+				total_blocks += ee.len;
+		}
+		inode->i_blocks = total_blocks * (BRIEFS_BLOCK_SIZE / 512);
+	}
+
+	/* Let VFS handle page cache truncation */
+	truncate_setsize(inode, new_size);
+
+	/* Persist the inode to disk */
+	{
+		u64 ino = inode->i_ino;
+		u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+		u64 idx = ino - 1;
+		u64 blk = idx / (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
+		u64 off = (idx % (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+		struct buffer_head *ibh = sb_bread(inode->i_sb, inodeTableBlock + blk);
+		if (ibh) {
+			struct briefs_inode *di = (struct briefs_inode *)(ibh->b_data + off);
+			memcpy(di, &binfo->disk_inode, sizeof(struct briefs_inode));
+			mark_buffer_dirty(ibh);
+			sync_dirty_buffer(ibh);
+			brelse(ibh);
+		}
+	}
+
+	return 0;
+
+out_copy:
+	/* For non-size changes, just copy attributes */
+	setattr_copy(idmap, inode, attr);
+	mark_inode_dirty(inode);
+	return 0;
+}
+
 /* briefs_getattr - get file attributes */
 int briefs_getattr(struct mnt_idmap *idmap, const struct path *path,
+
                    struct kstat *stat, u32 request_mask, unsigned int query_flags)
 {
 	struct inode *inode = d_inode(path->dentry);

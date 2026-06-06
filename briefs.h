@@ -444,6 +444,8 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 /* File operations */
 ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to);
 ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from);
+int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+                   struct iattr *attr);
 int briefs_getattr(struct mnt_idmap *idmap, const struct path *path,
                    struct kstat *stat, u32 request_mask, unsigned int query_flags);
 int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync);
