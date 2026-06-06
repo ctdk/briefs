@@ -16,20 +16,6 @@
  * with block 0 being the first data block on disk.  Convert to absolute
  * block numbers for sb_bread/sb_getblk using this helper.
  */
-static inline u64 data_region_start(struct briefs_superblock *sb)
-{
-	return sb->trie_node_pool_start + sb->trie_blocks_used;
-}
-
-/* Convert a data-relative block to an absolute block number */
-
-/* Convert a data-relative block to an absolute block number */
-static inline u64 data_to_abs(struct briefs_superblock *sb, u64 rel_block)
-{
-	return data_region_start(sb) + rel_block;
-}
-
-/* Convert an absolute block number back to data-relative (inverse of data_to_abs) */
 /*
  * briefs_compute_i_blocks - compute number of 512-byte sectors used
  * by the inline extents in an inode. This only covers inline extents;
@@ -42,11 +28,6 @@ static inline u64 briefs_compute_i_blocks(struct briefs_inode *di)
 	for (i = 0; i < di->num_extents_inline; i++)
 		blocks += di->inline_extents[i].len;
 	return blocks * (BRIEFS_BLOCK_SIZE / 512);
-}
-
-static inline u64 abs_to_data(struct briefs_superblock *sb, u64 abs_block)
-{
-	return abs_block - data_region_start(sb);
 }
 
 /* Forward declaration */
@@ -102,79 +83,56 @@ const struct super_operations briefs_super_ops = {
 int briefs_readdir(struct file *file, struct dir_context *ctx) {
 	struct inode *dir = file_inode(file);
 	struct briefs_inode_info *binfo;
-	struct buffer_head *bh;
-	struct briefs_dir_block *dir_block;
-	struct briefs_dir_entry *entry;
-	u64 dir_block_num;
-	int i;
 	
-	pr_debug("briefs: readdir offset=%llu\n", ctx->pos);
-	
+	pr_debug("briefs: readdir offset=%llu (trie)\n", ctx->pos);
+
 	if (!S_ISDIR(dir->i_mode))
 		return -ENOTDIR;
-	
-	/* Emit . and .. via dir_emit_dots (handles both) */
+
+	/* Emit . and .. via dir_emit_dots */
 	if (ctx->pos < 2) {
 		if (!dir_emit_dots(file, ctx))
 			return -EIO;
 		ctx->pos = 2;
 	}
-	
-	/* Get directory data block from inline extent */
-	binfo = briefs_i(dir);
-	if (binfo->disk_inode.num_extents_inline == 0)
-		return 0;
-	
-	dir_block_num = binfo->disk_inode.inline_extents[0].phys;
-	
-	bh = sb_bread(dir->i_sb, dir_block_num);
-	if (!bh) {
-		pr_err("briefs: failed to read dir block %llu for readdir\n", dir_block_num);
-		return 0;
-	}
-	
-	dir_block = (struct briefs_dir_block *)bh->b_data;
-	if (dir_block->magic != BRIEFS_DIR_MAGIC) {
-		pr_err("briefs: invalid dir block magic in readdir: 0x%08x\n", dir_block->magic);
-		brelse(bh);
-		return 0;
-	}
-	
-	/*
-	 * Scan directory entries, mapping ctx->pos to on-disk array index.
-	 *
-	 * ctx->pos 0-1 are . and .. handled by dir_emit_dots above.
-	 * ctx->pos 2 -> on-disk entry index 0 (first real entry after . and ..)
-	 * ctx->pos 3 -> on-disk entry index 1, etc.
-	 *
-	 * ctx->pos advances monotonically even for deleted entries so the VFS
-	 * can seek() back to the right position after revalidating.
-	 */
-	u64 start_idx = ctx->pos > 2 ? ctx->pos : 2;
-	for (i = start_idx; i < dir_block->num_entries; i++) {
-		entry = (struct briefs_dir_entry *)(bh->b_data + sizeof(struct briefs_dir_block) +
-			                                    i * sizeof(struct briefs_dir_entry));
 
-		/* Skip deleted entries but advance ctx->pos so accounting doesn't break */
-		if (entry->name_len == 0 || entry->name_off == 0 ||
-		    entry->name_off > BRIEFS_BLOCK_SIZE) {
+	/* Iterate the directory trie starting from ctx->pos */
+	{
+		struct trie_iter iter;
+		int trie_idx = ctx->pos > 2 ? ctx->pos - 2 : 0;
+		int target_idx = 0;
+
+		binfo = briefs_i(dir);
+		briefs_trie_iter_init(&iter, &binfo->disk_inode);
+
+		while (1) {
+			char entry_name_buf[BRIEFS_NAME_LEN + 1];
+			int entry_name_len;
+			u64 entry_ino;
+			u8 entry_type;
+
+			if (briefs_trie_iter_next(dir->i_sb, &iter, &entry_ino, &entry_type,
+			                         entry_name_buf, &entry_name_len) != 0)
+				break;
+
+			if (target_idx < trie_idx) {
+				target_idx++;
+				ctx->pos++;
+				continue;
+			}
+
+			unsigned int file_type = (entry_type << 12) & S_IFMT;
+
+			if (!dir_emit(ctx, entry_name_buf, entry_name_len,
+			              entry_ino, fs_umode_to_dtype(file_type))) {
+				return 0;
+			}
+
 			ctx->pos++;
-			continue;
+			target_idx++;
 		}
-
-		char *entry_name = bh->b_data + BRIEFS_BLOCK_SIZE - entry->name_off + 2;
-		unsigned int file_type = (entry->type << 12) & S_IFMT;
-		
-		if (!dir_emit(ctx, entry_name, entry->name_len,
-		              entry->inode, fs_umode_to_dtype(file_type))) {
-			brelse(bh);
-			return 0;
-		}
-		
-		ctx->pos++;
 	}
-	
-	brelse(bh);
+
 	return 0;
 }
 
@@ -689,162 +647,47 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 }
 
 /*
- * briefs_add_dir_entry - append a directory entry to a parent directory.
- *
- * Reads the directory's data block, appends a new DirEntry, and packs the
- * name into the trailing name region.
+ * briefs_add_dir_entry - insert a directory entry into the directory trie.
  */
 int briefs_add_dir_entry(struct inode *dir, const char *name, size_t name_len, u64 child_ino, u8 type) {
 	struct briefs_inode_info *binfo;
-	struct buffer_head *bh;
-	struct briefs_dir_block *dir_block;
-	struct briefs_dir_entry *entry;
-	u64 dir_block_num;
-	int i, entry_off;
-	u32 entry_name_len = (u32)name_len;
-	u32 hdr_size = sizeof(struct briefs_dir_block);
-	u32 entry_sz = sizeof(struct briefs_dir_entry);
+	int ret;
 
 	if (!dir || !name || name_len < 1 || name_len > BRIEFS_NAME_LEN)
 		return -EINVAL;
 
 	binfo = briefs_i(dir);
 
-	if (binfo->disk_inode.num_extents_inline == 0) {
-		pr_err("briefs: dir inode %lu has no extents\n", dir->i_ino);
-		return -EIO;
+	if (binfo->disk_inode.dir_trie_root == 0) {
+		ret = briefs_trie_create_root(dir->i_sb, &binfo->disk_inode);
+		if (ret)
+			return ret;
 	}
 
-	dir_block_num = binfo->disk_inode.inline_extents[0].phys;
+	ret = briefs_trie_insert(dir->i_sb, &binfo->disk_inode,
+	                          name, name_len, child_ino, type);
+	if (ret == -EEXIST)
+		return 0;
 
-	bh = sb_bread(dir->i_sb, dir_block_num);
-	if (!bh) {
-		pr_err("briefs: failed to read dir block %llu\n", dir_block_num);
-		return -EIO;
-	}
-
-	dir_block = (struct briefs_dir_block *)bh->b_data;
-	if (dir_block->magic != BRIEFS_DIR_MAGIC) {
-		pr_err("briefs: invalid dir block magic: 0x%08x\n", dir_block->magic);
-		brelse(bh);
-		return -EIO;
-	}
-
-	/* Check if entry already exists */
-	for (i = 0; i < dir_block->num_entries; i++) {
-		entry = (struct briefs_dir_entry *)(bh->b_data + hdr_size + i * entry_sz);
-		if (entry->name_len == entry_name_len && entry->name_off > 0 &&
-		    entry->name_off <= BRIEFS_BLOCK_SIZE) {
-			char *ename = bh->b_data + BRIEFS_BLOCK_SIZE - entry->name_off + 2;
-			if (memcmp(ename, name, entry_name_len) == 0) {
-				/* Already exists - update inode */
-				entry->inode = child_ino;
-				entry->type = type;
-				mark_buffer_dirty(bh);
-				brelse(bh);
-				return 0;
-			}
-		}
-	}
-
-	/* Calculate position for new entry */
-	i = dir_block->num_entries;
-	entry_off = hdr_size + i * entry_sz;
-
-	/* Name region grows downward from block end */
-	u32 name_region_start = BRIEFS_BLOCK_SIZE - dir_block->names_size;
-	u32 new_name_start = name_region_start - (2 + entry_name_len);
-
-	if (entry_off + entry_sz > new_name_start) {
-		brelse(bh);
-		pr_err("briefs: dir block full for ino %lu\n", dir->i_ino);
-		return -ENOSPC;
-	}
-
-	/* Write name entry (length prefix + name bytes) */
-	*(__u16 *)(bh->b_data + new_name_start) = (__u16)entry_name_len;
-	memcpy(bh->b_data + new_name_start + 2, name, entry_name_len);
-
-	/* Write DirEntry */
-	entry = (struct briefs_dir_entry *)(bh->b_data + entry_off);
-	memset(entry, 0, entry_sz);
-	entry->inode = child_ino;
-	entry->type = type;
-	entry->name_len = (__u16)entry_name_len;
-	entry->name_off = (__u16)(BRIEFS_BLOCK_SIZE - new_name_start);
-
-	/* Update header */
-	dir_block->num_entries++;
-	dir_block->data_size = entry_off + entry_sz;
-	dir_block->names_size += (2 + entry_name_len);
-
-	mark_buffer_dirty(bh);
-	brelse(bh);
-
-	return 0;
+	return ret;
 }
 
 /*
- * briefs_remove_dir_entry - remove a directory entry by name.
- * Marks the entry as deleted (zeroes name_len/name_off).
+ * briefs_remove_dir_entry - remove a directory entry from the trie.
  */
 int briefs_remove_dir_entry(struct inode *dir, const char *name, size_t name_len)
 {
 	struct briefs_inode_info *binfo;
-	struct buffer_head *bh;
-	struct briefs_dir_block *dir_block;
-	struct briefs_dir_entry *entry;
-	u64 dir_block_num;
-	int i;
-	u32 hdr_size = sizeof(struct briefs_dir_block);
-	u32 entry_sz = sizeof(struct briefs_dir_entry);
 
 	if (!dir || !name || name_len < 1 || name_len > BRIEFS_NAME_LEN)
 		return -EINVAL;
 
 	binfo = briefs_i(dir);
 
-	if (binfo->disk_inode.num_extents_inline == 0)
+	if (binfo->disk_inode.dir_trie_root == 0)
 		return -ENOENT;
 
-	dir_block_num = binfo->disk_inode.inline_extents[0].phys;
-
-	bh = sb_bread(dir->i_sb, dir_block_num);
-	if (!bh)
-		return -EIO;
-
-	dir_block = (struct briefs_dir_block *)bh->b_data;
-	if (dir_block->magic != BRIEFS_DIR_MAGIC) {
-		brelse(bh);
-		return -EIO;
-	}
-
-	for (i = 0; i < dir_block->num_entries; i++) {
-		entry = (struct briefs_dir_entry *)(bh->b_data + hdr_size + i * entry_sz);
-
-		if (entry->name_len == 0 || entry->name_off == 0)
-			continue;
-
-		if (entry->name_len != name_len)
-			continue;
-
-		if (entry->name_off > 0 && entry->name_off <= BRIEFS_BLOCK_SIZE) {
-			char *ename = bh->b_data + BRIEFS_BLOCK_SIZE - entry->name_off + 2;
-			if (memcmp(ename, name, name_len) == 0) {
-				/* Found it — mark as deleted */
-				entry->name_len = 0;
-				entry->name_off = 0;
-				entry->inode = 0;
-				mark_buffer_dirty(bh);
-				sync_dirty_buffer(bh);
-				brelse(bh);
-				return 0;
-			}
-		}
-	}
-
-	brelse(bh);
-	return -ENOENT;
+	return briefs_trie_remove(dir->i_sb, &binfo->disk_inode, name, name_len);
 }
 
 /* briefs_fill_super - entry point for mount */
@@ -1417,6 +1260,12 @@ static void briefs_free_inode_data(struct inode *inode)
 	int i;
 	u64 b;
 
+	/* For directories, free the trie instead of file extents */
+	if (S_ISDIR(inode->i_mode)) {
+		briefs_trie_free_all(inode->i_sb, &binfo->disk_inode);
+		return;
+	}
+
 	/* Walk all extents (inline + chain) */
 	for (i = 0; i < binfo->disk_inode.num_extents_total; i++) {
 		if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext) != 0)
@@ -1501,27 +1350,22 @@ static void briefs_free_inode_num(struct super_block *sb, u64 ino) {
 	pr_debug("briefs: freed inode %llu\n", ino);
 }
 
-/* briefs_lookup - find inode by name in directory */
+/* briefs_lookup - find inode by name in directory trie */
 struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags) {
-	struct briefs_sb_info *bsi;
 	struct briefs_inode_info *binfo;
-	struct buffer_head *bh;
-	struct briefs_dir_block *dir_block;
-	struct briefs_dir_entry *entry;
 	const char *name;
 	unsigned int name_len;
-	u64 dir_block_num;
-	int i;
+	u64 found_ino;
+	u8 found_type;
+	int ret;
 	
-	if (!dir || !S_ISDIR(dir->i_mode)) {
+	if (!dir || !S_ISDIR(dir->i_mode))
 		return ERR_PTR(-ENOTDIR);
-	}
 	
-	bsi = dir->i_sb->s_fs_info;
 	name = dentry->d_name.name;
 	name_len = dentry->d_name.len;
 	
-	pr_debug("briefs: lookup for %pd in dir inode %lu\n", dentry, dir->i_ino);
+	pr_debug("briefs: trie lookup for %pd in dir inode %lu\n", dentry, dir->i_ino);
 	
 	/* Check for . and .. */
 	if (name_len == 1 && name[0] == '.') {
@@ -1533,64 +1377,31 @@ struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned 
 			igrab(dir);
 			return d_splice_alias(dir, dentry);
 		}
-		/* Look up parent inode from dir inode's parent_inode field */
-		struct briefs_inode_info *dinfo = briefs_i(dir);
-		u64 parent_ino = dinfo->disk_inode.parent_inode;
-		if (parent_ino == 0)
+		binfo = briefs_i(dir);
+		if (binfo->disk_inode.parent_inode == 0)
 			return ERR_PTR(-EIO);
-		struct inode *parent = briefs_iget(dir->i_sb, parent_ino);
-		if (IS_ERR(parent))
-			return ERR_CAST(parent);
-		return d_splice_alias(parent, dentry);
-	}
-	
-	/* Get directory data block from inline extent */
-	binfo = briefs_i(dir);
-	if (binfo->disk_inode.num_extents_inline == 0) {
-		return NULL;
-	}
-	
-	/* First inline extent points to the directory block */
-	dir_block_num = binfo->disk_inode.inline_extents[0].phys;
-	
-	bh = sb_bread(dir->i_sb, dir_block_num);
-	if (!bh) {
-		pr_err("briefs: failed to read dir block %llu\n", dir_block_num);
-		return ERR_PTR(-EIO);
-	}
-	
-	dir_block = (struct briefs_dir_block *)bh->b_data;
-	if (dir_block->magic != BRIEFS_DIR_MAGIC) {
-		pr_err("briefs: invalid dir block magic: 0x%08x\n", dir_block->magic);
-		brelse(bh);
-		return ERR_PTR(-EIO);
-	}
-	
-	/* Scan entries */
-	for (i = 0; i < dir_block->num_entries; i++) {
-		entry = (struct briefs_dir_entry *)(bh->b_data + sizeof(struct briefs_dir_block) +
-			                                    i * sizeof(struct briefs_dir_entry));
-		
-		if (entry->name_len != name_len)
-			continue;
-		
-		/* Compare name */
-		if (entry->name_off > 0 && entry->name_off <= BRIEFS_BLOCK_SIZE) {
-			char *entry_name = bh->b_data + BRIEFS_BLOCK_SIZE - entry->name_off + 2;
-			if (memcmp(entry_name, name, name_len) == 0) {
-				/* Found it */
-				struct inode *inode = briefs_iget(dir->i_sb, entry->inode);
-				brelse(bh);
-				if (IS_ERR(inode))
-					return ERR_CAST(inode);
-				return d_splice_alias(inode, dentry);
-			}
+		{
+			struct inode *parent = briefs_iget(dir->i_sb, binfo->disk_inode.parent_inode);
+			if (IS_ERR(parent))
+				return ERR_CAST(parent);
+			return d_splice_alias(parent, dentry);
 		}
 	}
 	
-	brelse(bh);
-	/* Name not found - return NULL for negative dentry */
-	return NULL;
+	/* Search the directory trie */
+	binfo = briefs_i(dir);
+	ret = briefs_trie_lookup(dir->i_sb, &binfo->disk_inode, name, name_len, &found_ino, &found_type);
+	if (ret == -ENOENT)
+		return NULL;
+	if (ret != 0)
+		return ERR_PTR(ret);
+	
+	{
+		struct inode *inode = briefs_iget(dir->i_sb, found_ino);
+		if (IS_ERR(inode))
+			return ERR_CAST(inode);
+		return d_splice_alias(inode, dentry);
+	}
 }
 
 /* briefs_create - create a new file or directory */
@@ -1690,76 +1501,19 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 		return -EEXIST;
 	}
 
-	/* For directories: allocate a data block and write . and .. entries */
+	/* For directories: create the directory trie root */
 	if (is_dir) {
 		struct briefs_inode_info *binfo = briefs_i(inode);
-		u64 rel_block = briefs_alloc_block(&bsi->alloc);
-		if (rel_block == 0) {
-			pr_err("briefs: no free blocks for new dir\n");
-			iput(inode);
-			return -ENOSPC;
-		}
-		u64 dir_block = data_to_abs(bsi->sb, rel_block);
 
-		/* Build directory block with . and .. entries */
-		struct buffer_head *dbh = sb_getblk(dir->i_sb, dir_block);
-		if (!dbh) {
-			pr_err("briefs: failed to get dir block %llu\n", dir_block);
+		ret = briefs_trie_create_root(dir->i_sb, &binfo->disk_inode);
+		if (ret) {
+			pr_err("briefs: failed to create dir trie root for ino %llu\n", ino);
 			iput(inode);
-			return -EIO;
+			return ret;
 		}
 
-		struct briefs_dir_block *dblk = (struct briefs_dir_block *)dbh->b_data;
-		memset(dblk, 0, BRIEFS_BLOCK_SIZE);
-		dblk->magic = BRIEFS_DIR_MAGIC;
-		dblk->num_entries = 2;
-
-		/* Entry 0: "." */
-		struct briefs_dir_entry *de = (struct briefs_dir_entry *)(dbh->b_data + sizeof(struct briefs_dir_block));
-		memset(de, 0, sizeof(*de));
-		de->inode = ino;
-		de->type = 4; /* S_IFDIR >> 12 */
-		de->name_len = 1;
-		de->name_off = 3; /* 2 bytes len + 1 byte name from block end */
-
-		/* Entry 1: ".." */
-		de = (struct briefs_dir_entry *)(dbh->b_data + sizeof(struct briefs_dir_block) + sizeof(struct briefs_dir_entry));
-		memset(de, 0, sizeof(*de));
-		de->inode = dir->i_ino;
-		de->type = 4;
-		de->name_len = 2;
-		de->name_off = 7; /* 2 bytes len + 2 bytes name from block end */
-
-		/* Pack names at end of block */
-		u32 name_pos = BRIEFS_BLOCK_SIZE;
-		/* "." first (closest to end) — matches Go mkfs NewDirBlock layout */
-		name_pos -= 3;
-		*(__u16 *)(dbh->b_data + name_pos) = 1;
-		memcpy(dbh->b_data + name_pos + 2, ".", 1);
-		/* ".." second (further from end) */
-		name_pos -= 4;
-		*(__u16 *)(dbh->b_data + name_pos) = 2;
-		memcpy(dbh->b_data + name_pos + 2, "..", 2);
-
-		dblk->data_size = sizeof(struct briefs_dir_block) + 2 * sizeof(struct briefs_dir_entry);
-		dblk->names_size = 7;
-
-		mark_buffer_dirty(dbh);
-		sync_dirty_buffer(dbh);
-		brelse(dbh);
-
-		/* Set up the new inode's extent to point to this dir block */
-		binfo->disk_inode.num_extents_inline = 1;
-		binfo->disk_inode.num_extents_total = 1;
-		binfo->disk_inode.inline_extents[0].offset = 0;
-		binfo->disk_inode.inline_extents[0].phys = dir_block;
-		binfo->disk_inode.inline_extents[0].len = 1;
-		binfo->disk_inode.inline_extents[0].flags = 0;
-
-		inode->i_size = dblk->data_size + dblk->names_size;
-		binfo->disk_inode.filesize = inode->i_size;
-
-		pr_debug("briefs: allocated dir block abs=%llu (rel=%llu) for inode %llu\n", dir_block, rel_block, ino);
+		pr_debug("briefs: created dir trie root block=%llu for inode %llu\n",
+			binfo->disk_inode.dir_trie_root, ino);
 	}
 
 	/* Write the inode to disk */

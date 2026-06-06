@@ -273,7 +273,8 @@ struct briefs_inode {
 	__u64 parent_inode;
 	__u32 link_count; /* same as nlinks? */
 	__u32 flags;
-	__u8 reserved[96]; /* zero padded to 512 bytes */
+	__u64 dir_trie_root;       /* block number of directory trie root (dirs only) */
+	__u8 reserved[88]; /* zero padded to 512 bytes */
 };
 
 /* Extent chain for overflow - 256 extents + header = 272 bytes */
@@ -289,6 +290,81 @@ struct briefs_extent_chain {
 
 /* Trie root block - first block in trie node pool */
 
+
+/* Bitwise trie macros for directory trie */
+#define TRIE_IS_LEAF(node) ((node)->node_type != NODE_TYPE_INTERM)
+#define TRIE_IS_FILE(node) ((node)->node_type == NODE_TYPE_FILE)
+#define TRIE_IS_DIR(node) ((node)->node_type == NODE_TYPE_DIR)
+
+/* Trie node flags */
+#define TRIE_FLAG_ROOT    0x00000001
+#define TRIE_FLAG_NEW     0x00000002
+#define TRIE_FLAG_DIRTY   0x00000004
+
+/* Trie node types */
+#define NODE_TYPE_FILE      0x01
+#define NODE_TYPE_DIR       0x02
+#define NODE_TYPE_INTERM    0x03
+
+#define NODE_FLAG_DELETED   0x00000004
+#define NODE_FLAG_ROOT      0x00000008
+
+/* Trie node - 32 bytes, one per block.
+ * Internal nodes dispatch children by a single byte of the filename.
+ * Leaf nodes hold the actual entry (name + inode).
+ * Names longer than briefs_name_len are not supported.
+ * The name itself is stored inline in the node block after this struct header,
+ * at BRIEFS_BLOCK_SIZE - name_offset.
+ */
+struct briefs_trie_node {
+	__u32 magic;              /* "TRN " - 0x54524E20 */
+	__u32 child_count;        /* number of children (0 for leaf) */
+	__u64 first_child;        /* block number of first child node */
+	__u64 next_sibling;       /* block number of next sibling at same depth */
+	__u8  depth;              /* depth in trie (0 = root) */
+	__u8  node_type;          /* NODE_TYPE_* */
+	__u8  byte_val;           /* the byte value this node represents (internal nodes) */
+	__u8  reserved[5];
+	__u64 flags;              /* NODE_FLAG_* */
+
+	/* Leaf entry data (valid only when node_type != NODE_TYPE_INTERM) */
+	__u64 inode;              /* inode number */
+	__u16 name_len;           /* full name length (not just remaining bytes) */
+	__u16 name_offset;        /* offset from block end to name bytes */
+};
+
+/*
+ * Trie block header - immediately follows trie nodes within a block
+ * (currently each node occupies a full block, so this is a placeholder
+ *  for future packed-multiple-nodes-per-block optimization).
+ *
+ * For now, each struct briefs_trie_node fills one 4096-byte block.
+ * The name is stored in the trailing bytes of that block.
+ */
+#define TRIE_NODE_NAME_BASE(node) ((void *)(node) + BRIEFS_BLOCK_SIZE - (node)->name_offset)
+
+/* Maximum name length the trie can store inline (name fits in unused tail of block) */
+#define TRIE_MAX_NAME_LEN (BRIEFS_BLOCK_SIZE - sizeof(struct briefs_trie_node))
+
+/* Trie operations - directory trie node allocation (uses data block allocator) */
+int briefs_trie_create_root(struct super_block *sb, struct briefs_inode *di);
+int briefs_trie_lookup(struct super_block *sb, struct briefs_inode *di,
+                       const char *name, int name_len, u64 *found_ino, u8 *found_type);
+int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
+                       const char *name, int name_len, u64 ino, u8 type);
+int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
+                       const char *name, int name_len);
+void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di);
+
+/* Trie iterator for readdir - depth-first walk yielding leaves */
+struct trie_iter {
+	u64 stack[256];
+	int sp;
+};
+
+void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di);
+int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
+                           u64 *ino, u8 *type, char *name_buf, int *name_len);
 
 /* Compute CRC32 checksum for journal record */
 __u32 briefs_crc32c(__u32 crc, const void *data, size_t len);
@@ -395,6 +471,18 @@ static inline struct briefs_sb_info *briefs_sb(struct super_block *sb) {
 
 static inline struct briefs_inode_info *briefs_i(struct inode *inode) {
 	return list_entry(inode, struct briefs_inode_info, vfs_inode);
+}
+
+/* Convert data-relative block to absolute block number */
+static inline u64 data_to_abs(struct briefs_superblock *sb, u64 rel_block)
+{
+	return sb->trie_node_pool_start + sb->trie_blocks_used + rel_block;
+}
+
+/* Convert absolute block number back to data-relative */
+static inline u64 abs_to_data(struct briefs_superblock *sb, u64 abs_block)
+{
+	return abs_block - (sb->trie_node_pool_start + sb->trie_blocks_used);
 }
 
 #ifdef __KERNEL__
