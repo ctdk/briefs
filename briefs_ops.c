@@ -30,6 +30,18 @@ static inline u64 data_to_abs(struct briefs_superblock *sb, u64 rel_block)
 }
 
 /* Convert an absolute block number back to data-relative (inverse of data_to_abs) */
+static inline u64 briefs_compute_i_blocks(struct briefs_inode *di)
+{
+	u64 blocks = 0;
+	int i;
+	for (i = 0; i < di->num_extents_inline; i++)
+		blocks += di->inline_extents[i].len;
+	u64 result = blocks * (BRIEFS_BLOCK_SIZE / 512);
+	pr_debug("briefs: compute_i_blocks: %llu extents, %llu blocks, result=%llu\n",
+		(u64)di->num_extents_inline, blocks, result);
+	return result;
+}
+
 static inline u64 abs_to_data(struct briefs_superblock *sb, u64 abs_block)
 {
 	return abs_block - data_region_start(sb);
@@ -51,7 +63,7 @@ const struct inode_operations briefs_dir_inode_ops = {
 /* Inode operations for files */
 const struct inode_operations briefs_file_inode_ops = {
 	.setattr = simple_setattr,
-	.getattr = simple_getattr,
+	.getattr = briefs_getattr,
 };
 
 /* File operations for directories */
@@ -367,7 +379,8 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from) {
 			binfo->disk_inode.filesize = pos;
 		}
 
-		inode->i_blocks = 0; /* TODO: compute from extents */
+		inode->i_blocks = briefs_compute_i_blocks(&binfo->disk_inode);
+
 		ktime_get_real_ts64(&now);
 		inode->i_mtime_sec = now.tv_sec;
 		inode->i_mtime_nsec = now.tv_nsec;
@@ -392,6 +405,7 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from) {
 		}
 
 		ret = done;
+
 	}
 
 	pr_debug("briefs: write_iter done=%zu\n", done);
@@ -892,7 +906,8 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 		inode->i_uid = make_kuid(&init_user_ns, disk_inode->uid);
 		inode->i_gid = make_kgid(&init_user_ns, disk_inode->gid);
 		inode->i_size = disk_inode->filesize;
-		inode->i_blocks = 0;
+		inode->i_blocks = briefs_compute_i_blocks(disk_inode);
+
 		set_nlink(inode, disk_inode->nlinks);
 
 		inode->i_atime_sec = disk_inode->atime_sec;
@@ -988,6 +1003,24 @@ int briefs_statfs(struct dentry *dentry, struct kstatfs *buf) {
 	buf->f_namelen = BRIEFS_NAME_LEN;
 	buf->f_fsid.val[0] = (u32)id;
 	buf->f_fsid.val[1] = (u32)(id >> 32);
+	return 0;
+}
+
+/* briefs_getattr - get file attributes */
+int briefs_getattr(struct mnt_idmap *idmap, const struct path *path,
+                   struct kstat *stat, u32 request_mask, unsigned int query_flags)
+{
+	struct inode *inode = d_inode(path->dentry);
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	u64 i_blocks;
+
+	generic_fillattr(idmap, request_mask, inode, stat);
+
+	/* Recompute i_blocks from extents to ensure accuracy */
+	i_blocks = briefs_compute_i_blocks(&binfo->disk_inode);
+	inode->i_blocks = i_blocks;
+	stat->blocks = i_blocks;
+	pr_debug("briefs: getattr ino=%lu i_blocks=%llu\n", inode->i_ino, i_blocks);
 	return 0;
 }
 
@@ -1215,7 +1248,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 		inode->i_uid = current_fsuid();
 		inode->i_gid = current_fsgid();
 		inode->i_size = 0;
-		inode->i_blocks = 0;
+		inode->i_blocks = briefs_compute_i_blocks(&binfo->disk_inode);
 		set_nlink(inode, is_dir ? 2 : 1);
 
 		ktime_get_real_ts64(&now);
