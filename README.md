@@ -57,6 +57,7 @@ DEFINITELY MISSING
 * Reusing inodes
 * FUSE implementation (requires less commitment than the kernel module)
 * Proper tests
+* Thorough annotations - Annotating the source code thoroughly will wait until tings settle down. Right now everything's still in constant flux, so there's no point thoroughly annotating something that may change unrecognizably or flat out disappear soon.
 
 LICENSE
 -------

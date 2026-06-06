@@ -3,3 +3,4 @@
 - FUSE for BrieFS once fsck.briefs is more than a stub.
 - Make list of desired functionality that still needs implementing.
 - Proper tests
+- Annotate the source code thoroughly once things are more stable
