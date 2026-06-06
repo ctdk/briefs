@@ -7,6 +7,9 @@
 #include <linux/slab.h>
 #include "briefs.h"
 
+/* Slab cache for inode allocations (larger than struct inode) */
+struct kmem_cache *briefs_inode_cachep;
+
 /* Filesystem type structure */
 static struct file_system_type briefs_fs_type = {
 	.owner = THIS_MODULE,
@@ -16,6 +19,13 @@ static struct file_system_type briefs_fs_type = {
 	.kill_sb = briefs_kill_sb,
 };
 
+/* Inode slab constructor - called for each new slab allocation */
+static void briefs_init_once(void *foo) {
+	struct briefs_inode_info *binfo = (struct briefs_inode_info *)foo;
+
+	inode_init_once(&binfo->vfs_inode);
+}
+
 /* Module init */
 static int __init briefs_init(void) {
 	int ret;
@@ -24,9 +34,20 @@ static int __init briefs_init(void) {
 	pr_info("briefs: magic=0x%016llx, block_size=%d, inode_size=%d\n",
 		(unsigned long long)_BRIEFS_SUPER_MAGIC, BRIEFS_BLOCK_SIZE, BRIEFS_INODE_SIZE);
 
+	/* Create slab cache for inodes */
+	briefs_inode_cachep = kmem_cache_create("briefs_inode_cache",
+		sizeof(struct briefs_inode_info),
+		0, (SLAB_RECLAIM_ACCOUNT | SLAB_ACCOUNT),
+		briefs_init_once);
+	if (!briefs_inode_cachep) {
+		pr_err("briefs: failed to create inode slab cache\n");
+		return -ENOMEM;
+	}
+
 	ret = register_filesystem(&briefs_fs_type);
 	if (ret) {
 		pr_err("briefs: failed to register filesystem: %d\n", ret);
+		kmem_cache_destroy(briefs_inode_cachep);
 		return ret;
 	}
 
@@ -38,6 +59,7 @@ static int __init briefs_init(void) {
 static void __exit briefs_exit(void) {
 	pr_info("briefs: unregistering filesystem\n");
 	unregister_filesystem(&briefs_fs_type);
+	kmem_cache_destroy(briefs_inode_cachep);
 	pr_info("briefs: unloading filesystem module\n");
 }
 

@@ -66,6 +66,8 @@ const struct super_operations briefs_super_ops = {
 	.write_inode = briefs_write_inode,
 	.evict_inode = briefs_evict_inode,
 	.umount_begin = briefs_umount_begin,
+	.alloc_inode = briefs_alloc_vfs_inode,
+	.free_inode = briefs_free_inode,
 };
 
 /* briefs_readdir - enumerate directory contents */
@@ -747,6 +749,23 @@ out:
 	return ret;
 }
 
+/* briefs_alloc_inode - allocate a VFS inode (called by VFS inode cache) */
+struct inode *briefs_alloc_vfs_inode(struct super_block *sb) {
+	struct briefs_inode_info *binfo;
+
+	binfo = alloc_inode_sb(sb, briefs_inode_cachep, GFP_KERNEL);
+	if (!binfo)
+		return NULL;
+
+	return &binfo->vfs_inode;
+}
+
+/* briefs_free_inode - free a VFS inode (called by VFS inode cache) */
+void briefs_free_inode(struct inode *inode) {
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	kmem_cache_free(briefs_inode_cachep, binfo);
+}
+
 /* briefs_iget - get an inode by number */
 struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 	struct inode *inode;
@@ -855,6 +874,24 @@ void briefs_put_super(struct super_block *sb) {
 		/* Sync journal before unmount */
 		if (bsi->journal && bsi->journal->dirty) {
 			briefs_journal_checkpoint(bsi->journal);
+		}
+
+		/* Sync allocation trie to disk */
+		if (!sb_rdonly(sb)) {
+			pr_info("briefs: syncing allocation trie\n");
+			briefs_alloc_sync(&bsi->alloc, sb);
+
+			/* Update superblock free counts on disk */
+			if (bsi->alloc.root_node) {
+				struct buffer_head *sbh = sb_bread(sb, 0);
+				if (sbh) {
+					struct briefs_superblock *bsb = (struct briefs_superblock *)sbh->b_data;
+					bsb->free_data_blocks = bsi->alloc.root_node->free_count;
+					mark_buffer_dirty(sbh);
+					sync_dirty_buffer(sbh);
+					brelse(sbh);
+				}
+			}
 		}
 
 		pr_info("briefs: cleaning up journal\n");

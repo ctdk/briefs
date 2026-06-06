@@ -9,6 +9,8 @@
 struct briefs_alloc {
 	struct briefs_superblock *sb;   /* on-disk superblock pointer */
 	struct trie_node *root_node;    /* in-memory copy of trie root */
+	struct trie_node **node_by_index; /* array of node pointers indexed by node index */
+	u64 node_count;                 /* total nodes in the trie */
 };
 
 /* Initialize allocator from superblock */
@@ -25,6 +27,9 @@ u64 briefs_alloc_block(struct briefs_alloc *alloc);
 
 /* Free a single block */
 void briefs_free_block(struct briefs_alloc *alloc, u64 phys_block);
+
+/* Sync the in-memory trie (free_count values) back to disk */
+int briefs_alloc_sync(struct briefs_alloc *alloc, struct super_block *sb);
 
 /* Cleanup allocator */
 void briefs_alloc_cleanup(struct briefs_alloc *alloc);

@@ -54,8 +54,13 @@ static struct trie_node *briefs_read_trie_node(struct super_block *sb, struct br
  * A node_index of 0 is a valid node (it is the first node in
  * the trie data blocks). The caller guards against no-child
  * sentinels by checking left_child/right_child before calling.
+ *
+ * If node_by_index is non-NULL, stores the node pointer at
+ * node_by_index[node_index] for later sync.
  */
-static int briefs_load_trie_recursive(struct super_block *sb, struct briefs_superblock *sb_disk, struct trie_node **node_ptr, u64 node_index)
+static int briefs_load_trie_recursive(struct super_block *sb, struct briefs_superblock *sb_disk,
+                                       struct trie_node **node_ptr, u64 node_index,
+                                       struct trie_node **node_by_index)
 {
 	struct trie_node *node;
 	int ret;
@@ -68,9 +73,14 @@ static int briefs_load_trie_recursive(struct super_block *sb, struct briefs_supe
 		return 0;
 	}
 
+	/* Record this node in the index array */
+	if (node_by_index)
+		node_by_index[node_index] = node;
+
 	/* Load children recursively (children are stored as node indices) */
 	if (node->left_child) {
-		ret = briefs_load_trie_recursive(sb, sb_disk, (struct trie_node **)&node->left_child, node->left_child);
+		ret = briefs_load_trie_recursive(sb, sb_disk, (struct trie_node **)&node->left_child,
+		                                 node->left_child, node_by_index);
 		if (ret) {
 			kfree(node);
 			return ret;
@@ -78,7 +88,8 @@ static int briefs_load_trie_recursive(struct super_block *sb, struct briefs_supe
 	}
 
 	if (node->right_child) {
-		ret = briefs_load_trie_recursive(sb, sb_disk, (struct trie_node **)&node->right_child, node->right_child);
+		ret = briefs_load_trie_recursive(sb, sb_disk, (struct trie_node **)&node->right_child,
+		                                 node->right_child, node_by_index);
 		if (ret) {
 			if (node->left_child)
 				kfree((struct trie_node *)node->left_child);
@@ -125,6 +136,8 @@ int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb, struct
 		return -EINVAL;
 
 	alloc->sb = sb_disk;
+	alloc->node_by_index = NULL;
+	alloc->node_count = 0;
 
 	/* Read trie root header block to get the root node index */
 	bh = sb_bread(sb, sb_disk->trie_root_block);
@@ -142,19 +155,35 @@ int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb, struct
 	}
 
 	root_node_index = root_hdr->root_node;
+	alloc->node_count = root_hdr->node_count;
 	pr_debug("briefs: trie root header: magic=0x%08x, version=%u, root_node=%llu, node_count=%u\n",
 		root_hdr->magic, root_hdr->version, root_node_index, root_hdr->node_count);
 	brelse(bh);
 
+	/* Allocate node index array for sync */
+	if (alloc->node_count > 0) {
+		alloc->node_by_index = kcalloc(alloc->node_count, sizeof(struct trie_node *), GFP_KERNEL);
+		if (!alloc->node_by_index) {
+			pr_err("briefs: failed to allocate trie index array (%llu entries)\n",
+				alloc->node_count);
+			return -ENOMEM;
+		}
+	}
+
 	/* Recursively load the entire trie from disk */
-	ret = briefs_load_trie_recursive(sb, sb_disk, &alloc->root_node, root_node_index);
+	ret = briefs_load_trie_recursive(sb, sb_disk, &alloc->root_node, root_node_index,
+	                                 alloc->node_by_index);
 	if (ret) {
 		pr_err("briefs: failed to load allocation trie (err=%d)\n", ret);
+		kfree(alloc->node_by_index);
+		alloc->node_by_index = NULL;
 		return ret;
 	}
 
 	if (!alloc->root_node) {
 		pr_err("briefs: no root node loaded from trie\n");
+		kfree(alloc->node_by_index);
+		alloc->node_by_index = NULL;
 		return -EIO;
 	}
 
@@ -499,6 +528,80 @@ bool briefs_range_is_free(struct trie_node *node, u64 offset, u64 count)
 }
 
 /*
+ * Sync the in-memory trie back to disk.
+ *
+ * Walks all trie nodes by index and writes their free_count values
+ * to the corresponding on-disk blocks. Only dirty blocks (where at
+ * least one node's free_count changed) are written.
+ *
+ * The trie structure (node indices, child pointers) never changes
+ * after mkfs — only free_count values are modified in memory.
+ */
+int briefs_alloc_sync(struct briefs_alloc *alloc, struct super_block *sb)
+{
+	struct briefs_superblock *sb_disk;
+	u64 nodes_per_block;
+	u64 total_blocks;
+	u64 bi;
+
+	if (!alloc || !sb || !alloc->root_node || !alloc->sb || !alloc->node_by_index)
+		return -EINVAL;
+
+	sb_disk = alloc->sb;
+	nodes_per_block = sb->s_blocksize / sizeof(struct trie_node);
+	total_blocks = (alloc->node_count + nodes_per_block - 1) / nodes_per_block;
+
+	pr_debug("briefs: syncing %llu trie nodes across %llu blocks\n",
+		alloc->node_count, total_blocks);
+
+	for (bi = 0; bi < total_blocks; bi++) {
+		u64 block_offset = sb_disk->trie_node_pool_start + 1 + bi;
+		struct buffer_head *bh;
+		u64 start_idx, end_idx, ni;
+		bool dirty = false;
+
+		bh = sb_bread(sb, block_offset);
+		if (!bh) {
+			pr_err("briefs: failed to read trie block %llu during sync\n", block_offset);
+			return -EIO;
+		}
+
+		start_idx = bi * nodes_per_block;
+		end_idx = start_idx + nodes_per_block;
+		if (end_idx > alloc->node_count)
+			end_idx = alloc->node_count;
+
+		for (ni = start_idx; ni < end_idx; ni++) {
+			struct trie_node *node = alloc->node_by_index[ni];
+			u64 byte_offset;
+			__u32 *disk_free_count;
+
+			if (!node)
+				continue;
+
+			byte_offset = (ni % nodes_per_block) * sizeof(struct trie_node)
+			              + offsetof(struct trie_node, free_count);
+			disk_free_count = (__u32 *)(bh->b_data + byte_offset);
+
+			if (*disk_free_count != node->free_count) {
+				*disk_free_count = node->free_count;
+				dirty = true;
+			}
+		}
+
+		if (dirty) {
+			mark_buffer_dirty(bh);
+			sync_dirty_buffer(bh);
+		}
+
+		brelse(bh);
+	}
+
+	pr_debug("briefs: trie sync complete\n");
+	return 0;
+}
+
+/*
  * Cleanup allocator
  */
 void briefs_alloc_cleanup(struct briefs_alloc *alloc)
@@ -511,5 +614,8 @@ void briefs_alloc_cleanup(struct briefs_alloc *alloc)
 		alloc->root_node = NULL;
 	}
 
+	kfree(alloc->node_by_index);
+	alloc->node_by_index = NULL;
+	alloc->node_count = 0;
 	alloc->sb = NULL;
 }

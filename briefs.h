@@ -474,7 +474,12 @@ struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
 
 /* Inode operation prototypes */
 struct inode *briefs_iget(struct super_block *sb, u64 ino);
+struct inode *briefs_alloc_vfs_inode(struct super_block *sb);
+void briefs_free_inode(struct inode *inode);
 int briefs_write_inode(struct inode *inode, struct writeback_control *wbc);
+
+/* Inode slab cache (defined in briefs.c) */
+extern struct kmem_cache *briefs_inode_cachep;
 
 /* Add a directory entry to a parent directory */
 int briefs_add_dir_entry(struct inode *dir, const char *name, size_t name_len, u64 child_ino, u8 type);
