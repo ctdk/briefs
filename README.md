@@ -1,12 +1,15 @@
 BrieFS!
 ======
 
+_"If you want a picture of the future, imagine a pelican standing on a human head -- for ever."_
+
 TODO: put something here
 
 RELATED
 -------
 
 * github.com/ctdk/briefs-utils: The briefs utilities, written in Golang, comprised of `mkfs.briefs` and `fsck.briefs`. These are unsurprisingly in progress, but `mkfs.briefs` creates very basic BrieFS volumes while `fsck.briefs` doesn't do anything yet.
+* github.com/ctdk/modern-xiafs: Computer filesystem archaeology. A port of an ancient Linux filesystem to modern kernels, updated as I get around to it.
 
 RATIONALE
 ---------
