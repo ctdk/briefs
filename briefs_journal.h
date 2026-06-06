@@ -12,8 +12,8 @@
 
 /* Journal context */
 struct briefs_journal {
-	struct briefs_superblock *sb;     /* superblock pointer */
-	struct block_device *bdev;        /* block device */
+	struct briefs_superblock *sb;     /* on-disk superblock pointer */
+	struct super_block *vfs_sb;       /* VFS super_block for buffer cache I/O */
 	unsigned char *cur_block;         /* current journal block buffer (4096 bytes) */
 	struct journal_block_header *cur_hdr; /* cast to block header */
 	u64 write_offset;                 /* byte offset for next record in cur_block */
@@ -28,11 +28,11 @@ struct briefs_journal {
 /* Initialize journal from superblock */
 int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb);
 
-/* Read a journal block from disk */
-int briefs_journal_read_block(struct briefs_journal *j, u64 block_offset, unsigned char *buf);
+/* Read a journal block from disk (returns buffer_head, caller must brelse) */
+struct buffer_head *briefs_journal_read_block(struct briefs_journal *j, u64 block_offset);
 
 /* Write a journal block to disk */
-int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, unsigned char *buf);
+int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, unsigned char *data);
 
 /* Write a record to the journal */
 int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_type type,
@@ -47,8 +47,8 @@ int briefs_journal_replay(struct briefs_journal *j);
 /* Cleanup journal */
 void briefs_journal_cleanup(struct briefs_journal *j);
 
-/* Open journal with block device */
-int briefs_journal_open(struct briefs_journal *j, struct briefs_superblock *sb, struct block_device *bdev);
+/* Open journal */
+int briefs_journal_open(struct briefs_journal *j, struct briefs_superblock *sb, struct super_block *vfs_sb);
 
 /* Sync dirty journal block to disk */
 int briefs_journal_sync(struct briefs_journal *j);

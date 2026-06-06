@@ -646,7 +646,7 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 		goto out_no_journal;
 	}
 
-	ret = briefs_journal_open(bsi->journal, bsb, sb->s_bdev);
+	ret = briefs_journal_open(bsi->journal, bsb, sb);
 	if (ret) {
 		pr_err("briefs: failed to initialize journal: %d\n", ret);
 		goto out_no_journal;

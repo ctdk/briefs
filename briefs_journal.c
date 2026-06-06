@@ -7,7 +7,7 @@
 #include <linux/stddef.h>
 #include <linux/types.h>
 #include <linux/blkdev.h>
-#include <linux/bio.h>
+#include <linux/buffer_head.h>
 
 #include "briefs.h"
 #include "briefs_alloc.h"
@@ -50,15 +50,15 @@ int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb) 
 }
 
 /*
- * Open journal with block device
+ * Open journal
  */
-int briefs_journal_open(struct briefs_journal *j, struct briefs_superblock *sb, struct block_device *bdev) {
+int briefs_journal_open(struct briefs_journal *j, struct briefs_superblock *sb, struct super_block *vfs_sb) {
 	int ret;
 
 	ret = briefs_journal_init(j, sb);
 	if (ret) return ret;
 
-	j->bdev = bdev;
+	j->vfs_sb = vfs_sb;
 	return 0;
 }
 
@@ -84,47 +84,30 @@ u64 briefs_journal_prev_block(struct briefs_journal *j, u64 cur) {
 }
 
 /*
- * Read a journal block from disk
+ * Read a journal block from disk using the buffer cache.
+ * Returns a buffer_head (caller must brelse), or NULL on error.
  */
-int briefs_journal_read_block(struct briefs_journal *j, u64 block_offset, unsigned char *buf) {
-	struct bio *bio;
-	int ret;
-
-	if (!j || !j->bdev || !buf) return -EINVAL;
+struct buffer_head *briefs_journal_read_block(struct briefs_journal *j, u64 block_offset) {
+	if (!j || !j->vfs_sb)
+		return NULL;
 
 	if (block_offset < j->journal_start || block_offset >= j->journal_end) {
 		pr_err("briefs: journal read out of range (offset=%llu, range=[%llu,%llu))\n",
 			block_offset, j->journal_start, j->journal_end);
-		return -ERANGE;
+		return NULL;
 	}
 
-	bio = bio_alloc(j->bdev, 1, REQ_OP_READ, GFP_KERNEL);
-	if (!bio) return -ENOMEM;
-
-	if (!bio_add_page(bio, virt_to_page(buf), JOURNAL_BLOCK_SIZE, 0)) {
-		pr_err("briefs: bio_add_page failed for read at offset=%llu\n", block_offset);
-		bio_put(bio);
-		return -EIO;
-	}
-
-	bio->bi_iter.bi_sector = block_offset * (JOURNAL_BLOCK_SIZE / 512);
-	ret = submit_bio_wait(bio);
-	bio_put(bio);
-
-	if (ret)
-		pr_err("briefs: journal read failed at offset=%llu (err=%d)\n", block_offset, ret);
-
-	return ret;
+	return sb_bread(j->vfs_sb, block_offset);
 }
 
 /*
- * Write a journal block to disk
+ * Write a journal block to disk using the buffer cache.
+ * Copies data into a buffer_head, marks it dirty, and syncs.
  */
-int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, unsigned char *buf) {
-	struct bio *bio;
-	int ret;
+int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, unsigned char *data) {
+	struct buffer_head *bh;
 
-	if (!j || !j->bdev || !buf) return -EINVAL;
+	if (!j || !j->vfs_sb || !data) return -EINVAL;
 
 	if (block_offset < j->journal_start || block_offset >= j->journal_end) {
 		pr_err("briefs: journal write out of range (offset=%llu, range=[%llu,%llu))\n",
@@ -132,23 +115,18 @@ int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, unsig
 		return -ERANGE;
 	}
 
-	bio = bio_alloc(j->bdev, 1, REQ_OP_WRITE, GFP_KERNEL);
-	if (!bio) return -ENOMEM;
-
-	if (!bio_add_page(bio, virt_to_page(buf), JOURNAL_BLOCK_SIZE, 0)) {
-		pr_err("briefs: bio_add_page failed for write at offset=%llu\n", block_offset);
-		bio_put(bio);
+	bh = sb_getblk(j->vfs_sb, block_offset);
+	if (!bh) {
+		pr_err("briefs: sb_getblk failed for journal write at offset=%llu\n", block_offset);
 		return -EIO;
 	}
 
-	bio->bi_iter.bi_sector = block_offset * (JOURNAL_BLOCK_SIZE / 512);
-	ret = submit_bio_wait(bio);
-	bio_put(bio);
+	memcpy(bh->b_data, data, JOURNAL_BLOCK_SIZE);
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
 
-	if (ret)
-		pr_err("briefs: journal write failed at offset=%llu (err=%d)\n", block_offset, ret);
-
-	return ret;
+	return 0;
 }
 
 /*
@@ -296,36 +274,35 @@ int briefs_journal_replay(struct briefs_journal *j) {
 
 	u64 cur = j->sb->journal_log_start;
 	u64 end = j->sb->journal_log_end;
-	unsigned char *buf = kmalloc(JOURNAL_BLOCK_SIZE, GFP_KERNEL);
-	if (!buf) return -ENOMEM;
 
 	u32 records_replayed = 0;
 	u32 blocks_read = 0;
 
 	while (cur != end) {
-		int ret = briefs_journal_read_block(j, cur, buf);
-		if (ret) {
-			pr_err("briefs: journal replay failed at block=%llu (err=%d)\n", cur, ret);
-			kfree(buf);
-			return ret;
+		struct buffer_head *bh = briefs_journal_read_block(j, cur);
+		if (!bh) {
+			pr_err("briefs: journal replay failed at block=%llu\n", cur);
+			return -EIO;
 		}
 
 		blocks_read++;
 
-		struct journal_block_header *hdr = (struct journal_block_header *)buf;
+		struct journal_block_header *hdr = (struct journal_block_header *)bh->b_data;
 		if (hdr->magic != JOURNAL_MAGIC && hdr->magic != CHECKPOINT_MAGIC) {
 			pr_warn("briefs: invalid journal magic at block=%llu (got=0x%08x, expected=0x%08x)\n",
 				cur, hdr->magic, JOURNAL_MAGIC);
+			brelse(bh);
 			break;
 		}
 
 		/* Walk records by their actual sizes */
 		u64 rec_off = sizeof(struct journal_block_header);
 		for (u32 i = 0; i < hdr->record_count && rec_off < JOURNAL_BLOCK_SIZE; i++) {
-			struct journal_record_hdr *rh = (struct journal_record_hdr *)(buf + rec_off);
+			struct journal_record_hdr *rh = (struct journal_record_hdr *)(bh->b_data + rec_off);
 
 			if (rh->type <= JRN_NONE || rh->type >= JRN_END) {
 				pr_warn("briefs: invalid record type=%u at block=%llu\n", rh->type, cur);
+				brelse(bh);
 				break;
 			}
 
@@ -336,10 +313,9 @@ int briefs_journal_replay(struct briefs_journal *j) {
 			rec_off += sizeof(*rh) + rh->data_len;
 		}
 
+		brelse(bh);
 		cur = briefs_journal_next_block(j, cur);
 	}
-
-	kfree(buf);
 
 	pr_info("briefs: journal replay complete (blocks=%u, records=%u)\n",
 		blocks_read, records_replayed);
