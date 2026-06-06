@@ -297,6 +297,7 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from) {
 	size_t count = iov_iter_count(from);
 	size_t done = 0;
 	ssize_t ret = 0;
+	struct timespec64 now;
 
 	pr_debug("briefs: write_iter pos=%lld count=%zu\n", pos, count);
 
@@ -346,8 +347,11 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from) {
 		}
 
 		inode->i_blocks = 0; /* TODO: compute from extents */
-		inode->i_mtime_sec = ktime_get_real_seconds();
+		ktime_get_real_ts64(&now);
+		inode->i_mtime_sec = now.tv_sec;
+		inode->i_mtime_nsec = now.tv_nsec;
 		binfo->disk_inode.mtime_sec = inode->i_mtime_sec;
+		binfo->disk_inode.mtime_nsec = inode->i_mtime_nsec;
 
 		/* Persist inode */
 		{
@@ -416,7 +420,15 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 
 	disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
 
-	/* Copy in-memory disk_inode (already updated by caller) */
+	/* Sync VFS timestamp fields into in-memory copy first */
+	binfo->disk_inode.atime_sec = inode->i_atime_sec;
+	binfo->disk_inode.atime_nsec = inode->i_atime_nsec;
+	binfo->disk_inode.mtime_sec = inode->i_mtime_sec;
+	binfo->disk_inode.mtime_nsec = inode->i_mtime_nsec;
+	binfo->disk_inode.ctime_sec = inode->i_ctime_sec;
+	binfo->disk_inode.ctime_nsec = inode->i_ctime_nsec;
+
+	/* Copy in-memory disk_inode to the on-disk buffer */
 	memcpy(disk_inode, &binfo->disk_inode, sizeof(struct briefs_inode));
 
 	/* Update VFS-derived fields */
@@ -846,6 +858,13 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 		inode->i_blocks = 0;
 		set_nlink(inode, disk_inode->nlinks);
 
+		inode->i_atime_sec = disk_inode->atime_sec;
+		inode->i_atime_nsec = disk_inode->atime_nsec;
+		inode->i_mtime_sec = disk_inode->mtime_sec;
+		inode->i_mtime_nsec = disk_inode->mtime_nsec;
+		inode->i_ctime_sec = disk_inode->ctime_sec;
+		inode->i_ctime_nsec = disk_inode->ctime_nsec;
+
 		/* Set VFS operations based on inode type */
 		if (S_ISDIR(inode->i_mode)) {
 			inode->i_op = &briefs_dir_inode_ops;
@@ -1152,6 +1171,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	u64 inodeTableBlock, inodeBlock, inodeOffset, inodeIndex;
 	int ret;
 	bool is_dir = S_ISDIR(mode);
+	struct timespec64 now;
 
 	pr_debug("briefs: create %pd (mode=%o) in dir %lu\n", dentry, mode, dir->i_ino);
 
@@ -1199,7 +1219,9 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 		inode->i_blocks = 0;
 		set_nlink(inode, is_dir ? 2 : 1);
 
-		inode->i_atime_sec = inode->i_mtime_sec = inode->i_ctime_sec = ktime_get_real_seconds();
+		ktime_get_real_ts64(&now);
+		inode->i_atime_sec = inode->i_mtime_sec = inode->i_ctime_sec = now.tv_sec;
+		inode->i_atime_nsec = inode->i_mtime_nsec = inode->i_ctime_nsec = now.tv_nsec;
 
 		/* Set up briefs_inode fields */
 		binfo->disk_inode.inode_number = ino;
@@ -1211,6 +1233,14 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 		binfo->disk_inode.nlinks = is_dir ? 2 : 1;
 		binfo->disk_inode.num_extents_inline = 0;
 		binfo->disk_inode.num_extents_total = 0;
+		binfo->disk_inode.atime_sec = inode->i_atime_sec;
+		binfo->disk_inode.atime_nsec = inode->i_atime_nsec;
+		binfo->disk_inode.mtime_sec = inode->i_mtime_sec;
+		binfo->disk_inode.mtime_nsec = inode->i_mtime_nsec;
+		binfo->disk_inode.ctime_sec = inode->i_ctime_sec;
+		binfo->disk_inode.ctime_nsec = inode->i_ctime_nsec;
+		binfo->disk_inode.creation_time_sec = inode->i_ctime_sec;
+		binfo->disk_inode.creation_time_nsec = inode->i_ctime_nsec;
 
 		if (is_dir) {
 			inode->i_op = &briefs_dir_inode_ops;
