@@ -8,6 +8,7 @@
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/stddef.h>
+#include "briefs.h"
 
 static u32 crc32c_table[256];
 static bool crc32c_table_initialized = false;
