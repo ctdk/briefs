@@ -701,14 +701,29 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 
 	out_no_journal:
 	pr_err("briefs: journal init failed.\n");
+	if (bsi->journal) {
+		briefs_journal_cleanup(bsi->journal);
+		kfree(bsi->journal);
+		bsi->journal = NULL;
+	}
 	goto out_release;
 
 out_no_root:
 	pr_err("briefs: get root inode failed.\n");
+	if (bsi->journal) {
+		briefs_journal_cleanup(bsi->journal);
+		kfree(bsi->journal);
+		bsi->journal = NULL;
+	}
 	goto out_release;
 
 out_iput:
 	iput(root_inode);
+	if (bsi->journal) {
+		briefs_journal_cleanup(bsi->journal);
+		kfree(bsi->journal);
+		bsi->journal = NULL;
+	}
 	goto out_release;
 
 out_no_fs:
@@ -1315,6 +1330,13 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 
 /* briefs_mkdir - create a new directory */
 int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode) {
+	/* Directories at least aren't getting the proper mode set. Let's do
+	 * so now, although we may want to split directories and non-directories
+	 * into their own functions. */
+	mode |= S_IFDIR;
+	if (dir->i_mode & S_ISGID)
+		mode |= S_ISGID;
+
 	pr_debug("briefs: mkdir %pd (mode=%o)\n", dentry, mode);
 	return briefs_create(idmap, dir, dentry, mode, false);
 }

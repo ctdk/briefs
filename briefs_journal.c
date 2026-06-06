@@ -121,7 +121,15 @@ int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, unsig
 		return -EIO;
 	}
 
+	/* sb_getblk may return an unmapped buffer on loop devices.
+	 * Ensure the buffer is mapped before using it. */
+	if (!buffer_mapped(bh)) {
+		bh->b_blocknr = block_offset;
+		set_buffer_mapped(bh);
+	}
+
 	memcpy(bh->b_data, data, JOURNAL_BLOCK_SIZE);
+	set_buffer_uptodate(bh);
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
 	brelse(bh);
