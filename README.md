@@ -1,6 +1,8 @@
 BrieFS!
 ======
 
+[The BrieFS logo - a pelican wearing briefs (aka The Pelican's Briefs)](/images/briefs-logo-1.png)
+
 _"If you want a picture of the future, imagine a pelican standing on a human head -- for ever."_
 
 BrieFS: A Linux filesystem that solely uses [extents](https://en.wikipedia.org/wiki/Extent_(file_systems)) for file data, [tries](https://en.wikipedia.org/wiki/Trie) for storing directory contents, and [bitmap tries](https://en.wikipedia.org/wiki/Bitwise_trie_with_bitmap) for inode and block allocation.
