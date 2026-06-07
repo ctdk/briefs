@@ -1,7 +1,7 @@
 BrieFS!
 ======
 
-[The BrieFS logo - a pelican wearing briefs (aka The Pelican's Briefs)](https://github.com/ctdk/briefs/blob/master/images/briefs-logo-1.png)
+[The BrieFS logo - a pelican wearing briefs (aka The Pelican's Briefs)](images/briefs-logo-1.png)
 
 _"If you want a picture of the future, imagine a pelican standing on a human head -- for ever."_
 
