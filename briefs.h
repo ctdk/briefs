@@ -290,6 +290,8 @@ struct briefs_extent_chain {
 
 /* Trie root block - first block in trie node pool */
 
+/* Trie node magic "TRN " - 0x54524E20 */
+#define BRIEFS_TRIE_MAGIC 0x54524E20
 
 /* Bitwise trie macros for directory trie */
 #define TRIE_IS_LEAF(node) ((node)->node_type != NODE_TYPE_INTERM)

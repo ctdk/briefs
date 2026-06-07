@@ -70,7 +70,7 @@ static void briefs_trie_init_block(struct super_block *sb, u64 block,
 
 	memset(bh->b_data, 0, sb->s_blocksize);
 	node = (struct briefs_trie_node *)bh->b_data;
-	node->magic = 0x54524E20;
+	node->magic = BRIEFS_TRIE_MAGIC;
 	node->depth = depth;
 	node->byte_val = byte_val;
 	node->node_type = node_type;
@@ -125,7 +125,7 @@ static u64 briefs_trie_find_child(struct super_block *sb, u64 node_block, u8 byt
 		if (!cbh)
 			break;
 		cn = (struct briefs_trie_node *)cbh->b_data;
-		if (cn->magic != 0x54524E20) {
+		if (cn->magic != BRIEFS_TRIE_MAGIC) {
 			brelse(cbh);
 			break;
 		}
@@ -247,7 +247,7 @@ int briefs_trie_lookup(struct super_block *sb, struct briefs_inode *di,
 			return -EIO;
 
 		node = (struct briefs_trie_node *)bh->b_data;
-		if (node->magic != 0x54524E20) {
+		if (node->magic != BRIEFS_TRIE_MAGIC) {
 			brelse(bh);
 			return -EIO;
 		}
@@ -337,7 +337,7 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 			}
 			memset(bh->b_data, 0, sb->s_blocksize);
 			node = (struct briefs_trie_node *)bh->b_data;
-			node->magic = 0x54524E20;
+			node->magic = BRIEFS_TRIE_MAGIC;
 			node->depth = pos;
 			node->byte_val = bval;
 			node->node_type = leaf_type;
@@ -686,7 +686,7 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 			continue;
 
 		node = (struct briefs_trie_node *)bh->b_data;
-		if (node->magic != 0x54524E20) {
+		if (node->magic != BRIEFS_TRIE_MAGIC) {
 			brelse(bh);
 			continue;
 		}
