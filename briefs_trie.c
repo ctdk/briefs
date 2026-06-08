@@ -906,24 +906,53 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 			continue;
 		}
 
-		/* Push children onto stack for later processing */
+		/*
+		 * Push children onto the stack for later processing.
+		 * If the stack is too full to hold all children at once,
+		 * push the current node back and process one child at a time.
+		 */
 		if (node->first_child) {
 			u64 child = node->first_child;
+			int pushed = 0;
 
-			while (child && iter->sp < 256) {
-				struct buffer_head *cbh;
-				struct briefs_trie_node *cn;
+			while (child) {
+				if (iter->sp >= 256) {
+					/*
+					 * Stack full.  Push the current node back
+					 * so we resume here, then push just this
+					 * one child.  The remaining siblings will
+					 * be picked up when we return to this node.
+					 */
+					iter->stack[iter->sp++] = block;
+					iter->stack[iter->sp++] = child;
+					pushed = 1;
+					break;
+				}
 
 				iter->stack[iter->sp++] = child;
-				cbh = sb_bread(sb, child);
+				pushed++;
+
+				struct buffer_head *cbh = sb_bread(sb, child);
 				if (!cbh) break;
-				cn = (struct briefs_trie_node *)cbh->b_data;
+				struct briefs_trie_node *cn = (struct briefs_trie_node *)cbh->b_data;
 				child = cn->next_sibling;
 				brelse(cbh);
+			}
+
+			if (pushed) {
+				/*
+				 * We pushed children (or one child + ourselves).
+				 * Don't emit this node yet — we'll come back to
+				 * it after processing children.  The children are
+				 * on top of the stack, so they'll be processed first.
+				 */
+				brelse(bh);
+				continue;
 			}
 		}
 
 		/*
+		 * No children (or all children already processed).
 		 * Emit this node if it has leaf data:
 		 *   - NODE_STATUS_LEAF flag set (INTERM with leaf entry)
 		 *   - Pure leaf (node_type is FILE/DIR, not INTERM)
