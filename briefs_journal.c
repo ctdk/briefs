@@ -266,8 +266,97 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
 	return 0;
 }
 
+/**********************************************************************
+ * Replay helpers — operate on raw disk blocks, no VFS inode context.
+ **********************************************************************/
+
 /*
- * Mount/recovery: replay journal from last checkpoint
+ * Read an on-disk inode by inode number.
+ * Returns a pointer into the buffer (caller must brelse the bh).
+ */
+static struct briefs_inode *replay_read_inode(struct super_block *sb,
+					       u64 ino,
+					       struct buffer_head **bh_out)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	u64 inodeTableBlock, inodeBlock, inodeOffset, inodeIndex;
+	struct briefs_inode *di;
+
+	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+	inodeIndex = ino - 1;
+	inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
+	inodeOffset = (inodeIndex % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+
+	*bh_out = sb_bread(sb, inodeTableBlock + inodeBlock);
+	if (!*bh_out)
+		return NULL;
+
+	di = (struct briefs_inode *)((*bh_out)->b_data + inodeOffset);
+	if (di->magic != 0x494E4F44) {
+		brelse(*bh_out);
+		*bh_out = NULL;
+		return NULL;
+	}
+	return di;
+}
+
+/*
+ * Replay a JRN_DIR_UPDATE record (op=0 = add, op=1 = delete).
+ */
+static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
+{
+	struct buffer_head *parent_bh = NULL;
+	struct briefs_inode *parent_di;
+	struct buffer_head *child_bh = NULL;
+	struct briefs_inode *child_di;
+	int ret;
+
+	parent_di = replay_read_inode(sb, rec->parent_ino, &parent_bh);
+	if (!parent_di) {
+		pr_warn("briefs: replay can't read parent inode %llu (skip)\n",
+			rec->parent_ino);
+		return 0; /* skip — might have been freed already */
+	}
+
+	if (rec->op == 0) {
+		/* Add directory entry */
+		u8 ftype = 0;
+
+		/* Read child inode to get file type */
+		child_di = replay_read_inode(sb, rec->child_ino, &child_bh);
+		if (child_di) {
+			ftype = (child_di->filemode & S_IFMT) >> 12;
+			brelse(child_bh);
+		} else {
+			pr_warn("briefs: replay can't read child inode %llu, using ftype=0\n",
+				rec->child_ino);
+		}
+
+		ret = briefs_trie_insert(sb, parent_di,
+					 rec->name, rec->name_len,
+					 rec->child_ino, ftype);
+		if (ret == -EEXIST) {
+			/* Already applied — idempotent */
+			ret = 0;
+		}
+	} else {
+		/* Delete directory entry */
+		ret = briefs_trie_remove(sb, parent_di, rec->name, rec->name_len);
+		if (ret == -ENOENT) {
+			/* Already removed — idempotent */
+			ret = 0;
+		}
+	}
+
+	brelse(parent_bh);
+	return ret;
+}
+
+/*
+ * Mount/recovery: replay journal from last checkpoint.
+ *
+ * Walks the journal from journal_log_start to journal_log_end and re-applies
+ * each record.  After successful replay, the journal is marked clean.
  */
 int briefs_journal_replay(struct briefs_journal *j) {
 	if (!j) return -EINVAL;
@@ -282,9 +371,12 @@ int briefs_journal_replay(struct briefs_journal *j) {
 
 	u64 cur = j->sb->journal_log_start;
 	u64 end = j->sb->journal_log_end;
+	struct super_block *sb = j->vfs_sb;
+	struct briefs_sb_info *bsi = sb->s_fs_info;
 
 	u32 records_replayed = 0;
 	u32 blocks_read = 0;
+	u32 errors = 0;
 
 	while (cur != end) {
 		struct buffer_head *bh = briefs_journal_read_block(j, cur);
@@ -314,10 +406,38 @@ int briefs_journal_replay(struct briefs_journal *j) {
 				break;
 			}
 
-			if (rh->type != JRN_CHECKPOINT) {
-				records_replayed++;
+			if (rh->type == JRN_CHECKPOINT) {
+				rec_off += sizeof(*rh) + rh->data_len;
+				continue;
 			}
 
+			void *rec_data = bh->b_data + rec_off + sizeof(*rh);
+			int apply_ret = 0;
+
+			switch (rh->type) {
+			case JRN_DIR_UPDATE: {
+				struct jrn_dir_update *du = rec_data;
+				apply_ret = replay_dir_update(sb, du);
+				break;
+			}
+			case JRN_INODE_ALLOC: {
+				struct jrn_inode_alloc *ia = rec_data;
+				u64 inum = ia->ino; /* 1-based inode */
+				if (inum > 0)
+					briefs_reserve_block(&bsi->inode_alloc, inum - 1);
+				break;
+			}
+			default:
+				pr_debug("briefs: replay skipping unhandled record type=%u\n", rh->type);
+				break;
+			}
+
+			if (apply_ret) {
+				pr_err("briefs: replay error for record type=%u: %d\n",
+				       rh->type, apply_ret);
+				errors++;
+			}
+			records_replayed++;
 			rec_off += sizeof(*rh) + rh->data_len;
 		}
 
@@ -325,13 +445,14 @@ int briefs_journal_replay(struct briefs_journal *j) {
 		cur = briefs_journal_next_block(j, cur);
 	}
 
-	pr_info("briefs: journal replay complete (blocks=%u, records=%u)\n",
-		blocks_read, records_replayed);
+	pr_info("briefs: journal replay complete (blocks=%u, records=%u, errors=%u)\n",
+		blocks_read, records_replayed, errors);
 
+	/* Update superblock to mark journal clean */
 	j->sb->journal_log_start = j->sb->journal_log_end;
 	j->sb->checkpoint_seq++;
 
-	return 0;
+	return errors ? -EIO : 0;
 }
 
 /*

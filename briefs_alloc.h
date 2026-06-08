@@ -49,6 +49,12 @@ int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb,
 /* Allocate a single free block (returns data-relative block number, or 0 on ENOSPC) */
 u64 briefs_alloc_block(struct briefs_alloc *alloc);
 
+/*
+ * Reserve a specific block (mark it as allocated without searching).
+ * Used during journal replay to ensure bitmap matches recorded allocations.
+ */
+void briefs_reserve_block(struct briefs_alloc *alloc, u64 rel_block);
+
 /* Free a single block (data-relative block number) */
 void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block);
 

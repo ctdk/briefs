@@ -244,6 +244,40 @@ u64 briefs_alloc_block(struct briefs_alloc *alloc)
 /*
  * Free a single block (data-relative block number).
  */
+/*
+ * briefs_reserve_block - mark a specific block as allocated in the bitmap.
+ * Used during journal replay to ensure bitmap consistency.
+ * Returns 0 on success, -EINVAL if already allocated or out of range.
+ */
+void briefs_reserve_block(struct briefs_alloc *alloc, u64 rel_block)
+{
+	u64 w2, b2, w1, b1, w0, b0;
+
+	if (!alloc || !alloc->l0 || rel_block >= alloc->block_count)
+		return;
+
+	w2 = rel_block / 64;
+	b2 = rel_block % 64;
+	w1 = w2 / 64;
+	b1 = w2 % 64;
+	w0 = w1 / 64;
+	b0 = w1 % 64;
+
+	/* If already allocated, nothing to do */
+	if (!(alloc->l2[w2] & (1ULL << b2)))
+		return;
+
+	alloc->l2[w2] &= ~(1ULL << b2);
+	alloc->free_count--;
+
+	/* Propagate upward if word becomes all-zero */
+	if (alloc->l2[w2] == 0) {
+		alloc->l1[w1] &= ~(1ULL << b1);
+		if (alloc->l1[w1] == 0)
+			alloc->l0[w0] &= ~(1ULL << b0);
+	}
+}
+
 void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block)
 {
 	u64 w2, b2, w1, b1, w0, b0;
