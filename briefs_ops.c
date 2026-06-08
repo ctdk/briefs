@@ -39,6 +39,8 @@ static int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 			  struct dentry *dentry, const char *symname);
 static const char *briefs_get_link(struct dentry *dentry, struct inode *inode,
 				    struct delayed_call *done);
+static int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
+			 struct dentry *dentry, umode_t mode, dev_t rdev);
 
 /* Inode operations for directories */
 const struct inode_operations briefs_dir_inode_ops = {
@@ -46,6 +48,7 @@ const struct inode_operations briefs_dir_inode_ops = {
 	.lookup = briefs_lookup,
 	.mkdir = briefs_mkdir,
 	.symlink = briefs_symlink,
+	.mknod = briefs_mknod,
 	.unlink = briefs_unlink,
 	.rmdir = briefs_unlink,
 	.rename = briefs_rename,
@@ -964,6 +967,9 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 		} else if (S_ISLNK(inode->i_mode)) {
 			inode->i_op = &briefs_symlink_inode_ops;
 			/* no i_fop for symlinks */
+		} else if (S_ISBLK(inode->i_mode) || S_ISCHR(inode->i_mode) ||
+			   S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
+			init_special_inode(inode, inode->i_mode, disk_inode->rdev);
 		}
 
 		pr_info("briefs: inode %llu: mode=0x%04x, uid=%u, gid=%u, size=%llu, nlink=%u\n",
@@ -1562,6 +1568,167 @@ static int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	d_instantiate(dentry, inode);
 
 	pr_debug("briefs: symlink inode %llu -> %s added to dir\n", ino, symname);
+	return 0;
+}
+
+/*
+ * briefs_mknod - create a special file (block, char, fifo, socket).
+ */
+static int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
+			 struct dentry *dentry, umode_t mode, dev_t rdev)
+{
+	struct briefs_sb_info *bsi = dir->i_sb->s_fs_info;
+	struct inode *inode;
+	struct buffer_head *bh;
+	struct briefs_inode *disk_inode;
+	u64 ino;
+	u64 inodeTableBlock, inodeBlock, inodeOffset, inodeIndex;
+	int ret;
+	struct timespec64 now;
+
+	pr_debug("briefs: mknod %pd (mode=%o, rdev=%u:%u) in dir %lu\n",
+		 dentry, mode, MAJOR(rdev), MINOR(rdev), dir->i_ino);
+
+	/* Allocate new inode */
+	ino = briefs_alloc_inode(dir->i_sb);
+	if (ino == 0)
+		return -ENOSPC;
+
+	/* Log inode allocation */
+	if (bsi->journal) {
+		struct jrn_inode_alloc irec;
+		memset(&irec, 0, sizeof(irec));
+		irec.ino = ino;
+		irec.mode = mode & 07777;
+		irec.nlink = 1;
+		ret = briefs_journal_write_record(bsi->journal, JRN_INODE_ALLOC, &irec, sizeof(irec));
+		if (ret) return ret;
+	}
+
+	/* Log directory entry */
+	if (bsi->journal) {
+		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, ino,
+						dentry->d_name.name, dentry->d_name.len, 0);
+		if (ret) return ret;
+	}
+
+	/* Create new inode */
+	inode = iget_locked(dir->i_sb, ino);
+	if (!inode)
+		return -ENOMEM;
+
+	if (inode->i_state & I_NEW) {
+		struct briefs_inode_info *binfo = briefs_i(inode);
+		memset(&binfo->disk_inode, 0, sizeof(struct briefs_inode));
+		binfo->inode_number = ino;
+
+		inode->i_mode = mode;
+		inode->i_uid = current_fsuid();
+		inode->i_gid = current_fsgid();
+		inode->i_size = 0;
+		inode->i_blocks = 0;
+		set_nlink(inode, 1);
+
+		ktime_get_real_ts64(&now);
+		inode->i_atime_sec = inode->i_mtime_sec = inode->i_ctime_sec = now.tv_sec;
+		inode->i_atime_nsec = inode->i_mtime_nsec = inode->i_ctime_nsec = now.tv_nsec;
+
+		/*
+		 * Set up VFS inode for special file.
+		 * init_special_inode assigns the right i_fop based on type.
+		 */
+		init_special_inode(inode, mode, rdev);
+
+		/* Set up disk inode fields */
+		binfo->disk_inode.inode_number = ino;
+		binfo->disk_inode.magic = 0x494E4F44;
+		binfo->disk_inode.filemode = mode;
+		binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
+		binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);
+		binfo->disk_inode.filesize = 0;
+		binfo->disk_inode.nlinks = 1;
+		binfo->disk_inode.num_extents_inline = 0;
+		binfo->disk_inode.num_extents_total = 0;
+		binfo->disk_inode.rdev = rdev;
+		binfo->disk_inode.atime_sec = inode->i_atime_sec;
+		binfo->disk_inode.atime_nsec = inode->i_atime_nsec;
+		binfo->disk_inode.mtime_sec = inode->i_mtime_sec;
+		binfo->disk_inode.mtime_nsec = inode->i_mtime_nsec;
+		binfo->disk_inode.ctime_sec = inode->i_ctime_sec;
+		binfo->disk_inode.ctime_nsec = inode->i_ctime_nsec;
+		binfo->disk_inode.creation_time_sec = inode->i_ctime_sec;
+		binfo->disk_inode.creation_time_nsec = inode->i_ctime_nsec;
+
+		unlock_new_inode(inode);
+	} else {
+		iput(inode);
+		return -EEXIST;
+	}
+
+	/* Write the inode to disk */
+	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+	inodeIndex = ino - 1;
+	inodeBlock = inodeIndex / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
+	inodeOffset = (inodeIndex % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+
+	bh = sb_bread(dir->i_sb, inodeTableBlock + inodeBlock);
+	if (!bh) {
+		iput(inode);
+		return -EIO;
+	}
+	disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
+	memcpy(disk_inode, &briefs_i(inode)->disk_inode, sizeof(struct briefs_inode));
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+
+	/* Add directory entry to parent */
+	u8 ftype = (mode & S_IFMT) >> 12;
+	ret = briefs_add_dir_entry(dir, dentry->d_name.name, dentry->d_name.len, ino, ftype);
+	if (ret) {
+		pr_err("briefs: failed to add mknod dir entry %pd: %d\n", dentry, ret);
+		iput(inode);
+		return ret;
+	}
+
+	/* Update parent inode */
+	{
+		struct briefs_inode_info *pbinfo = briefs_i(dir);
+		inc_nlink(dir);
+		dir->i_size += sizeof(struct briefs_dir_entry) + 2 + dentry->d_name.len;
+		pbinfo->disk_inode.filesize = dir->i_size;
+		pbinfo->disk_inode.nlinks = dir->i_nlink;
+	}
+
+	/* Write parent inode */
+	{
+		u64 pIno = dir->i_ino;
+		u64 pIdx = pIno - 1;
+		u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
+		u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+		struct buffer_head *pbh = sb_bread(dir->i_sb, inodeTableBlock + pBlk);
+		if (pbh) {
+			struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + pOff);
+			pdi->filesize = dir->i_size;
+			pdi->nlinks = dir->i_nlink;
+			mark_buffer_dirty(pbh);
+			sync_dirty_buffer(pbh);
+			brelse(pbh);
+		}
+	}
+
+	/* Sync journal */
+	if (bsi->journal && bsi->journal->dirty) {
+		ret = briefs_journal_sync(bsi->journal);
+		if (ret) {
+			iput(inode);
+			return ret;
+		}
+	}
+
+	d_instantiate(dentry, inode);
+
+	pr_debug("briefs: mknod inode %llu (mode=%o) added to dir\n", ino, mode);
 	return 0;
 }
 

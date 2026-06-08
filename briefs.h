@@ -275,7 +275,8 @@ struct briefs_inode {
 	__u32 link_count; /* same as nlinks? */
 	__u32 flags;
 	__u64 dir_trie_root;       /* block number of directory trie root (dirs only) */
-	__u8 reserved[88]; /* zero padded to 512 bytes */
+	__u64 rdev;                /* device number (block/char special files) */
+	__u8 reserved[80]; /* zero padded to 512 bytes */
 };
 
 /* Extent chain for overflow - 256 extents + header = 272 bytes */
