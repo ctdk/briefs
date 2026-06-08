@@ -8,11 +8,14 @@
  *
  * Trie layout:
  *   - Internal nodes (NODE_TYPE_INTERM) have child_count > 0 and dispatch
- *     by the byte value at the node's depth in the filename.
- *   - Leaf nodes (NODE_TYPE_FILE / NODE_TYPE_DIR) have child_count = 0
- *     and store the full filename + inode in the trailing bytes of the block.
+ *     by the byte value at the node's depth in the filename.  An INTERM
+ *     node with NODE_STATUS_LEAF set also stores a leaf entry whose name
+ *     is a prefix of longer names branching from this node.
+ *   - Pure leaf nodes (child_count = 0) store the full filename + inode in
+ *     the trailing bytes of the block.
  *   - Children at each depth level are linked via first_child / next_sibling.
- *   - The root node is special: depth=0, byte_val=0 represents the empty prefix.
+ *   - The root node is special: depth=0, byte_val=0.  It is always an INTERM
+ *     node and may also have NODE_STATUS_LEAF if the root itself is a leaf.
  *
  * Name storage in leaf nodes:
  *   The full name is stored in the trailing bytes of the block, referenced by
@@ -239,8 +242,14 @@ int briefs_trie_lookup(struct super_block *sb, struct briefs_inode *di,
 		int entry_len;
 
 		child = briefs_trie_find_child(sb, cur, (u8)name[pos]);
-		if (child == 0)
-			return -ENOENT;
+		if (child == 0) {
+			/*
+			 * No child at this byte.  The current node `cur`
+			 * might have NODE_STATUS_LEAF set if a prefix entry
+			 * exists here.
+			 */
+			goto check_prefix;
+		}
 
 		bh = sb_bread(sb, child);
 		if (!bh)
@@ -252,12 +261,31 @@ int briefs_trie_lookup(struct super_block *sb, struct briefs_inode *di,
 			return -EIO;
 		}
 
-		if (node->node_type == NODE_TYPE_INTERM) {
+		if (node->node_type & NODE_TYPE_INTERM) {
+			/*
+			 * INTERM node — descend to children for the next
+			 * byte.  But first check if this node also has
+			 * NODE_STATUS_LEAF (prefix entry that shares this
+			 * byte and all preceding bytes).
+			 */
+			if (node->node_type & NODE_STATUS_LEAF) {
+				entry_name = (char *)bh->b_data + BRIEFS_BLOCK_SIZE - node->name_offset + 2;
+				entry_len = node->name_len - 2;
+				if (entry_len == name_len && memcmp(entry_name, name, name_len) == 0) {
+					if (found_ino)
+						*found_ino = node->inode;
+					if (found_type)
+						*found_type = node->node_type & ~NODE_STATUS_LEAF;
+					brelse(bh);
+					return 0;
+				}
+			}
 			cur = child;
 			brelse(bh);
 			continue;
 		}
 
+		/* Pure leaf node — check full name match */
 		entry_name = (char *)bh->b_data + BRIEFS_BLOCK_SIZE - node->name_offset;
 		entry_name += 2;
 		entry_len = node->name_len - 2;
@@ -266,13 +294,42 @@ int briefs_trie_lookup(struct super_block *sb, struct briefs_inode *di,
 			if (found_ino)
 				*found_ino = node->inode;
 			if (found_type)
-				*found_type = node->node_type;
+				*found_type = node->node_type & ~NODE_STATUS_LEAF;
 			brelse(bh);
 			return 0;
 		}
 
 		brelse(bh);
 		return -ENOENT;
+	}
+
+	/*
+	 * All name_len bytes consumed without finding a child.
+	 * The last node at `cur` may have NODE_STATUS_LEAF set —
+	 * a prefix entry (e.g. "file_1" when "file_10" split at '0').
+	 */
+check_prefix:
+	{
+		struct buffer_head *nbh = sb_bread(sb, cur);
+		if (nbh) {
+			struct briefs_trie_node *nnode;
+			nnode = (struct briefs_trie_node *)nbh->b_data;
+			if (nnode->node_type & NODE_STATUS_LEAF) {
+				char *zname;
+				int zlen;
+
+				zname = (char *)nbh->b_data + BRIEFS_BLOCK_SIZE - nnode->name_offset + 2;
+				zlen = nnode->name_len - 2;
+
+				if (zlen == name_len && memcmp(zname, name, name_len) == 0) {
+					if (found_ino) *found_ino = nnode->inode;
+					if (found_type) *found_type = nnode->node_type & ~NODE_STATUS_LEAF;
+					brelse(nbh);
+					return 0;
+				}
+			}
+			brelse(nbh);
+		}
 	}
 
 	return -ENOENT;
@@ -290,8 +347,7 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 	struct buffer_head *bh, *cbh;
 	struct briefs_trie_node *node, *cnode;
 	u64 cur, child, new_leaf;
-	u8 leaf_type;
-	int pos, stored_len, ret;
+	int pos, ret;
 
 	if (!di->dir_trie_root) {
 		ret = briefs_trie_create_root(sb, di);
@@ -305,27 +361,86 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 		return -ENAMETOOLONG;
 
 	for (pos = 0; pos < name_len; pos++) {
-		u8 bval;
-
-		bval = (u8)name[pos];
-		leaf_type = type;
+		u8 bval = (u8)name[pos];
 
 		if (pos == name_len - 1) {
-			u64 existing;
+			/*
+			 * Last byte of the name.  Check if a node already
+			 * exists at this byte value.
+			 */
+			u64 existing = briefs_trie_find_child(sb, cur, bval);
 
-			existing = briefs_trie_find_child(sb, cur, bval);
 			if (existing) {
 				cbh = sb_bread(sb, existing);
 				if (cbh) {
 					cnode = (struct briefs_trie_node *)cbh->b_data;
-					if (cnode->node_type != NODE_TYPE_INTERM) {
+
+					if (cnode->node_type & NODE_TYPE_INTERM) {
+						/*
+						 * Existing INTERM node.  Check for
+						 * duplicate name first.
+						 */
+						if (cnode->node_type & NODE_STATUS_LEAF) {
+							char *ename;
+							int elen;
+
+							ename = (char *)cbh->b_data + BRIEFS_BLOCK_SIZE - cnode->name_offset + 2;
+							elen = cnode->name_len - 2;
+							if (elen == name_len && memcmp(ename, name, name_len) == 0) {
+								brelse(cbh);
+								return -EEXIST;
+							}
+						}
+
+						/*
+						 * Set NODE_STATUS_LEAF on the existing
+						 * INTERM node.  Its name is a prefix
+						 * of longer names branching from it.
+						 */
+						cnode->node_type |= NODE_STATUS_LEAF;
+						cnode->inode = ino;
+						cnode->name_len = 2 + name_len;
+						{
+							u16 n_off = 2 + name_len;
+							char *n_dest = (char *)cbh->b_data + BRIEFS_BLOCK_SIZE - n_off;
+							*(__u16 *)n_dest = (__u16)name_len;
+							memcpy(n_dest + 2, name, name_len);
+							cnode->name_offset = n_off;
+						}
+
+						mark_buffer_dirty(cbh);
+						sync_dirty_buffer(cbh);
 						brelse(cbh);
-						return -EEXIST;
+						return 0;
 					}
+
+					/*
+					 * Existing pure leaf.  Check for duplicate,
+					 * then split.
+					 */
+					{
+						char *ename = (char *)cbh->b_data + BRIEFS_BLOCK_SIZE - cnode->name_offset + 2;
+						int elen = cnode->name_len - 2;
+						if (elen == name_len && memcmp(ename, name, name_len) == 0) {
+							brelse(cbh);
+							return -EEXIST;
+						}
+					}
+
+					/*
+					 * Two different names share all bytes through
+					 * this position.  Need to split: create an INTERM
+					 * node and reparent the existing leaf under it.
+					 */
 					brelse(cbh);
+					goto split_leaf;
 				}
 			}
 
+			/*
+			 * No existing child at this byte value.
+			 * Create a new pure leaf node.
+			 */
 			new_leaf = briefs_trie_alloc_node(sb);
 			if (new_leaf == 0)
 				return -ENOSPC;
@@ -340,22 +455,16 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 			node->magic = BRIEFS_TRIE_MAGIC;
 			node->depth = pos;
 			node->byte_val = bval;
-			node->node_type = leaf_type;
+			node->node_type = type;
 			node->inode = ino;
 			node->name_len = 2 + name_len;
-
-			stored_len = 2 + name_len;
 			{
-				u16 name_off;
-				char *name_dest;
-
-				name_off = stored_len;
-				name_dest = (char *)bh->b_data + BRIEFS_BLOCK_SIZE - name_off;
-				*(__u16 *)name_dest = (__u16)name_len;
-				memcpy(name_dest + 2, name, name_len);
-				node->name_offset = name_off;
+				u16 n_off = 2 + name_len;
+				char *n_dest = (char *)bh->b_data + BRIEFS_BLOCK_SIZE - n_off;
+				*(__u16 *)n_dest = (__u16)name_len;
+				memcpy(n_dest + 2, name, name_len);
+				node->name_offset = n_off;
 			}
-
 			mark_buffer_dirty(bh);
 			sync_dirty_buffer(bh);
 			brelse(bh);
@@ -363,6 +472,9 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 			goto link_child;
 		}
 
+		/*
+		 * Middle byte: find or create an INTERM child.
+		 */
 		child = briefs_trie_find_or_create_child(sb, cur, pos + 1, bval, NODE_TYPE_INTERM);
 		if (child == 0)
 			return -ENOSPC;
@@ -370,63 +482,79 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 		cbh = sb_bread(sb, child);
 		if (cbh) {
 			cnode = (struct briefs_trie_node *)cbh->b_data;
-			if (cnode->node_type != NODE_TYPE_INTERM) {
-				u64 internal;
-				u64 *link;
-
-				internal = briefs_trie_alloc_node(sb);
-				if (internal == 0) {
-					brelse(cbh);
-					return -ENOSPC;
-				}
-				briefs_trie_init_block(sb, internal, pos + 1, 0, NODE_TYPE_INTERM);
-
-				bh = sb_bread(sb, cur);
-				if (bh) {
-					node = (struct briefs_trie_node *)bh->b_data;
-					link = &node->first_child;
-					while (*link && *link != child) {
-						struct briefs_trie_node *tmp;
-						struct buffer_head *tbh;
-
-						tbh = sb_bread(sb, *link);
-						if (!tbh)
-							break;
-						tmp = (struct briefs_trie_node *)tbh->b_data;
-						link = &tmp->next_sibling;
-						brelse(tbh);
-					}
-					if (*link == child)
-						*link = internal;
-					mark_buffer_dirty(bh);
-					sync_dirty_buffer(bh);
-					brelse(bh);
-				}
-
-				bh = sb_bread(sb, internal);
-				if (bh) {
-					node = (struct briefs_trie_node *)bh->b_data;
-					node->first_child = child;
-					node->child_count = 1;
-					mark_buffer_dirty(bh);
-					sync_dirty_buffer(bh);
-					brelse(bh);
-				}
-
-				cnode->depth = pos + 1;
-				cnode->byte_val = 0; /* end-of-string sentinel */
-				mark_buffer_dirty(cbh);
-				sync_dirty_buffer(cbh);
+			if (!(cnode->node_type & NODE_TYPE_INTERM)) {
+				/*
+				 * Found a pure leaf where we need an INTERM.
+				 * Shared prefix collision — split.
+				 */
 				brelse(cbh);
-				cur = internal;
-			} else {
-				brelse(cbh);
-				cur = child;
+				goto split_leaf;
 			}
+			brelse(cbh);
+			cur = child;
 		} else {
 			cur = child;
 		}
 
+		continue;
+
+split_leaf:
+		{
+			u64 internal;
+			u64 *link;
+
+			internal = briefs_trie_alloc_node(sb);
+			if (internal == 0)
+				return -ENOSPC;
+			briefs_trie_init_block(sb, internal, pos + 1, bval, NODE_TYPE_INTERM);
+
+			/*
+			 * Re-parent: find the link from grandparent (cur)
+			 * to the leaf (`child`), redirect it to `internal`.
+			 */
+			bh = sb_bread(sb, cur);
+			if (bh) {
+				node = (struct briefs_trie_node *)bh->b_data;
+				link = &node->first_child;
+				while (*link && *link != child) {
+					struct briefs_trie_node *tmp;
+					struct buffer_head *tbh;
+
+					tbh = sb_bread(sb, *link);
+					if (!tbh)
+						break;
+					tmp = (struct briefs_trie_node *)tbh->b_data;
+					link = &tmp->next_sibling;
+					brelse(tbh);
+				}
+				if (*link == child)
+					*link = internal;
+				mark_buffer_dirty(bh);
+				sync_dirty_buffer(bh);
+				brelse(bh);
+			}
+
+			/*
+			 * Link the old leaf as a child of the new INTERM.
+			 * The leaf retains its original byte_val (the byte
+			 * that differentiates it from the new name at this
+			 * depth).  The new INTERM node has byte_val = bval
+			 * (the byte of the new name at this depth).  They
+			 * are siblings under the INTERM, distinguished by
+			 * their byte_val.
+			 */
+			bh = sb_bread(sb, internal);
+			if (bh) {
+				node = (struct briefs_trie_node *)bh->b_data;
+				node->first_child = child;
+				node->child_count = 1;
+				mark_buffer_dirty(bh);
+				sync_dirty_buffer(bh);
+				brelse(bh);
+			}
+
+			cur = internal;
+		}
 		continue;
 
 link_child:
@@ -439,9 +567,8 @@ link_child:
 		if (node->first_child == 0) {
 			node->first_child = new_leaf;
 		} else {
-			u64 last;
+			u64 last = node->first_child;
 
-			last = node->first_child;
 			while (last) {
 				cbh = sb_bread(sb, last);
 				if (!cbh)
@@ -490,7 +617,6 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 	cur = di->dir_trie_root;
 
 	for (pos = 0; pos < name_len; pos++) {
-
 		bh = sb_bread(sb, cur);
 		if (!bh)
 			return -EIO;
@@ -530,12 +656,36 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 			}
 			node = (struct briefs_trie_node *)cbh->b_data;
 
-			if (node->node_type == NODE_TYPE_INTERM) {
+			if ((node->node_type & NODE_TYPE_INTERM) &&
+			    !(node->node_type & NODE_STATUS_LEAF)) {
+				/*
+				 * Pure INTERM node — has children but no leaf
+				 * entry.  Cannot unlink "a directory with children"
+				 * through the trie.
+				 */
 				brelse(cbh);
 				brelse(bh);
 				return -ENOTEMPTY;
 			}
 
+			/*
+			 * Found the node.  Unlink it from the parent's
+			 * sibling chain.  If it's an INTERM with
+			 * NODE_STATUS_LEAF, just clear the leaf flag
+			 * — don't free the node, it still has children.
+			 * If it's a pure leaf, unlink and free.
+			 */
+			if (node->node_type & NODE_TYPE_INTERM) {
+				/* INTERM with NODE_STATUS_LEAF: clear leaf flag */
+				node->node_type &= ~NODE_STATUS_LEAF;
+				mark_buffer_dirty(cbh);
+				sync_dirty_buffer(cbh);
+				brelse(cbh);
+				brelse(bh);
+				return 0;
+			}
+
+			/* Pure leaf: unlink and free */
 			if (child_prev == 0) {
 				pnode->first_child = node->next_sibling;
 			} else {
@@ -694,10 +844,6 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 
 		/* Push children onto stack for later processing */
 		if (node->first_child) {
-			/* Walk sibling chain, pushing each onto the stack.
-			 * Entries will be processed in reverse-sibling order
-			 * (last sibling first), but BrieFS does not guarantee
-			 * readdir ordering. */
 			u64 child = node->first_child;
 
 			while (child && iter->sp < 256) {
@@ -713,17 +859,22 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 			}
 		}
 
-		/* If this is a leaf, emit it */
-		if (node->node_type != NODE_TYPE_INTERM) {
+		/*
+		 * Emit this node if it has leaf data:
+		 *   - NODE_STATUS_LEAF flag set (INTERM with leaf entry)
+		 *   - Pure leaf (node_type is FILE/DIR, not INTERM)
+		 */
+		if ((node->node_type & NODE_STATUS_LEAF) ||
+		    (node->node_type != NODE_TYPE_INTERM)) {
 			char *src;
 			int nlen;
 
 			src = (char *)bh->b_data + BRIEFS_BLOCK_SIZE - node->name_offset + 2;
-			nlen = node->name_len - 2; /* subtract 2-byte length prefix */
+			nlen = node->name_len - 2;
 
 			if (nlen > 0 && nlen <= BRIEFS_NAME_LEN) {
 				if (ino) *ino = node->inode;
-				if (type) *type = node->node_type;
+				if (type) *type = node->node_type & ~NODE_STATUS_LEAF;
 				if (name_buf && name_len) {
 					memcpy(name_buf, src, nlen);
 					*name_len = nlen;

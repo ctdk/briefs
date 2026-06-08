@@ -295,9 +295,7 @@ struct briefs_extent_chain {
 #define BRIEFS_TRIE_MAGIC 0x54524E20
 
 /* Bitwise trie macros for directory trie */
-#define TRIE_IS_LEAF(node) ((node)->node_type != NODE_TYPE_INTERM)
-#define TRIE_IS_FILE(node) ((node)->node_type == NODE_TYPE_FILE)
-#define TRIE_IS_DIR(node) ((node)->node_type == NODE_TYPE_DIR)
+#define TRIE_IS_LEAF(node) ((node)->node_type & NODE_STATUS_LEAF)
 
 /* Trie node flags */
 #define TRIE_FLAG_ROOT    0x00000001
@@ -307,7 +305,14 @@ struct briefs_extent_chain {
 /* Trie node types */
 #define NODE_TYPE_FILE      0x01
 #define NODE_TYPE_DIR       0x02
-#define NODE_TYPE_INTERM    0x03
+#define NODE_TYPE_INTERM    0x04
+/*
+ * NODE_STATUS_LEAF - this INTERM node also stores a leaf entry.
+ * Set on NODE_TYPE_INTERM nodes whose name is a prefix of longer
+ * names branching from this node (e.g. "file_1" when "file_10"
+ * and "file_100" also exist).
+ */
+#define NODE_STATUS_LEAF    0x08
 
 #define NODE_FLAG_DELETED   0x00000004
 #define NODE_FLAG_ROOT      0x00000008
@@ -330,7 +335,9 @@ struct briefs_trie_node {
 	__u8  reserved[5];
 	__u64 flags;              /* NODE_FLAG_* */
 
-	/* Leaf entry data (valid only when node_type != NODE_TYPE_INTERM) */
+	/* Leaf entry data.  Valid when TRIE_IS_LEAF(node) is true —
+	 * includes pure leaf nodes (FILE/DIR) and NODE_TYPE_INTERM
+	 * nodes with NODE_STATUS_LEAF set. */
 	__u64 inode;              /* inode number */
 	__u16 name_len;           /* full name length (not just remaining bytes) */
 	__u16 name_offset;        /* offset from block end to name bytes */
