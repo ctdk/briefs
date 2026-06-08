@@ -6,6 +6,7 @@
 #include <linux/fs.h>
 #include <linux/types.h>
 #include <linux/stddef.h>
+#include <linux/blk_types.h>
 #include "briefs_alloc.h"
 
 /* BrieFS magic number */
@@ -497,6 +498,12 @@ extern const struct inode_operations briefs_symlink_inode_ops;
 /* File operations */
 extern const struct file_operations briefs_dir_operations;
 extern const struct file_operations briefs_file_operations;
+
+/* address_space_operations */
+extern const struct address_space_operations briefs_aops;
+
+/* get_block callback - maps inode+iblock to buffer_head */
+int briefs_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create);
 
 /* super_operations */
 extern const struct super_operations briefs_super_ops;
