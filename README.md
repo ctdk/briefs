@@ -68,6 +68,7 @@ DEFINITELY MISSING OR BROKEN
 ----------------------------
 
 * Reusing inodes
+* Some journal functionality is missing.
 * FUSE implementation (requires less commitment than the kernel module)
 * Thorough annotations - Annotating the source code thoroughly will wait until tings settle down. Right now everything's still in constant flux, so there's no point thoroughly annotating something that may change unrecognizably or flat out disappear soon.
 * Refactoring. Since BrieFS is partly a project to learn about using AI assistance while coding, even though I've been reviewing what it's doing there's definitely some weirdness and clunkiness that needs to be gussied up and organized so it's easier to understand. This will go nicely hand in hand with the annotation project above.
