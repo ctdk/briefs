@@ -12,6 +12,8 @@
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
 
+static void briefs_free_inode_data(struct inode *inode);
+
 /*
  * Data region start: the allocator trie uses data-relative block numbers
  * with block 0 being the first data block on disk.  Convert to absolute
@@ -365,14 +367,12 @@ static int briefs_read_folio(struct file *file, struct folio *folio)
 	return mpage_read_folio(folio, briefs_get_block);
 }
 
-/* writepage: not used — writes go through direct sb_bread in write_iter */
-static int briefs_writepage(struct page *page, struct writeback_control *wbc)
+/* cribbing from xiafs rather than use the frankly shocking no-op openclaw
+ * suggested. I don't think briefs actually has trouble with running on loopback
+ * devices. o_O */
+static int briefs_writepages(struct address_space *mapping, struct writeback_control *wbc)
 {
-	/* Page cache writes go through briefs_write_iter which does
-	 * direct sb_bread writes. The page cache stays coherent via
-	 * invalidation after each write. Return 0 to keep the page
-	 * clean in the cache without I/O submission. */
-	return 0;
+	return mpage_writepages(mapping, wbc, briefs_get_block);
 }
 
 /* bmap: map file block to physical block */
@@ -381,23 +381,33 @@ static sector_t briefs_bmap(struct address_space *mapping, sector_t block)
 	return generic_block_bmap(mapping, block, briefs_get_block);
 }
 
-/* address_space_operations for BrieFS regular files.
- * Only read_folio and bmap are used (for mmap/exec).
- * Writes go through direct sb_bread in briefs_write_iter.
- */
-const struct address_space_operations briefs_aops = {
-	.dirty_folio	= block_dirty_folio,
-	.invalidate_folio = block_invalidate_folio,
-	.read_folio	= briefs_read_folio,
-	.writepage	= briefs_writepage,
-	.bmap		= briefs_bmap,
-	.migrate_folio	= buffer_migrate_folio,
-	.is_partially_uptodate = block_is_partially_uptodate,
-};
+/* cribbed from xiafs, at least for now. */
+static int briefs_write_begin(struct file *file, struct address_space *mapping, loff_t pos, unsigned len, struct folio **foliop, void **fsdata) {
+	int ret;
+	ret = block_write_begin(mapping, pos, len, foliop, briefs_get_block);
+
+	if (unlikely(ret)) {
+		loff_t isize = mapping->host->i_size;
+		if (pos + len > isize) {
+			truncate_pagecache(mapping->host, isize);
+			briefs_free_inode_data(mapping->host);
+		}
+	}
+
+	return ret;
+}
 
 /* Read file — uses page cache via generic_file_read_iter */
 ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to) {
 	return generic_file_read_iter(iocb, to);
+}
+
+static inline void briefs_write_truncate_info(struct inode *inode, loff_t range_start, loff_t range_end) {
+	/* Invalidate page cache so reads from the same range
+	 * will fetch from disk through read_folio */
+	invalidate_inode_pages2_range(inode->i_mapping,
+		range_start >> PAGE_SHIFT,
+		range_end >> PAGE_SHIFT);
 }
 
 /* Write file — direct sb_bread writes, bypassing page cache writeback */
@@ -411,10 +421,16 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from) {
 	ssize_t ret = 0;
 	struct timespec64 now;
 
-	pr_debug("briefs: write_iter pos=%lld count=%zu\n", pos, count);
+	pr_debug("briefs: write_iter pos=%lld count=%zu i_size=%lld ki_filp->f_flags=0x%x\n", pos, count, inode->i_size, iocb->ki_filp->f_flags);
 
 	if (pos < 0)
 		return -EINVAL;
+
+	/* Handle O_APPEND: write at end of file */
+	if (iocb->ki_filp->f_flags & O_APPEND) {
+		pos = inode->i_size;
+		iocb->ki_pos = pos;
+	}
 
 	while (count > 0) {
 		u64 file_block = pos / BRIEFS_BLOCK_SIZE;
@@ -1726,3 +1742,22 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 	pr_debug("briefs: renamed %pd -> %pd\n", old_dentry, new_dentry);
 	return 0;
 }
+
+/* address_space_operations for BrieFS regular files.
+ * Only read_folio and bmap are used (for mmap/exec).
+ * Writes go through direct sb_bread in briefs_write_iter.
+ *
+ * Taking some inspiration from xiafs for some of these operations.
+ */
+const struct address_space_operations briefs_aops = {
+	.dirty_folio	= block_dirty_folio,
+	.invalidate_folio = block_invalidate_folio,
+	.read_folio	= briefs_read_folio,
+	.writepages	= briefs_writepages,
+	.bmap		= briefs_bmap,
+	.migrate_folio	= buffer_migrate_folio,
+	.is_partially_uptodate = block_is_partially_uptodate,
+	.direct_IO  	= noop_direct_IO,
+	.write_begin 	= briefs_write_begin,
+	.write_end 	= generic_write_end,
+};

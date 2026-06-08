@@ -379,7 +379,7 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 					brelse(cbh);
 					return -ENOSPC;
 				}
-				briefs_trie_init_block(sb, internal, pos + 1, bval, NODE_TYPE_INTERM);
+				briefs_trie_init_block(sb, internal, pos + 1, 0, NODE_TYPE_INTERM);
 
 				bh = sb_bread(sb, cur);
 				if (bh) {
@@ -414,6 +414,7 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 				}
 
 				cnode->depth = pos + 1;
+				cnode->byte_val = 0; /* end-of-string sentinel */
 				mark_buffer_dirty(cbh);
 				sync_dirty_buffer(cbh);
 				brelse(cbh);
