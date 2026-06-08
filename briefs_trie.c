@@ -521,7 +521,8 @@ split_leaf:
 			 * Convert it to an INTERM node with
 			 * NODE_STATUS_LEAF set, and continue descending
 			 * for the remaining bytes of the new name.
-			 * The old leaf's ftype is preserved in reserved[0].
+			 * The old leaf's ftype is preserved in f_type (formerly
+			 * reserved[0]).
 			 */
 			lnode->node_type = NODE_TYPE_INTERM | NODE_STATUS_LEAF;
 			lnode->depth = pos + 1;

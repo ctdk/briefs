@@ -338,13 +338,14 @@ struct briefs_trie_node {
 	__u8  depth;              /* depth in trie (0 = root) */
 	__u8  node_type;          /* NODE_TYPE_* */
 	__u8  byte_val;           /* the byte value this node represents (internal nodes) */
-	__u8  reserved[5];
+	__u8  f_type; 		  /* file type, formerly reserved[0] */
+	__u8  reserved[4];
 	__u64 flags;              /* NODE_FLAG_* */
 
 	/* Leaf entry data.  Valid when TRIE_IS_LEAF(node) is true —
 	 * includes pure leaf nodes and NODE_TYPE_INTERM nodes with
 	 * NODE_STATUS_LEAF set.  The file type (ftype) for leaf entries
-	 * is stored in reserved[0]. */
+	 * is stored in ftype (formerly reserved[0]). */
 	__u64 inode;              /* inode number */
 	__u16 name_len;           /* full name length (not just remaining bytes) */
 	__u16 name_offset;        /* offset from block end to name bytes */
@@ -355,8 +356,8 @@ struct briefs_trie_node {
  * The node_type field is used for trie structure only (INTERM, STATUS_LEAF);
  * the actual file type (ftype from S_IFMT >> 12) lives here.
  */
-#define TRIE_NODE_FTYPE(node) ((node)->reserved[0])
-#define TRIE_SET_FTYPE(node, ftype) ((node)->reserved[0] = (ftype))
+#define TRIE_NODE_FTYPE(node) ((node)->f_type)
+#define TRIE_SET_FTYPE(node, ftype) ((node)->f_type = (ftype))
 
 /*
  * Trie block header - immediately follows trie nodes within a block
