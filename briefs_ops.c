@@ -2120,6 +2120,9 @@ static int briefs_link(struct dentry *old_dentry, struct inode *dir,
 	/* Increment nlink on the inode */
 	inc_nlink(inode);
 
+	/* Journal the nlink change */
+	briefs_journal_inode_update(bsi->journal, inode);
+
 	/* Update parent directory size */
 	dir->i_size += sizeof(struct briefs_dir_entry) + 2 + new_dentry->d_name.len;
 	briefs_i(dir)->disk_inode.filesize = dir->i_size;
@@ -2204,9 +2207,14 @@ int briefs_unlink(struct inode *dir, struct dentry *dentry) {
 		drop_nlink(inode);
 	}
 
+	/* Journal the nlink change */
+	briefs_journal_inode_update(bsi->journal, inode);
+
 	/* If directory, also drop parent's nlink (.. reference) */
-	if (S_ISDIR(inode->i_mode))
+	if (S_ISDIR(inode->i_mode)) {
 		drop_nlink(dir);
+		briefs_journal_inode_update(bsi->journal, dir);
+	}
 
 	/* Update parent inode on disk */
 	{
@@ -2278,7 +2286,9 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 	if (old_dir != new_dir) {
 		if (S_ISDIR(inode->i_mode)) {
 			drop_nlink(old_dir);
+			briefs_journal_inode_update(bsi->journal, old_dir);
 			inc_nlink(new_dir);
+			briefs_journal_inode_update(bsi->journal, new_dir);
 		}
 	}
 

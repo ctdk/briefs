@@ -353,6 +353,92 @@ static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
 }
 
 /*
+ * Replay a JRN_INODE_UPDATE record.
+ * Writes the recorded inode state back to the on-disk inode block.
+ */
+static int replay_inode_update(struct super_block *sb, struct jrn_inode_update *rec)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct buffer_head *bh = NULL;
+	struct briefs_inode *di;
+	u64 inodeTableBlock, inodeBlock, inodeOffset;
+
+	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+	u64 idx = rec->ino - 1;
+	inodeBlock = idx / (sb->s_blocksize / BRIEFS_INODE_SIZE);
+	inodeOffset = (idx % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+
+	bh = sb_bread(sb, inodeTableBlock + inodeBlock);
+	if (!bh) {
+		pr_warn("briefs: replay can't read inode block for %llu (skip)\n", rec->ino);
+		return 0;
+	}
+
+	di = (struct briefs_inode *)(bh->b_data + inodeOffset);
+
+	di->inode_number = rec->ino;
+	di->magic = 0x494E4F44;
+	di->filemode = rec->mode;
+	di->nlinks = rec->nlink;
+	di->uid = rec->uid;
+	di->gid = rec->gid;
+	di->filesize = rec->size;
+	di->atime_sec = rec->atime_sec;
+	di->atime_nsec = rec->atime_nsec;
+	di->mtime_sec = rec->mtime_sec;
+	di->mtime_nsec = rec->mtime_nsec;
+	di->ctime_sec = rec->ctime_sec;
+	di->ctime_nsec = rec->ctime_nsec;
+	di->flags = rec->flags;
+
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+
+	pr_debug("briefs: replay restored inode %llu (mode=%o nlink=%u size=%llu)\n",
+		rec->ino, rec->mode, rec->nlink, rec->size);
+	return 0;
+}
+
+/*
+ * Replay a JRN_EXTENT_ALLOC record.
+ * Marks the data blocks in the extent as allocated in the bitmap.
+ */
+static int replay_extent_alloc(struct super_block *sb, struct jrn_extent_alloc *rec)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	u64 b;
+
+	for (b = 0; b < rec->length; b++) {
+		u64 abs_block = rec->phys_start + b;
+		u64 rel_block = abs_to_data(bsi->sb, abs_block);
+		briefs_reserve_block(&bsi->alloc, rel_block);
+	}
+
+	pr_debug("briefs: replay reserved %llu data blocks at phys=%llu for ino=%llu\n",
+		rec->length, rec->phys_start, rec->ino);
+	return 0;
+}
+
+/*
+ * Replay a JRN_EXTENT_FREE record.
+ *
+ * We do not re-free blocks here because JRN_EXTENT_FREE does not carry
+ * phys_start — only offset + length.  Without the physical address we
+ * cannot reliably mark blocks free in the bitmap.  This is safe: if we
+ * crashed after the free record was written, the blocks were already freed
+ * from the allocator before the record was logged.  At worst, a few blocks
+ * remain marked allocated on disk (false positive), causing premature
+ * ENOSPC but never data corruption.  A subsequent fsck can reclaim them.
+ */
+static int replay_extent_free(struct super_block *sb, struct jrn_extent_free *rec)
+{
+	pr_debug("briefs: replay skipping EXTENT_FREE for ino=%llu offset=%llu len=%llu\n",
+		rec->ino, rec->offset, rec->length);
+	return 0;
+}
+
+/*
  * Mount/recovery: replay journal from last checkpoint.
  *
  * Walks the journal from journal_log_start to journal_log_end and re-applies
@@ -422,9 +508,24 @@ int briefs_journal_replay(struct briefs_journal *j) {
 			}
 			case JRN_INODE_ALLOC: {
 				struct jrn_inode_alloc *ia = rec_data;
-				u64 inum = ia->ino; /* 1-based inode */
+				u64 inum = ia->ino;
 				if (inum > 0)
 					briefs_reserve_block(&bsi->inode_alloc, inum - 1);
+				break;
+			}
+			case JRN_INODE_UPDATE: {
+				struct jrn_inode_update *iu = rec_data;
+				apply_ret = replay_inode_update(sb, iu);
+				break;
+			}
+			case JRN_EXTENT_ALLOC: {
+				struct jrn_extent_alloc *ea = rec_data;
+				apply_ret = replay_extent_alloc(sb, ea);
+				break;
+			}
+			case JRN_EXTENT_FREE: {
+				struct jrn_extent_free *ef = rec_data;
+				apply_ret = replay_extent_free(sb, ef);
 				break;
 			}
 			default:
@@ -506,7 +607,7 @@ int briefs_journal_extent_alloc(struct briefs_journal *j, u64 ino,
 }
 
 /*
- * Log a block free (extent removal).
+ * Log an extent free (block removal).
  */
 int briefs_journal_extent_free(struct briefs_journal *j, u64 ino,
 			       u64 offset, u64 length)
@@ -521,6 +622,39 @@ int briefs_journal_extent_free(struct briefs_journal *j, u64 ino,
 	rec.length = length;
 
 	return briefs_journal_write_record(j, JRN_EXTENT_FREE, &rec, sizeof(rec));
+}
+
+/*
+ * Log an inode metadata update (mode, nlink, size, timestamps).
+ * Reads the current state from binfo->disk_inode and writes a
+ * JRN_INODE_UPDATE record.  Safe to call with NULL journal (no-op).
+ */
+int briefs_journal_inode_update(struct briefs_journal *j,
+				 struct inode *inode)
+{
+	struct jrn_inode_update rec;
+	struct briefs_inode_info *binfo;
+
+	if (!j) return 0;
+
+	binfo = briefs_i(inode);
+
+	memset(&rec, 0, sizeof(rec));
+	rec.ino = inode->i_ino;
+	rec.mode = inode->i_mode;
+	rec.nlink = inode->i_nlink;
+	rec.uid = from_kuid(&init_user_ns, inode->i_uid);
+	rec.gid = from_kgid(&init_user_ns, inode->i_gid);
+	rec.size = inode->i_size;
+	rec.atime_sec = inode->i_atime_sec;
+	rec.atime_nsec = inode->i_atime_nsec;
+	rec.mtime_sec = inode->i_mtime_sec;
+	rec.mtime_nsec = inode->i_mtime_nsec;
+	rec.ctime_sec = inode->i_ctime_sec;
+	rec.ctime_nsec = inode->i_ctime_nsec;
+	rec.flags = binfo->disk_inode.flags;
+
+	return briefs_journal_write_record(j, JRN_INODE_UPDATE, &rec, sizeof(rec));
 }
 
 /*

@@ -247,7 +247,6 @@ u64 briefs_alloc_block(struct briefs_alloc *alloc)
 /*
  * briefs_reserve_block - mark a specific block as allocated in the bitmap.
  * Used during journal replay to ensure bitmap consistency.
- * Returns 0 on success, -EINVAL if already allocated or out of range.
  */
 void briefs_reserve_block(struct briefs_alloc *alloc, u64 rel_block)
 {
@@ -263,10 +262,11 @@ void briefs_reserve_block(struct briefs_alloc *alloc, u64 rel_block)
 	w0 = w1 / 64;
 	b0 = w1 % 64;
 
-	/* If already allocated, nothing to do */
+	/* If already allocated (bit already 0), nothing to do */
 	if (!(alloc->l2[w2] & (1ULL << b2)))
 		return;
 
+	/* Clear the bit = mark allocated, update free count */
 	alloc->l2[w2] &= ~(1ULL << b2);
 	alloc->free_count--;
 
