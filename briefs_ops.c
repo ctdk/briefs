@@ -45,6 +45,7 @@ static int briefs_link(struct dentry *old_dentry, struct inode *dir,
 		       struct dentry *new_dentry);
 static int briefs_dir_open(struct inode *inode, struct file *file);
 static int briefs_dir_release(struct inode *inode, struct file *file);
+static int briefs_sync_fs(struct super_block *sb, int wait);
 
 /* Inode operations for directories */
 const struct inode_operations briefs_dir_inode_ops = {
@@ -93,6 +94,7 @@ const struct file_operations briefs_file_operations = {
 /* Superblock operations */
 const struct super_operations briefs_super_ops = {
 	.put_super = briefs_put_super,
+	.sync_fs = briefs_sync_fs,
 	.statfs = briefs_statfs,
 	.write_inode = briefs_write_inode,
 	.evict_inode = briefs_evict_inode,
@@ -597,13 +599,36 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from) {
 /* briefs_fsync - sync file data and metadata to disk */
 int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
 	struct inode *inode = file->f_mapping->host;
+	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
 	int ret;
 
 	ret = file_write_and_wait_range(file, start, end);
 	if (ret)
 		return ret;
 
-	return sync_inode_metadata(inode, 1);
+	ret = sync_inode_metadata(inode, 1);
+	if (ret)
+		return ret;
+
+	/* Flush journal to disk on explicit fsync */
+	if (bsi->journal && bsi->journal->dirty) {
+		ret = briefs_journal_sync(bsi->journal);
+	}
+
+	return ret;
+}
+
+/*
+ * briefs_sync_fs - sync the filesystem (called by sync(2), syncfs(2), umount).
+ * Flushes the journal to ensure crash-recovery ordering is up to date.
+ */
+int briefs_sync_fs(struct super_block *sb, int wait)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+
+	if (bsi->journal && bsi->journal->dirty)
+		return briefs_journal_sync(bsi->journal);
+	return 0;
 }
 
 /* Open file */
@@ -1633,15 +1658,6 @@ static int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		}
 	}
 
-	/* Sync journal */
-	if (bsi->journal && bsi->journal->dirty) {
-		ret = briefs_journal_sync(bsi->journal);
-		if (ret) {
-			iput(inode);
-			return ret;
-		}
-	}
-
 	d_instantiate(dentry, inode);
 
 	pr_debug("briefs: symlink inode %llu -> %s added to dir\n", ino, symname);
@@ -1791,15 +1807,6 @@ static int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 			mark_buffer_dirty(pbh);
 			sync_dirty_buffer(pbh);
 			brelse(pbh);
-		}
-	}
-
-	/* Sync journal */
-	if (bsi->journal && bsi->journal->dirty) {
-		ret = briefs_journal_sync(bsi->journal);
-		if (ret) {
-			iput(inode);
-			return ret;
 		}
 	}
 
@@ -2067,26 +2074,19 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	}
 
 	/* Write parent inode */
-	{u64 pIno = dir->i_ino;
-	u64 pIdx = pIno - 1;
-	u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
-	u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-	struct buffer_head *pbh = sb_bread(dir->i_sb, inodeTableBlock + pBlk);
-	if (pbh) {
-		struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + pOff);
-		pdi->filesize = dir->i_size;
-		pdi->nlinks = dir->i_nlink;
-		mark_buffer_dirty(pbh);
-		sync_dirty_buffer(pbh);
-		brelse(pbh);
-	}}
-
-	/* Sync journal */
-	if (bsi->journal && bsi->journal->dirty) {
-		ret = briefs_journal_sync(bsi->journal);
-		if (ret) {
-			iput(inode);
-			return ret;
+	{
+		u64 pIno = dir->i_ino;
+		u64 pIdx = pIno - 1;
+		u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
+		u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+		struct buffer_head *pbh = sb_bread(dir->i_sb, inodeTableBlock + pBlk);
+		if (pbh) {
+			struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + pOff);
+			pdi->filesize = dir->i_size;
+			pdi->nlinks = dir->i_nlink;
+			mark_buffer_dirty(pbh);
+			sync_dirty_buffer(pbh);
+			brelse(pbh);
 		}
 	}
 
@@ -2192,12 +2192,6 @@ static int briefs_link(struct dentry *old_dentry, struct inode *dir,
 		}
 	}
 
-	/* Sync journal */
-	if (bsi->journal && bsi->journal->dirty) {
-		ret = briefs_journal_sync(bsi->journal);
-		if (ret) return ret;
-	}
-
 	ihold(inode);
 	d_instantiate(new_dentry, inode);
 
@@ -2261,12 +2255,6 @@ int briefs_unlink(struct inode *dir, struct dentry *dentry) {
 			sync_dirty_buffer(pbh);
 			brelse(pbh);
 		}
-	}
-
-	/* Sync journal */
-	if (bsi->journal && bsi->journal->dirty) {
-		ret = briefs_journal_sync(bsi->journal);
-		if (ret) return ret;
 	}
 
 	pr_debug("briefs: unlinked %pd\n", dentry);
@@ -2357,12 +2345,6 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 				brelse(pbh);
 			}
 		}
-	}
-
-	/* Sync journal */
-	if (bsi->journal && bsi->journal->dirty) {
-		ret = briefs_journal_sync(bsi->journal);
-		if (ret) return ret;
 	}
 
 	pr_debug("briefs: renamed %pd -> %pd\n", old_dentry, new_dentry);
