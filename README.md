@@ -74,4 +74,14 @@ DEFINITELY MISSING OR BROKEN
 LICENSE
 -------
 
-BrieFS is dual licensed under the MIT license or the GNU GPL, version 2.0 only.
+BrieFS is dual licensed under the MIT license or the GNU GPL, version 2.0 only. See both LICENSE files for details.
+
+AUTHOR
+------
+
+Jeremy Bingham <jbingham@gmail.com>
+
+COPYRIGHT
+---------
+
+Copyright (c) 2026, Jeremy Bingham
