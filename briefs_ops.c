@@ -35,12 +35,17 @@ static inline u64 briefs_compute_i_blocks(struct briefs_inode *di)
 
 /* Forward declaration */
 static void briefs_free_inode_num(struct super_block *sb, u64 ino);
+static int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+			  struct dentry *dentry, const char *symname);
+static const char *briefs_get_link(struct dentry *dentry, struct inode *inode,
+				    struct delayed_call *done);
 
 /* Inode operations for directories */
 const struct inode_operations briefs_dir_inode_ops = {
 	.create = briefs_create,
 	.lookup = briefs_lookup,
 	.mkdir = briefs_mkdir,
+	.symlink = briefs_symlink,
 	.unlink = briefs_unlink,
 	.rmdir = briefs_unlink,
 	.rename = briefs_rename,
@@ -50,6 +55,11 @@ const struct inode_operations briefs_dir_inode_ops = {
 const struct inode_operations briefs_file_inode_ops = {
 	.setattr = briefs_setattr,
 	.getattr = briefs_getattr,
+};
+
+/* Inode operations for symlinks */
+const struct inode_operations briefs_symlink_inode_ops = {
+	.get_link = briefs_get_link,
 };
 
 /* File operations for directories */
@@ -951,6 +961,9 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 			inode->i_op = &briefs_file_inode_ops;
 			inode->i_fop = &briefs_file_operations;
 			inode->i_mapping->a_ops = &briefs_aops;
+		} else if (S_ISLNK(inode->i_mode)) {
+			inode->i_op = &briefs_symlink_inode_ops;
+			/* no i_fop for symlinks */
 		}
 
 		pr_info("briefs: inode %llu: mode=0x%04x, uid=%u, gid=%u, size=%llu, nlink=%u\n",
@@ -1336,6 +1349,272 @@ static void briefs_free_inode_num(struct super_block *sb, u64 ino) {
 		return;
 	briefs_free_block(&bsi->inode_alloc, ino - 1);
 	pr_debug("briefs: freed inode %llu\n", ino);
+}
+
+/*
+ * briefs_symlink - create a symbolic link.
+ * Stores the symlink target path as file data using the normal
+ * data block / extent mechanism.
+ */
+static int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+			   struct dentry *dentry, const char *symname)
+{
+	struct briefs_sb_info *bsi = dir->i_sb->s_fs_info;
+	struct inode *inode;
+	struct buffer_head *bh;
+	struct briefs_inode *disk_inode;
+	u64 ino;
+	u64 inodeTableBlock, inodeBlock, inodeOffset, inodeIndex;
+	int ret;
+	size_t len = strlen(symname);
+	struct timespec64 now;
+
+	pr_debug("briefs: symlink %pd -> %s in dir %lu\n", dentry, symname, dir->i_ino);
+
+	if (len == 0 || len > BRIEFS_NAME_LEN * 10)
+		return -ENAMETOOLONG;
+
+	/* Allocate new inode */
+	ino = briefs_alloc_inode(dir->i_sb);
+	if (ino == 0)
+		return -ENOSPC;
+
+	/* Log inode allocation */
+	if (bsi->journal) {
+		struct jrn_inode_alloc irec;
+		memset(&irec, 0, sizeof(irec));
+		irec.ino = ino;
+		irec.mode = S_IFLNK | 0777;
+		irec.nlink = 1;
+		ret = briefs_journal_write_record(bsi->journal, JRN_INODE_ALLOC, &irec, sizeof(irec));
+		if (ret) return ret;
+	}
+
+	/* Log directory entry */
+	if (bsi->journal) {
+		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, ino,
+						dentry->d_name.name, dentry->d_name.len, 0);
+		if (ret) return ret;
+	}
+
+	/* Create new inode */
+	inode = iget_locked(dir->i_sb, ino);
+	if (!inode)
+		return -ENOMEM;
+
+	if (inode->i_state & I_NEW) {
+		struct briefs_inode_info *binfo = briefs_i(inode);
+		memset(&binfo->disk_inode, 0, sizeof(struct briefs_inode));
+		binfo->inode_number = ino;
+
+		inode->i_mode = S_IFLNK | 0777;
+		inode->i_uid = current_fsuid();
+		inode->i_gid = current_fsgid();
+		inode->i_size = len;
+		inode->i_blocks = 0;
+		set_nlink(inode, 1);
+
+		ktime_get_real_ts64(&now);
+		inode->i_atime_sec = inode->i_mtime_sec = inode->i_ctime_sec = now.tv_sec;
+		inode->i_atime_nsec = inode->i_mtime_nsec = inode->i_ctime_nsec = now.tv_nsec;
+
+		binfo->disk_inode.inode_number = ino;
+		binfo->disk_inode.magic = 0x494E4F44;
+		binfo->disk_inode.filemode = S_IFLNK | 0777;
+		binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
+		binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);
+		binfo->disk_inode.filesize = len;
+		binfo->disk_inode.nlinks = 1;
+		binfo->disk_inode.num_extents_inline = 0;
+		binfo->disk_inode.num_extents_total = 0;
+		binfo->disk_inode.atime_sec = inode->i_atime_sec;
+		binfo->disk_inode.atime_nsec = inode->i_atime_nsec;
+		binfo->disk_inode.mtime_sec = inode->i_mtime_sec;
+		binfo->disk_inode.mtime_nsec = inode->i_mtime_nsec;
+		binfo->disk_inode.ctime_sec = inode->i_ctime_sec;
+		binfo->disk_inode.ctime_nsec = inode->i_ctime_nsec;
+		binfo->disk_inode.creation_time_sec = inode->i_ctime_sec;
+		binfo->disk_inode.creation_time_nsec = inode->i_ctime_nsec;
+
+		inode->i_op = &briefs_symlink_inode_ops;
+		/* no i_fop for symlinks — VFS uses get_link directly */
+
+		unlock_new_inode(inode);
+	} else {
+		iput(inode);
+		return -EEXIST;
+	}
+
+	/* Write the inode to disk first so extent storage can find it */
+	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+	inodeIndex = ino - 1;
+	inodeBlock = inodeIndex / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
+	inodeOffset = (inodeIndex % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+
+	bh = sb_bread(dir->i_sb, inodeTableBlock + inodeBlock);
+	if (!bh) {
+		iput(inode);
+		return -EIO;
+	}
+	disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
+	memcpy(disk_inode, &briefs_i(inode)->disk_inode, sizeof(struct briefs_inode));
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+
+	/*
+	 * Store the symlink target as file data.  Use the same
+	 * data-block + extent mechanism as regular file writes.
+	 * For short targets this fits in a single inline extent.
+	 */
+	if (len > 0) {
+		u64 rel = briefs_alloc_block(&bsi->alloc);
+		if (rel == 0) {
+			iput(inode);
+			return -ENOSPC;
+		}
+		u64 phys = data_to_abs(bsi->sb, rel);
+
+		bh = sb_bread(dir->i_sb, phys);
+		if (!bh) {
+			briefs_free_block(&bsi->alloc, rel);
+			iput(inode);
+			return -EIO;
+		}
+		memset(bh->b_data, 0, dir->i_sb->s_blocksize);
+		memcpy(bh->b_data, symname, len);
+		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);
+		brelse(bh);
+
+		struct briefs_extent ext;
+		ext.offset = 0;
+		ext.phys = phys;
+		ext.len = 1;
+		ext.flags = 0;
+		ret = briefs_append_extent(dir->i_sb, &briefs_i(inode)->disk_inode, &ext);
+		if (ret != 0) {
+			briefs_free_block(&bsi->alloc, rel);
+			iput(inode);
+			return ret;
+		}
+
+		inode->i_blocks = (BRIEFS_BLOCK_SIZE / 512);
+		briefs_i(inode)->disk_inode.num_extents_total = 1;
+		briefs_i(inode)->disk_inode.num_extents_inline = 1;
+		memcpy(&briefs_i(inode)->disk_inode.inline_extents[0], &ext, sizeof(ext));
+
+		/* Persist updated inode with extent */
+		bh = sb_bread(dir->i_sb, inodeTableBlock + inodeBlock);
+		if (bh) {
+			disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
+			memcpy(disk_inode, &briefs_i(inode)->disk_inode, sizeof(struct briefs_inode));
+			mark_buffer_dirty(bh);
+			sync_dirty_buffer(bh);
+			brelse(bh);
+		}
+	}
+
+	/* Add directory entry to parent */
+	u8 ftype = (S_IFLNK >> 12) & 0xff;
+	ret = briefs_add_dir_entry(dir, dentry->d_name.name, dentry->d_name.len, ino, ftype);
+	if (ret) {
+		pr_err("briefs: failed to add symlink dir entry %pd: %d\n", dentry, ret);
+		iput(inode);
+		return ret;
+	}
+
+	/* Update parent inode */
+	{
+		struct briefs_inode_info *pbinfo = briefs_i(dir);
+		inc_nlink(dir);
+		dir->i_size += sizeof(struct briefs_dir_entry) + 2 + dentry->d_name.len;
+		pbinfo->disk_inode.filesize = dir->i_size;
+		pbinfo->disk_inode.nlinks = dir->i_nlink;
+	}
+
+	/* Write parent inode */
+	{
+		u64 pIno = dir->i_ino;
+		u64 pIdx = pIno - 1;
+		u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
+		u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+		struct buffer_head *pbh = sb_bread(dir->i_sb, inodeTableBlock + pBlk);
+		if (pbh) {
+			struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + pOff);
+			pdi->filesize = dir->i_size;
+			pdi->nlinks = dir->i_nlink;
+			mark_buffer_dirty(pbh);
+			sync_dirty_buffer(pbh);
+			brelse(pbh);
+		}
+	}
+
+	/* Sync journal */
+	if (bsi->journal && bsi->journal->dirty) {
+		ret = briefs_journal_sync(bsi->journal);
+		if (ret) {
+			iput(inode);
+			return ret;
+		}
+	}
+
+	d_instantiate(dentry, inode);
+
+	pr_debug("briefs: symlink inode %llu -> %s added to dir\n", ino, symname);
+	return 0;
+}
+
+/*
+ * briefs_get_link - read the symlink target path.
+ * Called by the VFS when following a symlink.
+ */
+static const char *briefs_get_link(struct dentry *dentry, struct inode *inode,
+				    struct delayed_call *done)
+{
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	char *link;
+
+	pr_debug("briefs: get_link inode=%lu\n", inode->i_ino);
+
+	if (!dentry)
+		return ERR_PTR(-ECHILD);
+
+	if (inode->i_size == 0)
+		return ERR_PTR(-ENOENT);
+
+	/* Allocate a kernel buffer for the target path */
+	link = kmalloc(inode->i_size + 1, GFP_KERNEL);
+	if (!link)
+		return ERR_PTR(-ENOMEM);
+
+	/* Read the target from the first extent */
+	if (binfo->disk_inode.num_extents_total > 0) {
+		struct briefs_extent ext;
+		int ret;
+
+		ret = briefs_read_extent(inode->i_sb, &binfo->disk_inode, 0, &ext);
+		if (ret != 0) {
+			kfree(link);
+			return ERR_PTR(ret);
+		}
+
+		struct buffer_head *bh = sb_bread(inode->i_sb, ext.phys);
+		if (!bh) {
+			kfree(link);
+			return ERR_PTR(-EIO);
+		}
+
+		memcpy(link, bh->b_data, inode->i_size);
+		link[inode->i_size] = '\0';
+		brelse(bh);
+	} else {
+		kfree(link);
+		return ERR_PTR(-EIO);
+	}
+
+	set_delayed_call(done, kfree_link, link);
+	return link;
 }
 
 /* briefs_lookup - find inode by name in directory trie */

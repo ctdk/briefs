@@ -295,7 +295,8 @@ struct briefs_extent_chain {
 #define BRIEFS_TRIE_MAGIC 0x54524E20
 
 /* Bitwise trie macros for directory trie */
-#define TRIE_IS_LEAF(node) ((node)->node_type & NODE_STATUS_LEAF)
+#define TRIE_IS_LEAF(node) (((node)->node_type & NODE_TYPE_INTERM) == 0 || \
+			((node)->node_type & NODE_STATUS_LEAF))
 
 /* Trie node flags */
 #define TRIE_FLAG_ROOT    0x00000001
@@ -311,6 +312,10 @@ struct briefs_extent_chain {
  * Set on NODE_TYPE_INTERM nodes whose name is a prefix of longer
  * names branching from this node (e.g. "file_1" when "file_10"
  * and "file_100" also exist).
+ *
+ * The file type (ftype) for leaf entries is stored in the reserved[0]
+ * byte of the trie node struct, not in node_type.  node_type is used
+ * purely for trie structure (INTERM, STATUS_LEAF).
  */
 #define NODE_STATUS_LEAF    0x08
 
@@ -336,12 +341,21 @@ struct briefs_trie_node {
 	__u64 flags;              /* NODE_FLAG_* */
 
 	/* Leaf entry data.  Valid when TRIE_IS_LEAF(node) is true —
-	 * includes pure leaf nodes (FILE/DIR) and NODE_TYPE_INTERM
-	 * nodes with NODE_STATUS_LEAF set. */
+	 * includes pure leaf nodes and NODE_TYPE_INTERM nodes with
+	 * NODE_STATUS_LEAF set.  The file type (ftype) for leaf entries
+	 * is stored in reserved[0]. */
 	__u64 inode;              /* inode number */
 	__u16 name_len;           /* full name length (not just remaining bytes) */
 	__u16 name_offset;        /* offset from block end to name bytes */
 };
+
+/*
+ * Helper to get/set the file type stored in a trie node's reserved[0].
+ * The node_type field is used for trie structure only (INTERM, STATUS_LEAF);
+ * the actual file type (ftype from S_IFMT >> 12) lives here.
+ */
+#define TRIE_NODE_FTYPE(node) ((node)->reserved[0])
+#define TRIE_SET_FTYPE(node, ftype) ((node)->reserved[0] = (ftype))
 
 /*
  * Trie block header - immediately follows trie nodes within a block
