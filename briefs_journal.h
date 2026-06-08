@@ -22,8 +22,12 @@ struct briefs_journal {
 	u64 journal_end;                  /* last journal block */
 	u64 checkpoint_block;             /* checkpoint area (last journal block) */
 	u64 checkpoint_seq;               /* current checkpoint sequence */
+	u32 records_since_checkpoint;      /* records written since last checkpoint */
 	bool dirty;                       /* has uncommitted changes */
 };
+
+/* Checkpoint threshold — perform a checkpoint after this many records */
+#define JRN_CHECKPOINT_INTERVAL 64
 
 /* Initialize journal from superblock */
 int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb);

@@ -203,6 +203,7 @@ int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_ty
 	j->write_offset += total_size;
 	j->cur_hdr->record_count++;
 	j->dirty = true;
+	j->records_since_checkpoint++;
 
 	return 0;
 }
@@ -262,6 +263,7 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
 	j->sb->journal_log_end = j->write_pos;
 
 	j->dirty = false;
+	j->records_since_checkpoint = 0;
 
 	return 0;
 }
@@ -704,6 +706,17 @@ int briefs_journal_sync(struct briefs_journal *j) {
 	j->dirty = false;
 
 	pr_debug("briefs: journal synced, write_pos=%llu\n", j->write_pos);
+
+	/*
+	 * Periodic checkpoint: if we've accumulated enough records since
+	 * the last checkpoint, flush one now.  This prevents the journal
+	 * from growing unbounded between unmounts and limits replay time.
+	 */
+	if (j->records_since_checkpoint >= JRN_CHECKPOINT_INTERVAL) {
+		ret = briefs_journal_checkpoint(j);
+		if (ret)
+			pr_warn("briefs: periodic checkpoint failed: %d\n", ret);
+	}
 
 	return 0;
 }
