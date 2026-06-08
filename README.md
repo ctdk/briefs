@@ -59,17 +59,19 @@ WORKS
 * statfs
 * journal replay on mount
 * truncate
+* cp -r works properly
+* symlinks and other special files
+* a set of tests
+* rm -r works (still testing edge cases)
 
 DEFINITELY MISSING OR BROKEN
 ----------------------------
 
-* Can't execute ELF binaries from a briefs filesystem right now.
-* Normally creating files, writing files, making directories, that sort of thing work fine. However, a test run of untarring the linux kernel sources in a directory on a briefs filesystem had a very impressive kablooie. Be gentle for now until that's sorted.
-* Creating things that aren't either regular files or directories (meaning, no symlinks, device files, named pipes, or so on).
+* hard links are missing, although symlinks work
 * Reusing inodes
 * FUSE implementation (requires less commitment than the kernel module)
-* Proper tests
 * Thorough annotations - Annotating the source code thoroughly will wait until tings settle down. Right now everything's still in constant flux, so there's no point thoroughly annotating something that may change unrecognizably or flat out disappear soon.
+* Refactoring. Since BrieFS is partly a project to learn about using AI assistance while coding, even though I've been reviewing what it's doing there's definitely some weirdness and clunkiness that needs to be gussied up and organized so it's easier to understand. This will go nicely hand in hand with the annotation project above.
 
 LICENSE
 -------
