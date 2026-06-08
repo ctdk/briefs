@@ -41,11 +41,14 @@ static const char *briefs_get_link(struct dentry *dentry, struct inode *inode,
 				    struct delayed_call *done);
 static int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 			 struct dentry *dentry, umode_t mode, dev_t rdev);
+static int briefs_link(struct dentry *old_dentry, struct inode *dir,
+		       struct dentry *new_dentry);
 
 /* Inode operations for directories */
 const struct inode_operations briefs_dir_inode_ops = {
 	.create = briefs_create,
 	.lookup = briefs_lookup,
+	.link = briefs_link,
 	.mkdir = briefs_mkdir,
 	.symlink = briefs_symlink,
 	.mknod = briefs_mknod,
@@ -2030,6 +2033,99 @@ int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dent
 
 	pr_debug("briefs: mkdir %pd (mode=%o)\n", dentry, mode);
 	return briefs_create(idmap, dir, dentry, mode, false);
+}
+
+/*
+ * briefs_link - create a hard link.
+ *
+ * Creates a new directory entry pointing at the same inode as old_dentry.
+ * The source entry remains unchanged — the inode gains an additional link.
+ */
+static int briefs_link(struct dentry *old_dentry, struct inode *dir,
+		       struct dentry *new_dentry)
+{
+	struct inode *inode = d_inode(old_dentry);
+	struct briefs_sb_info *bsi = dir->i_sb->s_fs_info;
+	u8 ftype;
+	int ret;
+
+	pr_debug("briefs: link %pd -> %pd in dir %lu\n", old_dentry, new_dentry, dir->i_ino);
+
+	if (!inode)
+		return -ENOENT;
+
+	/* Hard links to directories are not permitted */
+	if (S_ISDIR(inode->i_mode))
+		return -EPERM;
+
+	/* Log new entry creation */
+	if (bsi->journal) {
+		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, inode->i_ino,
+						new_dentry->d_name.name, new_dentry->d_name.len, 0);
+		if (ret) return ret;
+	}
+
+	/* Add directory entry pointing at the existing inode */
+	ftype = (inode->i_mode & S_IFMT) >> 12;
+	ret = briefs_add_dir_entry(dir, new_dentry->d_name.name,
+				   new_dentry->d_name.len, inode->i_ino, ftype);
+	if (ret) {
+		pr_err("briefs: link failed to add dir entry: %d\n", ret);
+		return ret;
+	}
+
+	/* Increment nlink on the inode */
+	inc_nlink(inode);
+
+	/* Update parent directory size */
+	dir->i_size += sizeof(struct briefs_dir_entry) + 2 + new_dentry->d_name.len;
+	briefs_i(dir)->disk_inode.filesize = dir->i_size;
+
+	/* Persist the target inode with updated nlink */
+	{
+		u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+		u64 ino = inode->i_ino;
+		u64 idx = ino - 1;
+		u64 blk = idx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
+		u64 off = (idx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+		struct buffer_head *bh = sb_bread(dir->i_sb, inodeTableBlock + blk);
+		if (bh) {
+			struct briefs_inode *di = (struct briefs_inode *)(bh->b_data + off);
+			di->nlinks = inode->i_nlink;
+			mark_buffer_dirty(bh);
+			sync_dirty_buffer(bh);
+			brelse(bh);
+		}
+	}
+
+	/* Persist the parent directory with updated size */
+	{
+		u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+		u64 pIdx = dir->i_ino - 1;
+		u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
+		u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+		struct buffer_head *pbh = sb_bread(dir->i_sb, inodeTableBlock + pBlk);
+		if (pbh) {
+			struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + pOff);
+			pdi->filesize = dir->i_size;
+			pdi->nlinks = dir->i_nlink;
+			mark_buffer_dirty(pbh);
+			sync_dirty_buffer(pbh);
+			brelse(pbh);
+		}
+	}
+
+	/* Sync journal */
+	if (bsi->journal && bsi->journal->dirty) {
+		ret = briefs_journal_sync(bsi->journal);
+		if (ret) return ret;
+	}
+
+	ihold(inode);
+	d_instantiate(new_dentry, inode);
+
+	pr_debug("briefs: link inode %lu now has %u links\n", inode->i_ino, inode->i_nlink);
+	return 0;
 }
 
 /* briefs_unlink - remove a directory entry */
