@@ -43,6 +43,8 @@ static int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 			 struct dentry *dentry, umode_t mode, dev_t rdev);
 static int briefs_link(struct dentry *old_dentry, struct inode *dir,
 		       struct dentry *new_dentry);
+static int briefs_dir_open(struct inode *inode, struct file *file);
+static int briefs_dir_release(struct inode *inode, struct file *file);
 
 /* Inode operations for directories */
 const struct inode_operations briefs_dir_inode_ops = {
@@ -72,7 +74,8 @@ const struct inode_operations briefs_symlink_inode_ops = {
 const struct file_operations briefs_dir_operations = {
 	.llseek = generic_file_llseek,
 	.iterate_shared = briefs_readdir,
-	.release = NULL,
+	.open = briefs_dir_open,
+	.release = briefs_dir_release,
 	.fsync = briefs_fsync,
 };
 
@@ -101,8 +104,8 @@ const struct super_operations briefs_super_ops = {
 /* briefs_readdir - enumerate directory contents */
 int briefs_readdir(struct file *file, struct dir_context *ctx) {
 	struct inode *dir = file_inode(file);
-	struct briefs_inode_info *binfo;
-	
+	struct trie_iter *iter;
+
 	pr_debug("briefs: readdir offset=%llu (trie)\n", ctx->pos);
 
 	if (!S_ISDIR(dir->i_mode))
@@ -115,48 +118,47 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 		ctx->pos = 2;
 	}
 
-	/* Iterate the directory trie starting from ctx->pos */
-	{
-		struct trie_iter *iter;
-		int trie_idx = ctx->pos > 2 ? ctx->pos - 2 : 0;
-		int target_idx = 0;
-
+	/*
+	 * Get or create the persistent trie iterator.
+	 * If ctx->pos is 2 (just past dots), this is the first call or
+	 * a seek to 0 — (re)initialize the iterator.
+	 * If the iterator doesn't exist (e.g. opened without briefs_dir_open),
+	 * allocate one now.
+	 */
+	iter = file->private_data;
+	if (!iter) {
+		struct briefs_inode_info *binfo = briefs_i(dir);
 		iter = kmalloc(sizeof(struct trie_iter), GFP_KERNEL);
 		if (!iter)
 			return -ENOMEM;
-
-		binfo = briefs_i(dir);
 		briefs_trie_iter_init(iter, &binfo->disk_inode);
+		file->private_data = iter;
+	} else if (ctx->pos == 2 && iter->sp > 0) {
+		/* Seek to 0: reinitialize */
+		struct briefs_inode_info *binfo = briefs_i(dir);
+		briefs_trie_iter_init(iter, &binfo->disk_inode);
+	}
 
-		while (1) {
-			char entry_name_buf[BRIEFS_NAME_LEN + 1];
-			int entry_name_len;
-			u64 entry_ino;
-			u8 entry_type;
+	/* Iterate the trie from the current iterator position */
+	while (1) {
+		char entry_name_buf[BRIEFS_NAME_LEN + 1];
+		int entry_name_len;
+		u64 entry_ino;
+		u8 entry_type;
 
-			if (briefs_trie_iter_next(dir->i_sb, iter, &entry_ino, &entry_type,
-			                         entry_name_buf, &entry_name_len) != 0)
-				break;
+		if (briefs_trie_iter_next(dir->i_sb, iter, &entry_ino, &entry_type,
+		                         entry_name_buf, &entry_name_len) != 0)
+			break;
 
-			if (target_idx < trie_idx) {
-				target_idx++;
-				ctx->pos++;
-				continue;
-			}
+		unsigned int file_type = (entry_type << 12) & S_IFMT;
 
-			unsigned int file_type = (entry_type << 12) & S_IFMT;
-
-			if (!dir_emit(ctx, entry_name_buf, entry_name_len,
-			              entry_ino, fs_umode_to_dtype(file_type))) {
-				kfree(iter);
-				return 0;
-			}
-
-			ctx->pos++;
-			target_idx++;
+		if (!dir_emit(ctx, entry_name_buf, entry_name_len,
+		              entry_ino, fs_umode_to_dtype(file_type))) {
+			/* Buffer full — VFS will call us again with same ctx->pos */
+			return 0;
 		}
 
-		kfree(iter);
+		ctx->pos++;
 	}
 
 	return 0;
@@ -613,6 +615,35 @@ int briefs_open(struct inode *inode, struct file *file) {
 /* Release file */
 int briefs_release(struct inode *inode, struct file *file) {
 	pr_debug("briefs: release inode %lu\n", inode->i_ino);
+	return 0;
+}
+
+/* Open directory — allocate and initialize a persistent trie iterator */
+int briefs_dir_open(struct inode *inode, struct file *file) {
+	struct briefs_inode_info *binfo;
+	struct trie_iter *iter;
+
+	pr_debug("briefs: dir_open inode %lu\n", inode->i_ino);
+
+	if (!S_ISDIR(inode->i_mode))
+		return -ENOTDIR;
+
+	iter = kmalloc(sizeof(struct trie_iter), GFP_KERNEL);
+	if (!iter)
+		return -ENOMEM;
+
+	binfo = briefs_i(inode);
+	briefs_trie_iter_init(iter, &binfo->disk_inode);
+	file->private_data = iter;
+
+	return 0;
+}
+
+/* Release directory — free the persistent trie iterator */
+int briefs_dir_release(struct inode *inode, struct file *file) {
+	pr_debug("briefs: dir_release inode %lu\n", inode->i_ino);
+	kfree(file->private_data);
+	file->private_data = NULL;
 	return 0;
 }
 
