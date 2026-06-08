@@ -236,6 +236,11 @@ static int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 		di->inline_extents[n] = *ext;
 		di->num_extents_inline++;
 		di->num_extents_total++;
+
+		/* Journal the extent allocation */
+		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
+					    ext->offset, ext->phys,
+					    ext->len, n);
 		return 0;
 	}
 
@@ -249,6 +254,10 @@ static int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 			return -ENOSPC;
 		chain_block = data_to_abs(bsi->sb, rel);
 		di->extent_inline_base = chain_block;
+
+		/* Journal the chain block allocation */
+		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
+					    0, chain_block, 1, -1);
 
 		bh = sb_getblk(sb, chain_block);
 		if (!bh) {
@@ -277,6 +286,11 @@ static int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 			sync_dirty_buffer(bh);
 			brelse(bh);
 			di->num_extents_total++;
+
+			/* Journal the extent addition to chain */
+			briefs_journal_extent_alloc(bsi->journal, di->inode_number,
+						    ext->offset, ext->phys,
+						    ext->len, -1);
 			return 0;
 		}
 
@@ -299,6 +313,10 @@ static int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 		sync_dirty_buffer(bh);
 		brelse(bh);
 
+		/* Journal the new chain block allocation */
+		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
+					    0, new_block, 1, -1);
+
 		/* Set up new chain block */
 		bh = sb_getblk(sb, new_block);
 		if (!bh) {
@@ -313,6 +331,11 @@ static int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 		sync_dirty_buffer(bh);
 		brelse(bh);
 		di->num_extents_total++;
+
+		/* Journal the extent addition to chain */
+		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
+					    ext->offset, ext->phys,
+					    ext->len, -1);
 		return 0;
 	}
 }
@@ -1108,6 +1131,11 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			u64 blocks_to_free = ext_end - trunc_block;
 			u64 b;
 
+			/* Journal the partial extent free */
+			briefs_journal_extent_free(bsi->journal, inode->i_ino,
+						   ext.offset + ext.len - blocks_to_free,
+						   blocks_to_free);
+
 			for (b = 0; b < blocks_to_free; b++) {
 				u64 abs = ext.phys + ext.len - blocks_to_free + b;
 				u64 rel = abs_to_data(bsi->sb, abs);
@@ -1145,6 +1173,11 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		/* trunc_block <= ext_start - free the entire extent */
 		{
 			u64 b;
+
+			/* Journal the full extent free */
+			briefs_journal_extent_free(bsi->journal, inode->i_ino,
+						   ext.offset, ext.len);
+
 			for (b = 0; b < ext.len; b++) {
 				u64 abs = ext.phys + b;
 				u64 rel = abs_to_data(bsi->sb, abs);
@@ -1280,6 +1313,11 @@ static void briefs_free_inode_data(struct inode *inode)
 	for (i = 0; i < binfo->disk_inode.num_extents_total; i++) {
 		if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext) != 0)
 			break;
+
+		/* Journal the extent free */
+		briefs_journal_extent_free(bsi->journal, inode->i_ino,
+					   ext.offset, ext.len);
+
 		for (b = 0; b < ext.len; b++) {
 			u64 abs_block = ext.phys + b;
 			u64 rel_block = abs_to_data(bsi->sb, abs_block);
@@ -1295,6 +1333,11 @@ static void briefs_free_inode_data(struct inode *inode)
 		chain = (struct briefs_extent_chain *)bh->b_data;
 		next_chain = chain->next_overflow_block;
 		brelse(bh);
+
+		/* Journal the chain block free */
+		briefs_journal_extent_free(bsi->journal, inode->i_ino,
+					   0, 1);
+
 		briefs_free_block(&bsi->alloc, abs_to_data(bsi->sb, chain_block));
 		chain_block = next_chain;
 	}

@@ -63,4 +63,13 @@ u64 briefs_journal_prev_block(struct briefs_journal *j, u64 cur);
 int briefs_journal_dir_update(struct briefs_journal *j, u64 parent_ino, u64 child_ino,
                               const char *name, size_t name_len, u8 op);
 
+/* Log extent allocation */
+int briefs_journal_extent_alloc(struct briefs_journal *j, u64 ino,
+				 u64 offset, u64 phys_start,
+				 u64 length, int extent_index);
+
+/* Log extent free */
+int briefs_journal_extent_free(struct briefs_journal *j, u64 ino,
+			       u64 offset, u64 length);
+
 #endif /* _BRIEFS_JOURNAL_H */

@@ -480,6 +480,50 @@ int briefs_journal_dir_update(struct briefs_journal *j, u64 parent_ino, u64 chil
 }
 
 /*
+ * Log an extent allocation or extent append.
+ * ino: the inode the extent belongs to
+ * offset: logical block offset in the file
+ * phys_start: starting physical block (absolute)
+ * length: number of blocks
+ * extent_index: which inline extent slot this affects, or -1 for chain
+ */
+int briefs_journal_extent_alloc(struct briefs_journal *j, u64 ino,
+				 u64 offset, u64 phys_start,
+				 u64 length, int extent_index)
+{
+	struct jrn_extent_alloc rec;
+
+	if (!j) return 0; /* journal not active */
+
+	memset(&rec, 0, sizeof(rec));
+	rec.ino = ino;
+	rec.offset = offset;
+	rec.length = length;
+	rec.phys_start = phys_start;
+	rec.extent_index = (u32)extent_index;
+
+	return briefs_journal_write_record(j, JRN_EXTENT_ALLOC, &rec, sizeof(rec));
+}
+
+/*
+ * Log a block free (extent removal).
+ */
+int briefs_journal_extent_free(struct briefs_journal *j, u64 ino,
+			       u64 offset, u64 length)
+{
+	struct jrn_extent_free rec;
+
+	if (!j) return 0;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.ino = ino;
+	rec.offset = offset;
+	rec.length = length;
+
+	return briefs_journal_write_record(j, JRN_EXTENT_FREE, &rec, sizeof(rec));
+}
+
+/*
  * Cleanup journal
  */
 void briefs_journal_cleanup(struct briefs_journal *j) {
