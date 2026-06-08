@@ -4,6 +4,9 @@
 # ignore vagrant bits
 .vagrant/
 
+# ignore .bak files if created
+*.bak
+
 # ignore object files and other build artifacts
 *.o
 *.mod
