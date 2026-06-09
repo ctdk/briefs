@@ -73,8 +73,9 @@ struct jrn_extent_alloc {
 struct jrn_extent_free {
 	__u64 ino;            /* inode being modified */
 	__u64 offset;         /* logical block offset */
+	__u64 phys_start;     /* starting physical block */
 	__u64 length;         /* number of blocks freed */
-	__u8 reserved[56];    /* padding */
+	__u8 reserved[48];    /* padding to 64 bytes */
 };
 
 /* JRN_INODE_UPDATE */

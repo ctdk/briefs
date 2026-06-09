@@ -1243,8 +1243,9 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 			/* Journal the partial extent free */
 			briefs_journal_extent_free(bsi->journal, inode->i_ino,
-						   ext.offset + ext.len - blocks_to_free,
-						   blocks_to_free);
+					   ext.offset + ext.len - blocks_to_free,
+					   ext.phys + ext.len - blocks_to_free,
+					   blocks_to_free);
 
 			for (b = 0; b < blocks_to_free; b++) {
 				u64 abs = ext.phys + ext.len - blocks_to_free + b;
@@ -1288,7 +1289,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 			/* Journal the full extent free */
 			briefs_journal_extent_free(bsi->journal, inode->i_ino,
-						   ext.offset, ext.len);
+					   ext.offset, ext.phys, ext.len);
 
 			for (b = 0; b < ext.len; b++) {
 				u64 abs = ext.phys + b;
@@ -1432,7 +1433,7 @@ static void briefs_free_inode_data(struct inode *inode)
 
 		/* Journal the extent free */
 		briefs_journal_extent_free(bsi->journal, inode->i_ino,
-					   ext.offset, ext.len);
+					   ext.offset, ext.phys, ext.len);
 
 		/*
 		 * Sanity-check the extent length.  A corrupt ext.len (e.g. from
@@ -1465,7 +1466,7 @@ static void briefs_free_inode_data(struct inode *inode)
 
 		/* Journal the chain block free */
 		briefs_journal_extent_free(bsi->journal, inode->i_ino,
-					   0, 1);
+					   0, chain_block, 1);
 
 		briefs_free_block(&bsi->alloc, abs_to_data(bsi->sb, chain_block));
 		chain_block = next_chain;

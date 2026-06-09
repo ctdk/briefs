@@ -424,19 +424,21 @@ static int replay_extent_alloc(struct super_block *sb, struct jrn_extent_alloc *
 
 /*
  * Replay a JRN_EXTENT_FREE record.
- *
- * We do not re-free blocks here because JRN_EXTENT_FREE does not carry
- * phys_start — only offset + length.  Without the physical address we
- * cannot reliably mark blocks free in the bitmap.  This is safe: if we
- * crashed after the free record was written, the blocks were already freed
- * from the allocator before the record was logged.  At worst, a few blocks
- * remain marked allocated on disk (false positive), causing premature
- * ENOSPC but never data corruption.  A subsequent fsck can reclaim them.
+ * Marks the data blocks as free in the bitmap.
  */
 static int replay_extent_free(struct super_block *sb, struct jrn_extent_free *rec)
 {
-	pr_debug("briefs: replay skipping EXTENT_FREE for ino=%llu offset=%llu len=%llu\n",
-		rec->ino, rec->offset, rec->length);
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	u64 b;
+
+	for (b = 0; b < rec->length; b++) {
+		u64 abs_block = rec->phys_start + b;
+		u64 rel_block = abs_to_data(bsi->sb, abs_block);
+		briefs_free_block(&bsi->alloc, rel_block);
+	}
+
+	pr_debug("briefs: replay freed %llu data blocks at phys=%llu for ino=%llu\n",
+		 rec->length, rec->phys_start, rec->ino);
 	return 0;
 }
 
@@ -612,7 +614,7 @@ int briefs_journal_extent_alloc(struct briefs_journal *j, u64 ino,
  * Log an extent free (block removal).
  */
 int briefs_journal_extent_free(struct briefs_journal *j, u64 ino,
-			       u64 offset, u64 length)
+			       u64 offset, u64 phys_start, u64 length)
 {
 	struct jrn_extent_free rec;
 
@@ -621,6 +623,7 @@ int briefs_journal_extent_free(struct briefs_journal *j, u64 ino,
 	memset(&rec, 0, sizeof(rec));
 	rec.ino = ino;
 	rec.offset = offset;
+	rec.phys_start = phys_start;
 	rec.length = length;
 
 	return briefs_journal_write_record(j, JRN_EXTENT_FREE, &rec, sizeof(rec));

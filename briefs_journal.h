@@ -74,7 +74,7 @@ int briefs_journal_extent_alloc(struct briefs_journal *j, u64 ino,
 
 /* Log extent free */
 int briefs_journal_extent_free(struct briefs_journal *j, u64 ino,
-			       u64 offset, u64 length);
+			       u64 offset, u64 phys_start, u64 length);
 
 /* Log inode metadata update (nlink, mode, size, timestamps) */
 int briefs_journal_inode_update(struct briefs_journal *j,
