@@ -9,6 +9,7 @@
 #include <linux/buffer_head.h>
 #include <linux/mpage.h>
 #include <linux/seqlock.h>
+#include <linux/pagemap.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
@@ -84,8 +85,8 @@ const struct file_operations briefs_dir_operations = {
 /* File operations for regular files */
 const struct file_operations briefs_file_operations = {
 	.llseek = generic_file_llseek,
-	.read_iter = briefs_read_iter,
-	.write_iter = briefs_write_iter,
+	.read_iter = generic_file_read_iter,
+	.write_iter = generic_file_write_iter,
 	.open = briefs_open,
 	.release = briefs_release,
 	.mmap = generic_file_mmap,
@@ -480,162 +481,6 @@ static int briefs_write_begin(struct file *file, struct address_space *mapping, 
 		}
 	}
 
-	return ret;
-}
-
-/* Read file — uses page cache via generic_file_read_iter */
-ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to) {
-	return generic_file_read_iter(iocb, to);
-}
-
-static inline void briefs_write_truncate_info(struct inode *inode, loff_t range_start, loff_t range_end) {
-	/* Invalidate page cache so reads from the same range
-	 * will fetch from disk through read_folio */
-	invalidate_inode_pages2_range(inode->i_mapping,
-		range_start >> PAGE_SHIFT,
-		range_end >> PAGE_SHIFT);
-}
-
-/* Write file — direct sb_bread writes, bypassing page cache writeback */
-ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from) {
-	struct inode *inode = file_inode(iocb->ki_filp);
-	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
-	struct briefs_inode_info *binfo = briefs_i(inode);
-	loff_t pos = iocb->ki_pos;
-	size_t count = iov_iter_count(from);
-	size_t done = 0;
-	ssize_t ret = 0;
-	struct timespec64 now;
-
-	pr_debug("briefs: write_iter pos=%lld count=%zu i_size=%lld ki_filp->f_flags=0x%x\n", pos, count, inode->i_size, iocb->ki_filp->f_flags);
-
-	if (pos < 0)
-		return -EINVAL;
-
-	/* Handle O_APPEND: write at end of file */
-	if (iocb->ki_filp->f_flags & O_APPEND) {
-		pos = inode->i_size;
-		iocb->ki_pos = pos;
-	}
-
-	while (count > 0) {
-		u64 file_block = pos / BRIEFS_BLOCK_SIZE;
-		u64 offset_in_block = pos % BRIEFS_BLOCK_SIZE;
-		struct buffer_head *bh;
-		sector_t phys;
-		struct briefs_extent ext;
-		int i, ret2;
-
-		/* Check if block exists */
-		phys = 0;
-		for (i = 0; i < binfo->disk_inode.num_extents_total; i++) {
-			ret2 = briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext);
-			if (ret2 != 0) break;
-			if (file_block >= ext.offset && file_block < ext.offset + ext.len) {
-				phys = ext.phys + (file_block - ext.offset);
-				break;
-			}
-		}
-
-		if (phys == 0) {
-			/* Allocate new block */
-			u64 rel = briefs_alloc_block(&bsi->alloc);
-			if (rel == 0) {
-				ret = -ENOSPC;
-				break;
-			}
-			phys = data_to_abs(bsi->sb, rel);
-
-			struct briefs_extent new_ext;
-			new_ext.offset = (u64)file_block;
-			new_ext.phys = phys;
-			new_ext.len = 1;
-			new_ext.flags = 0;
-
-			ret2 = briefs_append_extent(inode->i_sb, &binfo->disk_inode, &new_ext);
-			if (ret2 != 0) {
-				briefs_free_block(&bsi->alloc, rel);
-				ret = ret2;
-				break;
-			}
-		}
-
-		bh = sb_bread(inode->i_sb, phys);
-		if (!bh) {
-			ret = -EIO;
-			break;
-		}
-
-		size_t chunk = min(count, BRIEFS_BLOCK_SIZE - offset_in_block);
-		size_t copied = copy_from_iter(bh->b_data + offset_in_block, chunk, from);
-		if (copied == 0) {
-			brelse(bh);
-			ret = -EFAULT;
-			break;
-		}
-
-		mark_buffer_dirty(bh);
-		sync_dirty_buffer(bh);
-		brelse(bh);
-
-		done += copied;
-		pos += copied;
-		count -= copied;
-	}
-
-	if (done > 0) {
-		iocb->ki_pos = pos;
-
-		if (pos > inode->i_size) {
-			inode->i_size = pos;
-			binfo->disk_inode.filesize = pos;
-		}
-
-		/* Compute i_blocks from all extents (inline + chain) */
-		{
-			struct briefs_extent ext;
-			u64 total_blocks = 0;
-			int j;
-			for (j = 0; j < binfo->disk_inode.num_extents_total; j++) {
-				if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, j, &ext) == 0)
-					total_blocks += ext.len;
-			}
-			inode->i_blocks = total_blocks * (BRIEFS_BLOCK_SIZE / 512);
-		}
-
-		ktime_get_real_ts64(&now);
-		inode->i_mtime_sec = now.tv_sec;
-		inode->i_mtime_nsec = now.tv_nsec;
-		binfo->disk_inode.mtime_sec = inode->i_mtime_sec;
-		binfo->disk_inode.mtime_nsec = inode->i_mtime_nsec;
-
-		/* Persist inode */
-		{
-			u64 ino = inode->i_ino;
-			u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
-			u64 idx = ino - 1;
-			u64 blk = idx / (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
-			u64 off = (idx % (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-			struct buffer_head *ibh = sb_bread(inode->i_sb, inodeTableBlock + blk);
-			if (ibh) {
-				struct briefs_inode *di = (struct briefs_inode *)(ibh->b_data + off);
-				memcpy(di, &binfo->disk_inode, sizeof(struct briefs_inode));
-				mark_buffer_dirty(ibh);
-				sync_dirty_buffer(ibh);
-				brelse(ibh);
-			}
-		}
-
-		/* Invalidate page cache so reads from the same range
-		 * will fetch from disk through read_folio */
-		invalidate_inode_pages2_range(inode->i_mapping,
-			iocb->ki_pos >> PAGE_SHIFT,
-			(iocb->ki_pos + done - 1) >> PAGE_SHIFT);
-
-		ret = done;
-	}
-
-	pr_debug("briefs: write_iter done=%zu\n", done);
 	return ret;
 }
 
@@ -2429,7 +2274,8 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 
 /* address_space_operations for BrieFS regular files.
  * Only read_folio and bmap are used (for mmap/exec).
- * Writes go through direct sb_bread in briefs_write_iter.
+ * address_space_operations for BrieFS regular files.
+ * All writes go through page cache via write_begin/write_end/writepages.
  *
  * Taking some inspiration from xiafs for some of these operations.
  */
