@@ -27,7 +27,7 @@
 /* Semantic versioning, yo */
 #define _BRIEFS_MAJOR_VER 0
 #define _BRIEFS_MINOR_VER 4
-#define _BRIEFS_PATCH_VER 0
+#define _BRIEFS_PATCH_VER 1
 
 /* Journal magic */
 #define JOURNAL_MAGIC 0x4A4E4C5A  /* "JNLZ" */
@@ -272,7 +272,7 @@ struct briefs_inode {
 	__u64 xattr_offset;
 	__u64 xattr_size;
 	__u64 parent_inode;
-	__u32 link_count; /* same as nlinks? */
+	__u32 unused; 		   /* used to duplicate nlinks, renamed */
 	__u32 flags;
 	__u64 dir_trie_root;       /* block number of directory trie root (dirs only) */
 	__u64 rdev;                /* device number (block/char special files) */
