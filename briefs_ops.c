@@ -754,14 +754,6 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	binfo->disk_inode.ctime_sec = inode->i_ctime_sec;
 	binfo->disk_inode.ctime_nsec = inode->i_ctime_nsec;
 
-	/* Sync VFS timestamp fields into in-memory copy first */
-	binfo->disk_inode.atime_sec = inode->i_atime_sec;
-	binfo->disk_inode.atime_nsec = inode->i_atime_nsec;
-	binfo->disk_inode.mtime_sec = inode->i_mtime_sec;
-	binfo->disk_inode.mtime_nsec = inode->i_mtime_nsec;
-	binfo->disk_inode.ctime_sec = inode->i_ctime_sec;
-	binfo->disk_inode.ctime_nsec = inode->i_ctime_nsec;
-
 	/*
 	 * Copy in-memory disk_inode to the on-disk buffer.
 	 * Use a seqcount retry loop to ensure we don't persist a
