@@ -488,6 +488,7 @@ struct briefs_inode_info {
 	struct inode vfs_inode;
 	struct briefs_inode disk_inode;
 	u64 inode_number;
+	seqcount_t extent_seq;   /* protects disk_inode extent fields */
 };
 
 /* yanked from the xiafs module, which in turn was yanked from minix */

@@ -8,6 +8,7 @@
 #include <linux/slab.h>
 #include <linux/buffer_head.h>
 #include <linux/mpage.h>
+#include <linux/seqlock.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
@@ -28,8 +29,16 @@ static inline u64 briefs_compute_i_blocks(struct briefs_inode *di)
 {
 	u64 blocks = 0;
 	int i;
-	for (i = 0; i < di->num_extents_inline; i++)
-		blocks += di->inline_extents[i].len;
+	struct briefs_inode_info *binfo = container_of(di, struct briefs_inode_info, disk_inode);
+	unsigned seq;
+
+	do {
+		seq = read_seqcount_begin(&binfo->extent_seq);
+		blocks = 0;
+		for (i = 0; i < di->num_extents_inline; i++)
+			blocks += di->inline_extents[i].len;
+	} while (read_seqcount_retry(&binfo->extent_seq, seq));
+
 	return blocks * (BRIEFS_BLOCK_SIZE / 512);
 }
 
@@ -177,6 +186,7 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 static int briefs_read_extent(struct super_block *sb, struct briefs_inode *di,
                                int idx, struct briefs_extent *ext)
 {
+	struct briefs_inode_info *binfo;
 	struct buffer_head *bh;
 	struct briefs_extent_chain *chain;
 	int chain_idx;
@@ -185,9 +195,15 @@ static int briefs_read_extent(struct super_block *sb, struct briefs_inode *di,
 	if (idx < 0 || idx >= di->num_extents_total)
 		return -ENOENT;
 
-	/* Check if the extent is inline */
+	binfo = container_of(di, struct briefs_inode_info, disk_inode);
+
+	/* Check if the extent is inline — read under seqcount protection */
 	if (idx < di->num_extents_inline) {
-		*ext = di->inline_extents[idx];
+		unsigned seq;
+		do {
+			seq = read_seqcount_begin(&binfo->extent_seq);
+			*ext = di->inline_extents[idx];
+		} while (read_seqcount_retry(&binfo->extent_seq, seq));
 		return 0;
 	}
 
@@ -229,17 +245,29 @@ static int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
                                  struct briefs_extent *ext)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct briefs_inode_info *binfo;
 	struct buffer_head *bh;
 	struct briefs_extent_chain *chain;
 	u64 rel, chain_block;
 	int slot;
 
+	/* Get the inode info from the embedded disk_inode */
+	binfo = container_of(di, struct briefs_inode_info, disk_inode);
+
+	/*
+	 * All modifications to extent fields are done inside a write_seqcount
+	 * critical section so that briefs_write_inode (called by VFS writeback)
+	 * never sees a partially-updated extent list.
+	 */
+
 	if (di->num_extents_inline < 8) {
 		/* Still fits inline */
+		write_seqcount_begin(&binfo->extent_seq);
 		int n = di->num_extents_inline;
 		di->inline_extents[n] = *ext;
 		di->num_extents_inline++;
 		di->num_extents_total++;
+		write_seqcount_end(&binfo->extent_seq);
 
 		/* Journal the extent allocation */
 		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
@@ -257,7 +285,10 @@ static int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 		if (rel == 0)
 			return -ENOSPC;
 		chain_block = data_to_abs(bsi->sb, rel);
+
+		write_seqcount_begin(&binfo->extent_seq);
 		di->extent_inline_base = chain_block;
+		write_seqcount_end(&binfo->extent_seq);
 
 		/* Journal the chain block allocation */
 		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
@@ -294,7 +325,10 @@ static int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 			mark_buffer_dirty(bh);
 			sync_dirty_buffer(bh);
 			brelse(bh);
+
+			write_seqcount_begin(&binfo->extent_seq);
 			di->num_extents_total++;
+			write_seqcount_end(&binfo->extent_seq);
 
 			/* Journal the extent addition to chain */
 			briefs_journal_extent_alloc(bsi->journal, di->inode_number,
@@ -322,6 +356,10 @@ static int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 		sync_dirty_buffer(bh);
 		brelse(bh);
 
+		write_seqcount_begin(&binfo->extent_seq);
+		di->extent_inline_base = chain_block; /* unnecessary but harmless */
+		write_seqcount_end(&binfo->extent_seq);
+
 		/* Journal the new chain block allocation */
 		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
 					    0, new_block, 1, -1);
@@ -344,7 +382,10 @@ static int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);
 		brelse(bh);
+
+		write_seqcount_begin(&binfo->extent_seq);
 		di->num_extents_total++;
+		write_seqcount_end(&binfo->extent_seq);
 
 		/* Journal the extent addition to chain */
 		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
@@ -721,15 +762,33 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	binfo->disk_inode.ctime_sec = inode->i_ctime_sec;
 	binfo->disk_inode.ctime_nsec = inode->i_ctime_nsec;
 
-	/* Copy in-memory disk_inode to the on-disk buffer */
-	memcpy(disk_inode, &binfo->disk_inode, sizeof(struct briefs_inode));
+	/* Sync VFS timestamp fields into in-memory copy first */
+	binfo->disk_inode.atime_sec = inode->i_atime_sec;
+	binfo->disk_inode.atime_nsec = inode->i_atime_nsec;
+	binfo->disk_inode.mtime_sec = inode->i_mtime_sec;
+	binfo->disk_inode.mtime_nsec = inode->i_mtime_nsec;
+	binfo->disk_inode.ctime_sec = inode->i_ctime_sec;
+	binfo->disk_inode.ctime_nsec = inode->i_ctime_nsec;
 
-	/* Update VFS-derived fields */
-	disk_inode->filemode = inode->i_mode;
-	disk_inode->uid = from_kuid(&init_user_ns, inode->i_uid);
-	disk_inode->gid = from_kgid(&init_user_ns, inode->i_gid);
-	disk_inode->filesize = inode->i_size;
-	disk_inode->nlinks = inode->i_nlink;
+	/*
+	 * Copy in-memory disk_inode to the on-disk buffer.
+	 * Use a seqcount retry loop to ensure we don't persist a
+	 * partially-updated extent list if briefs_append_extent or
+	 * another extent writer is in progress concurrently.
+	 */
+	{
+		unsigned seq;
+		do {
+			seq = read_seqcount_begin(&binfo->extent_seq);
+			memcpy(disk_inode, &binfo->disk_inode, sizeof(struct briefs_inode));
+			/* Update VFS-derived fields after the copy */
+			disk_inode->filemode = inode->i_mode;
+			disk_inode->uid = from_kuid(&init_user_ns, inode->i_uid);
+			disk_inode->gid = from_kgid(&init_user_ns, inode->i_gid);
+			disk_inode->filesize = inode->i_size;
+			disk_inode->nlinks = inode->i_nlink;
+		} while (read_seqcount_retry(&binfo->extent_seq, seq));
+	}
 
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
@@ -953,6 +1012,7 @@ struct inode *briefs_alloc_vfs_inode(struct super_block *sb) {
 	if (!binfo)
 		return NULL;
 
+	seqcount_init(&binfo->extent_seq);
 	return &binfo->vfs_inode;
 }
 
@@ -1211,6 +1271,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			ext.len -= blocks_to_free;
 
 			/* Update the extent in place (inline or chain) */
+			write_seqcount_begin(&binfo->extent_seq);
 			if (i < binfo->disk_inode.num_extents_inline) {
 				binfo->disk_inode.inline_extents[i] = ext;
 			} else {
@@ -1232,6 +1293,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 					brelse(bh);
 				}
 			}
+			write_seqcount_end(&binfo->extent_seq);
 			/* Done - all later extents already removed */
 			break;
 		}
@@ -1252,6 +1314,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		}
 
 		/* Remove the extent: shift remaining extents down */
+		write_seqcount_begin(&binfo->extent_seq);
 		if (i < binfo->disk_inode.num_extents_inline) {
 			/* Extent is inline - remove it */
 			int j;
@@ -1263,6 +1326,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		}
 
 		binfo->disk_inode.num_extents_total--;
+		write_seqcount_end(&binfo->extent_seq);
 	}
 
 	/* If trunc_block is 0 (truncate to empty), use the full cleanup path */
@@ -1278,10 +1342,12 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			briefs_free_block(&bsi->alloc, abs_to_data(bsi->sb, chain_block));
 			chain_block = next;
 		}
+		write_seqcount_begin(&binfo->extent_seq);
 		binfo->disk_inode.extent_inline_base = 0;
 		binfo->disk_inode.num_extents_inline = 0;
 		binfo->disk_inode.num_extents_total = 0;
 		memset(binfo->disk_inode.inline_extents, 0, sizeof(binfo->disk_inode.inline_extents));
+		write_seqcount_end(&binfo->extent_seq);
 	}
 
 	/* Update inode metadata */
@@ -1421,10 +1487,12 @@ static void briefs_free_inode_data(struct inode *inode)
 		chain_block = next_chain;
 	}
 
+	write_seqcount_begin(&binfo->extent_seq);
 	binfo->disk_inode.num_extents_inline = 0;
 	binfo->disk_inode.num_extents_total = 0;
 	binfo->disk_inode.extent_inline_base = 0;
 	memset(binfo->disk_inode.inline_extents, 0, sizeof(binfo->disk_inode.inline_extents));
+	write_seqcount_end(&binfo->extent_seq);
 }
 
 /* briefs_evict_inode - cleanup inode on eviction */
