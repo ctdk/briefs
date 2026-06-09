@@ -71,6 +71,12 @@ static void briefs_trie_init_block(struct super_block *sb, u64 block,
 	if (!bh)
 		return;
 
+	/* sb_getblk may return an unmapped buffer on loop devices */
+	if (!buffer_mapped(bh)) {
+		bh->b_blocknr = block;
+		set_buffer_mapped(bh);
+	}
+
 	memset(bh->b_data, 0, sb->s_blocksize);
 	node = (struct briefs_trie_node *)bh->b_data;
 	node->magic = BRIEFS_TRIE_MAGIC;
@@ -450,6 +456,11 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 			if (!bh) {
 				briefs_trie_free_node(sb, new_leaf);
 				return -EIO;
+			}
+			/* sb_getblk may return an unmapped buffer on loop devices */
+			if (!buffer_mapped(bh)) {
+				bh->b_blocknr = new_leaf;
+				set_buffer_mapped(bh);
 			}
 			memset(bh->b_data, 0, sb->s_blocksize);
 			node = (struct briefs_trie_node *)bh->b_data;

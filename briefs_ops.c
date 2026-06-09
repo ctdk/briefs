@@ -268,6 +268,11 @@ static int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 			briefs_free_block(&bsi->alloc, rel);
 			return -EIO;
 		}
+		/* sb_getblk may return an unmapped buffer on loop devices */
+		if (!buffer_mapped(bh)) {
+			bh->b_blocknr = chain_block;
+			set_buffer_mapped(bh);
+		}
 		memset(bh->b_data, 0, sb->s_blocksize);
 		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);
@@ -326,6 +331,11 @@ static int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 		if (!bh) {
 			briefs_free_block(&bsi->alloc, rel);
 			return -EIO;
+		}
+		/* sb_getblk may return an unmapped buffer on loop devices */
+		if (!buffer_mapped(bh)) {
+			bh->b_blocknr = new_block;
+			set_buffer_mapped(bh);
 		}
 		memset(bh->b_data, 0, sb->s_blocksize);
 		chain = (struct briefs_extent_chain *)bh->b_data;
@@ -1374,7 +1384,20 @@ static void briefs_free_inode_data(struct inode *inode)
 		briefs_journal_extent_free(bsi->journal, inode->i_ino,
 					   ext.offset, ext.len);
 
-		for (b = 0; b < ext.len; b++) {
+		/*
+		 * Sanity-check the extent length.  A corrupt ext.len (e.g. from
+		 * an inode written by an older buggy version) could cause an
+		 * infinite loop here, triggering a soft lockup watchdog.
+		 * Cap to a reasonable maximum to avoid this.
+		 */
+		u64 blocks_to_free = ext.len;
+		if (blocks_to_free > 1024 * 1024) {
+			pr_warn("briefs: inode %lu extent has suspicious len=%llu, capping to 1\n",
+				inode->i_ino, ext.len);
+			blocks_to_free = 1;
+		}
+
+		for (b = 0; b < blocks_to_free; b++) {
 			u64 abs_block = ext.phys + b;
 			u64 rel_block = abs_to_data(bsi->sb, abs_block);
 			briefs_free_block(&bsi->alloc, rel_block);
