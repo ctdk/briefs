@@ -284,7 +284,7 @@ static struct briefs_inode *replay_read_inode(struct super_block *sb,
 	u64 inodeTableBlock, inodeBlock, inodeOffset, inodeIndex;
 	struct briefs_inode *di;
 
-	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+	inodeTableBlock = briefs_inode_table_start(bsi->sb);
 	inodeIndex = ino - 1;
 	inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
 	inodeOffset = (inodeIndex % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
@@ -365,7 +365,7 @@ static int replay_inode_update(struct super_block *sb, struct jrn_inode_update *
 	struct briefs_inode *di;
 	u64 inodeTableBlock, inodeBlock, inodeOffset;
 
-	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+	inodeTableBlock = briefs_inode_table_start(bsi->sb);
 	u64 idx = rec->ino - 1;
 	inodeBlock = idx / (sb->s_blocksize / BRIEFS_INODE_SIZE);
 	inodeOffset = (idx % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;

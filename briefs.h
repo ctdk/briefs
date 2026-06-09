@@ -223,8 +223,7 @@ struct briefs_superblock {
 	__u64 trie_node_pool_size;
 	__u64 inode_bitmap_offset;
 	__u64 inode_bitmap_blocks;
-	__u64 data_bitmap_offset;
-	__u64 data_bitmap_blocks;
+	__u64 inode_table_offset;
 	__u64 journal_offset;
 	__u64 journal_blocks;
 	__u64 checkpoint_seq;
@@ -510,6 +509,12 @@ static inline u64 data_to_abs(struct briefs_superblock *sb, u64 rel_block)
 static inline u64 abs_to_data(struct briefs_superblock *sb, u64 abs_block)
 {
 	return abs_block - (sb->trie_node_pool_start + sb->trie_blocks_used);
+}
+
+/* Convenience: first block of the inode table on disk */
+static inline u64 briefs_inode_table_start(struct briefs_superblock *sb)
+{
+	return sb->inode_table_offset;
 }
 
 #ifdef __KERNEL__

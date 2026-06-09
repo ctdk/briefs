@@ -612,7 +612,7 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from) {
 		/* Persist inode */
 		{
 			u64 ino = inode->i_ino;
-			u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+			u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
 			u64 idx = ino - 1;
 			u64 blk = idx / (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
 			u64 off = (idx % (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
@@ -732,7 +732,7 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	pr_debug("briefs: write_inode %lu\n", inode->i_ino);
 
 	/* Calculate inode location */
-	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+	inodeTableBlock = briefs_inode_table_start(bsi->sb);
 	inodeIndex = inode->i_ino - 1;
 	inodeBlock = inodeIndex / (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
 	inodeOffset = (inodeIndex % (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
@@ -854,7 +854,7 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 
 	bsb = (struct briefs_superblock *) bh->b_data;
 
-	pr_info("briefs: superblock magic=0x%016llx, data_bitmap_offset=%llu, data_bitmap_blocks=%llu\n", bsb->magic, bsb->data_bitmap_offset, bsb->data_bitmap_blocks);
+	pr_info("briefs: superblock magic=0x%016llx, inode_table_offset=%llu\n", bsb->magic, bsb->inode_table_offset);
 
 	sb->s_magic = bsb->magic;
 
@@ -1026,7 +1026,7 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 	}
 
 	/* Calculate inode location: inode table follows data bitmap */
-	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+	inodeTableBlock = briefs_inode_table_start(bsi->sb);
 	/* Inode table starts at inodeTableBlock. Each block holds 8 inodes (512 bytes each).
 	 * inodeIndex is the 0-based index into the inode table.
 	 * inodeBlock is the block offset within the inode table.
@@ -1044,12 +1044,12 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 
 	if (inode->i_state & I_NEW) {
 		/* Recompute inode location inside the locked block */
-		u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+		u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
 		u64 inodeIndex = ino - 1;
 		inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
 		inodeOffset = (inodeIndex % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-		pr_info("briefs: data_bitmap_offset=%llu, data_bitmap_blocks=%llu, inodeTableBlock=%llu, inodeIndex=%llu, inodeBlock=%llu, inodeOffset=%llu\n",
-			bsi->sb->data_bitmap_offset, bsi->sb->data_bitmap_blocks, inodeTableBlock, inodeIndex, inodeBlock, inodeOffset);
+		pr_info("briefs: inode_table_offset=%llu, inodeIndex=%llu, inodeBlock=%llu, inodeOffset=%llu\n",
+			bsi->sb->inode_table_offset, inodeIndex, inodeBlock, inodeOffset);
 		pr_info("briefs: reading inode %llu from block %llu (inodeTableBlock=%llu, inodeBlock=%llu)\n",
 			ino, inodeTableBlock + inodeBlock, inodeTableBlock, inodeBlock);
 		/* Read inode from disk */
@@ -1356,7 +1356,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	/* Persist the inode to disk */
 	{
 		u64 ino = inode->i_ino;
-		u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+		u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
 		u64 idx = ino - 1;
 		u64 blk = idx / (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
 		u64 off = (idx % (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
@@ -1629,7 +1629,7 @@ static int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	}
 
 	/* Write the inode to disk first so extent storage can find it */
-	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+	inodeTableBlock = briefs_inode_table_start(bsi->sb);
 	inodeIndex = ino - 1;
 	inodeBlock = inodeIndex / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
 	inodeOffset = (inodeIndex % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
@@ -1834,7 +1834,7 @@ static int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	}
 
 	/* Write the inode to disk */
-	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+	inodeTableBlock = briefs_inode_table_start(bsi->sb);
 	inodeIndex = ino - 1;
 	inodeBlock = inodeIndex / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
 	inodeOffset = (inodeIndex % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
@@ -2111,7 +2111,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	}
 
 	/* Write the inode to disk */
-	inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+	inodeTableBlock = briefs_inode_table_start(bsi->sb);
 	inodeIndex = ino - 1;
 	inodeBlock = inodeIndex / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
 	inodeOffset = (inodeIndex % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
@@ -2235,7 +2235,7 @@ static int briefs_link(struct dentry *old_dentry, struct inode *dir,
 
 	/* Persist the target inode with updated nlink */
 	{
-		u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+		u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
 		u64 ino = inode->i_ino;
 		u64 idx = ino - 1;
 		u64 blk = idx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
@@ -2252,7 +2252,7 @@ static int briefs_link(struct dentry *old_dentry, struct inode *dir,
 
 	/* Persist the parent directory with updated size */
 	{
-		u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+		u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
 		u64 pIdx = dir->i_ino - 1;
 		u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
 		u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
@@ -2318,7 +2318,7 @@ int briefs_unlink(struct inode *dir, struct dentry *dentry) {
 
 	/* Update parent inode on disk */
 	{
-		u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+		u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
 		u64 pIdx = dir->i_ino - 1;
 		u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
 		u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
@@ -2388,7 +2388,7 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 
 	/* Update parent inodes on disk */
 	{
-		u64 inodeTableBlock = bsi->sb->data_bitmap_offset + bsi->sb->data_bitmap_blocks;
+		u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
 		u64 inodes_per_block = old_dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE;
 
 		/* Write old_dir */
