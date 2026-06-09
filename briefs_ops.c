@@ -29,16 +29,8 @@ static inline u64 briefs_compute_i_blocks(struct briefs_inode *di)
 {
 	u64 blocks = 0;
 	int i;
-	struct briefs_inode_info *binfo = container_of(di, struct briefs_inode_info, disk_inode);
-	unsigned seq;
-
-	do {
-		seq = read_seqcount_begin(&binfo->extent_seq);
-		blocks = 0;
-		for (i = 0; i < di->num_extents_inline; i++)
-			blocks += di->inline_extents[i].len;
-	} while (read_seqcount_retry(&binfo->extent_seq, seq));
-
+	for (i = 0; i < di->num_extents_inline; i++)
+		blocks += di->inline_extents[i].len;
 	return blocks * (BRIEFS_BLOCK_SIZE / 512);
 }
 
