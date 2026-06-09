@@ -13,7 +13,7 @@
 #define _BRIEFS_SUPER_MAGIC 0x504C434E /* "PLCN" */
 
 /* Define the number of reserved/padding bytes in the superblock */
-#define _BRIEFS_SUPER_RESERVED 640
+#define _BRIEFS_SUPER_RESERVED 648
 
 #define _BRIEFS_ROOT_INO 1
 #define _BRIEFS_BAD_INO  2
@@ -26,8 +26,8 @@
 
 /* Semantic versioning, yo */
 #define _BRIEFS_MAJOR_VER 0
-#define _BRIEFS_MINOR_VER 4
-#define _BRIEFS_PATCH_VER 1
+#define _BRIEFS_MINOR_VER 5
+#define _BRIEFS_PATCH_VER 0
 
 /* Journal magic */
 #define JOURNAL_MAGIC 0x4A4E4C5A  /* "JNLZ" */
