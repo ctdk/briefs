@@ -547,6 +547,12 @@ struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
 struct inode *briefs_iget(struct super_block *sb, u64 ino);
 struct inode *briefs_alloc_vfs_inode(struct super_block *sb);
 void briefs_free_inode(struct inode *inode);
+u64 briefs_alloc_inode(struct super_block *sb);
+void briefs_free_inode_num(struct super_block *sb, u64 ino);
+void briefs_free_inode_data(struct inode *inode);
+u64 briefs_compute_i_blocks(struct briefs_inode *di);
+int briefs_read_extent(struct super_block *sb, struct briefs_inode *di, int index, struct briefs_extent *ext);
+int briefs_append_extent(struct super_block *sb, struct briefs_inode *di, struct briefs_extent *ext);
 int briefs_write_inode(struct inode *inode, struct writeback_control *wbc);
 
 /* Inode slab cache (defined in briefs.c) */
@@ -559,6 +565,9 @@ int briefs_add_dir_entry(struct inode *dir, const char *name, size_t name_len, u
 int briefs_remove_dir_entry(struct inode *dir, const char *name, size_t name_len);
 void briefs_evict_inode(struct inode *inode);
 void briefs_umount_begin(struct super_block *sb);
+int briefs_sync_fs(struct super_block *sb, int wait);
+int briefs_dir_open(struct inode *inode, struct file *file);
+int briefs_dir_release(struct inode *inode, struct file *file);
 
 /* Inode operations */
 int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl);
@@ -567,6 +576,10 @@ int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dent
 int briefs_unlink(struct inode *dir, struct dentry *dentry);
 int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
                   struct inode *new_dir, struct dentry *new_dentry, unsigned int flags);
+int briefs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *new_dentry);
+int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, const char *symname);
+int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, dev_t rdev);
+const char *briefs_get_link(struct dentry *dentry, struct inode *inode, struct delayed_call *done);
 
 /* File operations */
 ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to);
