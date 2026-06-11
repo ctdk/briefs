@@ -210,12 +210,22 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 /* briefs_evict_inode - cleanup inode on eviction */
 void briefs_evict_inode(struct inode *inode) {
 	pr_debug("briefs: evict_inode inode %lu\n", inode->i_ino);
+
+	/*
+	 * Truncate the page cache first — this releases all folios and
+	 * their buffer_heads before we free the backing blocks.  The order
+	 * matters: free_inode_data clears the block allocator's bits for
+	 * the extents, and if buffer_heads still reference those blocks,
+	 * a later reclaim of those stale folios will find
+	 * use-after-freed buffer_head chains.
+	 */
+	truncate_inode_pages_final(&inode->i_data);
+
 	/* When nlink drops to 0, free allocated blocks and the inode number */
 	if (inode->i_nlink == 0) {
 		briefs_free_inode_data(inode);
 		briefs_free_inode_num(inode->i_sb, inode->i_ino);
 	}
-	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
 }
 /* briefs_alloc_inode - allocate a new inode number using the bitmap pyramid */

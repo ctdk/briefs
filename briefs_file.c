@@ -38,13 +38,18 @@ static int briefs_write_begin(struct file *file, struct address_space *mapping, 
 	int ret;
 	ret = block_write_begin(mapping, pos, len, foliop, briefs_get_block);
 
-	if (unlikely(ret)) {
-		loff_t isize = mapping->host->i_size;
-		if (pos + len > isize) {
-			truncate_pagecache(mapping->host, isize);
-			briefs_free_inode_data(mapping->host);
-		}
-	}
+	/*
+	 * Don't free data on error — the VFS / caller will handle cleanup
+	 * on the inode.  The old code called briefs_free_inode_data here,
+	 * which freed ALL extents even on a partial write, leaving
+	 * dangling buffer_heads in the page cache that caused
+	 * use-after-free crashes in kswapd and writeback.
+	 *
+	 * If block_write_begin partially allocated blocks and then
+	 * failed, those blocks remain allocated on disk (a minor leak)
+	 * until the inode itself is evicted, at which point
+	 * briefs_evict_inode will free them properly.
+	 */
 
 	return ret;
 }

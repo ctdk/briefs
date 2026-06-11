@@ -251,11 +251,84 @@ int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 		return 0;
 	}
 }
+
+/*
+ * briefs_read_extent_chain - read an extent from the chain portion only,
+ * using caller-supplied snapshot values for num_extents_inline and
+ * extent_inline_base.  This avoids the seqcount inside briefs_read_extent
+ * and allows the caller (briefs_get_block) to iterate the extent list
+ * using a single metadata snapshot taken before the loop.
+ *
+ * Returns 0 on success with *ext filled, -ENOENT if not found.
+ */
+static int briefs_read_extent_chain(struct super_block *sb, int idx,
+                                    u64 snap_inline, u64 snap_chain_base,
+                                    struct briefs_extent *ext)
+{
+	struct buffer_head *bh;
+	struct briefs_extent_chain *chain;
+	int chain_idx;
+	u64 chain_block;
+
+	if (idx < snap_inline)
+		return -ENOENT;
+
+	chain_block = snap_chain_base;
+	if (chain_block == 0)
+		return -ENOENT;
+
+	chain_idx = idx - snap_inline;
+
+	while (chain_block) {
+		bh = sb_bread(sb, chain_block);
+		if (!bh) {
+			pr_err("briefs: failed to read chain block %llu\n", chain_block);
+			return -EIO;
+		}
+		chain = (struct briefs_extent_chain *)bh->b_data;
+
+		if (chain_idx < chain->num_extents_in_block) {
+			*ext = chain->extents[chain_idx];
+			brelse(bh);
+			return 0;
+		}
+
+		chain_idx -= chain->num_extents_in_block;
+		chain_block = chain->next_overflow_block;
+		brelse(bh);
+	}
+
+	return -ENOENT;
+}
+
 /*
  * briefs_get_block - get_block callback for block-based page cache helpers.
  *
  * Maps an inode block number (iblock) to a physical block on disk.
  * If create is set and the block is a hole, allocates a new block.
+ *
+ * Extent list synchronization:
+ *
+ * Currently uses a seqcount (binfo->extent_seq) to snapshot the extent
+ * metadata before iterating.  This ensures num_extents_total,
+ * num_extents_inline, and extent_inline_base are read atomically with
+ * respect to briefs_append_extent's writers.
+ *
+ * The chain blocks are append-only for the lifetime of the inode (freed
+ * only during briefs_free_inode_data / eviction), so walking from a
+ * snapped chain base is safe even without holding the seqcount open
+ * during I/O.  A concurrent append may add extents after our snapshot;
+ * we will simply miss them and fall through to the create path below.
+ * This wastes at most one block and one extent slot per race window.
+ *
+ * Future work: switch to a mutex or spinlock for strict atomicity of the
+ * read-then-append sequence (eliminating the wasted-block race above).
+ * See the discussion in commit message or design notes for trade-offs.
+ *
+ *   mutex: simpler reasoning, blocks instead of retries, but serializes
+ *          all extent access.  OK since briefs_get_block is process
+ *          context.
+ *   spinlock: even lighter, but expensive for the chain block I/O path.
  */
 int briefs_get_block(struct inode *inode, sector_t iblock,
                      struct buffer_head *bh_result, int create)
@@ -265,13 +338,45 @@ int briefs_get_block(struct inode *inode, sector_t iblock,
 	struct briefs_extent ext;
 	u64 phys;
 	int i, ret;
+	unsigned seq;
 
-	/* Look up in existing extents (inline + chain) */
-	for (i = 0; i < binfo->disk_inode.num_extents_total; i++) {
-		ret = briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext);
+	/*
+	 * Snapshot extent metadata under seqcount so we iterate a
+	 * consistent view even if briefs_append_extent runs concurrently.
+	 */
+	u64 snap_total, snap_inline, snap_chain_base;
+
+	do {
+		seq = read_seqcount_begin(&binfo->extent_seq);
+		snap_total = binfo->disk_inode.num_extents_total;
+		snap_inline = binfo->disk_inode.num_extents_inline;
+		snap_chain_base = binfo->disk_inode.extent_inline_base;
+	} while (read_seqcount_retry(&binfo->extent_seq, seq));
+
+	/* Look up iblock in the snapped extent view */
+	for (i = 0; i < snap_total; i++) {
+		if (i < snap_inline) {
+			/*
+			 * Inline extent — read under seqcount protection.
+			 * briefs_read_extent handles this correctly.
+			 */
+			ret = briefs_read_extent(inode->i_sb, &binfo->disk_inode,
+			                         i, &ext);
+		} else {
+			/*
+			 * Chain extent — walk from our snapped chain base.
+			 * The chain blocks are append-only (never freed until
+			 * eviction), so addressing into them by snapped index
+			 * is safe even if a concurrent writer adds new blocks.
+			 */
+			ret = briefs_read_extent_chain(inode->i_sb, i,
+			                               snap_inline,
+			                               snap_chain_base, &ext);
+		}
 		if (ret != 0)
 			break;
-		if ((u64)iblock >= ext.offset && (u64)iblock < ext.offset + ext.len) {
+		if ((u64)iblock >= ext.offset &&
+		    (u64)iblock < ext.offset + ext.len) {
 			phys = ext.phys + ((u64)iblock - ext.offset);
 			map_bh(bh_result, inode->i_sb, phys);
 			return 0;
