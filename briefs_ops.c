@@ -23,7 +23,7 @@ const struct inode_operations briefs_dir_inode_ops = {
 	.symlink = briefs_symlink,
 	.mknod = briefs_mknod,
 	.unlink = briefs_unlink,
-	.rmdir = briefs_unlink,
+	.rmdir = briefs_rmdir,
 	.rename = briefs_rename,
 };
 

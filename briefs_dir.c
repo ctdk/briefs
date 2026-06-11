@@ -488,9 +488,122 @@ static void update_parent_inode(struct inode *dir, struct briefs_sb_info *bsi) {
 	}
 }
 
+/* briefs_empty_dir - check if a directory is empty by scanning the trie. Since
+ * briefs does not store . or .. in the trie (dir_emit_dots handles those), any
+ * entry present means that the directory is not empty. */
+static int briefs_empty_dir(struct inode *inode, int *ret){
+	struct briefs_inode_info *binfo;
+	int res;
+
+	binfo = briefs_i(inode);
+
+	if (binfo->disk_inode.dir_trie_root != 0) {
+		struct trie_iter *iter;
+		char *entry_name_buf;
+		int entry_name_len;
+		u64 entry_ino;
+		u8 entry_type;
+
+		iter = kmalloc(sizeof(struct trie_iter), GFP_KERNEL);
+		if (!iter) {
+			*ret = -ENOMEM;
+			return 0;
+		}
+		entry_name_buf = kmalloc(BRIEFS_NAME_LEN + 1, GFP_KERNEL);
+		if (!entry_name_buf) {
+			kfree(iter);
+			*ret = -ENOMEM;
+			return 0;
+		}
+
+		briefs_trie_iter_init(iter, &binfo->disk_inode);
+		res = briefs_trie_iter_next(inode->i_sb, iter,
+					   &entry_ino, &entry_type,
+					   entry_name_buf, &entry_name_len);
+
+		/* for the love of all that is good, remove this as soon as it
+		 * isn't needed. */
+		pr_debug("briefs: rmdir found entry '%s'\n", entry_name_buf);
+
+		kfree(entry_name_buf);
+		kfree(iter);
+		if (res == 0) {
+			/* Found an entry — directory not empty */
+			pr_debug("briefs: rmdir not empty (entry found)\n");
+			*ret = -ENOTEMPTY;
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* briefs_unlink_common - common unlink/rmdir logic */
+static int briefs_unlink_common(struct inode *dir, struct dentry *dentry) {
+	struct briefs_sb_info *bsi;
+	struct inode *inode = d_inode(dentry);
+	int ret;
+
+	pr_debug("briefs: common unlink/rmdir logic %pd\n", dentry);
+
+	bsi = dir->i_sb->s_fs_info;
+
+	/* Log directory entry deletion */
+	if (bsi->journal) {
+		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, 0,
+						dentry->d_name.name, dentry->d_name.len, 1);
+		if (ret) {
+			pr_debug("journaling %pd failed\n", dentry);
+			return ret;
+		}
+	}
+
+	/* Remove the directory entry from the parent */
+	ret = briefs_remove_dir_entry(dir, dentry->d_name.name, dentry->d_name.len);
+	if (ret) {
+		pr_debug("removing %pd failed\n", dentry);
+		return ret;
+	}
+
+	/*
+	 * Drop nlink and mark inode dirty. The VFS will eventually evict
+	 * this inode (when cache pressure occurs or on unmount), at which
+	 * point briefs_evict_inode will free the data blocks and inode number.
+	 *
+	 * Without this mark_inode_dirty, the VFS might not write back the
+	 * nlink=0 to disk or evict the inode promptly.
+	 */
+	if (S_ISDIR(inode->i_mode)) {
+		drop_nlink(dir);
+		clear_nlink(inode);
+	} else {
+		drop_nlink(inode);
+		mark_inode_dirty(inode);
+	}
+
+	/* TODO: double check that this is *actually* the right thing to do. I
+	 * have a sneaking suspicion this was hallucinated or is wrong, but I
+	 * could easily be wrong myself. */
+	/* Update parent directory size to reflect deletion.
+	 * Each dir entry adds 2 (len prefix in trie name storage)
+	 * + name_len bytes to dir->i_size. */
+	if (dir->i_size >= 2 + dentry->d_name.len) {
+		dir->i_size -= 2 + dentry->d_name.len;
+		briefs_i(dir)->disk_inode.filesize = dir->i_size;
+	}
+
+	/* Journal the nlink change */
+	briefs_journal_inode_update(bsi->journal, inode);
+	briefs_journal_inode_update(bsi->journal, dir);
+
+	update_parent_inode(dir, bsi);
+
+	pr_debug("briefs: leaving common unlink/rmdir logic %pd\n", dentry);
+	return 0;
+}
+
+
 /* briefs_unlink - remove a directory entry */
 int briefs_unlink(struct inode *dir, struct dentry *dentry) {
-	struct briefs_sb_info *bsi;
 	struct inode *inode = d_inode(dentry);
 	int ret;
 
@@ -499,42 +612,40 @@ int briefs_unlink(struct inode *dir, struct dentry *dentry) {
 	if (!inode)
 		return -ENOENT;
 
-	bsi = dir->i_sb->s_fs_info;
+	/* POSIX: unlink on a directory must fail with EISDIR */
+	if (S_ISDIR(inode->i_mode))
+		return -EISDIR;
 
-	/* Log directory entry deletion */
-	if (bsi->journal) {
-		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, 0,
-						dentry->d_name.name, dentry->d_name.len, 1);
-		if (ret) return ret;
-	}
+	ret = briefs_unlink_common(dir, dentry);
 
-	/* Remove the directory entry */
-	ret = briefs_remove_dir_entry(dir, dentry->d_name.name, dentry->d_name.len);
-	if (ret)
-		return ret;
-
-	/* Drop nlink on the inode */
-	if (S_ISDIR(inode->i_mode)) {
-		/* Directory: clear nlink completely (2 -> 0) */
-		clear_nlink(inode);
-	} else {
-		drop_nlink(inode);
-	}
-
-	/* Journal the nlink change */
-	briefs_journal_inode_update(bsi->journal, inode);
-
-	/* If directory, also drop parent's nlink (.. reference) */
-	if (S_ISDIR(inode->i_mode)) {
-		drop_nlink(dir);
-		briefs_journal_inode_update(bsi->journal, dir);
-	}
-
-	/* Update parent inode on disk */
-	update_parent_inode(dir, bsi);
-	
 	pr_debug("briefs: unlinked %pd\n", dentry);
-	return 0;
+
+	return ret;
+}
+
+/* briefs_rmdir - remove a directory after checking that it's empty. */
+int briefs_rmdir(struct inode *dir, struct dentry *dentry) {
+	struct inode *inode = d_inode(dentry);
+	int ret;
+
+	pr_debug("briefs: rmdir %pd\n", dentry);
+
+	if (!inode)
+		return -ENOENT;
+
+	if (!S_ISDIR(inode->i_mode))
+		return -ENOTDIR;
+
+	/* Check if the director is empty */
+	if (!briefs_empty_dir(inode, &ret)) {
+		return ret;
+	}
+
+	ret = briefs_unlink_common(dir, dentry);
+
+	pr_debug("briefs: rmdir'd %pd\n", dentry);
+
+	return ret;
 }
 
 /* briefs_rename - rename a directory entry */

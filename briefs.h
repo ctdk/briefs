@@ -574,6 +574,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
 int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode);
 int briefs_unlink(struct inode *dir, struct dentry *dentry);
+int briefs_rmdir(struct inode *dir, struct dentry *dentry);
 int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
                   struct inode *new_dir, struct dentry *new_dentry, unsigned int flags);
 int briefs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *new_dentry);
