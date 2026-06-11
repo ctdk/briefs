@@ -15,21 +15,24 @@
  *     the trailing bytes of the block.
  *   - Children at each depth level are linked via first_child / next_sibling.
  *   - The root node is special: depth=0, byte_val=0.  It is always an INTERM
- *     node and may also have NODE_STATUS_LEAF if the root itself is a leaf.
+ *     node and may or may not have NODE_STATUS_LEAF.
  *
- * Name storage in leaf nodes:
- *   The full name is stored in the trailing bytes of the block, referenced by
- *   name_offset (offset from block end). The storage format is [len:2][name:N].
+ * Names are stored in the trailing bytes of each node's block.
+ * name_offset is the number of bytes from the end of the block to the
+ * start of the name data, which consists of a 2-byte length prefix followed
+ * by the name bytes.
  */
 
-#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/fs.h>
 #include <linux/slab.h>
-#include <linux/string.h>
-#include <linux/errno.h>
-#include <linux/vmalloc.h>
 #include <linux/buffer_head.h>
-
+#include <linux/vmalloc.h>
 #include "briefs.h"
+#include "briefs_alloc.h"
+
+/* Number of bytes for the 2-byte name-length prefix stored in the block */
+#define TRIE_NAME_PREFIX 2
 
 /*
  * briefs_trie_alloc_node - allocate a block for a new trie node.
@@ -59,7 +62,7 @@ static void briefs_trie_free_node(struct super_block *sb, u64 block)
 }
 
 /*
- * briefs_trie_init_block - initialize a freshly-allocated block as a trie node.
+ * briefs_trie_init_block - clear and initialize a trie node block.
  */
 static void briefs_trie_init_block(struct super_block *sb, u64 block,
                                     u8 depth, u8 byte_val, u8 node_type)
@@ -70,13 +73,11 @@ static void briefs_trie_init_block(struct super_block *sb, u64 block,
 	bh = sb_getblk(sb, block);
 	if (!bh)
 		return;
-
 	/* sb_getblk may return an unmapped buffer on loop devices */
 	if (!buffer_mapped(bh)) {
 		bh->b_blocknr = block;
 		set_buffer_mapped(bh);
 	}
-
 	memset(bh->b_data, 0, sb->s_blocksize);
 	node = (struct briefs_trie_node *)bh->b_data;
 	node->magic = BRIEFS_TRIE_MAGIC;
@@ -89,37 +90,16 @@ static void briefs_trie_init_block(struct super_block *sb, u64 block,
 }
 
 /*
- * briefs_trie_create_root - create a root trie node for a directory.
- * Sets di->dir_trie_root to the allocated block number.
- * Returns 0 on success, negative on error.
- */
-int briefs_trie_create_root(struct super_block *sb, struct briefs_inode *di)
-{
-	u64 block;
-	int ret;
-
-	block = briefs_trie_alloc_node(sb);
-	if (block == 0) {
-		ret = -ENOSPC;
-		return ret;
-	}
-
-	briefs_trie_init_block(sb, block, 0, 0, NODE_TYPE_INTERM);
-	di->dir_trie_root = block;
-	return 0;
-}
-
-/*
  * briefs_trie_find_child - find a child node by byte value.
- * Returns the absolute block number of the child, or 0 if not found.
  */
-static u64 briefs_trie_find_child(struct super_block *sb, u64 node_block, u8 byte_val)
+static u64 briefs_trie_find_child(struct super_block *sb, u64 parent_block,
+                                   u8 byte_val)
 {
-	struct buffer_head *bh;
-	struct briefs_trie_node *node;
+	struct buffer_head *bh, *cbh;
+	struct briefs_trie_node *node, *cn;
 	u64 child;
 
-	bh = sb_bread(sb, node_block);
+	bh = sb_bread(sb, parent_block);
 	if (!bh)
 		return 0;
 
@@ -127,9 +107,6 @@ static u64 briefs_trie_find_child(struct super_block *sb, u64 node_block, u8 byt
 	child = node->first_child;
 
 	while (child) {
-		struct buffer_head *cbh;
-		struct briefs_trie_node *cn;
-
 		cbh = sb_bread(sb, child);
 		if (!cbh)
 			break;
@@ -232,7 +209,9 @@ int briefs_trie_lookup(struct super_block *sb, struct briefs_inode *di,
                         const char *name, int name_len,
                         u64 *found_ino, u8 *found_type)
 {
-	u64 cur;
+	struct buffer_head *cbh;
+	struct briefs_trie_node *cnode;
+	u64 cur, child;
 	int pos;
 
 	if (!di->dir_trie_root)
@@ -241,105 +220,123 @@ int briefs_trie_lookup(struct super_block *sb, struct briefs_inode *di,
 	cur = di->dir_trie_root;
 
 	for (pos = 0; pos < name_len; pos++) {
-		struct buffer_head *bh;
-		struct briefs_trie_node *node;
-		u64 child;
-		char *entry_name;
-		int entry_len;
+		u8 bval = (u8)name[pos];
+		int found_leaf_at_byte;
 
-		child = briefs_trie_find_child(sb, cur, (u8)name[pos]);
-		if (child == 0) {
+		if (pos == name_len - 1) {
 			/*
-			 * No child at this byte.  The current node `cur`
-			 * might have NODE_STATUS_LEAF set if a prefix entry
-			 * exists here.
+			 * Last byte.  Check if a leaf exists at this
+			 * byte position.
 			 */
-			goto check_prefix;
-		}
+			child = briefs_trie_find_child(sb, cur, bval);
+			if (child == 0)
+				return -ENOENT;
 
-		bh = sb_bread(sb, child);
-		if (!bh)
-			return -EIO;
+			cbh = sb_bread(sb, child);
+			if (!cbh)
+				return -EIO;
 
-		node = (struct briefs_trie_node *)bh->b_data;
-		if (node->magic != BRIEFS_TRIE_MAGIC) {
-			brelse(bh);
-			return -EIO;
-		}
+			cnode = (struct briefs_trie_node *)cbh->b_data;
+			found_leaf_at_byte = 0;
 
-		if (node->node_type & NODE_TYPE_INTERM) {
-			/*
-			 * INTERM node — descend to children for the next
-			 * byte.  But first check if this node also has
-			 * NODE_STATUS_LEAF (prefix entry that shares this
-			 * byte and all preceding bytes).
-			 */
-			if (node->node_type & NODE_STATUS_LEAF) {
-				entry_name = (char *)bh->b_data + BRIEFS_BLOCK_SIZE - node->name_offset + 2;
-				entry_len = node->name_len - 2;
-				if (entry_len == name_len && memcmp(entry_name, name, name_len) == 0) {
-					if (found_ino)
-						*found_ino = node->inode;
-					if (found_type)
-						*found_type = TRIE_NODE_FTYPE(node);
-					brelse(bh);
-					return 0;
+			/* Check if the child has leaf data */
+			if (TRIE_IS_LEAF(cnode)) {
+				char *ename;
+				int elen;
+
+				ename = (char *)cbh->b_data + BRIEFS_BLOCK_SIZE - cnode->name_offset + 2;
+				elen = cnode->name_len - 2;
+				if (elen == name_len && memcmp(ename, name, name_len) == 0) {
+					*found_ino = cnode->inode;
+					*found_type = TRIE_NODE_FTYPE(cnode);
+					found_leaf_at_byte = 1;
 				}
 			}
-			cur = child;
-			brelse(bh);
-			continue;
+
+			/*
+			 * Even if the exact match is found and returned, we
+			 * still look at children.  If there are longer entries
+			 * that share this prefix, they exist as children of
+			 * this node.  But for lookup, we only care about the
+			 * exact match.
+			 */
+			brelse(cbh);
+			if (found_leaf_at_byte)
+				return 0;
+
+			/*
+			 * No exact match.  If this is an INTERM node without
+			 * the leaf flag, we know the name differs.
+			 */
+			return -ENOENT;
 		}
 
-		/* Pure leaf node — check full name match */
-		entry_name = (char *)bh->b_data + BRIEFS_BLOCK_SIZE - node->name_offset;
-		entry_name += 2;
-		entry_len = node->name_len - 2;
+		/*
+		 * Middle byte: find an INTERM child.
+		 */
+		child = briefs_trie_find_child(sb, cur, bval);
+		if (child == 0)
+			return -ENOENT;
 
-		if (entry_len == name_len && memcmp(entry_name, name, name_len) == 0) {
-			if (found_ino)
-				*found_ino = node->inode;
-			if (found_type)
-				*found_type = TRIE_NODE_FTYPE(node);
-			brelse(bh);
-			return 0;
-		}
+		cbh = sb_bread(sb, child);
+		if (!cbh)
+			return -EIO;
+		cnode = (struct briefs_trie_node *)cbh->b_data;
 
-		brelse(bh);
-		return -ENOENT;
-	}
+		if (!(cnode->node_type & NODE_TYPE_INTERM)) {
+			/*
+			 * Found a pure leaf where we need an INTERM.
+			 * Check if its full name matches the search name.
+			 */
+			char *ename;
+			int elen;
 
-	/*
-	 * All name_len bytes consumed without finding a child.
-	 * The last node at `cur` may have NODE_STATUS_LEAF set —
-	 * a prefix entry (e.g. "file_1" when "file_10" split at '0').
-	 */
-check_prefix:
-	{
-		struct buffer_head *nbh = sb_bread(sb, cur);
-		if (nbh) {
-			struct briefs_trie_node *nnode;
-			nnode = (struct briefs_trie_node *)nbh->b_data;
-			if (nnode->node_type & NODE_STATUS_LEAF) {
-				char *zname;
-				int zlen;
+			ename = (char *)cbh->b_data + BRIEFS_BLOCK_SIZE - cnode->name_offset + 2;
+			elen = cnode->name_len - 2;
+			brelse(cbh);
 
-				zname = (char *)nbh->b_data + BRIEFS_BLOCK_SIZE - nnode->name_offset + 2;
-				zlen = nnode->name_len - 2;
-
-				if (zlen == name_len && memcmp(zname, name, name_len) == 0) {
-					if (found_ino) *found_ino = nnode->inode;
-					if (found_type) *found_type = TRIE_NODE_FTYPE(nnode);
-					brelse(nbh);
-					return 0;
-				}
+			if (elen == name_len && memcmp(ename, name, name_len) == 0) {
+				*found_ino = cnode->inode;
+				*found_type = TRIE_NODE_FTYPE(cnode);
+				return 0;
 			}
-			brelse(nbh);
+			return -ENOENT;
 		}
+
+		brelse(cbh);
+		cur = child;
 	}
 
 	return -ENOENT;
 }
+
+/*
+ * briefs_trie_create_root - create the root node of a directory trie.
+ */
+int briefs_trie_create_root(struct super_block *sb, struct briefs_inode *di)
+{
+	u64 root_block;
+
+	root_block = briefs_trie_alloc_node(sb);
+	if (root_block == 0)
+		return -ENOSPC;
+
+	briefs_trie_init_block(sb, root_block, 0, 0, NODE_TYPE_INTERM);
+	di->dir_trie_root = root_block;
+
+	return 0;
+}
+
+/*
+ * briefs_trie_insert helper: split an existing pure leaf node when a new name
+ * shares its prefix through this position.  This creates an INTERM node and
+ * reparents the old leaf under it, handling both cases: when the old leaf
+ * is a prefix of the new name, and when the names differ at the next byte.
+ * 'child' is the block of the existing pure leaf, 'cur' is the current parent.
+ * 'pos' is the depth/position being split at.
+ * 'name' is the full new name being inserted (for name_len + data).
+ * On return, 'cur' is updated to the INTERM node for continued descent.
+ */
 
 /*
  * briefs_trie_insert - insert a name/inode entry into the directory trie.
@@ -674,7 +671,16 @@ link_child:
 /*
  * briefs_trie_remove - remove an entry from the directory trie.
  *
- * Returns 0 on success, -ENOENT if not found.
+ * Walks down the trie to find the target leaf node, unlinks it from its
+ * parent's sibling chain, frees it, and then walks back up collapsing any
+ * pure-INTERM routing nodes that become dead (no leaf entry, no children,
+ * child_count == 0).
+ *
+ * Both removal sites (pure leaf removal and clearing NODE_STATUS_LEAF on
+ * an INTERM node) trigger the collapse walk.
+ *
+ * Returns 0 on success, -ENOENT if not found, -ENOTEMPTY if the target
+ * node is a pure INTERM with children (can't be removed through the trie).
  */
 int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
                         const char *name, int name_len)
@@ -682,6 +688,9 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 	struct buffer_head *bh, *cbh;
 	struct briefs_trie_node *node, *pnode;
 	u64 cur, parent, child_prev, child;
+	/* Ancestry path from root to the leaf's parent, for collapse */
+	u64 ancestry[256];
+	int anc;
 	int pos;
 
 	if (!di->dir_trie_root)
@@ -690,6 +699,8 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 	parent = 0;
 	child_prev = 0;
 	cur = di->dir_trie_root;
+	anc = 0;
+	ancestry[anc++] = cur;
 
 	for (pos = 0; pos < name_len; pos++) {
 		bh = sb_bread(sb, cur);
@@ -756,6 +767,36 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 				mark_buffer_dirty(cbh);
 				sync_dirty_buffer(cbh);
 				brelse(cbh);
+
+				/*
+				 * If the INTERM now has no children, it's dead.
+				 * Unlink from parent and free, then collapse up.
+				 */
+				if (pnode->child_count == 0 && pnode->first_child == 0) {
+					/* Unlink child from parent */
+					if (child_prev == 0) {
+						pnode->first_child = node->next_sibling;
+					} else {
+						struct buffer_head *ppbh;
+						struct briefs_trie_node *ppn;
+						ppbh = sb_bread(sb, child_prev);
+						if (ppbh) {
+							ppn = (struct briefs_trie_node *)ppbh->b_data;
+							ppn->next_sibling = node->next_sibling;
+							mark_buffer_dirty(ppbh);
+							sync_dirty_buffer(ppbh);
+							brelse(ppbh);
+						}
+					}
+					pnode->child_count--;
+					mark_buffer_dirty(bh);
+					sync_dirty_buffer(bh);
+					brelse(bh);
+
+					briefs_trie_free_node(sb, child);
+					goto collapse;
+				}
+
 				brelse(bh);
 				return 0;
 			}
@@ -780,19 +821,97 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 			mark_buffer_dirty(bh);
 			sync_dirty_buffer(bh);
 			brelse(cbh);
-			brelse(bh);
 
 			briefs_trie_free_node(sb, child);
-			return 0;
+
+			/*
+			 * Now try to collapse dead routing nodes starting
+			 * from cur (the leaf's parent).
+			 */
+			goto collapse;
 		}
 
 		parent = cur;
 		child_prev = 0;
 		cur = child;
+		if (anc < 256)
+			ancestry[anc++] = cur;
 		brelse(bh);
 	}
 
 	return -ENOENT;
+
+collapse:
+	/*
+	 * Walk up the ancestry from cur toward root, freeing any dead
+	 * pure-INTERM routing nodes (no NODE_STATUS_LEAF, child_count == 0,
+	 * first_child == 0).
+	 *
+	 * ancestry[anc-1] is the target node (already freed), ancestry[anc-2]
+	 * is its parent (cur after the unlink above).
+	 */
+	int i;
+
+	for (i = anc - 1; i >= 1; i--) {
+		u64 check = ancestry[i];
+		struct buffer_head *cbh2;
+		struct briefs_trie_node *cn2;
+		struct buffer_head *pbh2;
+		struct briefs_trie_node *pn2;
+		u64 pblk = ancestry[i - 1];
+
+		cbh2 = sb_bread(sb, check);
+		if (!cbh2)
+			break;
+		cn2 = (struct briefs_trie_node *)cbh2->b_data;
+
+		if (!(cn2->node_type & NODE_TYPE_INTERM) ||
+		    (cn2->node_type & NODE_STATUS_LEAF) ||
+		    cn2->child_count != 0 ||
+		    cn2->first_child != 0) {
+			brelse(cbh2);
+			break;
+		}
+
+		/* Dead routing node.  Unlink from parent and free. */
+		pbh2 = sb_bread(sb, pblk);
+		if (!pbh2) {
+			brelse(cbh2);
+			break;
+		}
+		pn2 = (struct briefs_trie_node *)pbh2->b_data;
+
+		if (pn2->first_child == check) {
+			pn2->first_child = cn2->next_sibling;
+		} else {
+			u64 w = pn2->first_child;
+			while (w) {
+				struct buffer_head *wbh;
+				struct briefs_trie_node *wn;
+				wbh = sb_bread(sb, w);
+				if (!wbh) break;
+				wn = (struct briefs_trie_node *)wbh->b_data;
+				if (wn->next_sibling == check) {
+					wn->next_sibling = cn2->next_sibling;
+					mark_buffer_dirty(wbh);
+					sync_dirty_buffer(wbh);
+					brelse(wbh);
+					break;
+				}
+				w = wn->next_sibling;
+				brelse(wbh);
+			}
+		}
+		pn2->child_count--;
+		mark_buffer_dirty(pbh2);
+		sync_dirty_buffer(pbh2);
+		brelse(pbh2);
+
+		briefs_trie_free_node(sb, check);
+		brelse(cbh2);
+	}
+
+	return 0;
 }
 
 /*
@@ -888,11 +1007,20 @@ void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di)
 	if (di->dir_trie_root) {
 		iter->stack[0] = di->dir_trie_root;
 		iter->sp = 1;
+		iter->leaf_emitted[0] = 0;
 	}
 }
 
 /*
  * briefs_trie_iter_next - get the next leaf entry from the trie.
+ *
+ * Walks the trie depth-first, emitting leaf entries in order.  When a node
+ * has both leaf data (NODE_STATUS_LEAF) and children, the leaf is emitted
+ * first (it represents a shorter name that is a prefix of longer names
+ * branching from this node).  The node is re-pushed after emitting its leaf
+ * so that its children are processed next; leaf_emitted[] tracks that we've
+ * already emitted this node's leaf so we don't emit it again on re-visit.
+ *
  * Returns 0 if an entry was found, -ENOENT if iteration is complete.
  */
 int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
@@ -903,8 +1031,10 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 
 	while (iter->sp > 0) {
 		u64 block;
+		u8 emitted;
 
 		block = iter->stack[iter->sp - 1];
+		emitted = iter->leaf_emitted[iter->sp - 1];
 		iter->sp--;
 
 		bh = sb_bread(sb, block);
@@ -917,55 +1047,17 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 			continue;
 		}
 
-		/*
-		 * Push children onto the stack for later processing.
-		 * If the stack is too full to hold all children at once,
-		 * push the current node back and process one child at a time.
-		 */
-		if (node->first_child) {
-			u64 child = node->first_child;
-			int pushed = 0;
-
-			while (child) {
-				if (iter->sp >= 256) {
-					/*
-					 * Stack full.  Push the current node back
-					 * so we resume here, then push just this
-					 * one child.  The remaining siblings will
-					 * be picked up when we return to this node.
-					 */
-					iter->stack[iter->sp++] = block;
-					iter->stack[iter->sp++] = child;
-					pushed = 1;
-					break;
-				}
-
-				iter->stack[iter->sp++] = child;
-				pushed++;
-
-				struct buffer_head *cbh = sb_bread(sb, child);
-				if (!cbh) break;
-				struct briefs_trie_node *cn = (struct briefs_trie_node *)cbh->b_data;
-				child = cn->next_sibling;
-				brelse(cbh);
-			}
-
-			if (pushed) {
-				/*
-				 * We pushed children (or one child + ourselves).
-				 * Don't emit this node yet — we'll come back to
-				 * it after processing children.  The children are
-				 * on top of the stack, so they'll be processed first.
-				 */
-				brelse(bh);
-				continue;
-			}
+		if (emitted) {
+			/*
+			 * We've already emitted this node's leaf entry.
+			 * Just push children (if any) for processing.
+			 */
+			goto push_children;
 		}
 
 		/*
-		 * No children (or all children already processed).
-		 * Emit this node if it has leaf data:
-		 *   - NODE_STATUS_LEAF flag set (INTERM with leaf entry)
+		 * Emit leaf data if this node has any:
+		 *   - NODE_STATUS_LEAF flag set (INTERM node with a leaf entry)
 		 *   - Pure leaf (node_type is FILE/DIR, not INTERM)
 		 */
 		if ((node->node_type & NODE_STATUS_LEAF) ||
@@ -983,8 +1075,61 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 					memcpy(name_buf, src, nlen);
 					*name_len = nlen;
 				}
+
+				/*
+				 * If this node also has children, push it back
+				 * with leaf_emitted=1 so they are processed in
+				 * subsequent calls without re-emitting the leaf.
+				 */
+				if (node->first_child && iter->sp < 256) {
+					iter->stack[iter->sp] = block;
+					iter->leaf_emitted[iter->sp] = 1;
+					iter->sp++;
+				}
+
 				brelse(bh);
 				return 0;
+			}
+		}
+
+push_children:
+		if (node->first_child) {
+			u64 child = node->first_child;
+			int pushed = 0;
+
+			while (child) {
+				if (iter->sp >= 256) {
+					/*
+					 * Stack full.  Push the current node back
+					 * so we resume here, then push just this
+					 * one child.  The remaining siblings will
+					 * be picked up when we return to this node.
+					 */
+					iter->stack[iter->sp] = block;
+					iter->leaf_emitted[iter->sp] = 1;
+					iter->sp++;
+					iter->stack[iter->sp] = child;
+					iter->leaf_emitted[iter->sp] = 0;
+					iter->sp++;
+					pushed = 1;
+					break;
+				}
+
+				iter->stack[iter->sp] = child;
+				iter->leaf_emitted[iter->sp] = 0;
+				iter->sp++;
+				pushed++;
+
+				struct buffer_head *cbh = sb_bread(sb, child);
+				if (!cbh) break;
+				struct briefs_trie_node *cn = (struct briefs_trie_node *)cbh->b_data;
+				child = cn->next_sibling;
+				brelse(cbh);
+			}
+
+			if (pushed) {
+				brelse(bh);
+				continue;
 			}
 		}
 

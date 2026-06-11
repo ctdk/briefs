@@ -386,6 +386,11 @@ void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di);
 struct trie_iter {
 	u64 stack[256];
 	int sp;
+	/* Per-entry flag: 1 if this stack entry had its leaf emitted.
+	 * Used so that when an INTERM+NODE_STATUS_LEAF node is re-pushed
+	 * after emitting its own leaf, we can skip re-emission on re-visit.
+	 * Only valid for entries where stack[i] != 0 (sp entries). */
+	u8 leaf_emitted[256];
 };
 
 void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di);
