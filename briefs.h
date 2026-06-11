@@ -391,6 +391,14 @@ struct trie_iter {
 	 * after emitting its own leaf, we can skip re-emission on re-visit.
 	 * Only valid for entries where stack[i] != 0 (sp entries). */
 	u8 leaf_emitted[256];
+	/* One-entry re-emit buffer: when dir_emit fails in briefs_readdir,
+	 * the entry already consumed from the trie is saved here so it
+	 * can be returned on the next briefs_trie_iter_next call. */
+	bool pending;
+	u64 pending_ino;
+	u8 pending_type;
+	u8 pending_name_buf[BRIEFS_NAME_LEN + 1];
+	int pending_name_len;
 };
 
 void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di);

@@ -72,7 +72,14 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 
 		if (!dir_emit(ctx, entry_name_buf, entry_name_len,
 		              entry_ino, fs_umode_to_dtype(file_type))) {
-			/* Buffer full — VFS will call us again with same ctx->pos */
+			/* Buffer full - save this entry so briefs_trie_iter_next
+			 * returns it on the next call (VFS retries with same ctx->pos
+			 * and the trie iterator has already advanced past the entry). */
+			iter->pending = true;
+			iter->pending_ino = entry_ino;
+			iter->pending_type = entry_type;
+			iter->pending_name_len = entry_name_len;
+			memcpy(iter->pending_name_buf, entry_name_buf, entry_name_len);
 			return 0;
 		}
 

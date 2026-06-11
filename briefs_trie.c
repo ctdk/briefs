@@ -1035,6 +1035,7 @@ void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di)
 void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di)
 {
 	iter->sp = 0;
+	iter->pending = false;
 	if (di->dir_trie_root) {
 		iter->stack[0] = di->dir_trie_root;
 		iter->sp = 1;
@@ -1059,6 +1060,18 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 {
 	struct buffer_head *bh;
 	struct briefs_trie_node *node;
+
+	/* Return a previously-saved pending entry (dir_emit failed on it) */
+	if (iter->pending) {
+		iter->pending = false;
+		if (ino) *ino = iter->pending_ino;
+		if (type) *type = iter->pending_type;
+		if (name_buf && name_len) {
+			memcpy(name_buf, iter->pending_name_buf, iter->pending_name_len);
+			*name_len = iter->pending_name_len;
+		}
+		return 0;
+	}
 
 	while (iter->sp > 0) {
 		u64 block;
