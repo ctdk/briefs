@@ -472,6 +472,22 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 	pr_debug("briefs: link inode %lu now has %u links\n", inode->i_ino, inode->i_nlink);
 	return 0;
 }
+
+static void update_parent_inode(struct inode *dir, struct briefs_sb_info *bsi) {
+	u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
+	u64 pIdx = dir->i_ino - 1;
+	u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
+	u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+	struct buffer_head *pbh = sb_bread(dir->i_sb, inodeTableBlock + pBlk);
+	if (pbh) {
+		struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + pOff);
+		pdi->nlinks = dir->i_nlink;
+		mark_buffer_dirty(pbh);
+		sync_dirty_buffer(pbh);
+		brelse(pbh);
+	}
+}
+
 /* briefs_unlink - remove a directory entry */
 int briefs_unlink(struct inode *dir, struct dentry *dentry) {
 	struct briefs_sb_info *bsi;
@@ -515,24 +531,12 @@ int briefs_unlink(struct inode *dir, struct dentry *dentry) {
 	}
 
 	/* Update parent inode on disk */
-	{
-		u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
-		u64 pIdx = dir->i_ino - 1;
-		u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
-		u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-		struct buffer_head *pbh = sb_bread(dir->i_sb, inodeTableBlock + pBlk);
-		if (pbh) {
-			struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + pOff);
-			pdi->nlinks = dir->i_nlink;
-			mark_buffer_dirty(pbh);
-			sync_dirty_buffer(pbh);
-			brelse(pbh);
-		}
-	}
-
+	update_parent_inode(dir, bsi);
+	
 	pr_debug("briefs: unlinked %pd\n", dentry);
 	return 0;
 }
+
 /* briefs_rename - rename a directory entry */
 int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
                   struct inode *new_dir, struct dentry *new_dentry, unsigned int flags) {
