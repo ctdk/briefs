@@ -693,13 +693,31 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 	if (ret)
 		return ret;
 
-	/* Handle cross-directory rename: update nlink */
+	/* Handle cross-directory rename: update nlink and parent_inode */
 	if (old_dir != new_dir) {
 		if (S_ISDIR(inode->i_mode)) {
 			drop_nlink(old_dir);
 			briefs_journal_inode_update(bsi->journal, old_dir);
 			inc_nlink(new_dir);
 			briefs_journal_inode_update(bsi->journal, new_dir);
+
+			/* Update parent_inode in the moved directory's on-disk inode */
+			struct briefs_inode_info *moved_binfo = briefs_i(inode);
+			moved_binfo->disk_inode.parent_inode = new_dir->i_ino;
+			briefs_journal_inode_update(bsi->journal, inode);
+
+			u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
+			u64 idx = inode->i_ino - 1;
+			u64 blk = idx / (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
+			u64 off = (idx % (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+			struct buffer_head *mbh = sb_bread(inode->i_sb, inodeTableBlock + blk);
+			if (mbh) {
+				struct briefs_inode *mdi = (struct briefs_inode *)(mbh->b_data + off);
+				mdi->parent_inode = new_dir->i_ino;
+				mark_buffer_dirty(mbh);
+				sync_dirty_buffer(mbh);
+				brelse(mbh);
+			}
 		}
 	}
 

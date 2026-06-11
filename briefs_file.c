@@ -203,7 +203,57 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 				binfo->disk_inode.inline_extents[j] = binfo->disk_inode.inline_extents[j + 1];
 			binfo->disk_inode.num_extents_inline--;
 		} else {
-			/* Extent is in a chain block - we'll rebuild later */
+			/* Extent is in a chain block — remove it and
+			 * shift remaining extents in the block down. */
+			struct buffer_head *tbh;
+			struct briefs_extent_chain *tc;
+			u64 calias = binfo->disk_inode.extent_inline_base;
+			int cidx = i - binfo->disk_inode.num_extents_inline;
+			u64 prev_block = 0;
+
+			while (calias && cidx >= 0) {
+				tbh = sb_bread(inode->i_sb, calias);
+				if (!tbh)
+					break;
+				tc = (struct briefs_extent_chain *)tbh->b_data;
+
+				if (cidx < tc->num_extents_in_block) {
+					/* Found the block — shift extents down */
+					int j;
+					for (j = cidx; j < tc->num_extents_in_block - 1; j++)
+						tc->extents[j] = tc->extents[j + 1];
+					tc->num_extents_in_block--;
+
+					mark_buffer_dirty(tbh);
+					sync_dirty_buffer(tbh);
+
+					/* Free empty non-first chain block */
+					if (tc->num_extents_in_block == 0 &&
+					    prev_block != 0) {
+						struct buffer_head *pbh;
+						struct briefs_extent_chain *pc;
+
+						pbh = sb_bread(inode->i_sb, prev_block);
+						if (pbh) {
+							pc = (struct briefs_extent_chain *)pbh->b_data;
+							pc->next_overflow_block = 0;
+							mark_buffer_dirty(pbh);
+							sync_dirty_buffer(pbh);
+							brelse(pbh);
+						}
+						briefs_free_block(&bsi->alloc,
+							abs_to_data(bsi->sb, calias));
+					}
+
+					brelse(tbh);
+					break;
+				}
+
+				cidx -= tc->num_extents_in_block;
+				prev_block = calias;
+				brelse(tbh);
+				calias = tc->next_overflow_block;
+			}
 		}
 
 		binfo->disk_inode.num_extents_total--;

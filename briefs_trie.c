@@ -777,44 +777,55 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 			 * If it's a pure leaf, unlink and free.
 			 */
 			if (node->node_type & NODE_TYPE_INTERM) {
-				/* INTERM with NODE_STATUS_LEAF: clear leaf flag */
+				/*
+				 * INTERM with NODE_STATUS_LEAF: clear leaf flag.
+				 * Check whether the node has children BEFORE
+				 * releasing cbh — node is invalid after brelse.
+				 */
+				bool has_children = (node->first_child != 0 ||
+						    node->child_count != 0);
+
 				node->node_type &= ~NODE_STATUS_LEAF;
+
+				if (has_children) {
+					/* Still has children, keep the node */
+					mark_buffer_dirty(cbh);
+					sync_dirty_buffer(cbh);
+					brelse(cbh);
+					brelse(bh);
+					ret = 0;
+					goto out;
+				}
+
+				/*
+				 * No children — the node is dead.
+				 * Unlink from parent, free, collapse up.
+				 */
 				mark_buffer_dirty(cbh);
 				sync_dirty_buffer(cbh);
 				brelse(cbh);
 
-				/*
-				 * If the INTERM now has no children, it's dead.
-				 * Unlink from parent and free, then collapse up.
-				 */
-				if (pnode->child_count == 0 && pnode->first_child == 0) {
-					/* Unlink child from parent */
-					if (child_prev == 0) {
-						pnode->first_child = node->next_sibling;
-					} else {
-						struct buffer_head *ppbh;
-						struct briefs_trie_node *ppn;
-						ppbh = sb_bread(sb, child_prev);
-						if (ppbh) {
-							ppn = (struct briefs_trie_node *)ppbh->b_data;
-							ppn->next_sibling = node->next_sibling;
-							mark_buffer_dirty(ppbh);
-							sync_dirty_buffer(ppbh);
-							brelse(ppbh);
-						}
+				if (child_prev == 0) {
+					pnode->first_child = node->next_sibling;
+				} else {
+					struct buffer_head *ppbh;
+					struct briefs_trie_node *ppn;
+					ppbh = sb_bread(sb, child_prev);
+					if (ppbh) {
+						ppn = (struct briefs_trie_node *)ppbh->b_data;
+						ppn->next_sibling = node->next_sibling;
+						mark_buffer_dirty(ppbh);
+						sync_dirty_buffer(ppbh);
+						brelse(ppbh);
 					}
-					pnode->child_count--;
-					mark_buffer_dirty(bh);
-					sync_dirty_buffer(bh);
-					brelse(bh);
-
-					briefs_trie_free_node(sb, child);
-					goto collapse;
 				}
-
+				pnode->child_count--;
+				mark_buffer_dirty(bh);
+				sync_dirty_buffer(bh);
 				brelse(bh);
-				ret = 0;
-				goto out;
+
+				briefs_trie_free_node(sb, child);
+				goto collapse;
 			}
 
 			/* Pure leaf: unlink and free */
