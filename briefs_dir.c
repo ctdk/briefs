@@ -46,8 +46,13 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 			return -ENOMEM;
 		briefs_trie_iter_init(iter, &binfo->disk_inode);
 		file->private_data = iter;
-	} else if (ctx->pos == 2 && iter->sp > 0) {
-		/* Seek to 0: reinitialize */
+	} else if (ctx->pos == 2) {
+		/* Seek to 0: reinitialize the iterator.
+		 * Always reinitialize when ctx->pos is 2 (just past . and ..)
+		 * regardless of whether the iterator is exhausted.  The old
+		 * check (iter->sp > 0) skipped re-initialization when the
+		 * iterator was fully consumed, causing the directory to
+		 * appear empty after a seekdir(0) + readdir cycle. */
 		struct briefs_inode_info *binfo = briefs_i(dir);
 		briefs_trie_iter_init(iter, &binfo->disk_inode);
 	}
