@@ -34,6 +34,8 @@
 /* Number of bytes for the 2-byte name-length prefix stored in the block */
 #define TRIE_NAME_PREFIX 2
 
+#define TRIE_ANCESTRY_LIMIT 256
+
 /*
  * briefs_trie_alloc_node - allocate a block for a new trie node.
  * Returns the absolute block number, or 0 on failure.
@@ -689,12 +691,19 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 	struct briefs_trie_node *node, *pnode;
 	u64 cur, parent, child_prev, child;
 	/* Ancestry path from root to the leaf's parent, for collapse */
-	u64 ancestry[256];
+	/* u64 ancestry[256]; -- allocate ancestry explicitly*/
+	u64 *ancestry;
 	int anc;
 	int pos;
+	int ret;
 
-	if (!di->dir_trie_root)
-		return -ENOENT;
+	ancestry = kcalloc(TRIE_ANCESTRY_LIMIT, sizeof(u64), GFP_NOFS);
+	ret = 0;
+
+	if (!di->dir_trie_root) {
+		ret = -ENOENT;
+		goto out;
+	}
 
 	parent = 0;
 	child_prev = 0;
@@ -704,8 +713,10 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 
 	for (pos = 0; pos < name_len; pos++) {
 		bh = sb_bread(sb, cur);
-		if (!bh)
-			return -EIO;
+		if (!bh) {
+			ret = -EIO;
+			goto out;
+		}
 		pnode = (struct briefs_trie_node *)bh->b_data;
 		child = pnode->first_child;
 		child_prev = 0;
@@ -717,7 +728,8 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 			tbh = sb_bread(sb, child);
 			if (!tbh) {
 				brelse(bh);
-				return -EIO;
+				ret = -EIO;
+				goto out;
 			}
 			tnode = (struct briefs_trie_node *)tbh->b_data;
 			if (tnode->byte_val == (u8)name[pos]) {
@@ -731,14 +743,16 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 
 		if (child == 0) {
 			brelse(bh);
-			return -ENOENT;
+			ret = -ENOENT;
+			goto out;
 		}
 
 		if (pos == name_len - 1) {
 			cbh = sb_bread(sb, child);
 			if (!cbh) {
 				brelse(bh);
-				return -EIO;
+				ret = -EIO;
+				goto out;
 			}
 			node = (struct briefs_trie_node *)cbh->b_data;
 
@@ -751,7 +765,8 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 				 */
 				brelse(cbh);
 				brelse(bh);
-				return -ENOTEMPTY;
+				ret = -ENOTEMPTY;
+				goto out;
 			}
 
 			/*
@@ -798,7 +813,8 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 				}
 
 				brelse(bh);
-				return 0;
+				ret = 0;
+				goto out;
 			}
 
 			/* Pure leaf: unlink and free */
@@ -834,12 +850,13 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 		parent = cur;
 		child_prev = 0;
 		cur = child;
-		if (anc < 256)
+		if (anc < TRIE_ANCESTRY_LIMIT)
 			ancestry[anc++] = cur;
 		brelse(bh);
 	}
 
-	return -ENOENT;
+	ret = -ENOENT;
+	goto out;
 
 collapse:
 	/*
@@ -907,11 +924,14 @@ collapse:
 		sync_dirty_buffer(pbh2);
 		brelse(pbh2);
 
+
 		briefs_trie_free_node(sb, check);
 		brelse(cbh2);
 	}
 
-	return 0;
+out:
+	kfree(ancestry);
+	return ret;
 }
 
 /*
