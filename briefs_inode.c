@@ -152,7 +152,7 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 
 		disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
 
-		if (disk_inode->magic != 0x494E4F44) {
+		if (disk_inode->magic != _BRIEFS_INODE_MAGIC) {
 			pr_err("briefs: invalid inode magic for ino %llu: 0x%08llx\n", ino, disk_inode->magic);
 			brelse(bh);
 			unlock_new_inode(inode);

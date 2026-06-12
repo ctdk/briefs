@@ -420,7 +420,7 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		inode->i_atime_nsec = inode->i_mtime_nsec = inode->i_ctime_nsec = now.tv_nsec;
 
 		binfo->disk_inode.inode_number = ino;
-		binfo->disk_inode.magic = 0x494E4F44;
+		binfo->disk_inode.magic = _BRIEFS_INODE_MAGIC;
 		binfo->disk_inode.filemode = S_IFLNK | 0777;
 		binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
 		binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);
@@ -626,7 +626,7 @@ int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 
 		/* Set up disk inode fields */
 		binfo->disk_inode.inode_number = ino;
-		binfo->disk_inode.magic = 0x494E4F44;
+		binfo->disk_inode.magic = _BRIEFS_INODE_MAGIC;
 		binfo->disk_inode.filemode = mode;
 		binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
 		binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);

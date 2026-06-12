@@ -275,7 +275,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 
 		/* Set up briefs_inode fields */
 		binfo->disk_inode.inode_number = ino;
-		binfo->disk_inode.magic = 0x494E4F44;
+		binfo->disk_inode.magic = _BRIEFS_INODE_MAGIC;
 		binfo->disk_inode.filemode = mode;
 		binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
 		binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);

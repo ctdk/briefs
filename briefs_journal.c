@@ -294,7 +294,7 @@ static struct briefs_inode *replay_read_inode(struct super_block *sb,
 		return NULL;
 
 	di = (struct briefs_inode *)((*bh_out)->b_data + inodeOffset);
-	if (di->magic != 0x494E4F44) {
+	if (di->magic != _BRIEFS_INODE_MAGIC) {
 		brelse(*bh_out);
 		*bh_out = NULL;
 		return NULL;
@@ -379,7 +379,7 @@ static int replay_inode_update(struct super_block *sb, struct jrn_inode_update *
 	di = (struct briefs_inode *)(bh->b_data + inodeOffset);
 
 	di->inode_number = rec->ino;
-	di->magic = 0x494E4F44;
+	di->magic = _BRIEFS_INODE_MAGIC;
 	di->filemode = rec->mode;
 	di->nlinks = rec->nlink;
 	di->uid = rec->uid;

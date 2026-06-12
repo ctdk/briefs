@@ -11,6 +11,7 @@
 
 /* BrieFS magic number */
 #define _BRIEFS_SUPER_MAGIC 0x504C434E /* "PLCN" */
+#define _BRIEFS_INODE_MAGIC 0x494E4F44  /* "INOD" */
 
 /* Define the number of reserved/padding bytes in the superblock */
 #define _BRIEFS_SUPER_RESERVED 648
