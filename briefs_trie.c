@@ -86,6 +86,7 @@ static void briefs_trie_init_block(struct super_block *sb, u64 block,
 	node->depth = depth;
 	node->byte_val = byte_val;
 	node->node_type = node_type;
+	set_buffer_uptodate(bh);
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
 	brelse(bh);
