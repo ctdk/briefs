@@ -1,5 +1,6 @@
 .*.sw?
 **/.*.sw?
+.sw?
 
 # ignore vagrant bits
 .vagrant/
