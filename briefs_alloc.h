@@ -4,6 +4,7 @@
 #define _BRIEFS_ALLOC_H
 
 #include <linux/types.h>
+#include <linux/mutex.h>
 
 /* Forward declarations - defined in briefs.h */
 struct briefs_superblock;
@@ -36,6 +37,7 @@ struct briefs_alloc {
 	__u64 block_count;              /* total data blocks tracked */
 	__u64 free_count;               /* total free blocks */
 	u64 alloc_pool_start;           /* first block of allocator pool on disk */
+	struct mutex lock;               /* protects bitmaps and free_count */
 };
 
 /* Initialize data block allocator from superblock */

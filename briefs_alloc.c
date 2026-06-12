@@ -46,6 +46,7 @@ int briefs_alloc_init_at(struct briefs_alloc *alloc, struct super_block *sb,
 		return -EINVAL;
 
 	memset(alloc, 0, sizeof(*alloc));
+	mutex_init(&alloc->lock);
 	alloc->sb = sb;
 	alloc->alloc_pool_start = pool_block;
 
@@ -173,18 +174,16 @@ int briefs_alloc_init_at(struct briefs_alloc *alloc, struct super_block *sb,
 /*
  * Allocate a single free block.
  * Returns data-relative block number, or 0 if no space.
- *
- * Algorithm: scan Level 0 for first nonzero word, then find first
- * set bit within that word to get the Level 1 word index, then
- * repeat at Level 1 to get the Level 2 word index, then find the
- * first set bit in that Level 2 word for the exact block number.
  */
 u64 briefs_alloc_block(struct briefs_alloc *alloc)
 {
 	u64 w0, b0, w1_idx, l1_word, b1, w2_idx, l2_word, b2, block;
 
-	if (!alloc || alloc->free_count == 0 || !alloc->l0)
+	mutex_lock(&alloc->lock);
+	if (!alloc || alloc->free_count == 0 || !alloc->l0) {
+		mutex_unlock(&alloc->lock);
 		return 0;
+	}
 
 	for (w0 = 0; w0 < alloc->l0_words; w0++) {
 		if (alloc->l0[w0] == 0)
@@ -192,8 +191,10 @@ u64 briefs_alloc_block(struct briefs_alloc *alloc)
 		b0 = __builtin_ctzll(alloc->l0[w0]);
 
 		w1_idx = w0 * 64 + b0;
-		if (w1_idx >= alloc->l1_words)
+		if (w1_idx >= alloc->l1_words) {
+			mutex_unlock(&alloc->lock);
 			return 0;
+		}
 		l1_word = alloc->l1[w1_idx];
 		if (l1_word == 0) {
 			alloc->l0[w0] &= ~(1ULL << b0);
@@ -205,6 +206,7 @@ u64 briefs_alloc_block(struct briefs_alloc *alloc)
 		if (w2_idx >= alloc->l2_words) {
 			pr_err("briefs: alloc: w2_idx=%llu out of range (max=%llu)\n",
 				w2_idx, alloc->l2_words);
+			mutex_unlock(&alloc->lock);
 			return 0;
 		}
 		l2_word = alloc->l2[w2_idx];
@@ -220,6 +222,7 @@ u64 briefs_alloc_block(struct briefs_alloc *alloc)
 		if (block >= alloc->block_count) {
 			pr_err("briefs: alloc: block %llu out of range (max=%llu)\n",
 				block, alloc->block_count);
+			mutex_unlock(&alloc->lock);
 			return 0;
 		}
 
@@ -234,16 +237,15 @@ u64 briefs_alloc_block(struct briefs_alloc *alloc)
 				alloc->l0[w0] &= ~(1ULL << b0);
 		}
 
+		mutex_unlock(&alloc->lock);
 		return block;
 	}
 
 	pr_err("briefs: allocator returned 0 despite free_count=%llu\n", alloc->free_count);
+	mutex_unlock(&alloc->lock);
 	return 0;
 }
 
-/*
- * Free a single block (data-relative block number).
- */
 /*
  * briefs_reserve_block - mark a specific block as allocated in the bitmap.
  * Used during journal replay to ensure bitmap consistency.
@@ -252,8 +254,11 @@ void briefs_reserve_block(struct briefs_alloc *alloc, u64 rel_block)
 {
 	u64 w2, b2, w1, b1, w0, b0;
 
-	if (!alloc || !alloc->l0 || rel_block >= alloc->block_count)
+	mutex_lock(&alloc->lock);
+	if (!alloc || !alloc->l0 || rel_block >= alloc->block_count) {
+		mutex_unlock(&alloc->lock);
 		return;
+	}
 
 	w2 = rel_block / 64;
 	b2 = rel_block % 64;
@@ -263,8 +268,10 @@ void briefs_reserve_block(struct briefs_alloc *alloc, u64 rel_block)
 	b0 = w1 % 64;
 
 	/* If already allocated (bit already 0), nothing to do */
-	if (!(alloc->l2[w2] & (1ULL << b2)))
+	if (!(alloc->l2[w2] & (1ULL << b2))) {
+		mutex_unlock(&alloc->lock);
 		return;
+	}
 
 	/* Clear the bit = mark allocated, update free count */
 	alloc->l2[w2] &= ~(1ULL << b2);
@@ -276,14 +283,18 @@ void briefs_reserve_block(struct briefs_alloc *alloc, u64 rel_block)
 		if (alloc->l1[w1] == 0)
 			alloc->l0[w0] &= ~(1ULL << b0);
 	}
+	mutex_unlock(&alloc->lock);
 }
 
 void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block)
 {
 	u64 w2, b2, w1, b1, w0, b0;
 
-	if (!alloc || !alloc->l0 || rel_block >= alloc->block_count)
+	mutex_lock(&alloc->lock);
+	if (!alloc || !alloc->l0 || rel_block >= alloc->block_count) {
+		mutex_unlock(&alloc->lock);
 		return;
+	}
 
 	w2 = rel_block / 64;
 	b2 = rel_block % 64;
@@ -293,8 +304,10 @@ void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block)
 	b0 = w1 % 64;
 
 	/* If already free, nothing to do */
-	if (alloc->l2[w2] & (1ULL << b2))
+	if (alloc->l2[w2] & (1ULL << b2)) {
+		mutex_unlock(&alloc->lock);
 		return;
+	}
 
 	alloc->l2[w2] |= (1ULL << b2);
 	alloc->free_count++;
@@ -305,6 +318,7 @@ void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block)
 		if (alloc->l1[w1] == (1ULL << b1))
 			alloc->l0[w0] |= (1ULL << b0);
 	}
+	mutex_unlock(&alloc->lock);
 }
 
 /*
@@ -330,8 +344,11 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 	u64 l0_blocks, l1_blocks, l2_blocks;
 	u64 i;
 
-	if (!alloc || !alloc->sb || !alloc->l0)
+	mutex_lock(&alloc->lock);
+	if (!alloc || !alloc->sb || !alloc->l0) {
+		mutex_unlock(&alloc->lock);
 		return -EINVAL;
+	}
 
 	words_per_block = alloc->sb->s_blocksize / sizeof(u64);
 	l0_blocks = (alloc->l0_words + words_per_block - 1) / words_per_block;
@@ -353,6 +370,7 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 		bh = sb_bread(alloc->sb, offset);
 		if (!bh) {
 			pr_err("briefs: failed to read L0 block %llu during sync\n", offset);
+			mutex_unlock(&alloc->lock);
 			return -EIO;
 		}
 
@@ -382,6 +400,7 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 		bh = sb_bread(alloc->sb, offset);
 		if (!bh) {
 			pr_err("briefs: failed to read L1 block %llu during sync\n", offset);
+			mutex_unlock(&alloc->lock);
 			return -EIO;
 		}
 
@@ -411,6 +430,7 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 		bh = sb_bread(alloc->sb, offset);
 		if (!bh) {
 			pr_err("briefs: failed to read L2 block %llu during sync\n", offset);
+			mutex_unlock(&alloc->lock);
 			return -EIO;
 		}
 
@@ -441,6 +461,7 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 	}
 
 	pr_debug("briefs: allocator sync complete\n");
+	mutex_unlock(&alloc->lock);
 	return 0;
 }
 
