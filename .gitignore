@@ -7,6 +7,9 @@
 # ignore .bak files if created
 *.bak
 
+# ignore agent stuff, in the event I run claude in here or something
+.claude/
+
 # ignore object files and other build artifacts
 *.o
 *.mod
