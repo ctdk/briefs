@@ -400,7 +400,7 @@ struct trie_iter {
 	u8 pending_type;
 	u8 pending_name_buf[BRIEFS_NAME_LEN + 1];
 	int pending_name_len;
-		u64 gen;               /* generation of the trie when iterator was created */
+	u64 gen;               /* generation of the trie when iterator was created */
 };
 
 void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di, u64 gen);
@@ -503,8 +503,8 @@ struct briefs_inode_info {
 	struct briefs_inode disk_inode;
 	u64 inode_number;
 	seqcount_t extent_seq;   /* protects disk_inode extent fields */
-		struct mutex trie_lock;    /* protects directory trie structure */
-		u64 trie_gen;            /* generation counter for trie modifications */
+	struct mutex trie_lock;    /* protects directory trie structure */
+	u64 trie_gen;            /* generation counter for trie modifications */
 };
 
 /* yanked from the xiafs module, which in turn was yanked from minix */
