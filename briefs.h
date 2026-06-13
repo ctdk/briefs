@@ -27,7 +27,7 @@
 
 /* Semantic versioning, yo */
 #define _BRIEFS_MAJOR_VER 0
-#define _BRIEFS_MINOR_VER 5
+#define _BRIEFS_MINOR_VER 6
 #define _BRIEFS_PATCH_VER 0
 
 /* Journal magic */
