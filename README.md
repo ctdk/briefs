@@ -13,7 +13,7 @@ BrieFS: A Linux filesystem that solely uses [extents](https://en.wikipedia.org/w
 RELATED
 -------
 
-* [github.com/ctdk/briefs-utils](github.com/ctdk/briefs-utils): The briefs utilities, written in Golang, comprised of `mkfs.briefs` and `fsck.briefs`. These are unsurprisingly in progress, but `mkfs.briefs` creates BrieFS volumes while `fsck.briefs` doesn't do anything yet.
+* [github.com/ctdk/briefs-utils](github.com/ctdk/briefs-utils): The briefs utilities, written in Golang, composed of `mkfs.briefs`, `fsck.briefs`, and `fuse.briefs`. These are unsurprisingly in progress, but `mkfs.briefs` creates BrieFS volumes while `fsck.briefs` checks but does not repair BrieFS volumes and `fuse.briefs` provides a read-only FUSE bridge for those same BrieFS volumes.
 * [github.com/ctdk/modern-xiafs](github.com/ctdk/modern-xiafs): Computer filesystem archaeology. A port of an ancient Linux filesystem to modern kernels, updated as I get around to it.
 
 RATIONALE
@@ -47,6 +47,7 @@ WORKS
 * Kernel module unloading
 * Mounting a filesystem created by `mkfs.briefs`.
 * Unmounting a filesystem.
+* Scanning a filesystem with fsck and reporting errors. Filesystem repair is still unimplemented, unfortunately.
 * Listing the root directory.
 * touching files
 * mkdir creates directories
@@ -62,7 +63,7 @@ WORKS
 * cp -r works properly
 * symlinks and other special files
 * a set of tests
-* rm -r works (still testing edge cases)
+* rm -r works
 * Directory trie synchronization
 * Stale iterator detection
 * inode reuse
