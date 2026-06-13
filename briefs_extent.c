@@ -213,10 +213,6 @@ int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 		sync_dirty_buffer(bh);
 		brelse(bh);
 
-		write_seqcount_begin(&binfo->extent_seq);
-		di->extent_inline_base = chain_block; /* unnecessary but harmless */
-		write_seqcount_end(&binfo->extent_seq);
-
 		/* Journal the new chain block allocation */
 		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
 					    0, new_block, 1, -1);
