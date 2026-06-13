@@ -550,6 +550,7 @@ split_leaf:
 			u64 internal;
 			u64 *link;
 
+				u64 old_sibling = lnode->next_sibling;
 			brelse(lbh);
 
 			internal = briefs_trie_alloc_node(sb);
@@ -594,6 +595,7 @@ split_leaf:
 			if (bh) {
 				node = (struct briefs_trie_node *)bh->b_data;
 				node->first_child = child;
+					node->next_sibling = old_sibling;
 				node->child_count = 1;
 				mark_buffer_dirty(bh);
 				sync_dirty_buffer(bh);
