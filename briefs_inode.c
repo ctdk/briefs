@@ -245,8 +245,26 @@ u64 briefs_alloc_inode(struct super_block *sb) {
 }
 void briefs_free_inode_num(struct super_block *sb, u64 ino) {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
+	u64 inodeTableBlock, inodeBlock, inodeOffset;
+	struct buffer_head *bh;
+
 	if (ino == 0)
 		return;
+
+	/* Zero out the inode on disk so fsck doesn't see a "free" inode with valid magic */
+	inodeTableBlock = briefs_inode_table_start(bsi->sb);
+	u64 inodeIndex = ino - 1;
+	inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
+	inodeOffset = (inodeIndex % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+
+	bh = sb_bread(sb, inodeTableBlock + inodeBlock);
+	if (bh) {
+		memset(bh->b_data + inodeOffset, 0, BRIEFS_INODE_SIZE);
+		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);
+		brelse(bh);
+	}
+
 	briefs_free_block(&bsi->inode_alloc, ino - 1);
 	pr_debug("briefs: freed inode %llu\n", ino);
 }
