@@ -403,7 +403,7 @@ struct trie_iter {
 		u64 gen;               /* generation of the trie when iterator was created */
 };
 
-void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di);
+void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di, u64 gen);
 int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter, u64 current_gen, u64 *ino, u8 *type, char *name_buf, int *name_len);
 
 /* Compute CRC32 checksum for journal record */
@@ -513,7 +513,7 @@ static inline struct briefs_sb_info *briefs_sb(struct super_block *sb) {
 }
 
 static inline struct briefs_inode_info *briefs_i(struct inode *inode) {
-	return list_entry(inode, struct briefs_inode_info, vfs_inode);
+	return container_of(inode, struct briefs_inode_info, vfs_inode);
 }
 
 /* Convert data-relative block to absolute block number */

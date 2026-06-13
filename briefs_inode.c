@@ -163,7 +163,7 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 		}
 
 		/* Copy disk inode to VFS inode */
-		binfo = (struct briefs_inode_info *)inode;
+		binfo = briefs_i(inode);
 		memcpy(&binfo->disk_inode, disk_inode, sizeof(struct briefs_inode));
 		binfo->inode_number = ino;
 

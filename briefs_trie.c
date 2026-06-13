@@ -1033,10 +1033,11 @@ void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di)
 /*
  * briefs_trie_iter_init - initialize a trie iteration starting from root.
  */
-void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di)
+void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di, u64 gen)
 {
 	iter->sp = 0;
 	iter->pending = false;
+	iter->gen = gen;
 	if (di->dir_trie_root) {
 		iter->stack[0] = di->dir_trie_root;
 		iter->sp = 1;

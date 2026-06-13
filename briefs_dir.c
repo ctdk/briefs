@@ -46,8 +46,7 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 			return -ENOMEM;
 
 		mutex_lock(&binfo->trie_lock);
-		briefs_trie_iter_init(iter, &binfo->disk_inode);
-			iter->gen = binfo->trie_gen;
+		briefs_trie_iter_init(iter, &binfo->disk_inode, binfo->trie_gen);
 		mutex_unlock(&binfo->trie_lock);
 
 		file->private_data = iter;
@@ -61,8 +60,7 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 		struct briefs_inode_info *binfo = briefs_i(dir);
 
 		mutex_lock(&binfo->trie_lock);
-			iter->gen = binfo->trie_gen;
-		briefs_trie_iter_init(iter, &binfo->disk_inode);
+		briefs_trie_iter_init(iter, &binfo->disk_inode, binfo->trie_gen);
 		mutex_unlock(&binfo->trie_lock);
 	}
 
@@ -118,9 +116,8 @@ int briefs_dir_open(struct inode *inode, struct file *file) {
 		return -ENOMEM;
 
 	binfo = briefs_i(inode);
-		iter->gen = binfo->trie_gen;
 	mutex_lock(&binfo->trie_lock);
-	briefs_trie_iter_init(iter, &binfo->disk_inode);
+	briefs_trie_iter_init(iter, &binfo->disk_inode, binfo->trie_gen);
 	mutex_unlock(&binfo->trie_lock);
 	file->private_data = iter;
 
@@ -571,7 +568,7 @@ static int briefs_empty_dir(struct inode *inode, int *ret){
 			return 0;
 		}
 
-		briefs_trie_iter_init(iter, &binfo->disk_inode);
+		briefs_trie_iter_init(iter, &binfo->disk_inode, binfo->trie_gen);
 		res = briefs_trie_iter_next(inode->i_sb, iter, binfo->trie_gen,
 									   &entry_ino, &entry_type,
 									   entry_name_buf, &entry_name_len);
