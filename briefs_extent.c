@@ -16,7 +16,7 @@
 
 
 /* Extents per chain block (see struct briefs_extent_chain) */
-#define CHAIN_EXTENTS 256
+#define CHAIN_EXTENTS 127
 
 /*
  * Data region start: the allocator trie uses data-relative block numbers

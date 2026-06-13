@@ -285,7 +285,7 @@ struct briefs_extent_chain {
 	__u64 next_overflow_block;
 	__u32 num_extents_in_block;
 	__u32 pad;
-	struct briefs_extent extents[256];
+	struct briefs_extent extents[127];
 	__u64 checksum;
 };
 
@@ -385,13 +385,13 @@ void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di);
 
 /* Trie iterator for readdir - depth-first walk yielding leaves */
 struct trie_iter {
-	u64 stack[256];
+	u64 stack[512];
 	int sp;
 	/* Per-entry flag: 1 if this stack entry had its leaf emitted.
 	 * Used so that when an INTERM+NODE_STATUS_LEAF node is re-pushed
 	 * after emitting its own leaf, we can skip re-emission on re-visit.
 	 * Only valid for entries where stack[i] != 0 (sp entries). */
-	u8 leaf_emitted[256];
+	u8 leaf_emitted[512];
 	/* One-entry re-emit buffer: when dir_emit fails in briefs_readdir,
 	 * the entry already consumed from the trie is saved here so it
 	 * can be returned on the next briefs_trie_iter_next call. */

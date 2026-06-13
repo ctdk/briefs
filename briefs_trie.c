@@ -1150,7 +1150,7 @@ push_children:
 			int pushed = 0;
 
 			while (child) {
-				if (iter->sp >= 256) {
+				if (iter->sp >= 510) {
 					/*
 					 * Stack full.  Push the current node back
 					 * so we resume here, then push just this
