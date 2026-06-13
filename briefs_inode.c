@@ -88,6 +88,8 @@ struct inode *briefs_alloc_vfs_inode(struct super_block *sb) {
 		return NULL;
 
 	seqcount_init(&binfo->extent_seq);
+		mutex_init(&binfo->trie_lock);
+			binfo->trie_gen = 0;
 	return &binfo->vfs_inode;
 }
 /* briefs_free_inode - free a VFS inode (called by VFS inode cache) */

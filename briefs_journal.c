@@ -307,50 +307,50 @@ static struct briefs_inode *replay_read_inode(struct super_block *sb,
  */
 static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
 {
-	struct buffer_head *parent_bh = NULL;
-	struct briefs_inode *parent_di;
-	struct buffer_head *child_bh = NULL;
-	struct briefs_inode *child_di;
+	struct inode *parent;
+	struct briefs_inode_info *binfo;
 	int ret;
 
-	parent_di = replay_read_inode(sb, rec->parent_ino, &parent_bh);
-	if (!parent_di) {
-		pr_warn("briefs: replay can't read parent inode %llu (skip)\n",
+	parent = briefs_iget(sb, rec->parent_ino);
+	if (IS_ERR(parent)) {
+		pr_warn("briefs: replay can't iget parent inode %llu (skip)\n",
 			rec->parent_ino);
 		return 0; /* skip — might have been freed already */
 	}
+
+	binfo = briefs_i(parent);
+	mutex_lock(&binfo->trie_lock);
 
 	if (rec->op == 0) {
 		/* Add directory entry */
 		u8 ftype = 0;
 
 		/* Read child inode to get file type */
-		child_di = replay_read_inode(sb, rec->child_ino, &child_bh);
-		if (child_di) {
-			ftype = (child_di->filemode & S_IFMT) >> 12;
-			brelse(child_bh);
+		struct inode *child = briefs_iget(sb, rec->child_ino);
+		if (!IS_ERR(child)) {
+			ftype = (child->i_mode & S_IFMT) >> 12;
+			iput(child);
 		} else {
 			pr_warn("briefs: replay can't read child inode %llu, using ftype=0\n",
 				rec->child_ino);
 		}
 
-		ret = briefs_trie_insert(sb, parent_di,
-					 rec->name, rec->name_len,
-					 rec->child_ino, ftype);
+		ret = briefs_trie_insert(sb, &binfo->disk_inode,
+						 rec->name, rec->name_len,
+						 rec->child_ino, ftype);
 		if (ret == -EEXIST) {
-			/* Already applied — idempotent */
 			ret = 0;
 		}
 	} else {
 		/* Delete directory entry */
-		ret = briefs_trie_remove(sb, parent_di, rec->name, rec->name_len);
+		ret = briefs_trie_remove(sb, &binfo->disk_inode, rec->name, rec->name_len);
 		if (ret == -ENOENT) {
-			/* Already removed — idempotent */
 			ret = 0;
 		}
 	}
 
-	brelse(parent_bh);
+	mutex_unlock(&binfo->trie_lock);
+	iput(parent);
 	return ret;
 }
 

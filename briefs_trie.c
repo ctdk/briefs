@@ -877,11 +877,11 @@ collapse:
 	 * first_child == 0).
 	 *
 	 * ancestry[anc-1] is the target node (already freed), ancestry[anc-2]
-	 * is its parent (cur after the unlink above).
+	 * is its parent, and ancestry[anc-3] is the grandparent.
 	 */
 	int i;
 
-	for (i = anc - 1; i >= 1; i--) {
+	for (i = anc - 2; i >= 1; i--) {
 		u64 check = ancestry[i];
 		struct buffer_head *cbh2;
 		struct briefs_trie_node *cn2;
@@ -1057,10 +1057,14 @@ void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di)
  * Returns 0 if an entry was found, -ENOENT if iteration is complete.
  */
 int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
-                                  u64 *ino, u8 *type, char *name_buf, int *name_len)
+                                  u64 current_gen, u64 *ino, u8 *type, char *name_buf, int *name_len)
 {
 	struct buffer_head *bh;
 	struct briefs_trie_node *node;
+
+	if (iter->gen != current_gen)
+		return -ESTALE;
+
 
 	/* Return a previously-saved pending entry (dir_emit failed on it) */
 	if (iter->pending) {

@@ -44,7 +44,12 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 		iter = kmalloc(sizeof(struct trie_iter), GFP_KERNEL);
 		if (!iter)
 			return -ENOMEM;
+
+		mutex_lock(&binfo->trie_lock);
 		briefs_trie_iter_init(iter, &binfo->disk_inode);
+			iter->gen = binfo->trie_gen;
+		mutex_unlock(&binfo->trie_lock);
+
 		file->private_data = iter;
 	} else if (ctx->pos == 2) {
 		/* Seek to 0: reinitialize the iterator.
@@ -54,7 +59,11 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 		 * iterator was fully consumed, causing the directory to
 		 * appear empty after a seekdir(0) + readdir cycle. */
 		struct briefs_inode_info *binfo = briefs_i(dir);
+
+		mutex_lock(&binfo->trie_lock);
+			iter->gen = binfo->trie_gen;
 		briefs_trie_iter_init(iter, &binfo->disk_inode);
+		mutex_unlock(&binfo->trie_lock);
 	}
 
 	/* Iterate the trie from the current iterator position */
@@ -63,10 +72,15 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 		int entry_name_len;
 		u64 entry_ino;
 		u8 entry_type;
+		struct briefs_inode_info *binfo = briefs_i(dir);
 
-		if (briefs_trie_iter_next(dir->i_sb, iter, &entry_ino, &entry_type,
-		                         entry_name_buf, &entry_name_len) != 0)
+		mutex_lock(&binfo->trie_lock);
+		if (briefs_trie_iter_next(dir->i_sb, iter, binfo->trie_gen, &entry_ino, &entry_type,
+		                         entry_name_buf, &entry_name_len) != 0) {
+			mutex_unlock(&binfo->trie_lock);
 			break;
+		}
+		mutex_unlock(&binfo->trie_lock);
 
 		unsigned int file_type = (entry_type << 12) & S_IFMT;
 
@@ -88,6 +102,7 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 
 	return 0;
 }
+
 /* Open directory — allocate and initialize a persistent trie iterator */
 int briefs_dir_open(struct inode *inode, struct file *file) {
 	struct briefs_inode_info *binfo;
@@ -103,11 +118,15 @@ int briefs_dir_open(struct inode *inode, struct file *file) {
 		return -ENOMEM;
 
 	binfo = briefs_i(inode);
+		iter->gen = binfo->trie_gen;
+	mutex_lock(&binfo->trie_lock);
 	briefs_trie_iter_init(iter, &binfo->disk_inode);
+	mutex_unlock(&binfo->trie_lock);
 	file->private_data = iter;
 
 	return 0;
 }
+
 /* Release directory — free the persistent trie iterator */
 int briefs_dir_release(struct inode *inode, struct file *file) {
 	pr_debug("briefs: dir_release inode %lu\n", inode->i_ino);
@@ -115,6 +134,7 @@ int briefs_dir_release(struct inode *inode, struct file *file) {
 	file->private_data = NULL;
 	return 0;
 }
+
 /*
  * briefs_add_dir_entry - insert a directory entry into the directory trie.
  */
@@ -126,37 +146,53 @@ int briefs_add_dir_entry(struct inode *dir, const char *name, size_t name_len, u
 		return -EINVAL;
 
 	binfo = briefs_i(dir);
+	mutex_lock(&binfo->trie_lock);
 
 	if (binfo->disk_inode.dir_trie_root == 0) {
 		ret = briefs_trie_create_root(dir->i_sb, &binfo->disk_inode);
-		if (ret)
+		if (ret) {
+			mutex_unlock(&binfo->trie_lock);
 			return ret;
+		}
 	}
 
 	ret = briefs_trie_insert(dir->i_sb, &binfo->disk_inode,
-	                          name, name_len, child_ino, type);
-	if (ret == -EEXIST)
+				  name, name_len, child_ino, type);
+	if (ret == -EEXIST) {
+		mutex_unlock(&binfo->trie_lock);
 		return 0;
+	}
 
+		binfo->trie_gen++;
+	mutex_unlock(&binfo->trie_lock);
 	return ret;
 }
+
 /*
  * briefs_remove_dir_entry - remove a directory entry from the trie.
  */
 int briefs_remove_dir_entry(struct inode *dir, const char *name, size_t name_len)
 {
 	struct briefs_inode_info *binfo;
+	int ret;
 
 	if (!dir || !name || name_len < 1 || name_len > BRIEFS_NAME_LEN)
 		return -EINVAL;
 
 	binfo = briefs_i(dir);
+	mutex_lock(&binfo->trie_lock);
 
-	if (binfo->disk_inode.dir_trie_root == 0)
+	if (binfo->disk_inode.dir_trie_root == 0) {
+		mutex_unlock(&binfo->trie_lock);
 		return -ENOENT;
+	}
 
-	return briefs_trie_remove(dir->i_sb, &binfo->disk_inode, name, name_len);
+	ret = briefs_trie_remove(dir->i_sb, &binfo->disk_inode, name, name_len);
+		if (ret == 0) binfo->trie_gen++;
+	mutex_unlock(&binfo->trie_lock);
+	return ret;
 }
+
 /* briefs_lookup - find inode by name in directory trie */
 struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags) {
 	struct briefs_inode_info *binfo;
@@ -165,15 +201,15 @@ struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned 
 	u64 found_ino;
 	u8 found_type;
 	int ret;
-	
+
 	if (!dir || !S_ISDIR(dir->i_mode))
 		return ERR_PTR(-ENOTDIR);
-	
+
 	name = dentry->d_name.name;
 	name_len = dentry->d_name.len;
-	
+
 	pr_debug("briefs: trie lookup for %pd in dir inode %lu\n", dentry, dir->i_ino);
-	
+
 	/* Check for . and .. */
 	if (name_len == 1 && name[0] == '.') {
 		igrab(dir);
@@ -194,15 +230,17 @@ struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned 
 			return d_splice_alias(parent, dentry);
 		}
 	}
-	
+
 	/* Search the directory trie */
 	binfo = briefs_i(dir);
+	mutex_lock(&binfo->trie_lock);
 	ret = briefs_trie_lookup(dir->i_sb, &binfo->disk_inode, name, name_len, &found_ino, &found_type);
+	mutex_unlock(&binfo->trie_lock);
 	if (ret == -ENOENT)
 		return NULL;
 	if (ret != 0)
 		return ERR_PTR(ret);
-	
+
 	{
 		struct inode *inode = briefs_iget(dir->i_sb, found_ino);
 		if (IS_ERR(inode))
@@ -210,6 +248,7 @@ struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned 
 		return d_splice_alias(inode, dentry);
 	}
 }
+
 /* briefs_create - create a new file or directory */
 int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl) {
 	struct briefs_sb_info *bsi;
@@ -247,7 +286,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	/* Log directory entry */
 	if (bsi->journal) {
 		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, ino,
-						dentry->d_name.name, dentry->d_name.len, 0);
+							dentry->d_name.name, dentry->d_name.len, 0);
 		if (ret) return ret;
 	}
 
@@ -383,6 +422,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	pr_debug("briefs: created inode %llu, added to dir\n", ino);
 	return 0;
 }
+
 /* briefs_mkdir - create a new directory */
 int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode) {
 	/* Directories at least aren't getting the proper mode set. Let's do
@@ -395,6 +435,7 @@ int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dent
 	pr_debug("briefs: mkdir %pd (mode=%o)\n", dentry, mode);
 	return briefs_create(idmap, dir, dentry, mode, false);
 }
+
 /*
  * briefs_link - create a hard link.
  *
@@ -402,7 +443,7 @@ int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dent
  * The source entry remains unchanged — the inode gains an additional link.
  */
 int briefs_link(struct dentry *old_dentry, struct inode *dir,
-		       struct dentry *new_dentry)
+			       struct dentry *new_dentry)
 {
 	struct inode *inode = d_inode(old_dentry);
 	struct briefs_sb_info *bsi = dir->i_sb->s_fs_info;
@@ -421,14 +462,14 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 	/* Log new entry creation */
 	if (bsi->journal) {
 		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, inode->i_ino,
-						new_dentry->d_name.name, new_dentry->d_name.len, 0);
+							new_dentry->d_name.name, new_dentry->d_name.len, 0);
 		if (ret) return ret;
 	}
 
 	/* Add directory entry pointing at the existing inode */
 	ftype = (inode->i_mode & S_IFMT) >> 12;
 	ret = briefs_add_dir_entry(dir, new_dentry->d_name.name,
-				   new_dentry->d_name.len, inode->i_ino, ftype);
+					   new_dentry->d_name.len, inode->i_ino, ftype);
 	if (ret) {
 		pr_err("briefs: link failed to add dir entry: %d\n", ret);
 		return ret;
@@ -508,7 +549,7 @@ static int briefs_empty_dir(struct inode *inode, int *ret){
 	int res;
 
 	binfo = briefs_i(inode);
-
+	mutex_lock(&binfo->trie_lock);
 	if (binfo->disk_inode.dir_trie_root != 0) {
 		struct trie_iter *iter;
 		char *entry_name_buf;
@@ -519,19 +560,21 @@ static int briefs_empty_dir(struct inode *inode, int *ret){
 		iter = kmalloc(sizeof(struct trie_iter), GFP_KERNEL);
 		if (!iter) {
 			*ret = -ENOMEM;
+			mutex_unlock(&binfo->trie_lock);
 			return 0;
 		}
 		entry_name_buf = kmalloc(BRIEFS_NAME_LEN + 1, GFP_KERNEL);
 		if (!entry_name_buf) {
 			kfree(iter);
 			*ret = -ENOMEM;
+			mutex_unlock(&binfo->trie_lock);
 			return 0;
 		}
 
 		briefs_trie_iter_init(iter, &binfo->disk_inode);
-		res = briefs_trie_iter_next(inode->i_sb, iter,
-					   &entry_ino, &entry_type,
-					   entry_name_buf, &entry_name_len);
+		res = briefs_trie_iter_next(inode->i_sb, iter, binfo->trie_gen,
+									   &entry_ino, &entry_type,
+									   entry_name_buf, &entry_name_len);
 
 		/* for the love of all that is good, remove this as soon as it
 		 * isn't needed. */
@@ -543,9 +586,11 @@ static int briefs_empty_dir(struct inode *inode, int *ret){
 			/* Found an entry — directory not empty */
 			pr_debug("briefs: rmdir not empty (entry found)\n");
 			*ret = -ENOTEMPTY;
+			mutex_unlock(&binfo->trie_lock);
 			return 0;
 		}
 	}
+	mutex_unlock(&binfo->trie_lock);
 	return 1;
 }
 
@@ -562,7 +607,7 @@ static int briefs_unlink_common(struct inode *dir, struct dentry *dentry) {
 	/* Log directory entry deletion */
 	if (bsi->journal) {
 		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, 0,
-						dentry->d_name.name, dentry->d_name.len, 1);
+							dentry->d_name.name, dentry->d_name.len, 1);
 		if (ret) {
 			pr_debug("journaling %pd failed\n", dentry);
 			return ret;
@@ -613,7 +658,6 @@ static int briefs_unlink_common(struct inode *dir, struct dentry *dentry) {
 	return 0;
 }
 
-
 /* briefs_unlink - remove a directory entry */
 int briefs_unlink(struct inode *dir, struct dentry *dentry) {
 	struct inode *inode = d_inode(dentry);
@@ -662,7 +706,7 @@ int briefs_rmdir(struct inode *dir, struct dentry *dentry) {
 
 /* briefs_rename - rename a directory entry */
 int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
-                  struct inode *new_dir, struct dentry *new_dentry, unsigned int flags) {
+	                  struct inode *new_dir, struct dentry *new_dentry, unsigned int flags) {
 	struct briefs_sb_info *bsi;
 	struct inode *inode = d_inode(old_dentry);
 	int ret;
@@ -677,14 +721,14 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 	/* Log old entry deletion */
 	if (bsi->journal) {
 		ret = briefs_journal_dir_update(bsi->journal, old_dir->i_ino, 0,
-						old_dentry->d_name.name, old_dentry->d_name.len, 1);
+							old_dentry->d_name.name, old_dentry->d_name.len, 1);
 		if (ret) return ret;
 	}
 
 	/* Log new entry creation */
 	if (bsi->journal) {
 		ret = briefs_journal_dir_update(bsi->journal, new_dir->i_ino, inode->i_ino,
-						new_dentry->d_name.name, new_dentry->d_name.len, 0);
+							new_dentry->d_name.name, new_dentry->d_name.len, 0);
 		if (ret) return ret;
 	}
 
@@ -696,7 +740,7 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 	/* Add new entry */
 	u8 ftype = (inode->i_mode & S_IFMT) >> 12;
 	ret = briefs_add_dir_entry(new_dir, new_dentry->d_name.name, new_dentry->d_name.len,
-				   inode->i_ino, ftype);
+					   inode->i_ino, ftype);
 	if (ret)
 		return ret;
 
