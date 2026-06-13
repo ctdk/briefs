@@ -276,31 +276,6 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
  * Read an on-disk inode by inode number.
  * Returns a pointer into the buffer (caller must brelse the bh).
  */
-static struct briefs_inode *replay_read_inode(struct super_block *sb,
-					       u64 ino,
-					       struct buffer_head **bh_out)
-{
-	struct briefs_sb_info *bsi = sb->s_fs_info;
-	u64 inodeTableBlock, inodeBlock, inodeOffset, inodeIndex;
-	struct briefs_inode *di;
-
-	inodeTableBlock = briefs_inode_table_start(bsi->sb);
-	inodeIndex = ino - 1;
-	inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
-	inodeOffset = (inodeIndex % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-
-	*bh_out = sb_bread(sb, inodeTableBlock + inodeBlock);
-	if (!*bh_out)
-		return NULL;
-
-	di = (struct briefs_inode *)((*bh_out)->b_data + inodeOffset);
-	if (di->magic != _BRIEFS_INODE_MAGIC) {
-		brelse(*bh_out);
-		*bh_out = NULL;
-		return NULL;
-	}
-	return di;
-}
 
 /*
  * Replay a JRN_DIR_UPDATE record (op=0 = add, op=1 = delete).
