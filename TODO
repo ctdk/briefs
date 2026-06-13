@@ -1,8 +1,7 @@
-- Finish getting basic functionality working.
 - Support for preallocation would be very nice.
 - Support for info in /proc would also be nice.
-- Create fsck.briefs.
-- FUSE for BrieFS once fsck.briefs is more than a stub.
+- Create fsck.briefs. (In progress)
+- FUSE for BrieFS once fsck.briefs is more than a stub. (In progress)
 - Make list of desired functionality that still needs implementing.
 - Proper tests
 - Annotate the source code thoroughly once things are more stable
