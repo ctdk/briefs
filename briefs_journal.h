@@ -71,6 +71,25 @@ u64 briefs_journal_prev_block(struct briefs_journal *j, u64 cur);
 int briefs_journal_dir_update(struct briefs_journal *j, u64 parent_ino, u64 child_ino,
                               const char *name, size_t name_len, u8 op);
 
+/* Convenience wrappers for directory add/delete using a dentry */
+static inline int briefs_journal_dir_add(struct briefs_journal *j, u64 parent_ino,
+                                          u64 child_ino, struct dentry *dentry)
+{
+	return briefs_journal_dir_update(j, parent_ino, child_ino,
+					dentry->d_name.name, dentry->d_name.len, 0);
+}
+
+static inline int briefs_journal_dir_del(struct briefs_journal *j, u64 parent_ino,
+                                          struct dentry *dentry)
+{
+	return briefs_journal_dir_update(j, parent_ino, 0,
+					dentry->d_name.name, dentry->d_name.len, 1);
+}
+
+/* Log a newly allocated inode */
+int briefs_journal_inode_alloc(struct briefs_journal *j, u64 ino,
+                                umode_t mode, u32 nlink);
+
 /* Log extent allocation */
 int briefs_journal_extent_alloc(struct briefs_journal *j, u64 ino,
 				 u64 offset, u64 phys_start,

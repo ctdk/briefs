@@ -36,41 +36,70 @@ inline u64 briefs_compute_i_blocks(struct briefs_inode *di)
 		blocks += di->inline_extents[i].len;
 	return blocks * (BRIEFS_BLOCK_SIZE / 512);
 }
+
 /*
- * briefs_read_extent - read an extent by logical index from inline extents,
- * walking chain blocks as needed. Returns the extent data in *ext.
- * Returns 0 on success, -ENOENT if index >= num_extents_total.
+ * Free a contiguous run of data blocks.  Applies the same sanity cap on
+ * length that the inline free paths use to avoid infinite loops on corrupt
+ * extents.
  */
-int briefs_read_extent(struct super_block *sb, struct briefs_inode *di,
-                               int idx, struct briefs_extent *ext)
+void briefs_free_blocks_range(struct briefs_sb_info *bsi, u64 phys_start, u64 len)
 {
-	struct briefs_inode_info *binfo;
-	struct buffer_head *bh;
-	struct briefs_extent_chain *chain;
-	int chain_idx;
-	u64 chain_block;
+	u64 b;
+	u64 blocks_to_free = len;
 
-	if (idx < 0 || idx >= di->num_extents_total)
-		return -ENOENT;
-
-	binfo = container_of(di, struct briefs_inode_info, disk_inode);
-
-	/* Check if the extent is inline — read under seqcount protection */
-	if (idx < di->num_extents_inline) {
-		unsigned seq;
-		do {
-			seq = read_seqcount_begin(&binfo->extent_seq);
-			*ext = di->inline_extents[idx];
-		} while (read_seqcount_retry(&binfo->extent_seq, seq));
-		return 0;
+	if (blocks_to_free > 1024 * 1024) {
+		pr_warn("briefs: suspicious extent len=%llu, capping to 1\n", len);
+		blocks_to_free = 1;
 	}
 
-	/* Walk chain blocks */
-	chain_block = di->extent_inline_base;
-	if (chain_block == 0)
-		return -ENOENT;
+	for (b = 0; b < blocks_to_free; b++) {
+		u64 abs_block = phys_start + b;
+		u64 rel_block = abs_to_data(bsi->sb, abs_block);
+		briefs_free_block(&bsi->alloc, rel_block);
+	}
+}
 
-	chain_idx = idx - di->num_extents_inline;
+/*
+ * Free all chain blocks starting at chain_block.  Logs each chain block free
+ * to the journal and returns the data blocks to the allocator.
+ */
+void briefs_free_chain_blocks(struct super_block *sb, u64 chain_block)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct buffer_head *bh;
+	struct briefs_extent_chain *chain;
+	u64 next;
+
+	while (chain_block) {
+		bh = sb_bread(sb, chain_block);
+		if (!bh)
+			break;
+		chain = (struct briefs_extent_chain *)bh->b_data;
+		if (chain->checksum != 0 &&
+		    briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
+			pr_warn("briefs: chain block %llu checksum mismatch while freeing; continuing\n",
+				chain_block);
+		}
+		next = chain->next_overflow_block;
+		brelse(bh);
+
+		briefs_journal_extent_free(bsi->journal, 0, 0, chain_block, 1);
+		briefs_free_block(&bsi->alloc, abs_to_data(bsi->sb, chain_block));
+		chain_block = next;
+	}
+}
+
+/*
+ * Walk the chain starting at chain_block to find the extent at chain-relative
+ * index chain_idx.  On success, fills *ext and returns 0 with the buffer head
+ * released.  Returns -EIO on read/checksum failure, -ENOENT if the index is
+ * not found.
+ */
+static int briefs_read_chain_extent(struct super_block *sb, u64 chain_block,
+                                      int chain_idx, struct briefs_extent *ext)
+{
+	struct buffer_head *bh;
+	struct briefs_extent_chain *chain;
 
 	while (chain_block) {
 		bh = sb_bread(sb, chain_block);
@@ -98,6 +127,40 @@ int briefs_read_extent(struct super_block *sb, struct briefs_inode *di,
 	}
 
 	return -ENOENT;
+}
+
+/*
+ * briefs_read_extent - read an extent by logical index from inline extents,
+ * walking chain blocks as needed. Returns the extent data in *ext.
+ * Returns 0 on success, -ENOENT if index >= num_extents_total.
+ */
+int briefs_read_extent(struct super_block *sb, struct briefs_inode *di,
+                               int idx, struct briefs_extent *ext)
+{
+	struct briefs_inode_info *binfo;
+	int chain_idx;
+
+	if (idx < 0 || idx >= di->num_extents_total)
+		return -ENOENT;
+
+	binfo = container_of(di, struct briefs_inode_info, disk_inode);
+
+	/* Check if the extent is inline — read under seqcount protection */
+	if (idx < di->num_extents_inline) {
+		unsigned seq;
+		do {
+			seq = read_seqcount_begin(&binfo->extent_seq);
+			*ext = di->inline_extents[idx];
+		} while (read_seqcount_retry(&binfo->extent_seq, seq));
+		return 0;
+	}
+
+	/* Walk chain blocks */
+	if (di->extent_inline_base == 0)
+		return -ENOENT;
+
+	chain_idx = idx - di->num_extents_inline;
+	return briefs_read_chain_extent(sb, di->extent_inline_base, chain_idx, ext);
 }
 /*
  * __briefs_append_extent - internal append helper.  Caller must hold
@@ -223,18 +286,11 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
 					    0, chain_block, 1, -1);
 
-		bh = sb_getblk(sb, chain_block);
+		bh = briefs_get_zero_block(sb, chain_block);
 		if (!bh) {
 			briefs_free_block(&bsi->alloc, rel);
 			return -EIO;
 		}
-		/* sb_getblk may return an unmapped buffer on loop devices */
-		if (!buffer_mapped(bh)) {
-			bh->b_blocknr = chain_block;
-			set_buffer_mapped(bh);
-		}
-		memset(bh->b_data, 0, sb->s_blocksize);
-		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);
 		brelse(bh);
 	}
@@ -299,22 +355,15 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 					    0, new_block, 1, -1);
 
 		/* Set up new chain block */
-		bh = sb_getblk(sb, new_block);
+		bh = briefs_get_zero_block(sb, new_block);
 		if (!bh) {
 			briefs_free_block(&bsi->alloc, rel);
 			return -EIO;
 		}
-		/* sb_getblk may return an unmapped buffer on loop devices */
-		if (!buffer_mapped(bh)) {
-			bh->b_blocknr = new_block;
-			set_buffer_mapped(bh);
-		}
-		memset(bh->b_data, 0, sb->s_blocksize);
 		chain = (struct briefs_extent_chain *)bh->b_data;
 		chain->extents[0] = *ext;
 		chain->num_extents_in_block = 1;
 		chain->checksum = briefs_chain_checksum(bh->b_data);
-		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);
 		brelse(bh);
 
@@ -361,46 +410,16 @@ static int briefs_read_extent_chain(struct super_block *sb, int idx,
                                     u64 snap_inline, u64 snap_chain_base,
                                     struct briefs_extent *ext)
 {
-	struct buffer_head *bh;
-	struct briefs_extent_chain *chain;
 	int chain_idx;
-	u64 chain_block;
 
 	if (idx < snap_inline)
 		return -ENOENT;
 
-	chain_block = snap_chain_base;
-	if (chain_block == 0)
+	if (snap_chain_base == 0)
 		return -ENOENT;
 
 	chain_idx = idx - snap_inline;
-
-	while (chain_block) {
-		bh = sb_bread(sb, chain_block);
-		if (!bh) {
-			pr_err("briefs: failed to read chain block %llu\n", chain_block);
-			return -EIO;
-		}
-		chain = (struct briefs_extent_chain *)bh->b_data;
-
-		if (briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
-			pr_err("briefs: chain block %llu checksum mismatch\n", chain_block);
-			brelse(bh);
-			return -EIO;
-		}
-
-		if (chain_idx < chain->num_extents_in_block) {
-			*ext = chain->extents[chain_idx];
-			brelse(bh);
-			return 0;
-		}
-
-		chain_idx -= chain->num_extents_in_block;
-		chain_block = chain->next_overflow_block;
-		brelse(bh);
-	}
-
-	return -ENOENT;
+	return briefs_read_chain_extent(sb, snap_chain_base, chain_idx, ext);
 }
 
 /*
@@ -551,12 +570,8 @@ void briefs_free_inode_data(struct inode *inode)
 {
 	struct briefs_inode_info *binfo = briefs_i(inode);
 	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
-	struct buffer_head *bh;
-	struct briefs_extent_chain *chain;
 	struct briefs_extent ext;
-	u64 chain_block, next_chain;
 	int i;
-	u64 b;
 
 	/* For directories, free the trie instead of file extents */
 	if (S_ISDIR(inode->i_mode)) {
@@ -572,48 +587,11 @@ void briefs_free_inode_data(struct inode *inode)
 		/* Journal the extent free */
 		briefs_journal_extent_free(bsi->journal, inode->i_ino,
 					   ext.offset, ext.phys, ext.len);
-
-		/*
-		 * Sanity-check the extent length.  A corrupt ext.len (e.g. from
-		 * an inode written by an older buggy version) could cause an
-		 * infinite loop here, triggering a soft lockup watchdog.
-		 * Cap to a reasonable maximum to avoid this.
-		 */
-		u64 blocks_to_free = ext.len;
-		if (blocks_to_free > 1024 * 1024) {
-			pr_warn("briefs: inode %lu extent has suspicious len=%llu, capping to 1\n",
-				inode->i_ino, ext.len);
-			blocks_to_free = 1;
-		}
-
-		for (b = 0; b < blocks_to_free; b++) {
-			u64 abs_block = ext.phys + b;
-			u64 rel_block = abs_to_data(bsi->sb, abs_block);
-			briefs_free_block(&bsi->alloc, rel_block);
-		}
+		briefs_free_blocks_range(bsi, ext.phys, ext.len);
 	}
 
 	/* Free chain blocks */
-	chain_block = binfo->disk_inode.extent_inline_base;
-	while (chain_block) {
-		bh = sb_bread(inode->i_sb, chain_block);
-		if (!bh) break;
-		chain = (struct briefs_extent_chain *)bh->b_data;
-		if (chain->checksum != 0 &&
-		    briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
-			pr_warn("briefs: chain block %llu checksum mismatch while freeing inode %lu; continuing\n",
-				chain_block, inode->i_ino);
-		}
-		next_chain = chain->next_overflow_block;
-		brelse(bh);
-
-		/* Journal the chain block free */
-		briefs_journal_extent_free(bsi->journal, inode->i_ino,
-					   0, chain_block, 1);
-
-		briefs_free_block(&bsi->alloc, abs_to_data(bsi->sb, chain_block));
-		chain_block = next_chain;
-	}
+	briefs_free_chain_blocks(inode->i_sb, binfo->disk_inode.extent_inline_base);
 
 	write_seqcount_begin(&binfo->extent_seq);
 	binfo->disk_inode.num_extents_inline = 0;

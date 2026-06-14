@@ -267,98 +267,15 @@ struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned 
 
 /* briefs_create - create a new file or directory */
 int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl) {
-	struct briefs_sb_info *bsi;
-	struct briefs_superblock *sbk;
 	struct inode *inode;
-	u64 ino;
 	int ret;
 	bool is_dir = S_ISDIR(mode);
-	struct timespec64 now;
 
 	pr_debug("briefs: create %pd (mode=%o) in dir %lu\n", dentry, mode, dir->i_ino);
 
-	bsi = dir->i_sb->s_fs_info;
-	sbk = bsi->sb;
-
-	/* Allocate new inode */
-	ino = briefs_alloc_inode(dir->i_sb);
-	if (ino == 0)
-		return -ENOSPC;
-
-	/* Log inode allocation */
-	if (bsi->journal) {
-		struct jrn_inode_alloc irec;
-		memset(&irec, 0, sizeof(irec));
-		irec.ino = ino;
-		irec.mode = mode & 07777;
-		irec.nlink = is_dir ? 2 : 1;
-		ret = briefs_journal_write_record(bsi->journal, JRN_INODE_ALLOC, &irec, sizeof(irec));
-		if (ret) return ret;
-	}
-
-	/* Log directory entry */
-	if (bsi->journal) {
-		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, ino,
-							dentry->d_name.name, dentry->d_name.len, 0);
-		if (ret) return ret;
-	}
-
-	/* Create new inode — use iget_locked directly, skip disk read for new inodes */
-	inode = iget_locked(dir->i_sb, ino);
-	if (!inode)
-		return -ENOMEM;
-
-	if (inode->i_state & I_NEW) {
-		/* Set up the inode without reading from disk */
-		struct briefs_inode_info *binfo = briefs_i(inode);
-		memset(&binfo->disk_inode, 0, sizeof(struct briefs_inode));
-		binfo->inode_number = ino;
-
-		inode->i_mode = mode;
-		inode->i_uid = current_fsuid();
-		inode->i_gid = current_fsgid();
-		inode->i_size = 0;
-		inode->i_blocks = briefs_compute_i_blocks(&binfo->disk_inode);
-		set_nlink(inode, is_dir ? 2 : 1);
-
-		ktime_get_real_ts64(&now);
-		inode->i_atime_sec = inode->i_mtime_sec = inode->i_ctime_sec = now.tv_sec;
-		inode->i_atime_nsec = inode->i_mtime_nsec = inode->i_ctime_nsec = now.tv_nsec;
-
-		/* Set up briefs_inode fields */
-		binfo->disk_inode.inode_number = ino;
-		binfo->disk_inode.magic = _BRIEFS_INODE_MAGIC;
-		binfo->disk_inode.filemode = mode;
-		binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
-		binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);
-		binfo->disk_inode.filesize = 0;
-		binfo->disk_inode.nlinks = is_dir ? 2 : 1;
-		binfo->disk_inode.num_extents_inline = 0;
-		binfo->disk_inode.num_extents_total = 0;
-		binfo->disk_inode.atime_sec = inode->i_atime_sec;
-		binfo->disk_inode.atime_nsec = inode->i_atime_nsec;
-		binfo->disk_inode.mtime_sec = inode->i_mtime_sec;
-		binfo->disk_inode.mtime_nsec = inode->i_mtime_nsec;
-		binfo->disk_inode.ctime_sec = inode->i_ctime_sec;
-		binfo->disk_inode.ctime_nsec = inode->i_ctime_nsec;
-		binfo->disk_inode.creation_time_sec = inode->i_ctime_sec;
-		binfo->disk_inode.creation_time_nsec = inode->i_ctime_nsec;
-
-		if (is_dir) {
-			inode->i_op = &briefs_dir_inode_ops;
-			inode->i_fop = &briefs_dir_operations;
-		} else {
-			inode->i_op = &briefs_file_inode_ops;
-			inode->i_fop = &briefs_file_operations;
-			inode->i_mapping->a_ops = &briefs_aops;
-		}
-
-		unlock_new_inode(inode);
-	} else {
-		/* Inode already in cache — shouldn't happen for fresh alloc */
-		iput(inode);
-		return -EEXIST;
-	}
+	inode = briefs_new_inode(dir, dentry, mode, 0);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
 
 	/* For directories: create the directory trie root */
 	if (is_dir) {
@@ -366,53 +283,24 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 
 		ret = briefs_trie_create_root(dir->i_sb, &binfo->disk_inode);
 		if (ret) {
-			pr_err("briefs: failed to create dir trie root for ino %llu\n", ino);
+			pr_err("briefs: failed to create dir trie root for ino %lu\n", inode->i_ino);
 			iput(inode);
 			return ret;
 		}
 
-		pr_debug("briefs: created dir trie root block=%llu for inode %llu\n",
-			binfo->disk_inode.dir_trie_root, ino);
+		pr_debug("briefs: created dir trie root block=%llu for inode %lu\n",
+			binfo->disk_inode.dir_trie_root, inode->i_ino);
 	}
 
-	/* Write the inode to disk */
-	ret = briefs_persist_disk_inode(dir->i_sb, ino, &briefs_i(inode)->disk_inode, false);
+	ret = briefs_finish_create(dir, dentry, inode, is_dir ? 1 : 0);
 	if (ret) {
-		pr_err("briefs: failed to persist inode %llu for create: %d\n", ino, ret);
 		iput(inode);
 		return ret;
-	}
-
-	/* Add directory entry to parent */
-	u8 ftype = (mode & S_IFMT) >> 12;
-	ret = briefs_add_dir_entry(dir, dentry->d_name.name, dentry->d_name.len, ino, ftype);
-	if (ret) {
-		pr_err("briefs: failed to add dir entry %pd: %d\n", dentry, ret);
-		iput(inode);
-		return ret;
-	}
-
-	/* Update parent inode */
-	{
-		struct briefs_inode_info *pbinfo = briefs_i(dir);
-		if (is_dir)
-			inc_nlink(dir);
-		dir->i_size += sizeof(struct briefs_dir_entry) + 2 + dentry->d_name.len;
-		pbinfo->disk_inode.filesize = dir->i_size;
-		pbinfo->disk_inode.nlinks = dir->i_nlink;
-	}
-
-	/* Write parent inode */
-	{
-		struct briefs_inode_info *pbinfo = briefs_i(dir);
-		pbinfo->disk_inode.filesize = dir->i_size;
-		pbinfo->disk_inode.nlinks = dir->i_nlink;
-		briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
 	}
 
 	d_instantiate(dentry, inode);
 
-	pr_debug("briefs: created inode %llu, added to dir\n", ino);
+	pr_debug("briefs: created inode %lu, added to dir\n", inode->i_ino);
 	return 0;
 }
 
@@ -453,11 +341,9 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 		return -EPERM;
 
 	/* Log new entry creation */
-	if (bsi->journal) {
-		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, inode->i_ino,
-							new_dentry->d_name.name, new_dentry->d_name.len, 0);
-		if (ret) return ret;
-	}
+	ret = briefs_journal_dir_add(bsi->journal, dir->i_ino, inode->i_ino, new_dentry);
+	if (ret)
+		return ret;
 
 	/* Add directory entry pointing at the existing inode */
 	ftype = (inode->i_mode & S_IFMT) >> 12;
@@ -474,10 +360,6 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 	/* Journal the nlink change */
 	briefs_journal_inode_update(bsi->journal, inode);
 
-	/* Update parent directory size */
-	dir->i_size += sizeof(struct briefs_dir_entry) + 2 + new_dentry->d_name.len;
-	briefs_i(dir)->disk_inode.filesize = dir->i_size;
-
 	/* Persist the target inode with updated nlink */
 	{
 		struct briefs_inode_info *binfo = briefs_i(inode);
@@ -485,25 +367,18 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 		briefs_persist_disk_inode(dir->i_sb, inode->i_ino, &binfo->disk_inode, false);
 	}
 
-	/* Persist the parent directory with updated size */
-	{
-		struct briefs_inode_info *pbinfo = briefs_i(dir);
-		pbinfo->disk_inode.filesize = dir->i_size;
-		pbinfo->disk_inode.nlinks = dir->i_nlink;
-		briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
-	}
+	/* Update and persist parent directory */
+	ret = briefs_update_parent_dir(dir, bsi,
+					sizeof(struct briefs_dir_entry) + 2 + new_dentry->d_name.len,
+					0);
+	if (ret)
+		return ret;
 
 	ihold(inode);
 	d_instantiate(new_dentry, inode);
 
 	pr_debug("briefs: link inode %lu now has %u links\n", inode->i_ino, inode->i_nlink);
 	return 0;
-}
-
-static void update_parent_inode(struct inode *dir, struct briefs_sb_info *bsi) {
-	struct briefs_inode_info *pbinfo = briefs_i(dir);
-	pbinfo->disk_inode.nlinks = dir->i_nlink;
-	briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
 }
 
 /* briefs_empty_dir - check if a directory is empty by scanning the trie. Since
@@ -570,13 +445,10 @@ static int briefs_unlink_common(struct inode *dir, struct dentry *dentry) {
 	bsi = dir->i_sb->s_fs_info;
 
 	/* Log directory entry deletion */
-	if (bsi->journal) {
-		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, 0,
-							dentry->d_name.name, dentry->d_name.len, 1);
-		if (ret) {
-			pr_debug("journaling %pd failed\n", dentry);
-			return ret;
-		}
+	ret = briefs_journal_dir_del(bsi->journal, dir->i_ino, dentry);
+	if (ret) {
+		pr_debug("journaling %pd failed\n", dentry);
+		return ret;
 	}
 
 	/* Remove the directory entry from the parent */
@@ -605,19 +477,17 @@ static int briefs_unlink_common(struct inode *dir, struct dentry *dentry) {
 	/* TODO: double check that this is *actually* the right thing to do. I
 	 * have a sneaking suspicion this was hallucinated or is wrong, but I
 	 * could easily be wrong myself. */
-	/* Update parent directory size to reflect deletion.
-	 * Each dir entry adds 2 (len prefix in trie name storage)
-	 * + name_len bytes to dir->i_size. */
-	if (dir->i_size >= 2 + dentry->d_name.len) {
-		dir->i_size -= 2 + dentry->d_name.len;
-		briefs_i(dir)->disk_inode.filesize = dir->i_size;
-	}
-
-	/* Journal the nlink change */
+	/* Journal the target inode nlink change */
 	briefs_journal_inode_update(bsi->journal, inode);
-	briefs_journal_inode_update(bsi->journal, dir);
 
-	update_parent_inode(dir, bsi);
+	/* Update parent directory size and persist (nlink was already adjusted) */
+	ret = briefs_update_parent_dir(dir, bsi,
+					-(ssize_t)(2 + dentry->d_name.len),
+					0);
+	if (ret) {
+		pr_err("briefs: failed to update parent dir after unlink: %d\n", ret);
+		return ret;
+	}
 
 	pr_debug("briefs: leaving common unlink/rmdir logic %pd\n", dentry);
 	return 0;
@@ -684,18 +554,14 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 	bsi = old_dir->i_sb->s_fs_info;
 
 	/* Log old entry deletion */
-	if (bsi->journal) {
-		ret = briefs_journal_dir_update(bsi->journal, old_dir->i_ino, 0,
-							old_dentry->d_name.name, old_dentry->d_name.len, 1);
-		if (ret) return ret;
-	}
+	ret = briefs_journal_dir_del(bsi->journal, old_dir->i_ino, old_dentry);
+	if (ret)
+		return ret;
 
 	/* Log new entry creation */
-	if (bsi->journal) {
-		ret = briefs_journal_dir_update(bsi->journal, new_dir->i_ino, inode->i_ino,
-							new_dentry->d_name.name, new_dentry->d_name.len, 0);
-		if (ret) return ret;
-	}
+	ret = briefs_journal_dir_add(bsi->journal, new_dir->i_ino, inode->i_ino, new_dentry);
+	if (ret)
+		return ret;
 
 	/* Remove old entry */
 	ret = briefs_remove_dir_entry(old_dir, old_dentry->d_name.name, old_dentry->d_name.len);
@@ -726,19 +592,15 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 		}
 	}
 
-	/* Update parent inodes on disk */
-	{
-		struct briefs_inode_info *old_binfo = briefs_i(old_dir);
-		old_binfo->disk_inode.nlinks = old_dir->i_nlink;
-		briefs_persist_disk_inode(old_dir->i_sb, old_dir->i_ino,
-					  &old_binfo->disk_inode, false);
+	/* Persist parent directory nlink changes */
+	ret = briefs_update_parent_dir(old_dir, bsi, 0, 0);
+	if (ret)
+		return ret;
 
-		if (old_dir != new_dir) {
-			struct briefs_inode_info *new_binfo = briefs_i(new_dir);
-			new_binfo->disk_inode.nlinks = new_dir->i_nlink;
-			briefs_persist_disk_inode(new_dir->i_sb, new_dir->i_ino,
-						  &new_binfo->disk_inode, false);
-		}
+	if (old_dir != new_dir) {
+		ret = briefs_update_parent_dir(new_dir, bsi, 0, 0);
+		if (ret)
+			return ret;
 	}
 
 	pr_debug("briefs: renamed %pd -> %pd\n", old_dentry, new_dentry);

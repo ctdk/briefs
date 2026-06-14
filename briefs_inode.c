@@ -67,6 +67,196 @@ int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
 	return 0;
 }
 
+/*
+ * Allocate a writable buffer_head for an on-disk block and zero it.
+ * Returns the buffer head on success (caller must brelse), or NULL on error.
+ * The buffer is marked uptodate and dirty so callers can fill it and release.
+ */
+struct buffer_head *briefs_get_zero_block(struct super_block *sb, u64 block)
+{
+	struct buffer_head *bh;
+
+	bh = sb_getblk(sb, block);
+	if (!bh)
+		return NULL;
+
+	/* sb_getblk may return an unmapped buffer on loop devices */
+	if (!buffer_mapped(bh)) {
+		bh->b_blocknr = block;
+		set_buffer_mapped(bh);
+	}
+
+	memset(bh->b_data, 0, sb->s_blocksize);
+	set_buffer_uptodate(bh);
+	mark_buffer_dirty(bh);
+	return bh;
+}
+
+/*
+ * Update a parent directory after adding or removing an entry.
+ * size_delta is signed bytes to add to dir->i_size; link_delta is signed
+ * number of links to add (positive) or remove (negative).  Journals and
+ * persists the parent inode.
+ */
+int briefs_update_parent_dir(struct inode *dir, struct briefs_sb_info *bsi,
+                              ssize_t size_delta, int link_delta)
+{
+	struct briefs_inode_info *pbinfo = briefs_i(dir);
+	int ret;
+
+	if (size_delta < 0 && dir->i_size < (size_t)(-size_delta))
+		dir->i_size = 0;
+	else
+		dir->i_size += size_delta;
+
+	if (link_delta > 0)
+		inc_nlink(dir);
+	else if (link_delta < 0)
+		drop_nlink(dir);
+
+	pbinfo->disk_inode.filesize = dir->i_size;
+	pbinfo->disk_inode.nlinks = dir->i_nlink;
+
+	ret = briefs_journal_inode_update(bsi->journal, dir);
+	if (ret)
+		return ret;
+
+	return briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
+}
+
+/*
+ * Allocate a new inode number, journal the allocation and the future directory
+ * entry, initialize the VFS and on-disk inode, and persist it.  Does not add
+ * the directory entry or update the parent — the caller must finish with
+ * briefs_finish_create().  Returns the new inode, or an ERR_PTR on failure.
+ */
+struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
+                                umode_t mode, dev_t rdev)
+{
+	struct briefs_sb_info *bsi = dir->i_sb->s_fs_info;
+	struct inode *inode;
+	struct briefs_inode_info *binfo;
+	struct timespec64 now;
+	u64 ino;
+	int ret;
+	bool is_dir = S_ISDIR(mode);
+
+	/* Allocate new inode */
+	ino = briefs_alloc_inode(dir->i_sb);
+	if (ino == 0)
+		return ERR_PTR(-ENOSPC);
+
+	/* Log inode allocation */
+	ret = briefs_journal_inode_alloc(bsi->journal, ino, mode, is_dir ? 2 : 1);
+	if (ret)
+		goto fail_inode;
+
+	/* Log directory entry */
+	ret = briefs_journal_dir_add(bsi->journal, dir->i_ino, ino, dentry);
+	if (ret)
+		goto fail_inode;
+
+	/* Create new inode — use iget_locked directly, skip disk read for new inodes */
+	inode = iget_locked(dir->i_sb, ino);
+	if (!inode) {
+		ret = -ENOMEM;
+		goto fail_inode;
+	}
+
+	if (!(inode->i_state & I_NEW)) {
+		/* Inode already in cache — shouldn't happen for fresh alloc */
+		ret = -EEXIST;
+		goto fail_iget;
+	}
+
+	binfo = briefs_i(inode);
+	memset(&binfo->disk_inode, 0, sizeof(struct briefs_inode));
+	binfo->inode_number = ino;
+
+	inode->i_mode = mode;
+	inode->i_uid = current_fsuid();
+	inode->i_gid = current_fsgid();
+	inode->i_size = 0;
+	inode->i_blocks = briefs_compute_i_blocks(&binfo->disk_inode);
+	set_nlink(inode, is_dir ? 2 : 1);
+
+	ktime_get_real_ts64(&now);
+	inode->i_atime_sec = inode->i_mtime_sec = inode->i_ctime_sec = now.tv_sec;
+	inode->i_atime_nsec = inode->i_mtime_nsec = inode->i_ctime_nsec = now.tv_nsec;
+
+	/* Set up briefs_inode fields */
+	binfo->disk_inode.inode_number = ino;
+	binfo->disk_inode.magic = _BRIEFS_INODE_MAGIC;
+	binfo->disk_inode.filemode = mode;
+	binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
+	binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);
+	binfo->disk_inode.filesize = 0;
+	binfo->disk_inode.nlinks = is_dir ? 2 : 1;
+	binfo->disk_inode.num_extents_inline = 0;
+	binfo->disk_inode.num_extents_total = 0;
+	briefs_sync_inode_times(inode, &binfo->disk_inode);
+
+	if (is_dir) {
+		inode->i_op = &briefs_dir_inode_ops;
+		inode->i_fop = &briefs_dir_operations;
+	} else if (S_ISREG(mode)) {
+		inode->i_op = &briefs_file_inode_ops;
+		inode->i_fop = &briefs_file_operations;
+		inode->i_mapping->a_ops = &briefs_aops;
+	} else if (S_ISLNK(mode)) {
+		inode->i_op = &briefs_symlink_inode_ops;
+	} else if (S_ISBLK(mode) || S_ISCHR(mode) ||
+		   S_ISFIFO(mode) || S_ISSOCK(mode)) {
+		init_special_inode(inode, mode, rdev);
+		binfo->disk_inode.rdev = rdev;
+	}
+
+	unlock_new_inode(inode);
+
+	/* Persist the on-disk inode */
+	ret = briefs_persist_disk_inode(dir->i_sb, ino, &binfo->disk_inode, false);
+	if (ret)
+		goto fail_iget;
+
+	return inode;
+
+fail_iget:
+	iput(inode);
+fail_inode:
+	briefs_free_inode_num(dir->i_sb, ino);
+	return ERR_PTR(ret);
+}
+
+/*
+ * Add a directory entry for a newly created inode and update the parent.
+ * Returns 0 on success, negative errno on error.  The caller still owns the
+ * inode reference and must iput() it on failure.
+ */
+int briefs_finish_create(struct inode *dir, struct dentry *dentry,
+                          struct inode *inode, int link_delta)
+{
+	struct briefs_sb_info *bsi = dir->i_sb->s_fs_info;
+	u8 ftype = (inode->i_mode & S_IFMT) >> 12;
+	int ret;
+
+	ret = briefs_add_dir_entry(dir, dentry->d_name.name, dentry->d_name.len,
+				    inode->i_ino, ftype);
+	if (ret) {
+		pr_err("briefs: failed to add dir entry %pd: %d\n", dentry, ret);
+		return ret;
+	}
+
+	ret = briefs_update_parent_dir(dir, bsi,
+					sizeof(struct briefs_dir_entry) + 2 + dentry->d_name.len,
+					link_delta);
+	if (ret) {
+		pr_err("briefs: failed to update parent dir after create: %d\n", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
 /* briefs_write_inode - persist VFS inode to disk */
 int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	struct briefs_sb_info *bsi;
@@ -88,12 +278,7 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 		return PTR_ERR(bh);
 
 	/* Sync VFS timestamp fields into in-memory copy first */
-	binfo->disk_inode.atime_sec = inode->i_atime_sec;
-	binfo->disk_inode.atime_nsec = inode->i_atime_nsec;
-	binfo->disk_inode.mtime_sec = inode->i_mtime_sec;
-	binfo->disk_inode.mtime_nsec = inode->i_mtime_nsec;
-	binfo->disk_inode.ctime_sec = inode->i_ctime_sec;
-	binfo->disk_inode.ctime_nsec = inode->i_ctime_nsec;
+	briefs_sync_inode_times(inode, &binfo->disk_inode);
 
 	/*
 	 * Copy in-memory disk_inode to the on-disk buffer.

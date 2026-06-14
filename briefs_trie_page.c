@@ -220,17 +220,12 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 		return -ENOSPC;
 	block = data_to_abs(bsi->sb, rel);
 
-	bh = sb_getblk(sb, block);
+	bh = briefs_get_zero_block(sb, block);
 	if (!bh) {
 		briefs_free_block(&bsi->alloc, rel);
 		return -EIO;
 	}
-	if (!buffer_mapped(bh)) {
-		bh->b_blocknr = block;
-		set_buffer_mapped(bh);
-	}
 
-	memset(bh->b_data, 0, sb->s_blocksize);
 	page = (struct briefs_trie_page *)bh->b_data;
 	page->magic = BRIEFS_TRIE_PAGE_MAGIC;
 	page->version = 1;
@@ -243,8 +238,6 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 	node->byte_val = byte_val;
 	node->node_type = node_type;
 
-	set_buffer_uptodate(bh);
-	mark_buffer_dirty(bh);
 	brelse(bh);
 
 	*out_ref = TRIE_MAKE_REF(block, 0);

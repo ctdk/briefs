@@ -29,6 +29,19 @@ int briefs_sync_fs(struct super_block *sb, int wait)
 /* briefs_fill_super - entry point for mount */
 /* Keeping things simple, at least at first. Cribbing off of xiafs_fill_super
  * since it's reasonably simple but gets the job done. */
+/*
+ * Clean up the journal attached to a briefs_sb_info during mount error paths.
+ */
+static void briefs_cleanup_bsi_journal(struct briefs_sb_info *bsi)
+{
+	if (!bsi || !bsi->journal)
+		return;
+
+	briefs_journal_cleanup(bsi->journal);
+	kfree(bsi->journal);
+	bsi->journal = NULL;
+}
+
 int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 	struct buffer_head *bh;
 	struct briefs_superblock *bsb;
@@ -136,29 +149,17 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 
 	out_no_journal:
 	pr_err("briefs: journal init failed.\n");
-	if (bsi->journal) {
-		briefs_journal_cleanup(bsi->journal);
-		kfree(bsi->journal);
-		bsi->journal = NULL;
-	}
+	briefs_cleanup_bsi_journal(bsi);
 	goto out_release;
 
 out_no_root:
 	pr_err("briefs: get root inode failed.\n");
-	if (bsi->journal) {
-		briefs_journal_cleanup(bsi->journal);
-		kfree(bsi->journal);
-		bsi->journal = NULL;
-	}
+	briefs_cleanup_bsi_journal(bsi);
 	goto out_release;
 
 out_iput:
 	iput(root_inode);
-	if (bsi->journal) {
-		briefs_journal_cleanup(bsi->journal);
-		kfree(bsi->journal);
-		bsi->journal = NULL;
-	}
+	briefs_cleanup_bsi_journal(bsi);
 	goto out_release;
 
 out_no_fs:

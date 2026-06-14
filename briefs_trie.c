@@ -65,19 +65,22 @@ static int trie_get_node(struct super_block *sb, u64 ref,
 }
 
 /*
- * Find a child node by byte value.  Returns the child node reference in
- * *child_ref, or 0 if not found.
+ * Find a child node by byte value.  On success, fills *child_ref with the
+ * matching child reference and *prev_ref with the previous sibling (0 if the
+ * child is the first child).  Returns 0 on success, -ENOENT if not found.
  */
-static u64 briefs_trie_find_child(struct super_block *sb, u64 parent_ref,
-                                   u8 byte_val)
+static int trie_find_child_with_prev(struct super_block *sb, u64 parent_ref,
+                                      u8 byte_val, u64 *child_ref,
+                                      u64 *prev_ref)
 {
 	struct buffer_head *pbh, *cbh;
 	struct briefs_trie_page *ppage, *cpage;
 	struct briefs_trie_node *pnode, *cnode;
+	u64 prev = 0;
 	u64 child;
 
 	if (trie_read_node(sb, parent_ref, &pbh, &ppage, &pnode) != 0)
-		return 0;
+		return -EIO;
 
 	child = pnode->first_child;
 	while (!TRIE_REF_IS_NULL(child)) {
@@ -85,15 +88,31 @@ static u64 briefs_trie_find_child(struct super_block *sb, u64 parent_ref,
 		if (IS_ERR(cbh))
 			break;
 		if (cnode->byte_val == byte_val) {
+			*child_ref = child;
+			*prev_ref = prev;
 			brelse(cbh);
 			brelse(pbh);
-			return child;
+			return 0;
 		}
+		prev = child;
 		child = cnode->next_sibling;
 		brelse(cbh);
 	}
 
 	brelse(pbh);
+	return -ENOENT;
+}
+
+/*
+ * Find a child node by byte value.  Returns the child node reference, or 0
+ * if not found.
+ */
+static u64 briefs_trie_find_child(struct super_block *sb, u64 parent_ref,
+                                   u8 byte_val)
+{
+	u64 child, prev;
+	if (trie_find_child_with_prev(sb, parent_ref, byte_val, &child, &prev) == 0)
+		return child;
 	return 0;
 }
 
@@ -642,35 +661,14 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 	ancestry[anc++] = cur;
 
 	for (pos = 0; pos < name_len; pos++) {
-		if (trie_read_node(sb, cur, &bh, &page, &pnode) != 0) {
-			ret = -EIO;
+		ret = trie_find_child_with_prev(sb, cur, (u8)name[pos], &child, &child_prev);
+		if (ret != 0) {
+			ret = (ret == -ENOENT) ? -ENOENT : -EIO;
 			goto out;
 		}
-		child = pnode->first_child;
-		child_prev = 0;
 
-		while (!TRIE_REF_IS_NULL(child)) {
-			struct buffer_head *tbh;
-			struct briefs_trie_page *tpage;
-			struct briefs_trie_node *tnode;
-
-			if (trie_read_node(sb, child, &tbh, &tpage, &tnode) != 0) {
-				brelse(bh);
-				ret = -EIO;
-				goto out;
-			}
-			if (tnode->byte_val == (u8)name[pos]) {
-				brelse(tbh);
-				break;
-			}
-			child_prev = child;
-			child = tnode->next_sibling;
-			brelse(tbh);
-		}
-
-		if (TRIE_REF_IS_NULL(child)) {
-			brelse(bh);
-			ret = -ENOENT;
+		if (trie_read_node(sb, cur, &bh, &page, &pnode) != 0) {
+			ret = -EIO;
 			goto out;
 		}
 

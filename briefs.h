@@ -651,6 +651,8 @@ void briefs_free_inode_data(struct inode *inode);
 u64 briefs_compute_i_blocks(struct briefs_inode *di);
 int briefs_read_extent(struct super_block *sb, struct briefs_inode *di, int index, struct briefs_extent *ext);
 int briefs_append_extent(struct super_block *sb, struct briefs_inode *di, struct briefs_extent *ext);
+void briefs_free_blocks_range(struct briefs_sb_info *bsi, u64 phys_start, u64 len);
+void briefs_free_chain_blocks(struct super_block *sb, u64 chain_block);
 int briefs_write_inode(struct inode *inode, struct writeback_control *wbc);
 
 /* Disk inode I/O helpers (briefs_inode.c) */
@@ -658,6 +660,31 @@ struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
                                              struct briefs_inode **di);
 int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
                                const struct briefs_inode *src, bool sync);
+struct buffer_head *briefs_get_zero_block(struct super_block *sb, u64 block);
+
+/* Mirror VFS timestamps into a disk inode */
+static inline void briefs_sync_inode_times(struct inode *inode,
+                                            struct briefs_inode *di)
+{
+	di->atime_sec = inode->i_atime_sec;
+	di->atime_nsec = inode->i_atime_nsec;
+	di->mtime_sec = inode->i_mtime_sec;
+	di->mtime_nsec = inode->i_mtime_nsec;
+	di->ctime_sec = inode->i_ctime_sec;
+	di->ctime_nsec = inode->i_ctime_nsec;
+	di->creation_time_sec = inode->i_ctime_sec;
+	di->creation_time_nsec = inode->i_ctime_nsec;
+}
+
+/* Update a parent directory after adding/removing an entry */
+int briefs_update_parent_dir(struct inode *dir, struct briefs_sb_info *bsi,
+                              ssize_t size_delta, int link_delta);
+
+/* New inode creation helpers (briefs_inode.c) */
+struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
+                                umode_t mode, dev_t rdev);
+int briefs_finish_create(struct inode *dir, struct dentry *dentry,
+                          struct inode *inode, int link_delta);
 
 /* Inode slab cache (defined in briefs.c) */
 extern struct kmem_cache *briefs_inode_cachep;

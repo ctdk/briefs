@@ -425,13 +425,8 @@ static int replay_extent_alloc(struct super_block *sb, struct jrn_extent_alloc *
 static int replay_extent_free(struct super_block *sb, struct jrn_extent_free *rec)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
-	u64 b;
 
-	for (b = 0; b < rec->length; b++) {
-		u64 abs_block = rec->phys_start + b;
-		u64 rel_block = abs_to_data(bsi->sb, abs_block);
-		briefs_free_block(&bsi->alloc, rel_block);
-	}
+	briefs_free_blocks_range(bsi, rec->phys_start, rec->length);
 
 	pr_debug("briefs: replay freed %llu data blocks at phys=%llu for ino=%llu\n",
 		 rec->length, rec->phys_start, rec->ino);
@@ -578,6 +573,25 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	j->sb->checkpoint_seq++;
 
 	return errors ? -EIO : 0;
+}
+
+/*
+ * Log a newly allocated inode.
+ */
+int briefs_journal_inode_alloc(struct briefs_journal *j, u64 ino,
+				umode_t mode, u32 nlink)
+{
+	struct jrn_inode_alloc rec;
+
+	if (!j)
+		return 0;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.ino = ino;
+	rec.mode = mode & 07777;
+	rec.nlink = nlink;
+
+	return briefs_journal_write_record(j, JRN_INODE_ALLOC, &rec, sizeof(rec));
 }
 
 /*

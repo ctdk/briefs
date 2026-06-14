@@ -135,7 +135,6 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		if (trunc_block > ext_start && trunc_block < ext_end) {
 			/* Truncation falls inside this extent - shorten it */
 			u64 blocks_to_free = ext_end - trunc_block;
-			u64 b;
 
 			/* Journal the partial extent free */
 			briefs_journal_extent_free(bsi->journal, inode->i_ino,
@@ -143,11 +142,9 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 					   ext.phys + ext.len - blocks_to_free,
 					   blocks_to_free);
 
-			for (b = 0; b < blocks_to_free; b++) {
-				u64 abs = ext.phys + ext.len - blocks_to_free + b;
-				u64 rel = abs_to_data(bsi->sb, abs);
-				briefs_free_block(&bsi->alloc, rel);
-			}
+			briefs_free_blocks_range(bsi,
+						 ext.phys + ext.len - blocks_to_free,
+						 blocks_to_free);
 
 			ext.len -= blocks_to_free;
 
@@ -188,17 +185,10 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 		/* trunc_block <= ext_start - free the entire extent */
 		{
-			u64 b;
-
 			/* Journal the full extent free */
 			briefs_journal_extent_free(bsi->journal, inode->i_ino,
 					   ext.offset, ext.phys, ext.len);
-
-			for (b = 0; b < ext.len; b++) {
-				u64 abs = ext.phys + b;
-				u64 rel = abs_to_data(bsi->sb, abs);
-				briefs_free_block(&bsi->alloc, rel);
-			}
+			briefs_free_blocks_range(bsi, ext.phys, ext.len);
 		}
 
 		/* Remove the extent: shift remaining extents down */
@@ -276,22 +266,8 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 	/* If trunc_block is 0 (truncate to empty), use the full cleanup path */
 	if (new_size == 0) {
-		/* Free all remaining extents (they're all before trunc_block=0) and chain blocks */
-		chain_block = binfo->disk_inode.extent_inline_base;
-		while (chain_block) {
-			bh = sb_bread(inode->i_sb, chain_block);
-			if (!bh) break;
-			chain = (struct briefs_extent_chain *)bh->b_data;
-			if (chain->checksum != 0 &&
-			    briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
-				pr_warn("briefs: truncate ino=%lu chain block %llu checksum mismatch while freeing\n",
-					inode->i_ino, chain_block);
-			}
-			u64 next = chain->next_overflow_block;
-			brelse(bh);
-			briefs_free_block(&bsi->alloc, abs_to_data(bsi->sb, chain_block));
-			chain_block = next;
-		}
+		/* Free all remaining chain blocks */
+		briefs_free_chain_blocks(inode->i_sb, binfo->disk_inode.extent_inline_base);
 		write_seqcount_begin(&binfo->extent_seq);
 		binfo->disk_inode.extent_inline_base = 0;
 		binfo->disk_inode.num_extents_inline = 0;
@@ -367,93 +343,21 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 {
 	struct briefs_sb_info *bsi = dir->i_sb->s_fs_info;
 	struct inode *inode;
-	u64 ino;
 	int ret;
 	size_t len = strlen(symname);
-	struct timespec64 now;
 
 	pr_debug("briefs: symlink %pd -> %s in dir %lu\n", dentry, symname, dir->i_ino);
 
 	if (len == 0 || len > BRIEFS_NAME_LEN * 10)
 		return -ENAMETOOLONG;
 
-	/* Allocate new inode */
-	ino = briefs_alloc_inode(dir->i_sb);
-	if (ino == 0)
-		return -ENOSPC;
+	inode = briefs_new_inode(dir, dentry, S_IFLNK | 0777, 0);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
 
-	/* Log inode allocation */
-	if (bsi->journal) {
-		struct jrn_inode_alloc irec;
-		memset(&irec, 0, sizeof(irec));
-		irec.ino = ino;
-		irec.mode = S_IFLNK | 0777;
-		irec.nlink = 1;
-		ret = briefs_journal_write_record(bsi->journal, JRN_INODE_ALLOC, &irec, sizeof(irec));
-		if (ret) return ret;
-	}
-
-	/* Log directory entry */
-	if (bsi->journal) {
-		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, ino,
-						dentry->d_name.name, dentry->d_name.len, 0);
-		if (ret) return ret;
-	}
-
-	/* Create new inode */
-	inode = iget_locked(dir->i_sb, ino);
-	if (!inode)
-		return -ENOMEM;
-
-	if (inode->i_state & I_NEW) {
-		struct briefs_inode_info *binfo = briefs_i(inode);
-		memset(&binfo->disk_inode, 0, sizeof(struct briefs_inode));
-		binfo->inode_number = ino;
-
-		inode->i_mode = S_IFLNK | 0777;
-		inode->i_uid = current_fsuid();
-		inode->i_gid = current_fsgid();
-		inode->i_size = len;
-		inode->i_blocks = 0;
-		set_nlink(inode, 1);
-
-		ktime_get_real_ts64(&now);
-		inode->i_atime_sec = inode->i_mtime_sec = inode->i_ctime_sec = now.tv_sec;
-		inode->i_atime_nsec = inode->i_mtime_nsec = inode->i_ctime_nsec = now.tv_nsec;
-
-		binfo->disk_inode.inode_number = ino;
-		binfo->disk_inode.magic = _BRIEFS_INODE_MAGIC;
-		binfo->disk_inode.filemode = S_IFLNK | 0777;
-		binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
-		binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);
-		binfo->disk_inode.filesize = len;
-		binfo->disk_inode.nlinks = 1;
-		binfo->disk_inode.num_extents_inline = 0;
-		binfo->disk_inode.num_extents_total = 0;
-		binfo->disk_inode.atime_sec = inode->i_atime_sec;
-		binfo->disk_inode.atime_nsec = inode->i_atime_nsec;
-		binfo->disk_inode.mtime_sec = inode->i_mtime_sec;
-		binfo->disk_inode.mtime_nsec = inode->i_mtime_nsec;
-		binfo->disk_inode.ctime_sec = inode->i_ctime_sec;
-		binfo->disk_inode.ctime_nsec = inode->i_ctime_nsec;
-		binfo->disk_inode.creation_time_sec = inode->i_ctime_sec;
-		binfo->disk_inode.creation_time_nsec = inode->i_ctime_nsec;
-
-		inode->i_op = &briefs_symlink_inode_ops;
-		/* no i_fop for symlinks — VFS uses get_link directly */
-
-		unlock_new_inode(inode);
-	} else {
-		iput(inode);
-		return -EEXIST;
-	}
-
-	/* Write the inode to disk first so extent storage can find it */
-	ret = briefs_persist_disk_inode(dir->i_sb, ino, &briefs_i(inode)->disk_inode, false);
-	if (ret) {
-		iput(inode);
-		return ret;
-	}
+	/* Set the symlink size in the VFS and disk inode */
+	inode->i_size = len;
+	briefs_i(inode)->disk_inode.filesize = len;
 
 	/*
 	 * Store the symlink target as file data.  Use the same
@@ -498,38 +402,18 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		memcpy(&briefs_i(inode)->disk_inode.inline_extents[0], &ext, sizeof(ext));
 
 		/* Persist updated inode with extent */
-		briefs_persist_disk_inode(dir->i_sb, ino, &briefs_i(inode)->disk_inode, false);
+		briefs_persist_disk_inode(dir->i_sb, inode->i_ino, &briefs_i(inode)->disk_inode, false);
 	}
 
-	/* Add directory entry to parent */
-	u8 ftype = (S_IFLNK >> 12) & 0xff;
-	ret = briefs_add_dir_entry(dir, dentry->d_name.name, dentry->d_name.len, ino, ftype);
+	ret = briefs_finish_create(dir, dentry, inode, 1);
 	if (ret) {
-		pr_err("briefs: failed to add symlink dir entry %pd: %d\n", dentry, ret);
 		iput(inode);
 		return ret;
 	}
 
-	/* Update parent inode */
-	{
-		struct briefs_inode_info *pbinfo = briefs_i(dir);
-		inc_nlink(dir);
-		dir->i_size += sizeof(struct briefs_dir_entry) + 2 + dentry->d_name.len;
-		pbinfo->disk_inode.filesize = dir->i_size;
-		pbinfo->disk_inode.nlinks = dir->i_nlink;
-	}
-
-	/* Write parent inode */
-	{
-		struct briefs_inode_info *pbinfo = briefs_i(dir);
-		pbinfo->disk_inode.filesize = dir->i_size;
-		pbinfo->disk_inode.nlinks = dir->i_nlink;
-		briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
-	}
-
 	d_instantiate(dentry, inode);
 
-	pr_debug("briefs: symlink inode %llu -> %s added to dir\n", ino, symname);
+	pr_debug("briefs: symlink inode %lu -> %s added to dir\n", inode->i_ino, symname);
 	return 0;
 }
 /*
@@ -538,127 +422,25 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 			 struct dentry *dentry, umode_t mode, dev_t rdev)
 {
-	struct briefs_sb_info *bsi = dir->i_sb->s_fs_info;
 	struct inode *inode;
-	u64 ino;
 	int ret;
-	struct timespec64 now;
 
 	pr_debug("briefs: mknod %pd (mode=%o, rdev=%u:%u) in dir %lu\n",
 		 dentry, mode, MAJOR(rdev), MINOR(rdev), dir->i_ino);
 
-	/* Allocate new inode */
-	ino = briefs_alloc_inode(dir->i_sb);
-	if (ino == 0)
-		return -ENOSPC;
+	inode = briefs_new_inode(dir, dentry, mode, rdev);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
 
-	/* Log inode allocation */
-	if (bsi->journal) {
-		struct jrn_inode_alloc irec;
-		memset(&irec, 0, sizeof(irec));
-		irec.ino = ino;
-		irec.mode = mode & 07777;
-		irec.nlink = 1;
-		ret = briefs_journal_write_record(bsi->journal, JRN_INODE_ALLOC, &irec, sizeof(irec));
-		if (ret) return ret;
-	}
-
-	/* Log directory entry */
-	if (bsi->journal) {
-		ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, ino,
-						dentry->d_name.name, dentry->d_name.len, 0);
-		if (ret) return ret;
-	}
-
-	/* Create new inode */
-	inode = iget_locked(dir->i_sb, ino);
-	if (!inode)
-		return -ENOMEM;
-
-	if (inode->i_state & I_NEW) {
-		struct briefs_inode_info *binfo = briefs_i(inode);
-		memset(&binfo->disk_inode, 0, sizeof(struct briefs_inode));
-		binfo->inode_number = ino;
-
-		inode->i_mode = mode;
-		inode->i_uid = current_fsuid();
-		inode->i_gid = current_fsgid();
-		inode->i_size = 0;
-		inode->i_blocks = 0;
-		set_nlink(inode, 1);
-
-		ktime_get_real_ts64(&now);
-		inode->i_atime_sec = inode->i_mtime_sec = inode->i_ctime_sec = now.tv_sec;
-		inode->i_atime_nsec = inode->i_mtime_nsec = inode->i_ctime_nsec = now.tv_nsec;
-
-		/*
-		 * Set up VFS inode for special file.
-		 * init_special_inode assigns the right i_fop based on type.
-		 */
-		init_special_inode(inode, mode, rdev);
-
-		/* Set up disk inode fields */
-		binfo->disk_inode.inode_number = ino;
-		binfo->disk_inode.magic = _BRIEFS_INODE_MAGIC;
-		binfo->disk_inode.filemode = mode;
-		binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
-		binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);
-		binfo->disk_inode.filesize = 0;
-		binfo->disk_inode.nlinks = 1;
-		binfo->disk_inode.num_extents_inline = 0;
-		binfo->disk_inode.num_extents_total = 0;
-		binfo->disk_inode.rdev = rdev;
-		binfo->disk_inode.atime_sec = inode->i_atime_sec;
-		binfo->disk_inode.atime_nsec = inode->i_atime_nsec;
-		binfo->disk_inode.mtime_sec = inode->i_mtime_sec;
-		binfo->disk_inode.mtime_nsec = inode->i_mtime_nsec;
-		binfo->disk_inode.ctime_sec = inode->i_ctime_sec;
-		binfo->disk_inode.ctime_nsec = inode->i_ctime_nsec;
-		binfo->disk_inode.creation_time_sec = inode->i_ctime_sec;
-		binfo->disk_inode.creation_time_nsec = inode->i_ctime_nsec;
-
-		unlock_new_inode(inode);
-	} else {
-		iput(inode);
-		return -EEXIST;
-	}
-
-	/* Write the inode to disk */
-	ret = briefs_persist_disk_inode(dir->i_sb, ino, &briefs_i(inode)->disk_inode, false);
+	ret = briefs_finish_create(dir, dentry, inode, 1);
 	if (ret) {
 		iput(inode);
 		return ret;
-	}
-
-	/* Add directory entry to parent */
-	u8 ftype = (mode & S_IFMT) >> 12;
-	ret = briefs_add_dir_entry(dir, dentry->d_name.name, dentry->d_name.len, ino, ftype);
-	if (ret) {
-		pr_err("briefs: failed to add mknod dir entry %pd: %d\n", dentry, ret);
-		iput(inode);
-		return ret;
-	}
-
-	/* Update parent inode */
-	{
-		struct briefs_inode_info *pbinfo = briefs_i(dir);
-		inc_nlink(dir);
-		dir->i_size += sizeof(struct briefs_dir_entry) + 2 + dentry->d_name.len;
-		pbinfo->disk_inode.filesize = dir->i_size;
-		pbinfo->disk_inode.nlinks = dir->i_nlink;
-	}
-
-	/* Write parent inode */
-	{
-		struct briefs_inode_info *pbinfo = briefs_i(dir);
-		pbinfo->disk_inode.filesize = dir->i_size;
-		pbinfo->disk_inode.nlinks = dir->i_nlink;
-		briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
 	}
 
 	d_instantiate(dentry, inode);
 
-	pr_debug("briefs: mknod inode %llu (mode=%o) added to dir\n", ino, mode);
+	pr_debug("briefs: mknod inode %lu (mode=%o) added to dir\n", inode->i_ino, mode);
 	return 0;
 }
 /*
