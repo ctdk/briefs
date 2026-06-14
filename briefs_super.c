@@ -235,6 +235,8 @@ void briefs_put_super(struct super_block *sb) {
 		pr_info("briefs: alloc_cleanup done\n");
 	}
 
+	briefs_trie_cleanup_state(sb);
+
 	pr_info("briefs: put_super\n");
 }
 /* shamelessly yoinking from xiafs - incomplete */

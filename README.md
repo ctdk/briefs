@@ -66,6 +66,7 @@ WORKS
 * rm -r works
 * Directory trie synchronization
 * Stale iterator detection
+* Packed directory trie pages (BrieFS 0.7.0+), storing up to 64 nodes per 4 KiB block
 * inode reuse
 * CRC32C checksum verification for journal records and extent chain blocks
 

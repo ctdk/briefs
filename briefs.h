@@ -27,8 +27,8 @@
 
 /* Semantic versioning, yo */
 #define _BRIEFS_MAJOR_VER 0
-#define _BRIEFS_MINOR_VER 6
-#define _BRIEFS_PATCH_VER 5
+#define _BRIEFS_MINOR_VER 7
+#define _BRIEFS_PATCH_VER 0
 
 /* Journal magic */
 #define JOURNAL_MAGIC 0x4A4E4C5A  /* "JNLZ" */
@@ -278,7 +278,7 @@ struct briefs_inode {
 	__u64 parent_inode;
 	__u32 unused; 		   /* used to duplicate nlinks, renamed */
 	__u32 flags;
-	__u64 dir_trie_root;       /* block number of directory trie root (dirs only) */
+	__u64 dir_trie_root;       /* packed trie node reference: (block << 6) | slot (dirs only) */
 	__u64 rdev;                /* device number (block/char special files) */
 	__u8 reserved[80]; /* zero padded to 512 bytes */
 };
@@ -315,8 +315,9 @@ static inline int briefs_verify_chain_checksum(const void *data, __u64 stored)
 
 /* Trie root block - first block in trie node pool */
 
-/* Trie node magic "TRN " - 0x54524E20 */
-#define BRIEFS_TRIE_MAGIC 0x54524E20
+/* Trie node/page magic values */
+#define BRIEFS_TRIE_MAGIC      0x54524E20  /* "TRN " - legacy single-node blocks */
+#define BRIEFS_TRIE_PAGE_MAGIC 0x54524E50  /* "TRNP" - packed multi-node pages */
 
 /* Bitwise trie macros for directory trie */
 #define TRIE_IS_LEAF(node) (((node)->node_type & NODE_TYPE_INTERM) == 0 || \
@@ -337,63 +338,105 @@ static inline int briefs_verify_chain_checksum(const void *data, __u64 stored)
  * names branching from this node (e.g. "file_1" when "file_10"
  * and "file_100" also exist).
  *
- * The file type (ftype) for leaf entries is stored in the reserved[0]
- * byte of the trie node struct, not in node_type.  node_type is used
- * purely for trie structure (INTERM, STATUS_LEAF).
+ * The file type (ftype) for leaf entries is stored in f_type, not in
+ * node_type.  node_type is used purely for trie structure (INTERM, STATUS_LEAF).
  */
 #define NODE_STATUS_LEAF    0x08
 
 #define NODE_FLAG_DELETED   0x00000004
 #define NODE_FLAG_ROOT      0x00000008
 
-/* Trie node - 32 bytes, one per block.
- * Internal nodes dispatch children by a single byte of the filename.
- * Leaf nodes hold the actual entry (name + inode).
- * Names longer than briefs_name_len are not supported.
- * The name itself is stored inline in the node block after this struct header,
- * at BRIEFS_BLOCK_SIZE - name_offset.
+/*
+ * Packed trie page layout (BrieFS >= 0.7.0).
+ *
+ * Directory trie nodes are packed into 4 KiB "pages" allocated from the
+ * data-block allocator.  Each page holds up to TRIE_SLOTS_PER_BLOCK node
+ * slots and a shared variable-length name heap.  Child/sibling links are
+ * stored as 64-bit "node references" rather than block numbers.
+ *
+ * A node reference is encoded as:
+ *   ref = (absolute_block_number << TRIE_SLOT_BITS) | slot_index
+ * with ref == 0 meaning "null".  Slots are numbered 0..TRIE_SLOTS_PER_BLOCK-1
+ * inside each page; slot 0 is the root node for that page.
  */
-struct briefs_trie_node {
-	__u32 magic;              /* "TRN " - 0x54524E20 */
-	__u32 child_count;        /* number of children (0 for leaf) */
-	__u64 first_child;        /* block number of first child node */
-	__u64 next_sibling;       /* block number of next sibling at same depth */
-	__u8  depth;              /* depth in trie (0 = root) */
-	__u8  node_type;          /* NODE_TYPE_* */
-	__u8  byte_val;           /* the byte value this node represents (internal nodes) */
-	__u8  f_type; 		  /* file type, formerly reserved[0] */
-	__u8  reserved[4];
-	__u64 flags;              /* NODE_FLAG_* */
+#define TRIE_SLOTS_PER_BLOCK 64
+#define TRIE_SLOT_BITS 6
+#define TRIE_SLOT_MASK ((1ULL << TRIE_SLOT_BITS) - 1)
 
-	/* Leaf entry data.  Valid when TRIE_IS_LEAF(node) is true —
-	 * includes pure leaf nodes and NODE_TYPE_INTERM nodes with
-	 * NODE_STATUS_LEAF set.  The file type (ftype) for leaf entries
-	 * is stored in ftype (formerly reserved[0]). */
-	__u64 inode;              /* inode number */
-	__u16 name_len;           /* full name length (not just remaining bytes) */
-	__u16 name_offset;        /* offset from block end to name bytes */
-};
+#define TRIE_MAKE_REF(block, slot) (((u64)(block) << TRIE_SLOT_BITS) | ((slot) & TRIE_SLOT_MASK))
+#define TRIE_REF_BLOCK(ref) ((ref) >> TRIE_SLOT_BITS)
+#define TRIE_REF_SLOT(ref) ((ref) & TRIE_SLOT_MASK)
+#define TRIE_REF_IS_NULL(ref) ((ref) == 0)
 
 /*
- * Helper to get/set the file type stored in a trie node's reserved[0].
- * The node_type field is used for trie structure only (INTERM, STATUS_LEAF);
+ * Trie page header (20 bytes packed), followed immediately by the slot array.
+ * Name data is stored in a heap that grows upward from the end of the block
+ * toward the slot array.
+ */
+struct briefs_trie_page {
+	__u32 magic;              /* BRIEFS_TRIE_PAGE_MAGIC */
+	__u32 version;            /* 1 */
+	__u16 live_count;         /* number of allocated slots */
+	__u16 free_name_off;      /* bytes of name heap used, measured from
+				   * the end of the block */
+	__u64 free_slots;         /* bitmap of free slots (bit i == 1 -> free) */
+} __attribute__((packed));
+
+/*
+ * Trie node slot (36 bytes packed).  One slot per directory trie node.
+ * first_child and next_sibling are node references, not block numbers.
+ */
+struct briefs_trie_node {
+	__u64 first_child;        /* node reference of first child */
+	__u64 next_sibling;       /* node reference of next sibling */
+	__u64 inode;              /* inode number (leaf entries) */
+	__u16 name_len;           /* full name length + 2-byte prefix, or 0 if free */
+	__u16 name_offset;        /* offset from block end to name bytes, or 0 if free */
+	__u8  depth;              /* depth in trie (0 = root) */
+	__u8  node_type;          /* NODE_TYPE_* */
+	__u8  byte_val;           /* the byte value this node represents */
+	__u8  f_type;             /* file type for leaf entries (S_IFMT >> 12) */
+	__u16 flags;              /* NODE_FLAG_* */
+	__u16 child_count;        /* number of children */
+} __attribute__((packed));
+
+/*
+ * Helper to get/set the file type stored in f_type.
+ * node_type is used for trie structure only (INTERM, STATUS_LEAF);
  * the actual file type (ftype from S_IFMT >> 12) lives here.
  */
 #define TRIE_NODE_FTYPE(node) ((node)->f_type)
 #define TRIE_SET_FTYPE(node, ftype) ((node)->f_type = (ftype))
 
 /*
- * Trie block header - immediately follows trie nodes within a block
- * (currently each node occupies a full block, so this is a placeholder
- *  for future packed-multiple-nodes-per-block optimization).
- *
- * For now, each struct briefs_trie_node fills one 4096-byte block.
- * The name is stored in the trailing bytes of that block.
+ * Pointer to the name bytes for a node slot.  The 2-byte little-endian
+ * length prefix lives at (base - 2); the name bytes follow it.
  */
-#define TRIE_NODE_NAME_BASE(node) ((void *)(node) + BRIEFS_BLOCK_SIZE - (node)->name_offset)
+#define TRIE_NODE_NAME_BASE(page_base, node) \
+	((void *)(page_base) + BRIEFS_BLOCK_SIZE - (node)->name_offset + 2)
 
-/* Maximum name length the trie can store inline (name fits in unused tail of block) */
-#define TRIE_MAX_NAME_LEN (BRIEFS_BLOCK_SIZE - sizeof(struct briefs_trie_node))
+/* Maximum inline name length a packed trie slot can hold */
+#define TRIE_MAX_NAME_LEN BRIEFS_NAME_LEN
+
+/*
+ * Legacy single-node-per-block layout is no longer supported as of BrieFS 0.7.0.
+ * The old struct is preserved below for reference/debugging of legacy images.
+ */
+struct briefs_trie_node_legacy {
+	__u32 magic;
+	__u32 child_count;
+	__u64 first_child;
+	__u64 next_sibling;
+	__u8  depth;
+	__u8  node_type;
+	__u8  byte_val;
+	__u8  f_type;
+	__u8  reserved[4];
+	__u64 flags;
+	__u64 inode;
+	__u16 name_len;
+	__u16 name_offset;
+};
 
 /* Trie operations - directory trie node allocation (uses data block allocator) */
 int briefs_trie_create_root(struct super_block *sb, struct briefs_inode *di);
@@ -404,6 +447,22 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
                        const char *name, int name_len);
 void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di);
+
+/* Packed trie page helpers (briefs_trie_page.c) */
+struct buffer_head *briefs_trie_read_page(struct super_block *sb, u64 node_ref,
+                                          struct briefs_trie_page **page,
+                                          struct briefs_trie_node **node);
+struct buffer_head *briefs_trie_get_page(struct super_block *sb, u64 node_ref,
+                                          struct briefs_trie_page **page,
+                                          struct briefs_trie_node **node);
+u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len);
+void briefs_trie_free_node(struct super_block *sb, u64 node_ref);
+int briefs_trie_node_store_name(struct super_block *sb, u64 node_ref,
+                                const char *name, size_t name_len);
+int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
+                          u8 node_type, u64 *out_ref);
+void briefs_trie_cleanup_state(struct super_block *sb);
+void briefs_trie_page_add_partial(struct super_block *sb, u64 block);
 
 /* Trie iterator for readdir - depth-first walk yielding leaves */
 struct trie_iter {
