@@ -156,10 +156,29 @@ int briefs_add_dir_entry(struct inode *dir, const char *name, size_t name_len, u
 	ret = briefs_trie_insert(dir->i_sb, &binfo->disk_inode,
 				  name, name_len, child_ino, type);
 	if (ret == -EEXIST) {
-		mutex_unlock(&binfo->trie_lock);
-		return 0;
+		/*
+		 * Name already exists in the trie.  Update it in place with the
+		 * new inode and file type rather than leaving the old pointer in
+		 * place.  This prevents the directory entry from pointing at a
+		 * freed/reused inode after an overwrite.
+		 */
+		ret = briefs_trie_update_entry(dir->i_sb, &binfo->disk_inode,
+					       name, name_len, child_ino, type);
+		if (ret == -ENOENT) {
+			/*
+			 * Fallback: the existing entry is a pure leaf that the
+			 * update helper can't replace.  Remove it and re-insert.
+			 */
+			ret = briefs_trie_remove(dir->i_sb, &binfo->disk_inode,
+						 name, name_len);
+			if (ret == 0) {
+				ret = briefs_trie_insert(dir->i_sb, &binfo->disk_inode,
+							 name, name_len, child_ino, type);
+			}
+		}
 	}
 
+	if (ret == 0)
 		binfo->trie_gen++;
 	mutex_unlock(&binfo->trie_lock);
 	return ret;
@@ -375,7 +394,6 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
 	memcpy(disk_inode, &briefs_i(inode)->disk_inode, sizeof(struct briefs_inode));
 	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
 	brelse(bh);
 
 	/* Add directory entry to parent */
@@ -409,7 +427,6 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 			pdi->filesize = dir->i_size;
 			pdi->nlinks = dir->i_nlink;
 			mark_buffer_dirty(pbh);
-			sync_dirty_buffer(pbh);
 			brelse(pbh);
 		}
 	}
@@ -494,7 +511,6 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 			struct briefs_inode *di = (struct briefs_inode *)(bh->b_data + off);
 			di->nlinks = inode->i_nlink;
 			mark_buffer_dirty(bh);
-			sync_dirty_buffer(bh);
 			brelse(bh);
 		}
 	}
@@ -511,7 +527,6 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 			pdi->filesize = dir->i_size;
 			pdi->nlinks = dir->i_nlink;
 			mark_buffer_dirty(pbh);
-			sync_dirty_buffer(pbh);
 			brelse(pbh);
 		}
 	}
@@ -533,7 +548,6 @@ static void update_parent_inode(struct inode *dir, struct briefs_sb_info *bsi) {
 		struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + pOff);
 		pdi->nlinks = dir->i_nlink;
 		mark_buffer_dirty(pbh);
-		sync_dirty_buffer(pbh);
 		brelse(pbh);
 	}
 }
@@ -763,7 +777,6 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 				struct briefs_inode *mdi = (struct briefs_inode *)(mbh->b_data + off);
 				mdi->parent_inode = new_dir->i_ino;
 				mark_buffer_dirty(mbh);
-				sync_dirty_buffer(mbh);
 				brelse(mbh);
 			}
 		}
@@ -784,7 +797,6 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 				struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + off);
 				pdi->nlinks = old_dir->i_nlink;
 				mark_buffer_dirty(pbh);
-				sync_dirty_buffer(pbh);
 				brelse(pbh);
 			}
 		}
@@ -799,7 +811,6 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 				struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + off);
 				pdi->nlinks = new_dir->i_nlink;
 				mark_buffer_dirty(pbh);
-				sync_dirty_buffer(pbh);
 				brelse(pbh);
 			}
 		}

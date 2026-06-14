@@ -101,8 +101,13 @@ struct buffer_head *briefs_journal_read_block(struct briefs_journal *j, u64 bloc
 }
 
 /*
- * Write a journal block to disk using the buffer cache.
- * Copies data into a buffer_head, marks it dirty, and syncs.
+ * Write a journal block to the buffer cache.
+ *
+ * This path is hot during metadata-heavy workloads (untar creates thousands
+ * of journal records).  We deliberately avoid sync_dirty_buffer() here and
+ * rely on mark_buffer_dirty() so the block can be batched with other dirty
+ * buffers and flushed by pdflush / explicit sync.  The journal is explicitly
+ * flushed on fsync, syncfs, periodic checkpoint, and umount.
  */
 int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, unsigned char *data) {
 	struct buffer_head *bh;
@@ -131,7 +136,6 @@ int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, unsig
 	memcpy(bh->b_data, data, JOURNAL_BLOCK_SIZE);
 	set_buffer_uptodate(bh);
 	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
 	brelse(bh);
 
 	return 0;

@@ -74,7 +74,6 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	}
 
 	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
 	brelse(bh);
 
 	return 0;
@@ -88,8 +87,9 @@ struct inode *briefs_alloc_vfs_inode(struct super_block *sb) {
 		return NULL;
 
 	seqcount_init(&binfo->extent_seq);
-		mutex_init(&binfo->trie_lock);
-			binfo->trie_gen = 0;
+	mutex_init(&binfo->trie_lock);
+	mutex_init(&binfo->extent_lock);
+	binfo->trie_gen = 0;
 	return &binfo->vfs_inode;
 }
 /* briefs_free_inode - free a VFS inode (called by VFS inode cache) */

@@ -173,7 +173,6 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 						chain->extents[ci] = ext;
 						chain->checksum = briefs_chain_checksum(bh->b_data);
 						mark_buffer_dirty(bh);
-						sync_dirty_buffer(bh);
 						brelse(bh);
 						break;
 					}
@@ -241,7 +240,6 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 					tc->checksum = briefs_chain_checksum(tbh->b_data);
 
 					mark_buffer_dirty(tbh);
-					sync_dirty_buffer(tbh);
 
 					/* Free empty non-first chain block */
 					if (tc->num_extents_in_block == 0 &&
@@ -255,7 +253,6 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 							pc->next_overflow_block = 0;
 							pc->checksum = briefs_chain_checksum(pbh->b_data);
 							mark_buffer_dirty(pbh);
-							sync_dirty_buffer(pbh);
 							brelse(pbh);
 						}
 						briefs_free_block(&bsi->alloc,
@@ -334,7 +331,6 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			struct briefs_inode *di = (struct briefs_inode *)(ibh->b_data + off);
 			memcpy(di, &binfo->disk_inode, sizeof(struct briefs_inode));
 			mark_buffer_dirty(ibh);
-			sync_dirty_buffer(ibh);
 			brelse(ibh);
 		}
 	}
@@ -482,7 +478,6 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
 	memcpy(disk_inode, &briefs_i(inode)->disk_inode, sizeof(struct briefs_inode));
 	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
 	brelse(bh);
 
 	/*
@@ -507,7 +502,6 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		memset(bh->b_data, 0, dir->i_sb->s_blocksize);
 		memcpy(bh->b_data, symname, len);
 		mark_buffer_dirty(bh);
-		sync_dirty_buffer(bh);
 		brelse(bh);
 
 		struct briefs_extent ext;
@@ -533,7 +527,6 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 			disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
 			memcpy(disk_inode, &briefs_i(inode)->disk_inode, sizeof(struct briefs_inode));
 			mark_buffer_dirty(bh);
-			sync_dirty_buffer(bh);
 			brelse(bh);
 		}
 	}
@@ -568,7 +561,6 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 			pdi->filesize = dir->i_size;
 			pdi->nlinks = dir->i_nlink;
 			mark_buffer_dirty(pbh);
-			sync_dirty_buffer(pbh);
 			brelse(pbh);
 		}
 	}
@@ -686,7 +678,6 @@ int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
 	memcpy(disk_inode, &briefs_i(inode)->disk_inode, sizeof(struct briefs_inode));
 	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
 	brelse(bh);
 
 	/* Add directory entry to parent */
@@ -719,7 +710,6 @@ int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 			pdi->filesize = dir->i_size;
 			pdi->nlinks = dir->i_nlink;
 			mark_buffer_dirty(pbh);
-			sync_dirty_buffer(pbh);
 			brelse(pbh);
 		}
 	}

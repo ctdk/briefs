@@ -535,6 +535,84 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 }
 
 /*
+ * briefs_trie_update_entry - update the inode and file type of an existing
+ * directory entry in the trie.  Used when a create/symlink/mknod operation
+ * replaces an existing name without first removing it.
+ *
+ * Returns 0 on success, -ENOENT if the name is not in the trie.
+ */
+int briefs_trie_update_entry(struct super_block *sb, struct briefs_inode *di,
+                             const char *name, size_t name_len,
+                             u64 new_ino, u8 new_type)
+{
+	struct buffer_head *cbh;
+	struct briefs_trie_page *cpage;
+	struct briefs_trie_node *cnode;
+	u64 cur, child;
+	int pos;
+
+	if (TRIE_REF_IS_NULL(di->dir_trie_root))
+		return -ENOENT;
+
+	cur = di->dir_trie_root;
+
+	for (pos = 0; pos < name_len; pos++) {
+		u8 bval = (u8)name[pos];
+
+		child = briefs_trie_find_child(sb, cur, bval);
+		if (TRIE_REF_IS_NULL(child))
+			return -ENOENT;
+
+		if (trie_get_node(sb, child, &cbh, &cpage, &cnode) != 0)
+			return -EIO;
+
+		if (pos == name_len - 1) {
+			if (TRIE_IS_LEAF(cnode)) {
+				char *ename = trie_node_name(cbh->b_data, cnode);
+				int elen = cnode->name_len - 2;
+
+				if (elen == (int)name_len &&
+				    memcmp(ename, name, name_len) == 0) {
+					cnode->inode = new_ino;
+					TRIE_SET_FTYPE(cnode, new_type);
+					mark_buffer_dirty(cbh);
+					brelse(cbh);
+					return 0;
+				}
+			}
+			brelse(cbh);
+			return -ENOENT;
+		}
+
+		if (!(cnode->node_type & NODE_TYPE_INTERM)) {
+			/* Pure leaf where we need an INTERM. */
+			char *ename = trie_node_name(cbh->b_data, cnode);
+			int elen = cnode->name_len - 2;
+
+			brelse(cbh);
+			if (elen == (int)name_len &&
+			    memcmp(ename, name, name_len) == 0) {
+				/*
+				 * A pure leaf occupies the exact full name.  To
+				 * replace it with a new entry, the caller must split
+				 * or remove the old one first; this update path only
+				 * handles cases where the trie already has internal
+				 * nodes for each byte.  Report ENOENT so the caller
+				 * falls back to remove+insert.
+				 */
+				return -ENOENT;
+			}
+			return -ENOENT;
+		}
+
+		brelse(cbh);
+		cur = child;
+	}
+
+	return -ENOENT;
+}
+
+/*
  * briefs_trie_remove - remove an entry from the directory trie.
  */
 int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,

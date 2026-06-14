@@ -26,8 +26,12 @@ struct briefs_journal {
 	bool dirty;                       /* has uncommitted changes */
 };
 
-/* Checkpoint threshold — perform a checkpoint after this many records */
-#define JRN_CHECKPOINT_INTERVAL 64
+/*
+ * Checkpoint threshold — perform a checkpoint after this many records.
+ * Bumped from 64 to 1024 to reduce synchronous flush overhead during
+ * metadata-heavy workloads.
+ */
+#define JRN_CHECKPOINT_INTERVAL 1024
 
 /* Initialize journal from superblock */
 int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb);

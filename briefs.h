@@ -463,6 +463,9 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
                           u8 node_type, u64 *out_ref);
 void briefs_trie_cleanup_state(struct super_block *sb);
 void briefs_trie_page_add_partial(struct super_block *sb, u64 block);
+int briefs_trie_update_entry(struct super_block *sb, struct briefs_inode *di,
+                            const char *name, size_t name_len,
+                            u64 new_ino, u8 new_type);
 
 /* Trie iterator for readdir - depth-first walk yielding leaves */
 struct trie_iter {
@@ -582,6 +585,7 @@ struct briefs_inode_info {
 	u64 inode_number;
 	seqcount_t extent_seq;   /* protects disk_inode extent fields */
 	struct mutex trie_lock;    /* protects directory trie structure */
+	struct mutex extent_lock;  /* serializes extent list appends */
 	u64 trie_gen;            /* generation counter for trie modifications */
 };
 

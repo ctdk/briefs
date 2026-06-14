@@ -100,11 +100,12 @@ int briefs_read_extent(struct super_block *sb, struct briefs_inode *di,
 	return -ENOENT;
 }
 /*
- * briefs_append_extent - append an extent to the extent list, creating
- * chain blocks if the 8 inline slots are full.
+ * __briefs_append_extent - internal append helper.  Caller must hold
+ * binfo->extent_lock.  Appends an extent to the list, creating chain blocks
+ * if the 8 inline slots are full.
  * Returns 0 on success, -ENOSPC if no blocks available for chain.
  */
-int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
+static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
                                  struct briefs_extent *ext)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
@@ -145,8 +146,9 @@ int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 	chain_block = di->extent_inline_base;
 	if (chain_block == 0) {
 		rel = briefs_alloc_block(&bsi->alloc);
-		if (rel == 0)
+		if (rel == 0) {
 			return -ENOSPC;
+		}
 		chain_block = data_to_abs(bsi->sb, rel);
 
 		write_seqcount_begin(&binfo->extent_seq);
@@ -176,8 +178,9 @@ int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 	/* Walk to the last chain block */
 	while (1) {
 		bh = sb_bread(sb, chain_block);
-		if (!bh)
+		if (!bh) {
 			return -EIO;
+		}
 		chain = (struct briefs_extent_chain *)bh->b_data;
 
 		if (briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
@@ -261,6 +264,24 @@ int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 					    ext->len, -1);
 		return 0;
 	}
+}
+
+/*
+ * briefs_append_extent - append an extent to the extent list.  Takes the
+ * per-inode extent lock and calls the internal helper.  This is the
+ * entry point for callers that are not already holding the lock.
+ */
+int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
+                         struct briefs_extent *ext)
+{
+	struct briefs_inode_info *binfo;
+	int ret;
+
+	binfo = container_of(di, struct briefs_inode_info, disk_inode);
+	mutex_lock(&binfo->extent_lock);
+	ret = __briefs_append_extent(sb, di, ext);
+	mutex_unlock(&binfo->extent_lock);
+	return ret;
 }
 
 /*
@@ -404,12 +425,35 @@ int briefs_get_block(struct inode *inode, sector_t iblock,
 	if (!create)
 		return 0;
 
-	/* Allocate and append a new single-block extent */
+	/*
+	 * Allocate and append a new single-block extent.  Take the extent
+	 * lock and re-check the mapping: another thread may have appended the
+	 * block while we were doing the unlocked lookup above.  Without the
+	 * re-check, two threads can both append an extent for the same iblock,
+	 * leaving the first allocated block unreachable (leaked).
+	 */
+	mutex_lock(&binfo->extent_lock);
+
+	for (i = 0; i < binfo->disk_inode.num_extents_total; i++) {
+		ret = briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext);
+		if (ret != 0)
+			continue;
+		if ((u64)iblock >= ext.offset &&
+		    (u64)iblock < ext.offset + ext.len) {
+			phys = ext.phys + ((u64)iblock - ext.offset);
+			map_bh(bh_result, inode->i_sb, phys);
+			mutex_unlock(&binfo->extent_lock);
+			return 0;
+		}
+	}
+
 	{
 		struct briefs_extent new_ext;
 		u64 rel = briefs_alloc_block(&bsi->alloc);
-		if (rel == 0)
+		if (rel == 0) {
+			mutex_unlock(&binfo->extent_lock);
 			return -ENOSPC;
+		}
 
 		phys = data_to_abs(bsi->sb, rel);
 
@@ -418,14 +462,23 @@ int briefs_get_block(struct inode *inode, sector_t iblock,
 		new_ext.len = 1;
 		new_ext.flags = 0;
 
-		ret = briefs_append_extent(inode->i_sb, &binfo->disk_inode, &new_ext);
+		ret = __briefs_append_extent(inode->i_sb, &binfo->disk_inode, &new_ext);
 		if (ret != 0) {
 			briefs_free_block(&bsi->alloc, rel);
+			mutex_unlock(&binfo->extent_lock);
 			return ret;
 		}
 
+		/*
+		 * The extent list changed; make sure the VFS writes back the
+		 * inode so the on-disk inode references this block.  Otherwise
+		 * the block is allocated but unreferenced after a sync.
+		 */
+		mark_inode_dirty(inode);
+
 		map_bh(bh_result, inode->i_sb, phys);
 		set_buffer_new(bh_result);
+		mutex_unlock(&binfo->extent_lock);
 		return 0;
 	}
 }
