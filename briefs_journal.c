@@ -142,14 +142,21 @@ int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, unsig
 }
 
 /*
- * Compute CRC32C for record data
+ * Compute CRC32C for a journal record.
+ *
+ * Computes a single chained CRC over type + flags + data_len + data.
+ * The previous implementation XORed four separate CRCs; that was both
+ * slower (four passes over the small header fields) and not a valid CRC.
  */
 static u32 compute_record_checksum(enum journal_record_type type, u32 flags,
                                     u32 data_len, const void *data) {
-	return briefs_crc32c(0, &type, sizeof(type)) ^
-	       briefs_crc32c(0, &flags, sizeof(flags)) ^
-	       briefs_crc32c(0, &data_len, sizeof(data_len)) ^
-	       briefs_crc32c(0, data, data_len);
+	u32 crc;
+
+	crc = briefs_crc32c(0, &type, sizeof(type));
+	crc = briefs_crc32c(crc, &flags, sizeof(flags));
+	crc = briefs_crc32c(crc, &data_len, sizeof(data_len));
+	crc = briefs_crc32c(crc, data, data_len);
+	return crc;
 }
 
 /*
