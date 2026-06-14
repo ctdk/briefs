@@ -335,6 +335,51 @@ static u64 alloc_level_block_offset(struct briefs_alloc *alloc, u64 words_per_bl
 }
 
 /*
+ * Sync one level of the in-memory bitmap pyramid back to disk.
+ * array: level array to sync
+ * words: number of u64 words in this level
+ * level: 0, 1, or 2
+ * Returns 0 on success, -EIO if a block read fails.
+ */
+static int briefs_alloc_sync_level(struct briefs_alloc *alloc, u64 *array,
+                                    u64 words, int level,
+                                    u64 words_per_block,
+                                    u64 l0_blocks, u64 l1_blocks)
+{
+	u64 level_blocks = (words + words_per_block - 1) / words_per_block;
+	u64 i, j;
+
+	for (i = 0; i < level_blocks; i++) {
+		struct buffer_head *bh;
+		u64 offset = alloc_level_block_offset(alloc, words_per_block, l0_blocks, l1_blocks, level, i);
+		u64 start = i * words_per_block;
+		u64 n = min_t(u64, words - start, words_per_block);
+		bool dirty = false;
+
+		bh = sb_bread(alloc->sb, offset);
+		if (!bh) {
+			pr_err("briefs: failed to read L%d block %llu during sync\n",
+			       level, offset);
+			return -EIO;
+		}
+
+		for (j = 0; j < n; j++) {
+			if (((u64 *)bh->b_data)[j] != array[start + j]) {
+				((u64 *)bh->b_data)[j] = array[start + j];
+				dirty = true;
+			}
+		}
+
+		if (dirty) {
+			mark_buffer_dirty(bh);
+			sync_dirty_buffer(bh);
+		}
+		brelse(bh);
+	}
+	return 0;
+}
+
+/*
  * Sync the in-memory bitmap back to disk.
  * Only writes blocks that have changed.
  */
@@ -342,7 +387,7 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 {
 	u64 words_per_block;
 	u64 l0_blocks, l1_blocks, l2_blocks;
-	u64 i;
+	int ret;
 
 	mutex_lock(&alloc->lock);
 	if (!alloc || !alloc->sb || !alloc->l0) {
@@ -359,93 +404,27 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 		l0_blocks, l1_blocks, l2_blocks);
 
 	/* Sync level 0 */
-	for (i = 0; i < l0_blocks; i++) {
-		struct buffer_head *bh;
-		u64 offset = alloc_level_block_offset(alloc, words_per_block, l0_blocks, l1_blocks, 0, i);
-		u64 start = i * words_per_block;
-		u64 n = min_t(u64, alloc->l0_words - start, words_per_block);
-		u64 j;
-		bool dirty = false;
-
-		bh = sb_bread(alloc->sb, offset);
-		if (!bh) {
-			pr_err("briefs: failed to read L0 block %llu during sync\n", offset);
-			mutex_unlock(&alloc->lock);
-			return -EIO;
-		}
-
-		for (j = 0; j < n; j++) {
-			if (((u64 *)bh->b_data)[j] != alloc->l0[start + j]) {
-				((u64 *)bh->b_data)[j] = alloc->l0[start + j];
-				dirty = true;
-			}
-		}
-
-		if (dirty) {
-			mark_buffer_dirty(bh);
-			sync_dirty_buffer(bh);
-		}
-		brelse(bh);
+	ret = briefs_alloc_sync_level(alloc, alloc->l0, alloc->l0_words, 0,
+	                               words_per_block, l0_blocks, l1_blocks);
+	if (ret) {
+		mutex_unlock(&alloc->lock);
+		return ret;
 	}
 
 	/* Sync level 1 */
-	for (i = 0; i < l1_blocks; i++) {
-		struct buffer_head *bh;
-		u64 offset = alloc_level_block_offset(alloc, words_per_block, l0_blocks, l1_blocks, 1, i);
-		u64 start = i * words_per_block;
-		u64 n = min_t(u64, alloc->l1_words - start, words_per_block);
-		u64 j;
-		bool dirty = false;
-
-		bh = sb_bread(alloc->sb, offset);
-		if (!bh) {
-			pr_err("briefs: failed to read L1 block %llu during sync\n", offset);
-			mutex_unlock(&alloc->lock);
-			return -EIO;
-		}
-
-		for (j = 0; j < n; j++) {
-			if (((u64 *)bh->b_data)[j] != alloc->l1[start + j]) {
-				((u64 *)bh->b_data)[j] = alloc->l1[start + j];
-				dirty = true;
-			}
-		}
-
-		if (dirty) {
-			mark_buffer_dirty(bh);
-			sync_dirty_buffer(bh);
-		}
-		brelse(bh);
+	ret = briefs_alloc_sync_level(alloc, alloc->l1, alloc->l1_words, 1,
+	                               words_per_block, l0_blocks, l1_blocks);
+	if (ret) {
+		mutex_unlock(&alloc->lock);
+		return ret;
 	}
 
 	/* Sync level 2 */
-	for (i = 0; i < l2_blocks; i++) {
-		struct buffer_head *bh;
-		u64 offset = alloc_level_block_offset(alloc, words_per_block, l0_blocks, l1_blocks, 2, i);
-		u64 start = i * words_per_block;
-		u64 n = min_t(u64, alloc->l2_words - start, words_per_block);
-		u64 j;
-		bool dirty = false;
-
-		bh = sb_bread(alloc->sb, offset);
-		if (!bh) {
-			pr_err("briefs: failed to read L2 block %llu during sync\n", offset);
-			mutex_unlock(&alloc->lock);
-			return -EIO;
-		}
-
-		for (j = 0; j < n; j++) {
-			if (((u64 *)bh->b_data)[j] != alloc->l2[start + j]) {
-				((u64 *)bh->b_data)[j] = alloc->l2[start + j];
-				dirty = true;
-			}
-		}
-
-		if (dirty) {
-			mark_buffer_dirty(bh);
-			sync_dirty_buffer(bh);
-		}
-		brelse(bh);
+	ret = briefs_alloc_sync_level(alloc, alloc->l2, alloc->l2_words, 2,
+	                               words_per_block, l0_blocks, l1_blocks);
+	if (ret) {
+		mutex_unlock(&alloc->lock);
+		return ret;
 	}
 
 	/* Update the header block's free_count */
