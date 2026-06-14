@@ -97,7 +97,7 @@ insmod "$KERNEL_MODULE" && pass "briefs_fs module loaded" || fail "module load f
 echo ""
 echo "=== Phase 1: mkfs ==="
 SIZE=8192
-"$MKBRIEFS" -o "$TEST_IMG" -s "$SIZE" 2>/dev/null && pass "mkfs.briefs creates image" || fail "mkfs failed"
+"$MKBRIEFS" -s "$SIZE" "$TEST_IMG" 2>/dev/null && pass "mkfs.briefs creates image" || fail "mkfs failed"
 [ -f "$TEST_IMG" ] && pass "image file exists" || fail "image file missing"
 
 # Phase 2: Mount
@@ -210,7 +210,7 @@ echo "=== Phase 11: fsck ==="
 sync
 # Unmount before fsck so the checker sees a quiescent, consistent image.
 umount "$MNT_POINT" 2>/dev/null || true
-"$FSCKBRIEFS" -d "$TEST_IMG" 2>/dev/null && pass "fsck reports no errors" || fail "fsck found errors"
+"$FSCKBRIEFS" "$TEST_IMG" 2>/dev/null && pass "fsck reports no errors" || fail "fsck found errors"
 
 # --- Summary ---
 echo ""
