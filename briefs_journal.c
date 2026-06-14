@@ -208,7 +208,6 @@ int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_ty
 	/* Check if record fits in remaining block space */
 	if (j->write_offset + total_size > JOURNAL_BLOCK_SIZE) {
 		/* Flush current block to disk */
-		j->cur_hdr->record_count = j->cur_hdr->record_count;
 		int ret = briefs_journal_write_block(j, j->write_pos, j->cur_block);
 		if (ret) return ret;
 
@@ -750,9 +749,8 @@ void briefs_journal_cleanup(struct briefs_journal *j) {
 int briefs_journal_sync(struct briefs_journal *j) {
 	int ret;
 
-	if (!j || !j->dirty) return 0;
-
-	j->cur_hdr->record_count = j->cur_hdr->record_count;
+	if (!j || !j->dirty)
+		return 0;
 
 	/* Write current block to disk */
 	ret = briefs_journal_write_block(j, j->write_pos, j->cur_block);
