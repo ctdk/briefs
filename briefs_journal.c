@@ -365,23 +365,14 @@ static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
  */
 static int replay_inode_update(struct super_block *sb, struct jrn_inode_update *rec)
 {
-	struct briefs_sb_info *bsi = sb->s_fs_info;
-	struct buffer_head *bh = NULL;
 	struct briefs_inode *di;
-	u64 inodeTableBlock, inodeBlock, inodeOffset;
+	struct buffer_head *bh;
 
-	inodeTableBlock = briefs_inode_table_start(bsi->sb);
-	u64 idx = rec->ino - 1;
-	inodeBlock = idx / (sb->s_blocksize / BRIEFS_INODE_SIZE);
-	inodeOffset = (idx % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-
-	bh = sb_bread(sb, inodeTableBlock + inodeBlock);
-	if (!bh) {
+	bh = briefs_read_inode_block(sb, rec->ino, &di);
+	if (IS_ERR(bh)) {
 		pr_warn("briefs: replay can't read inode block for %llu (skip)\n", rec->ino);
 		return 0;
 	}
-
-	di = (struct briefs_inode *)(bh->b_data + inodeOffset);
 
 	di->inode_number = rec->ino;
 	di->magic = _BRIEFS_INODE_MAGIC;

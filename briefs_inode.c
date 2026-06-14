@@ -14,13 +14,66 @@
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
 
+/*
+ * Read the on-disk inode block for a given inode number.
+ * Returns a buffer_head with a pointer to the inode in *di, or an
+ * ERR_PTR on failure.  The caller must brelse() the buffer head.
+ */
+struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
+                                             struct briefs_inode **di)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	u64 inodeTableBlock, inodeIndex, inodeBlock, inodeOffset;
+	struct buffer_head *bh;
+
+	if (!bsi || !bsi->sb)
+		return ERR_PTR(-EIO);
+
+	inodeTableBlock = briefs_inode_table_start(bsi->sb);
+	inodeIndex = ino - 1;
+	inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
+	inodeOffset = (inodeIndex % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+
+	bh = sb_bread(sb, inodeTableBlock + inodeBlock);
+	if (!bh) {
+		pr_err("briefs: failed to read inode block for ino %llu\n", ino);
+		return ERR_PTR(-EIO);
+	}
+
+	*di = (struct briefs_inode *)(bh->b_data + inodeOffset);
+	return bh;
+}
+
+/*
+ * Persist a complete struct briefs_inode to disk for the given inode number.
+ * If sync is true, also sync the buffer to ensure durability (used during
+ * journal replay).  Returns 0 on success, negative errno on error.
+ */
+int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
+                               const struct briefs_inode *src, bool sync)
+{
+	struct briefs_inode *di;
+	struct buffer_head *bh;
+
+	bh = briefs_read_inode_block(sb, ino, &di);
+	if (IS_ERR(bh))
+		return PTR_ERR(bh);
+
+	memcpy(di, src, sizeof(struct briefs_inode));
+	mark_buffer_dirty(bh);
+	if (sync)
+		sync_dirty_buffer(bh);
+	brelse(bh);
+	return 0;
+}
+
 /* briefs_write_inode - persist VFS inode to disk */
 int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	struct briefs_sb_info *bsi;
 	struct briefs_inode_info *binfo;
-	struct buffer_head *bh;
 	struct briefs_inode *disk_inode;
-	u64 inodeTableBlock, inodeBlock, inodeOffset, inodeIndex;
+	struct buffer_head *bh;
+	unsigned seq;
 
 	if (!inode)
 		return -EINVAL;
@@ -30,20 +83,9 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 
 	pr_debug("briefs: write_inode %lu\n", inode->i_ino);
 
-	/* Calculate inode location */
-	inodeTableBlock = briefs_inode_table_start(bsi->sb);
-	inodeIndex = inode->i_ino - 1;
-	inodeBlock = inodeIndex / (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
-	inodeOffset = (inodeIndex % (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-
-	/* Read the block containing this inode */
-	bh = sb_bread(inode->i_sb, inodeTableBlock + inodeBlock);
-	if (!bh) {
-		pr_err("briefs: failed to read inode block for write_inode %lu\n", inode->i_ino);
-		return -EIO;
-	}
-
-	disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
+	bh = briefs_read_inode_block(inode->i_sb, inode->i_ino, &disk_inode);
+	if (IS_ERR(bh))
+		return PTR_ERR(bh);
 
 	/* Sync VFS timestamp fields into in-memory copy first */
 	binfo->disk_inode.atime_sec = inode->i_atime_sec;
@@ -59,19 +101,16 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	 * partially-updated extent list if briefs_append_extent or
 	 * another extent writer is in progress concurrently.
 	 */
-	{
-		unsigned seq;
-		do {
-			seq = read_seqcount_begin(&binfo->extent_seq);
-			memcpy(disk_inode, &binfo->disk_inode, sizeof(struct briefs_inode));
-			/* Update VFS-derived fields after the copy */
-			disk_inode->filemode = inode->i_mode;
-			disk_inode->uid = from_kuid(&init_user_ns, inode->i_uid);
-			disk_inode->gid = from_kgid(&init_user_ns, inode->i_gid);
-			disk_inode->filesize = inode->i_size;
-			disk_inode->nlinks = inode->i_nlink;
-		} while (read_seqcount_retry(&binfo->extent_seq, seq));
-	}
+	do {
+		seq = read_seqcount_begin(&binfo->extent_seq);
+		memcpy(disk_inode, &binfo->disk_inode, sizeof(struct briefs_inode));
+		/* Update VFS-derived fields after the copy */
+		disk_inode->filemode = inode->i_mode;
+		disk_inode->uid = from_kuid(&init_user_ns, inode->i_uid);
+		disk_inode->gid = from_kgid(&init_user_ns, inode->i_gid);
+		disk_inode->filesize = inode->i_size;
+		disk_inode->nlinks = inode->i_nlink;
+	} while (read_seqcount_retry(&binfo->extent_seq, seq));
 
 	mark_buffer_dirty(bh);
 	brelse(bh);
@@ -104,9 +143,6 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 	struct buffer_head *bh;
 	struct briefs_inode *disk_inode;
 	struct briefs_sb_info *bsi;
-	u64 inodeTableBlock;
-	u64 inodeBlock;
-	u64 inodeOffset;
 
 	pr_debug("briefs: iget inode %llu\n", ino);
 
@@ -116,17 +152,6 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 		return ERR_PTR(-EIO);
 	}
 
-	/* Calculate inode location: inode table follows data bitmap */
-	inodeTableBlock = briefs_inode_table_start(bsi->sb);
-	/* Inode table starts at inodeTableBlock. Each block holds 8 inodes (512 bytes each).
-	 * inodeIndex is the 0-based index into the inode table.
-	 * inodeBlock is the block offset within the inode table.
-	 * inodeOffset is the byte offset within that block.
-	 */
-	u64 inodeIndex = ino - 1;
-	inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
-	inodeOffset = (inodeIndex % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-
 	inode = iget_locked(sb, ino);
 	if (!inode) {
 		pr_err("briefs: iget_locked failed\n");
@@ -134,25 +159,14 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 	}
 
 	if (inode->i_state & I_NEW) {
-		/* Recompute inode location inside the locked block */
-		u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
-		u64 inodeIndex = ino - 1;
-		inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
-		inodeOffset = (inodeIndex % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-		pr_info("briefs: inode_table_offset=%llu, inodeIndex=%llu, inodeBlock=%llu, inodeOffset=%llu\n",
-			bsi->sb->inode_table_offset, inodeIndex, inodeBlock, inodeOffset);
-		pr_info("briefs: reading inode %llu from block %llu (inodeTableBlock=%llu, inodeBlock=%llu)\n",
-			ino, inodeTableBlock + inodeBlock, inodeTableBlock, inodeBlock);
 		/* Read inode from disk */
-		bh = sb_bread(sb, inodeTableBlock + inodeBlock);
-		if (!bh) {
+		bh = briefs_read_inode_block(sb, ino, &disk_inode);
+		if (IS_ERR(bh)) {
 			pr_err("briefs: unable to read inode block for ino %llu\n", ino);
 			unlock_new_inode(inode);
 			iput(inode);
 			return ERR_PTR(-EIO);
 		}
-
-		disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
 
 		if (disk_inode->magic != _BRIEFS_INODE_MAGIC) {
 			pr_err("briefs: invalid inode magic for ino %llu: 0x%08llx\n", ino, disk_inode->magic);
@@ -245,8 +259,7 @@ u64 briefs_alloc_inode(struct super_block *sb) {
 }
 void briefs_free_inode_num(struct super_block *sb, u64 ino) {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
-	u64 inodeTableBlock, inodeBlock, inodeOffset;
-	struct buffer_head *bh;
+	struct briefs_inode zero_di = {0};
 
 	if (ino == 0)
 		return;
@@ -256,17 +269,7 @@ void briefs_free_inode_num(struct super_block *sb, u64 ino) {
 	 * valid magic.  This is metadata bookkeeping, not a durability boundary,
 	 * so just mark the buffer dirty and let the block cache write it back.
 	 */
-	inodeTableBlock = briefs_inode_table_start(bsi->sb);
-	u64 inodeIndex = ino - 1;
-	inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
-	inodeOffset = (inodeIndex % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-
-	bh = sb_bread(sb, inodeTableBlock + inodeBlock);
-	if (bh) {
-		memset(bh->b_data + inodeOffset, 0, BRIEFS_INODE_SIZE);
-		mark_buffer_dirty(bh);
-		brelse(bh);
-	}
+	briefs_persist_disk_inode(sb, ino, &zero_di, false);
 
 	briefs_free_block(&bsi->inode_alloc, ino - 1);
 	pr_debug("briefs: freed inode %llu\n", ino);

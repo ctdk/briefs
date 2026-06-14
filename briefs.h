@@ -653,6 +653,12 @@ int briefs_read_extent(struct super_block *sb, struct briefs_inode *di, int inde
 int briefs_append_extent(struct super_block *sb, struct briefs_inode *di, struct briefs_extent *ext);
 int briefs_write_inode(struct inode *inode, struct writeback_control *wbc);
 
+/* Disk inode I/O helpers (briefs_inode.c) */
+struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
+                                             struct briefs_inode **di);
+int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
+                               const struct briefs_inode *src, bool sync);
+
 /* Inode slab cache (defined in briefs.c) */
 extern struct kmem_cache *briefs_inode_cachep;
 

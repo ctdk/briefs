@@ -320,20 +320,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	truncate_setsize(inode, new_size);
 
 	/* Persist the inode to disk */
-	{
-		u64 ino = inode->i_ino;
-		u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
-		u64 idx = ino - 1;
-		u64 blk = idx / (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
-		u64 off = (idx % (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-		struct buffer_head *ibh = sb_bread(inode->i_sb, inodeTableBlock + blk);
-		if (ibh) {
-			struct briefs_inode *di = (struct briefs_inode *)(ibh->b_data + off);
-			memcpy(di, &binfo->disk_inode, sizeof(struct briefs_inode));
-			mark_buffer_dirty(ibh);
-			brelse(ibh);
-		}
-	}
+	briefs_persist_disk_inode(inode->i_sb, inode->i_ino, &binfo->disk_inode, false);
 
 	return 0;
 
@@ -380,10 +367,7 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 {
 	struct briefs_sb_info *bsi = dir->i_sb->s_fs_info;
 	struct inode *inode;
-	struct buffer_head *bh;
-	struct briefs_inode *disk_inode;
 	u64 ino;
-	u64 inodeTableBlock, inodeBlock, inodeOffset, inodeIndex;
 	int ret;
 	size_t len = strlen(symname);
 	struct timespec64 now;
@@ -465,20 +449,11 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	}
 
 	/* Write the inode to disk first so extent storage can find it */
-	inodeTableBlock = briefs_inode_table_start(bsi->sb);
-	inodeIndex = ino - 1;
-	inodeBlock = inodeIndex / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
-	inodeOffset = (inodeIndex % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-
-	bh = sb_bread(dir->i_sb, inodeTableBlock + inodeBlock);
-	if (!bh) {
+	ret = briefs_persist_disk_inode(dir->i_sb, ino, &briefs_i(inode)->disk_inode, false);
+	if (ret) {
 		iput(inode);
-		return -EIO;
+		return ret;
 	}
-	disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
-	memcpy(disk_inode, &briefs_i(inode)->disk_inode, sizeof(struct briefs_inode));
-	mark_buffer_dirty(bh);
-	brelse(bh);
 
 	/*
 	 * Store the symlink target as file data.  Use the same
@@ -486,6 +461,7 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	 * For short targets this fits in a single inline extent.
 	 */
 	if (len > 0) {
+		struct buffer_head *bh;
 		u64 rel = briefs_alloc_block(&bsi->alloc);
 		if (rel == 0) {
 			iput(inode);
@@ -522,13 +498,7 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		memcpy(&briefs_i(inode)->disk_inode.inline_extents[0], &ext, sizeof(ext));
 
 		/* Persist updated inode with extent */
-		bh = sb_bread(dir->i_sb, inodeTableBlock + inodeBlock);
-		if (bh) {
-			disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
-			memcpy(disk_inode, &briefs_i(inode)->disk_inode, sizeof(struct briefs_inode));
-			mark_buffer_dirty(bh);
-			brelse(bh);
-		}
+		briefs_persist_disk_inode(dir->i_sb, ino, &briefs_i(inode)->disk_inode, false);
 	}
 
 	/* Add directory entry to parent */
@@ -551,18 +521,10 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 
 	/* Write parent inode */
 	{
-		u64 pIno = dir->i_ino;
-		u64 pIdx = pIno - 1;
-		u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
-		u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-		struct buffer_head *pbh = sb_bread(dir->i_sb, inodeTableBlock + pBlk);
-		if (pbh) {
-			struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + pOff);
-			pdi->filesize = dir->i_size;
-			pdi->nlinks = dir->i_nlink;
-			mark_buffer_dirty(pbh);
-			brelse(pbh);
-		}
+		struct briefs_inode_info *pbinfo = briefs_i(dir);
+		pbinfo->disk_inode.filesize = dir->i_size;
+		pbinfo->disk_inode.nlinks = dir->i_nlink;
+		briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
 	}
 
 	d_instantiate(dentry, inode);
@@ -578,10 +540,7 @@ int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 {
 	struct briefs_sb_info *bsi = dir->i_sb->s_fs_info;
 	struct inode *inode;
-	struct buffer_head *bh;
-	struct briefs_inode *disk_inode;
 	u64 ino;
-	u64 inodeTableBlock, inodeBlock, inodeOffset, inodeIndex;
 	int ret;
 	struct timespec64 now;
 
@@ -665,20 +624,11 @@ int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	}
 
 	/* Write the inode to disk */
-	inodeTableBlock = briefs_inode_table_start(bsi->sb);
-	inodeIndex = ino - 1;
-	inodeBlock = inodeIndex / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
-	inodeOffset = (inodeIndex % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-
-	bh = sb_bread(dir->i_sb, inodeTableBlock + inodeBlock);
-	if (!bh) {
+	ret = briefs_persist_disk_inode(dir->i_sb, ino, &briefs_i(inode)->disk_inode, false);
+	if (ret) {
 		iput(inode);
-		return -EIO;
+		return ret;
 	}
-	disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
-	memcpy(disk_inode, &briefs_i(inode)->disk_inode, sizeof(struct briefs_inode));
-	mark_buffer_dirty(bh);
-	brelse(bh);
 
 	/* Add directory entry to parent */
 	u8 ftype = (mode & S_IFMT) >> 12;
@@ -700,18 +650,10 @@ int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 
 	/* Write parent inode */
 	{
-		u64 pIno = dir->i_ino;
-		u64 pIdx = pIno - 1;
-		u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
-		u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-		struct buffer_head *pbh = sb_bread(dir->i_sb, inodeTableBlock + pBlk);
-		if (pbh) {
-			struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + pOff);
-			pdi->filesize = dir->i_size;
-			pdi->nlinks = dir->i_nlink;
-			mark_buffer_dirty(pbh);
-			brelse(pbh);
-		}
+		struct briefs_inode_info *pbinfo = briefs_i(dir);
+		pbinfo->disk_inode.filesize = dir->i_size;
+		pbinfo->disk_inode.nlinks = dir->i_nlink;
+		briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
 	}
 
 	d_instantiate(dentry, inode);

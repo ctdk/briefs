@@ -270,10 +270,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	struct briefs_sb_info *bsi;
 	struct briefs_superblock *sbk;
 	struct inode *inode;
-	struct buffer_head *bh;
-	struct briefs_inode *disk_inode;
 	u64 ino;
-	u64 inodeTableBlock, inodeBlock, inodeOffset, inodeIndex;
 	int ret;
 	bool is_dir = S_ISDIR(mode);
 	struct timespec64 now;
@@ -379,22 +376,12 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	}
 
 	/* Write the inode to disk */
-	inodeTableBlock = briefs_inode_table_start(bsi->sb);
-	inodeIndex = ino - 1;
-	inodeBlock = inodeIndex / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
-	inodeOffset = (inodeIndex % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-
-	bh = sb_bread(dir->i_sb, inodeTableBlock + inodeBlock);
-	if (!bh) {
-		pr_err("briefs: failed to read inode block for create %llu\n", ino);
+	ret = briefs_persist_disk_inode(dir->i_sb, ino, &briefs_i(inode)->disk_inode, false);
+	if (ret) {
+		pr_err("briefs: failed to persist inode %llu for create: %d\n", ino, ret);
 		iput(inode);
-		return -EIO;
+		return ret;
 	}
-
-	disk_inode = (struct briefs_inode *)(bh->b_data + inodeOffset);
-	memcpy(disk_inode, &briefs_i(inode)->disk_inode, sizeof(struct briefs_inode));
-	mark_buffer_dirty(bh);
-	brelse(bh);
 
 	/* Add directory entry to parent */
 	u8 ftype = (mode & S_IFMT) >> 12;
@@ -417,18 +404,10 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 
 	/* Write parent inode */
 	{
-		u64 pIno = dir->i_ino;
-		u64 pIdx = pIno - 1;
-		u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
-		u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-		struct buffer_head *pbh = sb_bread(dir->i_sb, inodeTableBlock + pBlk);
-		if (pbh) {
-			struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + pOff);
-			pdi->filesize = dir->i_size;
-			pdi->nlinks = dir->i_nlink;
-			mark_buffer_dirty(pbh);
-			brelse(pbh);
-		}
+		struct briefs_inode_info *pbinfo = briefs_i(dir);
+		pbinfo->disk_inode.filesize = dir->i_size;
+		pbinfo->disk_inode.nlinks = dir->i_nlink;
+		briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
 	}
 
 	d_instantiate(dentry, inode);
@@ -501,34 +480,17 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 
 	/* Persist the target inode with updated nlink */
 	{
-		u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
-		u64 ino = inode->i_ino;
-		u64 idx = ino - 1;
-		u64 blk = idx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
-		u64 off = (idx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-		struct buffer_head *bh = sb_bread(dir->i_sb, inodeTableBlock + blk);
-		if (bh) {
-			struct briefs_inode *di = (struct briefs_inode *)(bh->b_data + off);
-			di->nlinks = inode->i_nlink;
-			mark_buffer_dirty(bh);
-			brelse(bh);
-		}
+		struct briefs_inode_info *binfo = briefs_i(inode);
+		binfo->disk_inode.nlinks = inode->i_nlink;
+		briefs_persist_disk_inode(dir->i_sb, inode->i_ino, &binfo->disk_inode, false);
 	}
 
 	/* Persist the parent directory with updated size */
 	{
-		u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
-		u64 pIdx = dir->i_ino - 1;
-		u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
-		u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-		struct buffer_head *pbh = sb_bread(dir->i_sb, inodeTableBlock + pBlk);
-		if (pbh) {
-			struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + pOff);
-			pdi->filesize = dir->i_size;
-			pdi->nlinks = dir->i_nlink;
-			mark_buffer_dirty(pbh);
-			brelse(pbh);
-		}
+		struct briefs_inode_info *pbinfo = briefs_i(dir);
+		pbinfo->disk_inode.filesize = dir->i_size;
+		pbinfo->disk_inode.nlinks = dir->i_nlink;
+		briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
 	}
 
 	ihold(inode);
@@ -539,17 +501,9 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 }
 
 static void update_parent_inode(struct inode *dir, struct briefs_sb_info *bsi) {
-	u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
-	u64 pIdx = dir->i_ino - 1;
-	u64 pBlk = pIdx / (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
-	u64 pOff = (pIdx % (dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-	struct buffer_head *pbh = sb_bread(dir->i_sb, inodeTableBlock + pBlk);
-	if (pbh) {
-		struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + pOff);
-		pdi->nlinks = dir->i_nlink;
-		mark_buffer_dirty(pbh);
-		brelse(pbh);
-	}
+	struct briefs_inode_info *pbinfo = briefs_i(dir);
+	pbinfo->disk_inode.nlinks = dir->i_nlink;
+	briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
 }
 
 /* briefs_empty_dir - check if a directory is empty by scanning the trie. Since
@@ -767,52 +721,23 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 			struct briefs_inode_info *moved_binfo = briefs_i(inode);
 			moved_binfo->disk_inode.parent_inode = new_dir->i_ino;
 			briefs_journal_inode_update(bsi->journal, inode);
-
-			u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
-			u64 idx = inode->i_ino - 1;
-			u64 blk = idx / (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE);
-			u64 off = (idx % (inode->i_sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
-			struct buffer_head *mbh = sb_bread(inode->i_sb, inodeTableBlock + blk);
-			if (mbh) {
-				struct briefs_inode *mdi = (struct briefs_inode *)(mbh->b_data + off);
-				mdi->parent_inode = new_dir->i_ino;
-				mark_buffer_dirty(mbh);
-				brelse(mbh);
-			}
+			briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+						  &moved_binfo->disk_inode, false);
 		}
 	}
 
 	/* Update parent inodes on disk */
 	{
-		u64 inodeTableBlock = briefs_inode_table_start(bsi->sb);
-		u64 inodes_per_block = old_dir->i_sb->s_blocksize / BRIEFS_INODE_SIZE;
+		struct briefs_inode_info *old_binfo = briefs_i(old_dir);
+		old_binfo->disk_inode.nlinks = old_dir->i_nlink;
+		briefs_persist_disk_inode(old_dir->i_sb, old_dir->i_ino,
+					  &old_binfo->disk_inode, false);
 
-		/* Write old_dir */
-		{
-			u64 idx = old_dir->i_ino - 1;
-			u64 blk = idx / inodes_per_block;
-			u64 off = (idx % inodes_per_block) * BRIEFS_INODE_SIZE;
-			struct buffer_head *pbh = sb_bread(old_dir->i_sb, inodeTableBlock + blk);
-			if (pbh) {
-				struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + off);
-				pdi->nlinks = old_dir->i_nlink;
-				mark_buffer_dirty(pbh);
-				brelse(pbh);
-			}
-		}
-
-		/* Write new_dir if different */
 		if (old_dir != new_dir) {
-			u64 idx = new_dir->i_ino - 1;
-			u64 blk = idx / inodes_per_block;
-			u64 off = (idx % inodes_per_block) * BRIEFS_INODE_SIZE;
-			struct buffer_head *pbh = sb_bread(new_dir->i_sb, inodeTableBlock + blk);
-			if (pbh) {
-				struct briefs_inode *pdi = (struct briefs_inode *)(pbh->b_data + off);
-				pdi->nlinks = new_dir->i_nlink;
-				mark_buffer_dirty(pbh);
-				brelse(pbh);
-			}
+			struct briefs_inode_info *new_binfo = briefs_i(new_dir);
+			new_binfo->disk_inode.nlinks = new_dir->i_nlink;
+			briefs_persist_disk_inode(new_dir->i_sb, new_dir->i_ino,
+						  &new_binfo->disk_inode, false);
 		}
 	}
 
