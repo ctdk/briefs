@@ -149,6 +149,25 @@ static u32 compute_record_checksum(enum journal_record_type type, u32 flags,
 }
 
 /*
+ * Verify a journal record checksum.
+ * Returns 0 if the checksum is valid (or zero, meaning legacy/no checksum),
+ * -EIO if it does not match.
+ */
+static int verify_record_checksum(struct journal_record_hdr *rh, const void *data)
+{
+	u32 computed;
+
+	if (rh->checksum == 0)
+		return 0; /* legacy record with no checksum */
+
+	computed = compute_record_checksum(rh->type, rh->flags, rh->data_len, data);
+	if (computed != rh->checksum)
+		return -EIO;
+
+	return 0;
+}
+
+/*
  * Write a record to the journal.
  * Records are appended sequentially within the current block.
  * If a record doesn't fit, the current block is flushed to disk,
@@ -462,13 +481,38 @@ int briefs_journal_replay(struct briefs_journal *j) {
 
 		/* Walk records by their actual sizes */
 		u64 rec_off = sizeof(struct journal_block_header);
+		bool legacy_checksum_warned = false;
 		for (u32 i = 0; i < hdr->record_count && rec_off < JOURNAL_BLOCK_SIZE; i++) {
 			struct journal_record_hdr *rh = (struct journal_record_hdr *)(bh->b_data + rec_off);
 
 			if (rh->type <= JRN_NONE || rh->type >= JRN_END) {
 				pr_warn("briefs: invalid record type=%u at block=%llu\n", rh->type, cur);
 				brelse(bh);
-				break;
+				return -EIO;
+			}
+
+			/* Bounds check the record data */
+			if (rec_off + sizeof(*rh) + rh->data_len > JOURNAL_BLOCK_SIZE) {
+				pr_err("briefs: journal record overflows block at block=%llu (rec_off=%llu data_len=%u)\n",
+				       cur, rec_off, rh->data_len);
+				brelse(bh);
+				return -EIO;
+			}
+
+			void *rec_data = bh->b_data + rec_off + sizeof(*rh);
+
+			/* Verify record checksum before replaying */
+			if (rh->checksum == 0) {
+				if (!legacy_checksum_warned) {
+					pr_warn("briefs: legacy journal record with no checksum at block=%llu; skipping CRC verification for this replay\n",
+					        cur);
+					legacy_checksum_warned = true;
+				}
+			} else if (verify_record_checksum(rh, rec_data) != 0) {
+				pr_err("briefs: journal checksum mismatch at block=%llu record=%u type=%u\n",
+				       cur, i, rh->type);
+				brelse(bh);
+				return -EIO;
 			}
 
 			if (rh->type == JRN_CHECKPOINT) {
@@ -476,7 +520,6 @@ int briefs_journal_replay(struct briefs_journal *j) {
 				continue;
 			}
 
-			void *rec_data = bh->b_data + rec_off + sizeof(*rh);
 			int apply_ret = 0;
 
 			switch (rh->type) {

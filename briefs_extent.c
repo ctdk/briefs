@@ -80,6 +80,12 @@ int briefs_read_extent(struct super_block *sb, struct briefs_inode *di,
 		}
 		chain = (struct briefs_extent_chain *)bh->b_data;
 
+		if (briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
+			pr_err("briefs: chain block %llu checksum mismatch\n", chain_block);
+			brelse(bh);
+			return -EIO;
+		}
+
 		if (chain_idx < chain->num_extents_in_block) {
 			*ext = chain->extents[chain_idx];
 			brelse(bh);
@@ -174,11 +180,18 @@ int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 			return -EIO;
 		chain = (struct briefs_extent_chain *)bh->b_data;
 
+		if (briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
+			pr_err("briefs: chain block %llu checksum mismatch on append\n", chain_block);
+			brelse(bh);
+			return -EIO;
+		}
+
 		if (chain->num_extents_in_block < CHAIN_EXTENTS) {
 			/* Room in this block */
 			slot = chain->num_extents_in_block;
 			chain->extents[slot] = *ext;
 			chain->num_extents_in_block++;
+			chain->checksum = briefs_chain_checksum(bh->b_data);
 			mark_buffer_dirty(bh);
 			sync_dirty_buffer(bh);
 			brelse(bh);
@@ -209,6 +222,7 @@ int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 		}
 		u64 new_block = data_to_abs(bsi->sb, rel);
 		chain->next_overflow_block = new_block;
+		chain->checksum = briefs_chain_checksum(bh->b_data);
 		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);
 		brelse(bh);
@@ -232,6 +246,7 @@ int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 		chain = (struct briefs_extent_chain *)bh->b_data;
 		chain->extents[0] = *ext;
 		chain->num_extents_in_block = 1;
+		chain->checksum = briefs_chain_checksum(bh->b_data);
 		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);
 		brelse(bh);
@@ -282,6 +297,12 @@ static int briefs_read_extent_chain(struct super_block *sb, int idx,
 			return -EIO;
 		}
 		chain = (struct briefs_extent_chain *)bh->b_data;
+
+		if (briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
+			pr_err("briefs: chain block %llu checksum mismatch\n", chain_block);
+			brelse(bh);
+			return -EIO;
+		}
 
 		if (chain_idx < chain->num_extents_in_block) {
 			*ext = chain->extents[chain_idx];
@@ -461,6 +482,11 @@ void briefs_free_inode_data(struct inode *inode)
 		bh = sb_bread(inode->i_sb, chain_block);
 		if (!bh) break;
 		chain = (struct briefs_extent_chain *)bh->b_data;
+		if (chain->checksum != 0 &&
+		    briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
+			pr_warn("briefs: chain block %llu checksum mismatch while freeing inode %lu; continuing\n",
+				chain_block, inode->i_ino);
+		}
 		next_chain = chain->next_overflow_block;
 		brelse(bh);
 

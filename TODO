@@ -2,7 +2,6 @@
 - Support for info in /proc would also be nice.
 - Create fsck.briefs. (In progress)
 - FUSE for BrieFS once fsck.briefs is more than a stub. (In progress)
-- CRC is being computed, but not verified. It should be verified.
 - Make list of desired functionality that still needs implementing.
 - Proper tests
 - Annotate the source code thoroughly once things are more stable

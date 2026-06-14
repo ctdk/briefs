@@ -13,6 +13,7 @@ TEST_IMG="${TMPDIR:-/tmp}/briefs-test-$$.img"
 MNT_POINT="/tmp/briefs-mnt-$$"
 KERNEL_MODULE="/vagrant/briefs_fs.ko"
 MKBRIEFS="/go/src/github.com/ctdk/briefs-utils/mkfs.briefs"
+FSCKBRIEFS="/go/src/github.com/ctdk/briefs-utils/fsck.briefs"
 LOSETUP=/sbin/losetup
 
 # If SSH_CMD given, wrap everything in SSH
@@ -63,6 +64,12 @@ if [ ! -x "$MKBRIEFS" ]; then
   # Try to use cached mkfs from /go
   cd /go/src/github.com/ctdk/briefs-utils || fail "No briefs-utils found"
   go build -o "$MKBRIEFS" ./cmd/mkfs 2>/dev/null || fail "Cannot build mkfs.briefs"
+fi
+
+# Build fsck if needed
+if [ ! -x "$FSCKBRIEFS" ]; then
+  cd /go/src/github.com/ctdk/briefs-utils || fail "No briefs-utils found"
+  go build -o "$FSCKBRIEFS" ./cmd/fsck 2>/dev/null || fail "Cannot build fsck.briefs"
 fi
 
 echo "=== BrieFS Test Suite ==="
@@ -196,6 +203,12 @@ echo ""
 echo "=== Phase 10: statfs ==="
 STAT=$(stat -f "$MNT_POINT" 2>/dev/null)
 [ -n "$STAT" ] && pass "statfs returns output" || fail "statfs"
+
+# Phase 11: fsck CRC/structure check
+echo ""
+echo "=== Phase 11: fsck ==="
+sync
+"$FSCKBRIEFS" -d "$TEST_IMG" 2>/dev/null && pass "fsck reports no errors" || fail "fsck found errors"
 
 # --- Summary ---
 echo ""

@@ -162,8 +162,16 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 					bh = sb_bread(inode->i_sb, chain_block);
 					if (!bh) break;
 					chain = (struct briefs_extent_chain *)bh->b_data;
+					if (chain->checksum != 0 &&
+					    briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
+						pr_warn("briefs: truncate ino=%lu chain block %llu checksum mismatch; aborting\n",
+							inode->i_ino, chain_block);
+						brelse(bh);
+						break;
+					}
 					if (ci < chain->num_extents_in_block) {
 						chain->extents[ci] = ext;
+						chain->checksum = briefs_chain_checksum(bh->b_data);
 						mark_buffer_dirty(bh);
 						sync_dirty_buffer(bh);
 						brelse(bh);
@@ -216,6 +224,13 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 				if (!tbh)
 					break;
 				tc = (struct briefs_extent_chain *)tbh->b_data;
+				if (tc->checksum != 0 &&
+				    briefs_verify_chain_checksum(tbh->b_data, tc->checksum) != 0) {
+					pr_warn("briefs: truncate ino=%lu chain block %llu checksum mismatch; aborting\n",
+						inode->i_ino, calias);
+					brelse(tbh);
+					break;
+				}
 
 				if (cidx < tc->num_extents_in_block) {
 					/* Found the block — shift extents down */
@@ -223,6 +238,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 					for (j = cidx; j < tc->num_extents_in_block - 1; j++)
 						tc->extents[j] = tc->extents[j + 1];
 					tc->num_extents_in_block--;
+					tc->checksum = briefs_chain_checksum(tbh->b_data);
 
 					mark_buffer_dirty(tbh);
 					sync_dirty_buffer(tbh);
@@ -237,6 +253,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 						if (pbh) {
 							pc = (struct briefs_extent_chain *)pbh->b_data;
 							pc->next_overflow_block = 0;
+							pc->checksum = briefs_chain_checksum(pbh->b_data);
 							mark_buffer_dirty(pbh);
 							sync_dirty_buffer(pbh);
 							brelse(pbh);
@@ -268,6 +285,11 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			bh = sb_bread(inode->i_sb, chain_block);
 			if (!bh) break;
 			chain = (struct briefs_extent_chain *)bh->b_data;
+			if (chain->checksum != 0 &&
+			    briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
+				pr_warn("briefs: truncate ino=%lu chain block %llu checksum mismatch while freeing\n",
+					inode->i_ino, chain_block);
+			}
 			u64 next = chain->next_overflow_block;
 			brelse(bh);
 			briefs_free_block(&bsi->alloc, abs_to_data(bsi->sb, chain_block));

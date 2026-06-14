@@ -170,6 +170,9 @@ struct jrn_checkpoint {
 #define JRN_DIR_UPDATE_SIZE 320
 #define JRN_CHECKPOINT_SIZE 80
 
+/* Compute CRC32C checksum */
+__u32 briefs_crc32c(__u32 crc, const void *data, size_t len);
+
 /* Journal block header (16 bytes) */
 struct journal_block_header {
 	__u32 magic;          /* JOURNAL_MAGIC */
@@ -289,6 +292,25 @@ struct briefs_extent_chain {
 	__u64 checksum;
 };
 
+/*
+ * Extent chain block checksum helpers.
+ * The checksum covers bytes [0, block_size-16), i.e. the header and all
+ * 127 extents but not the 8-byte checksum field itself (nor the 8 bytes of
+ * trailing padding). A stored value of zero is treated as legacy (no
+ * checksum) and always verifies.
+ */
+static inline __u64 briefs_chain_checksum(const void *data)
+{
+	return (__u64)briefs_crc32c(0, data, BRIEFS_BLOCK_SIZE - 2 * sizeof(__u64));
+}
+
+static inline int briefs_verify_chain_checksum(const void *data, __u64 stored)
+{
+	if (stored == 0)
+		return 0; /* legacy block with no checksum */
+	return (briefs_chain_checksum(data) == stored) ? 0 : -EIO;
+}
+
 /* Function headers and the like */
 
 /* Trie root block - first block in trie node pool */
@@ -405,9 +427,6 @@ struct trie_iter {
 
 void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di, u64 gen);
 int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter, u64 current_gen, u64 *ino, u8 *type, char *name_buf, int *name_len);
-
-/* Compute CRC32 checksum for journal record */
-__u32 briefs_crc32c(__u32 crc, const void *data, size_t len);
 
 /* Directory block magic */
 #define BRIEFS_DIR_MAGIC 0x44525952  /* "DRYR" */
