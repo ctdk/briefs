@@ -112,8 +112,9 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 	struct briefs_inode_info *binfo;
 	struct buffer_head *bh;
 	struct briefs_extent_chain *chain;
+	struct briefs_extent last;
 	u64 rel, chain_block;
-	int slot;
+	int slot, ret, chain_idx, block_slot, blocks_to_skip;
 
 	/* Get the inode info from the embedded disk_inode */
 	binfo = container_of(di, struct briefs_inode_info, disk_inode);
@@ -123,6 +124,69 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 	 * critical section so that briefs_write_inode (called by VFS writeback)
 	 * never sees a partially-updated extent list.
 	 */
+
+	/*
+	 * If the new extent is contiguous with the last one, merge it instead
+	 * of creating a new extent.  Sequential writes therefore build a single
+	 * large extent rather than thousands of single-block extents, which
+	 * keeps extent lookup O(1) instead of O(n).
+	 */
+	if (di->num_extents_total > 0) {
+		int last_idx = di->num_extents_total - 1;
+
+		ret = briefs_read_extent(sb, di, last_idx, &last);
+		if (ret == 0 &&
+		    ext->offset == last.offset + last.len &&
+		    ext->phys == last.phys + last.len) {
+			if (last_idx < di->num_extents_inline) {
+				write_seqcount_begin(&binfo->extent_seq);
+				di->inline_extents[last_idx].len++;
+				write_seqcount_end(&binfo->extent_seq);
+			} else {
+				chain_idx = last_idx - di->num_extents_inline;
+				block_slot = chain_idx % CHAIN_EXTENTS;
+				blocks_to_skip = chain_idx / CHAIN_EXTENTS;
+				chain_block = di->extent_inline_base;
+
+				while (blocks_to_skip-- > 0) {
+					bh = sb_bread(sb, chain_block);
+					if (!bh)
+						return -EIO;
+					chain = (struct briefs_extent_chain *)bh->b_data;
+					if (briefs_verify_chain_checksum(bh->b_data,
+						    chain->checksum) != 0) {
+						brelse(bh);
+						return -EIO;
+					}
+					chain_block = chain->next_overflow_block;
+					brelse(bh);
+					if (chain_block == 0)
+						return -EIO;
+				}
+
+				bh = sb_bread(sb, chain_block);
+				if (!bh)
+					return -EIO;
+				chain = (struct briefs_extent_chain *)bh->b_data;
+				if (briefs_verify_chain_checksum(bh->b_data,
+					    chain->checksum) != 0) {
+					brelse(bh);
+					return -EIO;
+				}
+				chain->extents[block_slot].len++;
+				chain->checksum = briefs_chain_checksum(bh->b_data);
+				mark_buffer_dirty(bh);
+				sync_dirty_buffer(bh);
+				brelse(bh);
+			}
+
+			/* Journal the new block allocation for bitmap recovery */
+			briefs_journal_extent_alloc(bsi->journal, di->inode_number,
+						    ext->offset, ext->phys,
+						    ext->len, -1);
+			return 0;
+		}
+	}
 
 	if (di->num_extents_inline < 8) {
 		/* Still fits inline */
