@@ -11,10 +11,11 @@ set -euo pipefail
 SSH_CMD="${1:-}"
 TEST_IMG="${TMPDIR:-/tmp}/briefs-test-$$.img"
 MNT_POINT="/tmp/briefs-mnt-$$"
-KERNEL_MODULE="${BRIEFS_MODULE:-/vagrant/briefs_fs.ko}"
-MKBRIEFS="${BRIEFS_MKFS:-/go/src/github.com/ctdk/briefs-utils/mkfs.briefs}"
-FSCKBRIEFS="${BRIEFS_FSCK:-/go/src/github.com/ctdk/briefs-utils/fsck.briefs}"
-LOSETUP=${BRIEFS_LOSETUP:-/sbin/losetup}
+KERNEL_MODULE="${BRIEFS_MODULE:-/home/jeremy/src/briefs/briefs_fs.ko}"
+MKBRIEFS="${BRIEFS_MKFS:-/home/jeremy/go/bin/mkfs.briefs}"
+FSCKBRIEFS="${BRIEFS_FSCK:-/home/jeremy/go/bin/fsck.briefs}"
+LOSETUP="${BRIEFS_LOSETUP:-$(command -v losetup || echo /sbin/losetup)}"
+LOSETUP_DISCOVER="${BRIEFS_LOSETUP_DISCOVER:-true}"
 
 # If SSH_CMD given, wrap everything in SSH
 if [ -n "$SSH_CMD" ]; then
@@ -50,9 +51,10 @@ check_file() {
 
 cleanup() {
   umount "$MNT_POINT" 2>/dev/null || true
-  $LOSETUP -d /dev/loop0 2>/dev/null || true
-  $LOSETUP -d /dev/loop1 2>/dev/null || true
-  $LOSETUP -d /dev/loop2 2>/dev/null || true
+  if [ -n "${BRIEFS_LOOP_DEV:-}" ]; then
+    $LOSETUP -d "$BRIEFS_LOOP_DEV" 2>/dev/null || true
+    unset BRIEFS_LOOP_DEV
+  fi
   rmmod briefs_fs 2>/dev/null || true
   rm -f "$TEST_IMG"
   rmdir "$MNT_POINT" 2>/dev/null || true

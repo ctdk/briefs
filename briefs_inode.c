@@ -97,31 +97,52 @@ struct buffer_head *briefs_get_zero_block(struct super_block *sb, u64 block)
  * size_delta is signed bytes to add to dir->i_size; link_delta is signed
  * number of links to add (positive) or remove (negative).  Journals and
  * persists the parent inode.
+ *
+ * This helper is transactional: if persistence fails, the VFS inode and the
+ * cached disk_inode are left in their pre-update state.
  */
 int briefs_update_parent_dir(struct inode *dir, struct briefs_sb_info *bsi,
                               ssize_t size_delta, int link_delta)
 {
 	struct briefs_inode_info *pbinfo = briefs_i(dir);
+	u64 old_size = dir->i_size;
+	u32 old_nlink = dir->i_nlink;
+	u64 new_size;
+	u32 new_nlink;
 	int ret;
 
-	if (size_delta < 0 && dir->i_size < (size_t)(-size_delta))
-		dir->i_size = 0;
+	if (size_delta < 0 && old_size < (size_t)(-size_delta))
+		new_size = 0;
 	else
-		dir->i_size += size_delta;
+		new_size = old_size + size_delta;
 
+	new_nlink = old_nlink;
 	if (link_delta > 0)
-		inc_nlink(dir);
+		new_nlink++;
 	else if (link_delta < 0)
-		drop_nlink(dir);
+		new_nlink--;
 
-	pbinfo->disk_inode.filesize = dir->i_size;
-	pbinfo->disk_inode.nlinks = dir->i_nlink;
+	pbinfo->disk_inode.filesize = new_size;
+	pbinfo->disk_inode.nlinks = new_nlink;
 
 	ret = briefs_journal_inode_update(bsi->journal, dir);
-	if (ret)
+	if (ret) {
+		pbinfo->disk_inode.filesize = old_size;
+		pbinfo->disk_inode.nlinks = old_nlink;
 		return ret;
+	}
 
-	return briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
+	ret = briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
+	if (ret) {
+		pbinfo->disk_inode.filesize = old_size;
+		pbinfo->disk_inode.nlinks = old_nlink;
+		return ret;
+	}
+
+	/* Commit the updates to VFS state only after successful persistence. */
+	dir->i_size = new_size;
+	set_nlink(dir, new_nlink);
+	return 0;
 }
 
 /*
@@ -310,8 +331,9 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	if (IS_ERR(bh))
 		return PTR_ERR(bh);
 
-	/* Sync VFS timestamp fields into in-memory copy first */
+	/* Sync VFS timestamp and size fields into in-memory copy first */
 	briefs_sync_inode_times(inode, &binfo->disk_inode);
+	binfo->disk_inode.filesize = inode->i_size;
 
 	/*
 	 * Copy in-memory disk_inode to the on-disk buffer, converting to

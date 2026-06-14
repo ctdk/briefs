@@ -338,17 +338,21 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 	if (S_ISDIR(inode->i_mode))
 		return -EPERM;
 
-	/* Log new entry creation */
-	ret = briefs_journal_dir_add(bsi->journal, dir->i_ino, inode->i_ino, new_dentry);
-	if (ret)
-		return ret;
-
 	/* Add directory entry pointing at the existing inode */
 	ftype = (inode->i_mode & S_IFMT) >> 12;
 	ret = briefs_add_dir_entry(dir, new_dentry->d_name.name,
 					   new_dentry->d_name.len, inode->i_ino, ftype);
 	if (ret) {
 		pr_err("briefs: link failed to add dir entry: %d\n", ret);
+		return ret;
+	}
+
+	/* Log new entry creation only after the entry is on disk. */
+	ret = briefs_journal_dir_add(bsi->journal, dir->i_ino, inode->i_ino, new_dentry);
+	if (ret) {
+		pr_err("briefs: link failed to journal dir add: %d\n", ret);
+		briefs_remove_dir_entry(dir, new_dentry->d_name.name,
+					new_dentry->d_name.len);
 		return ret;
 	}
 
@@ -362,15 +366,37 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 	{
 		struct briefs_inode_info *binfo = briefs_i(inode);
 		binfo->disk_inode.nlinks = inode->i_nlink;
-		briefs_persist_disk_inode(dir->i_sb, inode->i_ino, &binfo->disk_inode, false);
+		ret = briefs_persist_disk_inode(dir->i_sb, inode->i_ino,
+								&binfo->disk_inode, false);
+		if (ret) {
+			pr_err("briefs: link failed to persist target inode: %d\n", ret);
+			drop_nlink(inode);
+			binfo->disk_inode.nlinks = inode->i_nlink;
+			briefs_remove_dir_entry(dir, new_dentry->d_name.name,
+							new_dentry->d_name.len);
+			briefs_journal_dir_del(bsi->journal, dir->i_ino, new_dentry);
+			briefs_persist_disk_inode(dir->i_sb, inode->i_ino,
+								  &binfo->disk_inode, false);
+			return ret;
+		}
 	}
 
 	/* Update and persist parent directory */
 	ret = briefs_update_parent_dir(dir, bsi,
-					sizeof(struct briefs_dir_entry) + 2 + new_dentry->d_name.len,
-					0);
-	if (ret)
+						sizeof(struct briefs_dir_entry) + 2 + new_dentry->d_name.len,
+						0);
+	if (ret) {
+		struct briefs_inode_info *binfo = briefs_i(inode);
+		pr_err("briefs: link failed to update parent dir: %d\n", ret);
+		drop_nlink(inode);
+		binfo->disk_inode.nlinks = inode->i_nlink;
+		briefs_remove_dir_entry(dir, new_dentry->d_name.name,
+						new_dentry->d_name.len);
+		briefs_journal_dir_del(bsi->journal, dir->i_ino, new_dentry);
+		briefs_persist_disk_inode(dir->i_sb, inode->i_ino,
+							  &binfo->disk_inode, false);
 		return ret;
+	}
 
 	ihold(inode);
 	d_instantiate(new_dentry, inode);
@@ -378,6 +404,7 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 	pr_debug("briefs: link inode %lu now has %u links\n", inode->i_ino, inode->i_nlink);
 	return 0;
 }
+
 
 /* briefs_empty_dir - check if a directory is empty by scanning the trie. Since
  * briefs does not store . or .. in the trie (dir_emit_dots handles those), any

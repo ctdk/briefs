@@ -483,6 +483,37 @@ static int replay_trie_alloc(struct super_block *sb, struct jrn_trie_alloc *rec)
 }
 
 /*
+ * briefs_journal_sync_superblock - persist the in-memory superblock fields
+ * back to the on-disk superblock buffer.  Called after journal replay so a
+ * second crash does not force redundant replay.
+ */
+static int briefs_journal_sync_superblock(struct briefs_journal *j)
+{
+	struct super_block *vfs_sb = j->vfs_sb;
+	struct buffer_head *bh;
+	struct briefs_superblock *disk_sb;
+
+	if (!vfs_sb)
+		return -EINVAL;
+
+	bh = sb_bread(vfs_sb, 0);
+	if (!bh)
+		return -EIO;
+
+	disk_sb = (struct briefs_superblock *)bh->b_data;
+	disk_sb->checkpoint_seq = j->sb->checkpoint_seq;
+	disk_sb->journal_log_start = j->sb->journal_log_start;
+	disk_sb->journal_log_end = j->sb->journal_log_end;
+	disk_sb->free_data_blocks = j->sb->free_data_blocks;
+	disk_sb->free_inodes = j->sb->free_inodes;
+
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+	return 0;
+}
+
+/*
  * Mount/recovery: replay journal from last checkpoint.
  *
  * Walks the journal from journal_log_start to journal_log_end and re-applies
@@ -638,6 +669,26 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	/* Update superblock to mark journal clean */
 	j->sb->journal_log_start = j->sb->journal_log_end;
 	j->sb->checkpoint_seq = cpu_to_le64(le64_to_cpu(j->sb->checkpoint_seq) + 1);
+
+	/*
+	 * Replay may have changed the allocator free counts.  Copy the current
+	 * allocator state into the superblock so the clean checkpoint reflects
+	 * the true free space.
+	 */
+	{
+		struct briefs_sb_info *bsi = j->vfs_sb->s_fs_info;
+		if (bsi) {
+			j->sb->free_data_blocks = cpu_to_le64(bsi->alloc.free_count);
+			j->sb->free_inodes = cpu_to_le64(bsi->inode_alloc.free_count);
+		}
+	}
+
+	/* Persist the clean superblock so a second crash skips replay. */
+	{
+		int sync_ret = briefs_journal_sync_superblock(j);
+		if (sync_ret)
+			pr_err("briefs: failed to sync superblock after replay: %d\n", sync_ret);
+	}
 
 	return errors ? -EIO : 0;
 }
