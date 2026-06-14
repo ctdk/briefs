@@ -95,12 +95,12 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
 	struct briefs_extent ext;
 	u64 new_size, old_size, trunc_block;
-	int i, ret;
+	int ret;
 	struct buffer_head *bh;
 	struct briefs_extent_chain *chain;
 	u64 chain_block;
 	int ci;
-	
+	s64 i;
 
 	/* Only handle truncation (i_attr_valid & ATTR_SIZE, new size < old) */
 	if (!(attr->ia_valid & ATTR_SIZE))
@@ -117,9 +117,13 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 	trunc_block = (new_size + BRIEFS_BLOCK_SIZE - 1) / BRIEFS_BLOCK_SIZE;
 
+	/* Nothing to do if the inode has no extents. */
+	if (binfo->disk_inode.num_extents_total == 0)
+		goto out_copy;
+
 	/* Iterate extents in reverse; trunc_block may fall inside an extent
 	 * or before it. Remove or shorten affected extents. */
-	for (i = binfo->disk_inode.num_extents_total - 1; i >= 0; i--) {
+	for (i = (s64)binfo->disk_inode.num_extents_total - 1; i >= 0; i--) {
 		ret = briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext);
 		if (ret != 0)
 			break;
@@ -377,7 +381,7 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		struct buffer_head *bh;
 		u64 rel = briefs_alloc_block(&bsi->alloc);
 		if (rel == 0) {
-			iput(inode);
+			briefs_create_abort(dir->i_sb, dir, inode, &dentry->d_name, false);
 			return -ENOSPC;
 		}
 		u64 phys = data_to_abs(bsi->sb, rel);
@@ -385,7 +389,7 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		bh = sb_bread(dir->i_sb, phys);
 		if (!bh) {
 			briefs_free_block(&bsi->alloc, rel);
-			iput(inode);
+			briefs_create_abort(dir->i_sb, dir, inode, &dentry->d_name, false);
 			return -EIO;
 		}
 		memset(bh->b_data, 0, dir->i_sb->s_blocksize);
@@ -401,7 +405,7 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		ret = briefs_append_extent(dir->i_sb, &briefs_i(inode)->disk_inode, &ext);
 		if (ret != 0) {
 			briefs_free_block(&bsi->alloc, rel);
-			iput(inode);
+			briefs_create_abort(dir->i_sb, dir, inode, &dentry->d_name, false);
 			return ret;
 		}
 
@@ -415,10 +419,8 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	}
 
 	ret = briefs_finish_create(dir, dentry, inode, 1);
-	if (ret) {
-		iput(inode);
+	if (ret)
 		return ret;
-	}
 
 	d_instantiate(dentry, inode);
 
@@ -442,10 +444,8 @@ int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 		return PTR_ERR(inode);
 
 	ret = briefs_finish_create(dir, dentry, inode, 1);
-	if (ret) {
-		iput(inode);
+	if (ret)
 		return ret;
-	}
 
 	d_instantiate(dentry, inode);
 

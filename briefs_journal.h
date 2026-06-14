@@ -89,6 +89,9 @@ static inline int briefs_journal_dir_del(struct briefs_journal *j, u64 parent_in
 int briefs_journal_inode_alloc(struct briefs_journal *j, u64 ino,
                                 umode_t mode, u32 nlink);
 
+/* Log freeing of an inode */
+int briefs_journal_inode_free(struct briefs_journal *j, u64 ino);
+
 /* Log extent allocation */
 int briefs_journal_extent_alloc(struct briefs_journal *j, u64 ino,
 				 u64 offset, u64 phys_start,
@@ -101,5 +104,9 @@ int briefs_journal_extent_free(struct briefs_journal *j, u64 ino,
 /* Log inode metadata update (nlink, mode, size, timestamps) */
 int briefs_journal_inode_update(struct briefs_journal *j,
 				struct inode *inode);
+
+/* Log allocation/free of a packed directory-trie page */
+int briefs_journal_trie_alloc(struct briefs_journal *j, u64 abs_block);
+int briefs_journal_trie_free(struct briefs_journal *j, u64 abs_block);
 
 #endif /* _BRIEFS_JOURNAL_H */

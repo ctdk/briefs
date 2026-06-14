@@ -867,6 +867,97 @@ void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di)
 }
 
 /*
+ * briefs_trie_iter_alloc - allocate a trie iterator with a dynamically
+ * growing stack.  The returned iterator must be freed with
+ * briefs_trie_iter_free().
+ */
+struct trie_iter *briefs_trie_iter_alloc(void)
+{
+	struct trie_iter *iter;
+
+	iter = kmalloc(sizeof(*iter), GFP_KERNEL);
+	if (!iter)
+		return NULL;
+
+	iter->cap = 256;
+	iter->stack = kmalloc_array(iter->cap, sizeof(u64), GFP_KERNEL);
+	iter->leaf_emitted = kmalloc_array(iter->cap, sizeof(u8), GFP_KERNEL);
+	if (!iter->stack || !iter->leaf_emitted) {
+		kfree(iter->stack);
+		kfree(iter->leaf_emitted);
+		kfree(iter);
+		return NULL;
+	}
+
+	iter->sp = 0;
+	iter->pending = false;
+	iter->gen = 0;
+	return iter;
+}
+
+/*
+ * briefs_trie_iter_free - free a trie iterator and its dynamic stack.
+ */
+void briefs_trie_iter_free(struct trie_iter *iter)
+{
+	if (!iter)
+		return;
+	kfree(iter->stack);
+	kfree(iter->leaf_emitted);
+	kfree(iter);
+}
+
+/*
+ * Grow the iterator stack to fit at least need more entries.
+ * Returns 0 on success, -ENOMEM on failure.
+ */
+static int trie_iter_grow(struct trie_iter *iter, int need)
+{
+	int new_cap = iter->cap;
+
+	while (new_cap < iter->sp + need)
+		new_cap *= 2;
+
+	if (new_cap == iter->cap)
+		return 0;
+
+	{
+		u64 *new_stack;
+		u8 *new_emitted;
+
+		new_stack = krealloc(iter->stack, new_cap * sizeof(u64), GFP_KERNEL);
+		new_emitted = krealloc(iter->leaf_emitted, new_cap * sizeof(u8), GFP_KERNEL);
+		if (!new_stack || !new_emitted) {
+			kfree(new_stack);
+			kfree(new_emitted);
+			return -ENOMEM;
+		}
+		iter->stack = new_stack;
+		iter->leaf_emitted = new_emitted;
+		iter->cap = new_cap;
+	}
+	return 0;
+}
+
+/*
+ * Push a node reference onto the iterator stack.
+ * Returns 0 on success, -ENOMEM if the stack could not be grown.
+ */
+static int trie_iter_push(struct trie_iter *iter, u64 ref, u8 emitted)
+{
+	int ret;
+
+	ret = trie_iter_grow(iter, 1);
+	if (ret)
+		return ret;
+
+	iter->stack[iter->sp] = ref;
+	iter->leaf_emitted[iter->sp] = emitted;
+	iter->sp++;
+	return 0;
+}
+
+/*
  * briefs_trie_iter_init - initialize a trie iteration starting from root.
  */
 void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di, u64 gen)
@@ -891,6 +982,7 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 	struct buffer_head *bh;
 	struct briefs_trie_page *page;
 	struct briefs_trie_node *node;
+	int ret;
 
 	if (iter->gen != current_gen)
 		return -ESTALE;
@@ -933,10 +1025,12 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 					*name_len = nlen;
 				}
 
-				if (!TRIE_REF_IS_NULL(trie_node_first_child(node)) && iter->sp < 256) {
-					iter->stack[iter->sp] = ref;
-					iter->leaf_emitted[iter->sp] = 1;
-					iter->sp++;
+				if (!TRIE_REF_IS_NULL(trie_node_first_child(node))) {
+					ret = trie_iter_push(iter, ref, 1);
+					if (ret) {
+						brelse(bh);
+						return ret;
+					}
 				}
 
 				brelse(bh);
@@ -950,20 +1044,11 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 			int pushed = 0;
 
 			while (!TRIE_REF_IS_NULL(child)) {
-				if (iter->sp >= 510) {
-					iter->stack[iter->sp] = ref;
-					iter->leaf_emitted[iter->sp] = 1;
-					iter->sp++;
-					iter->stack[iter->sp] = child;
-					iter->leaf_emitted[iter->sp] = 0;
-					iter->sp++;
-					pushed = 1;
-					break;
+				ret = trie_iter_push(iter, child, 0);
+				if (ret) {
+					brelse(bh);
+					return ret;
 				}
-
-				iter->stack[iter->sp] = child;
-				iter->leaf_emitted[iter->sp] = 0;
-				iter->sp++;
 				pushed++;
 
 				{

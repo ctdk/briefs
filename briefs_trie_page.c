@@ -23,6 +23,7 @@
 #include <linux/unaligned.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
+#include "briefs_journal.h"
 
 /*
  * Per-superblock state tracking partially-full trie pages.  We use a mutex
@@ -238,6 +239,9 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 	node->depth = depth;
 	node->byte_val = byte_val;
 	node->node_type = node_type;
+
+	/* Journal the trie page allocation so recovery knows this block is in use. */
+	briefs_journal_trie_alloc(bsi->journal, block);
 
 	brelse(bh);
 
@@ -638,6 +642,8 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 		 */
 		sync_dirty_buffer(bh);
 		brelse(bh);
+		/* Journal the trie page free so recovery does not leave it allocated. */
+		briefs_journal_trie_free(bsi->journal, block);
 		briefs_free_block(&bsi->alloc, abs_to_data(bsi->sb, block));
 	} else {
 		brelse(bh);

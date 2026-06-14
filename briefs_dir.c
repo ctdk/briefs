@@ -41,7 +41,7 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 	iter = file->private_data;
 	if (!iter) {
 		struct briefs_inode_info *binfo = briefs_i(dir);
-		iter = kmalloc(sizeof(struct trie_iter), GFP_KERNEL);
+		iter = briefs_trie_iter_alloc();
 		if (!iter)
 			return -ENOMEM;
 
@@ -111,7 +111,7 @@ int briefs_dir_open(struct inode *inode, struct file *file) {
 	if (!S_ISDIR(inode->i_mode))
 		return -ENOTDIR;
 
-	iter = kmalloc(sizeof(struct trie_iter), GFP_KERNEL);
+	iter = briefs_trie_iter_alloc();
 	if (!iter)
 		return -ENOMEM;
 
@@ -127,7 +127,7 @@ int briefs_dir_open(struct inode *inode, struct file *file) {
 /* Release directory — free the persistent trie iterator */
 int briefs_dir_release(struct inode *inode, struct file *file) {
 	pr_debug("briefs: dir_release inode %lu\n", inode->i_ino);
-	kfree(file->private_data);
+	briefs_trie_iter_free(file->private_data);
 	file->private_data = NULL;
 	return 0;
 }
@@ -284,7 +284,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 		ret = briefs_trie_create_root(dir->i_sb, &binfo->disk_inode);
 		if (ret) {
 			pr_err("briefs: failed to create dir trie root for ino %lu\n", inode->i_ino);
-			iput(inode);
+			briefs_create_abort(dir->i_sb, dir, inode, &dentry->d_name, false);
 			return ret;
 		}
 
@@ -293,10 +293,8 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	}
 
 	ret = briefs_finish_create(dir, dentry, inode, is_dir ? 1 : 0);
-	if (ret) {
-		iput(inode);
+	if (ret)
 		return ret;
-	}
 
 	d_instantiate(dentry, inode);
 
@@ -397,7 +395,7 @@ static int briefs_empty_dir(struct inode *inode, int *ret){
 		u64 entry_ino;
 		u8 entry_type;
 
-		iter = kmalloc(sizeof(struct trie_iter), GFP_KERNEL);
+		iter = briefs_trie_iter_alloc();
 		if (!iter) {
 			*ret = -ENOMEM;
 			mutex_unlock(&binfo->trie_lock);
@@ -421,7 +419,7 @@ static int briefs_empty_dir(struct inode *inode, int *ret){
 		pr_debug("briefs: rmdir found entry '%s'\n", entry_name_buf);
 
 		kfree(entry_name_buf);
-		kfree(iter);
+		briefs_trie_iter_free(iter);
 		if (res == 0) {
 			/* Found an entry — directory not empty */
 			pr_debug("briefs: rmdir not empty (entry found)\n");

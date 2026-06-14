@@ -44,7 +44,7 @@ enum journal_record_type {
 	JRN_INODE_ALLOC,
 	JRN_INODE_FREE,
 	JRN_BITMAP_UPDATE,
-	JRN_TRIE_UPDATE,
+	JRN_TRIE_ALLOC,
 	JRN_DIR_UPDATE,
 	JRN_SBBLOCK_UPDATE,
 	JRN_CHECKPOINT,
@@ -126,15 +126,10 @@ struct jrn_bitmap_update {
 	__u8 reserved2[39];   /* padding to 64 bytes */
 };
 
-/* JRN_TRIE_UPDATE */
-struct jrn_trie_update {
-	__le64 node_offset;   /* block offset of trie node */
-	__le32 range_start;
-	__le32 range_len;
-	__le32 free_count;
-	__le64 left_child;
-	__le64 right_child;
-	__le32 flags;
+/* JRN_TRIE_ALLOC - log allocation/free of a packed directory-trie page */
+struct jrn_trie_alloc {
+	__le64 block;      /* absolute data block used as a trie page */
+	__le32 op;         /* 0 = allocated, 1 = freed */
 	__le32 reserved;
 };
 
@@ -628,13 +623,14 @@ int briefs_trie_update_entry(struct super_block *sb, struct briefs_inode *di,
 
 /* Trie iterator for readdir - depth-first walk yielding leaves */
 struct trie_iter {
-	u64 stack[512];
+	u64 *stack;
+	u8 *leaf_emitted;
 	int sp;
+	int cap;
 	/* Per-entry flag: 1 if this stack entry had its leaf emitted.
 	 * Used so that when an INTERM+NODE_STATUS_LEAF node is re-pushed
 	 * after emitting its own leaf, we can skip re-emission on re-visit.
 	 * Only valid for entries where stack[i] != 0 (sp entries). */
-	u8 leaf_emitted[512];
 	/* One-entry re-emit buffer: when dir_emit fails in briefs_readdir,
 	 * the entry already consumed from the trie is saved here so it
 	 * can be returned on the next briefs_trie_iter_next call. */
@@ -646,6 +642,8 @@ struct trie_iter {
 	u64 gen;               /* generation of the trie when iterator was created */
 };
 
+struct trie_iter *briefs_trie_iter_alloc(void);
+void briefs_trie_iter_free(struct trie_iter *iter);
 void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di, u64 gen);
 int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter, u64 current_gen, u64 *ino, u8 *type, char *name_buf, int *name_len);
 
@@ -846,6 +844,9 @@ struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
                                 umode_t mode, dev_t rdev);
 int briefs_finish_create(struct inode *dir, struct dentry *dentry,
                           struct inode *inode, int link_delta);
+void briefs_create_abort(struct super_block *sb, struct inode *dir,
+                        struct inode *inode, const struct qstr *name,
+                        bool dir_add_logged);
 
 /* Inode slab cache (defined in briefs.c) */
 extern struct kmem_cache *briefs_inode_cachep;
@@ -916,7 +917,7 @@ static inline void briefs_build_bug_on_sizes(void)
 	BUILD_BUG_ON(sizeof(struct jrn_extent_free) != 80);
 	BUILD_BUG_ON(sizeof(struct jrn_inode_alloc) != 40);
 	BUILD_BUG_ON(sizeof(struct jrn_bitmap_update) != 64);
-	BUILD_BUG_ON(sizeof(struct jrn_trie_update) != 48);
+	BUILD_BUG_ON(sizeof(struct jrn_trie_alloc) != 16);
 	BUILD_BUG_ON(sizeof(struct jrn_inode_free) != 32);
 }
 

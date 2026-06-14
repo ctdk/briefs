@@ -125,10 +125,10 @@ int briefs_update_parent_dir(struct inode *dir, struct briefs_sb_info *bsi,
 }
 
 /*
- * Allocate a new inode number, journal the allocation and the future directory
- * entry, initialize the VFS and on-disk inode, and persist it.  Does not add
- * the directory entry or update the parent — the caller must finish with
- * briefs_finish_create().  Returns the new inode, or an ERR_PTR on failure.
+ * Allocate a new inode number, journal the allocation, initialize the VFS and
+ * on-disk inode, and persist it.  Does not add the directory entry or update
+ * the parent — the caller must finish with briefs_finish_create().  Returns
+ * the new inode, or an ERR_PTR on failure.
  */
 struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
                                 umode_t mode, dev_t rdev)
@@ -148,11 +148,6 @@ struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
 
 	/* Log inode allocation */
 	ret = briefs_journal_inode_alloc(bsi->journal, ino, mode, is_dir ? 2 : 1);
-	if (ret)
-		goto fail_inode;
-
-	/* Log directory entry */
-	ret = briefs_journal_dir_add(bsi->journal, dir->i_ino, ino, dentry);
 	if (ret)
 		goto fail_inode;
 
@@ -221,16 +216,45 @@ struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
 	return inode;
 
 fail_iget:
+	briefs_journal_inode_free(bsi->journal, ino);
+	briefs_free_inode_num(dir->i_sb, ino);
 	iput(inode);
+	return ERR_PTR(ret);
 fail_inode:
+	briefs_journal_inode_free(bsi->journal, ino);
 	briefs_free_inode_num(dir->i_sb, ino);
 	return ERR_PTR(ret);
 }
 
 /*
+ * Abort a partially completed create/symlink/mknod operation.
+ * Must be called after briefs_new_inode() succeeded and before d_instantiate().
+ * If dir_add_logged is true, the directory entry was already journaled and
+ * will be removed from disk with a compensating JRN_DIR_DEL record.
+ */
+void briefs_create_abort(struct super_block *sb, struct inode *dir,
+                         struct inode *inode, const struct qstr *name,
+                         bool dir_add_logged)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+
+	if (name) {
+		briefs_remove_dir_entry(dir, name->name, name->len);
+		if (dir_add_logged)
+			briefs_journal_dir_update(bsi->journal, dir->i_ino, 0,
+						name->name, name->len, 1);
+	}
+
+	briefs_journal_inode_free(bsi->journal, inode->i_ino);
+	briefs_free_inode_data(inode);
+	briefs_free_inode_num(sb, inode->i_ino);
+	iput(inode);
+}
+
+/*
  * Add a directory entry for a newly created inode and update the parent.
- * Returns 0 on success, negative errno on error.  The caller still owns the
- * inode reference and must iput() it on failure.
+ * Returns 0 on success, negative errno on error.  On failure the inode is
+ * rolled back and iput() is called, so the caller must not touch it again.
  */
 int briefs_finish_create(struct inode *dir, struct dentry *dentry,
                           struct inode *inode, int link_delta)
@@ -243,6 +267,14 @@ int briefs_finish_create(struct inode *dir, struct dentry *dentry,
 				    inode->i_ino, ftype);
 	if (ret) {
 		pr_err("briefs: failed to add dir entry %pd: %d\n", dentry, ret);
+		briefs_create_abort(dir->i_sb, dir, inode, &dentry->d_name, false);
+		return ret;
+	}
+
+	ret = briefs_journal_dir_add(bsi->journal, dir->i_ino, inode->i_ino, dentry);
+	if (ret) {
+		pr_err("briefs: failed to journal dir add %pd: %d\n", dentry, ret);
+		briefs_create_abort(dir->i_sb, dir, inode, &dentry->d_name, false);
 		return ret;
 	}
 
@@ -251,6 +283,7 @@ int briefs_finish_create(struct inode *dir, struct dentry *dentry,
 					link_delta);
 	if (ret) {
 		pr_err("briefs: failed to update parent dir after create: %d\n", ret);
+		briefs_create_abort(dir->i_sb, dir, inode, &dentry->d_name, true);
 		return ret;
 	}
 

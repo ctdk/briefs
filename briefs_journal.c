@@ -461,6 +461,28 @@ static int replay_extent_free(struct super_block *sb, struct jrn_extent_free *re
 }
 
 /*
+ * Replay a JRN_TRIE_ALLOC record (op=0 = alloc, op=1 = free).
+ * Updates the data allocator bitmap so that trie page blocks are not
+ * reused for file data during recovery.
+ */
+static int replay_trie_alloc(struct super_block *sb, struct jrn_trie_alloc *rec)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	u64 block = le64_to_cpu(rec->block);
+	u32 op = le32_to_cpu(rec->op);
+
+	if (op == 0) {
+		u64 rel = abs_to_data(bsi->sb, block);
+		briefs_reserve_block(&bsi->alloc, rel);
+		pr_debug("briefs: replay reserved trie page block %llu\n", block);
+	} else {
+		briefs_free_blocks_range(bsi, block, 1);
+		pr_debug("briefs: replay freed trie page block %llu\n", block);
+	}
+	return 0;
+}
+
+/*
  * Mount/recovery: replay journal from last checkpoint.
  *
  * Walks the journal from journal_log_start to journal_log_end and re-applies
@@ -565,6 +587,13 @@ int briefs_journal_replay(struct briefs_journal *j) {
 					briefs_reserve_block(&bsi->inode_alloc, inum - 1);
 				break;
 			}
+			case JRN_INODE_FREE: {
+				struct jrn_inode_free *ifree = rec_data;
+				u64 inum = le64_to_cpu(ifree->ino);
+				if (inum > 0)
+					briefs_free_block(&bsi->inode_alloc, inum - 1);
+				break;
+			}
 			case JRN_INODE_UPDATE: {
 				struct jrn_inode_update *iu = rec_data;
 				apply_ret = replay_inode_update(sb, iu);
@@ -578,6 +607,11 @@ int briefs_journal_replay(struct briefs_journal *j) {
 			case JRN_EXTENT_FREE: {
 				struct jrn_extent_free *ef = rec_data;
 				apply_ret = replay_extent_free(sb, ef);
+				break;
+			}
+			case JRN_TRIE_ALLOC: {
+				struct jrn_trie_alloc *ta = rec_data;
+				apply_ret = replay_trie_alloc(sb, ta);
 				break;
 			}
 			default:
@@ -625,6 +659,22 @@ int briefs_journal_inode_alloc(struct briefs_journal *j, u64 ino,
 	rec.nlink = cpu_to_le32(nlink);
 
 	return briefs_journal_write_record(j, JRN_INODE_ALLOC, &rec, sizeof(rec));
+}
+
+/*
+ * Log freeing of an inode.
+ */
+int briefs_journal_inode_free(struct briefs_journal *j, u64 ino)
+{
+	struct jrn_inode_free rec;
+
+	if (!j)
+		return 0;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.ino = cpu_to_le64(ino);
+
+	return briefs_journal_write_record(j, JRN_INODE_FREE, &rec, sizeof(rec));
 }
 
 /*
@@ -788,4 +838,38 @@ int briefs_journal_sync(struct briefs_journal *j) {
 	}
 
 	return 0;
+}
+
+/*
+ * Log allocation of a packed directory-trie page.
+ */
+int briefs_journal_trie_alloc(struct briefs_journal *j, u64 abs_block)
+{
+	struct jrn_trie_alloc rec;
+
+	if (!j)
+		return 0;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.block = cpu_to_le64(abs_block);
+	rec.op = cpu_to_le32(0);
+
+	return briefs_journal_write_record(j, JRN_TRIE_ALLOC, &rec, sizeof(rec));
+}
+
+/*
+ * Log freeing of a packed directory-trie page.
+ */
+int briefs_journal_trie_free(struct briefs_journal *j, u64 abs_block)
+{
+	struct jrn_trie_alloc rec;
+
+	if (!j)
+		return 0;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.block = cpu_to_le64(abs_block);
+	rec.op = cpu_to_le32(1);
+
+	return briefs_journal_write_record(j, JRN_TRIE_ALLOC, &rec, sizeof(rec));
 }
