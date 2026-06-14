@@ -11,10 +11,10 @@ set -euo pipefail
 SSH_CMD="${1:-}"
 TEST_IMG="${TMPDIR:-/tmp}/briefs-test-$$.img"
 MNT_POINT="/tmp/briefs-mnt-$$"
-KERNEL_MODULE="/vagrant/briefs_fs.ko"
-MKBRIEFS="/go/src/github.com/ctdk/briefs-utils/mkfs.briefs"
-FSCKBRIEFS="/go/src/github.com/ctdk/briefs-utils/fsck.briefs"
-LOSETUP=/sbin/losetup
+KERNEL_MODULE="${BRIEFS_MODULE:-/vagrant/briefs_fs.ko}"
+MKBRIEFS="${BRIEFS_MKFS:-/go/src/github.com/ctdk/briefs-utils/mkfs.briefs}"
+FSCKBRIEFS="${BRIEFS_FSCK:-/go/src/github.com/ctdk/briefs-utils/fsck.briefs}"
+LOSETUP=${BRIEFS_LOSETUP:-/sbin/losetup}
 
 # If SSH_CMD given, wrap everything in SSH
 if [ -n "$SSH_CMD" ]; then
@@ -208,6 +208,8 @@ STAT=$(stat -f "$MNT_POINT" 2>/dev/null)
 echo ""
 echo "=== Phase 11: fsck ==="
 sync
+# Unmount before fsck so the checker sees a quiescent, consistent image.
+umount "$MNT_POINT" 2>/dev/null || true
 "$FSCKBRIEFS" -d "$TEST_IMG" 2>/dev/null && pass "fsck reports no errors" || fail "fsck found errors"
 
 # --- Summary ---
