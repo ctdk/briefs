@@ -30,6 +30,7 @@
 struct briefs_trie_pages {
 	struct list_head partial;       /* pages with at least one free slot */
 	struct mutex lock;                /* protects the list and page metadata */
+	u64 hot_block;                  /* recently used partial page (fast path) */
 };
 
 /*
@@ -83,6 +84,7 @@ static struct briefs_trie_sb_state *briefs_trie_ensure_state(struct super_block 
 	st->sb = sb;
 	INIT_LIST_HEAD(&st->pages.partial);
 	mutex_init(&st->pages.lock);
+	st->pages.hot_block = 0;
 
 	spin_lock(&briefs_trie_states_lock);
 	list_add(&st->list, &briefs_trie_states);
@@ -243,11 +245,6 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 
 	set_buffer_uptodate(bh);
 	mark_buffer_dirty(bh);
-	/*
-	 * Sync the freshly initialized page header before the caller links it
-	 * into the trie.  This is a lifecycle boundary, not a hot path.
-	 */
-	sync_dirty_buffer(bh);
 	brelse(bh);
 
 	*out_ref = TRIE_MAKE_REF(block, 0);
@@ -365,6 +362,8 @@ void briefs_trie_page_add_partial(struct super_block *sb, u64 block)
 
 	mutex_lock(&pages->lock);
 	__trie_page_add_partial_locked(pages, block);
+	if (pages->hot_block == 0)
+		pages->hot_block = block;
 	mutex_unlock(&pages->lock);
 }
 
@@ -375,6 +374,65 @@ void briefs_trie_page_add_partial(struct super_block *sb, u64 block)
  * for internal/root nodes that have no name.  Returns a node reference, or 0
  * on failure.
  */
+/*
+ * Try to allocate a node from a specific block.  Caller must hold pages->lock.
+ * Returns a node reference on success, 0 on failure.
+ */
+static u64 trie_alloc_from_block(struct super_block *sb, struct briefs_trie_pages *pages,
+                                  u64 block, u16 name_size)
+{
+	struct buffer_head *bh;
+	struct briefs_trie_page *page;
+	struct briefs_trie_node *node;
+	u64 slot;
+	u64 ref = 0;
+
+	bh = sb_getblk(sb, block);
+	if (!bh)
+		return 0;
+	if (!buffer_mapped(bh)) {
+		bh->b_blocknr = block;
+		set_buffer_mapped(bh);
+	}
+
+	page = (struct briefs_trie_page *)bh->b_data;
+	if (page->magic != BRIEFS_TRIE_PAGE_MAGIC) {
+		brelse(bh);
+		return 0;
+	}
+
+	if (!trie_page_has_name_heap(page, name_size)) {
+		brelse(bh);
+		return 0;
+	}
+
+	if (trie_page_alloc_slot(page, &slot) != 0) {
+		brelse(bh);
+		return 0;
+	}
+
+	node = trie_slot_at(bh->b_data, slot);
+	memset(node, 0, sizeof(*node));
+	if (name_size > 0) {
+		page->free_name_off += name_size;
+		node->name_len = name_size;
+		node->name_offset = page->free_name_off;
+	}
+	set_buffer_uptodate(bh);
+	mark_buffer_dirty(bh);
+	ref = TRIE_MAKE_REF(block, slot);
+
+	if (page->free_slots == 0 ||
+	    page->free_name_off >=
+	    BRIEFS_BLOCK_SIZE - trie_page_data_end()) {
+		/* Page became full; hot_block will be cleared below. */
+		ref |= (1ULL << 63);
+	}
+
+	brelse(bh);
+	return ref;
+}
+
 u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len)
 {
 	struct briefs_trie_sb_state *st;
@@ -383,7 +441,6 @@ u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len)
 	struct buffer_head *bh;
 	struct briefs_trie_page *page;
 	struct briefs_trie_node *node;
-	u64 slot;
 	u64 ref = 0;
 	u16 name_size;
 
@@ -395,6 +452,24 @@ u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len)
 	name_size = (name_len > 0) ? (name_len + 2) : 0;
 
 	mutex_lock(&pages->lock);
+
+	/*
+	 * Fast path: try the cached hot page first.  Most allocations reuse
+	 * the same page repeatedly, so this avoids a full list scan.
+	 */
+	if (pages->hot_block != 0) {
+		ref = trie_alloc_from_block(sb, pages, pages->hot_block, name_size);
+		if (ref != 0) {
+			if (ref & (1ULL << 63)) {
+				/* Hot page became full. */
+				pages->hot_block = 0;
+				ref &= ~(1ULL << 63);
+			}
+			mutex_unlock(&pages->lock);
+			return ref;
+		}
+		pages->hot_block = 0;
+	}
 
 	/*
 	 * Scan the partial page list for a page with both a free slot and
@@ -410,63 +485,19 @@ u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len)
 			if (scanned++ >= max_scan)
 				break;
 
-			bh = sb_getblk(sb, entry->block);
-			if (!bh) {
+			ref = trie_alloc_from_block(sb, pages, entry->block, name_size);
+			if (ref == 0)
+				continue;
+
+			if (ref & (1ULL << 63)) {
+				/* Page became full. */
 				list_del(&entry->list);
 				kfree(entry);
-				continue;
-			}
-			if (!buffer_mapped(bh)) {
-				bh->b_blocknr = entry->block;
-				set_buffer_mapped(bh);
+				ref &= ~(1ULL << 63);
+			} else {
+				pages->hot_block = entry->block;
 			}
 
-			page = (struct briefs_trie_page *)bh->b_data;
-			if (page->magic != BRIEFS_TRIE_PAGE_MAGIC) {
-				brelse(bh);
-				list_del(&entry->list);
-				kfree(entry);
-				continue;
-			}
-
-			/*
-			 * Reject pages that cannot hold the name without touching the
-			 * slot bitmap.  Move them to the tail so they don't stall
-			 * future scans for similarly-sized names.
-			 */
-			if (!trie_page_has_name_heap(page, name_size)) {
-				brelse(bh);
-				list_move_tail(&entry->list, &pages->partial);
-				continue;
-			}
-
-			/* Need a free slot. */
-			if (trie_page_alloc_slot(page, &slot) != 0) {
-				brelse(bh);
-				continue;
-			}
-
-			node = trie_slot_at(bh->b_data, slot);
-			memset(node, 0, sizeof(*node));
-			if (name_size > 0) {
-				/* Name heap was already confirmed to fit. */
-				page->free_name_off += name_size;
-				node->name_len = name_size;
-				node->name_offset = page->free_name_off;
-			}
-			set_buffer_uptodate(bh);
-			mark_buffer_dirty(bh);
-			ref = TRIE_MAKE_REF(entry->block, slot);
-
-			/* If the page is now full, remove it from the partial list. */
-			if (page->free_slots == 0 ||
-			    page->free_name_off >=
-			    BRIEFS_BLOCK_SIZE - trie_page_data_end()) {
-				list_del(&entry->list);
-				kfree(entry);
-			}
-
-			brelse(bh);
 			mutex_unlock(&pages->lock);
 			return ref;
 		}
@@ -492,6 +523,9 @@ u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len)
 	}
 
 	briefs_trie_page_add_partial(sb, TRIE_REF_BLOCK(ref));
+	mutex_lock(&pages->lock);
+	pages->hot_block = TRIE_REF_BLOCK(ref);
+	mutex_unlock(&pages->lock);
 	return ref;
 }
 
@@ -594,6 +628,8 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 				break;
 			}
 		}
+		if (pages->hot_block == block)
+			pages->hot_block = 0;
 	}
 
 	mutex_unlock(&pages->lock);

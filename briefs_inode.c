@@ -251,7 +251,11 @@ void briefs_free_inode_num(struct super_block *sb, u64 ino) {
 	if (ino == 0)
 		return;
 
-	/* Zero out the inode on disk so fsck doesn't see a "free" inode with valid magic */
+	/*
+	 * Zero out the inode on disk so fsck doesn't see a "free" inode with
+	 * valid magic.  This is metadata bookkeeping, not a durability boundary,
+	 * so just mark the buffer dirty and let the block cache write it back.
+	 */
 	inodeTableBlock = briefs_inode_table_start(bsi->sb);
 	u64 inodeIndex = ino - 1;
 	inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
@@ -261,7 +265,6 @@ void briefs_free_inode_num(struct super_block *sb, u64 ino) {
 	if (bh) {
 		memset(bh->b_data + inodeOffset, 0, BRIEFS_INODE_SIZE);
 		mark_buffer_dirty(bh);
-		sync_dirty_buffer(bh);
 		brelse(bh);
 	}
 
