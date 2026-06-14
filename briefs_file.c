@@ -156,25 +156,28 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 				ci = i - binfo->disk_inode.num_extents_inline;
 				chain_block = binfo->disk_inode.extent_inline_base;
 				while (chain_block && ci >= 0) {
+					u32 num_in_block;
+
 					bh = sb_bread(inode->i_sb, chain_block);
 					if (!bh) break;
 					chain = (struct briefs_extent_chain *)bh->b_data;
-					if (chain->checksum != 0 &&
+					if (le64_to_cpu(chain->checksum) != 0 &&
 					    briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
 						pr_warn("briefs: truncate ino=%lu chain block %llu checksum mismatch; aborting\n",
 							inode->i_ino, chain_block);
 						brelse(bh);
 						break;
 					}
-					if (ci < chain->num_extents_in_block) {
-						chain->extents[ci] = ext;
-						chain->checksum = briefs_chain_checksum(bh->b_data);
+					num_in_block = le32_to_cpu(chain->num_extents_in_block);
+					if (ci < num_in_block) {
+						briefs_cpu_extent_to_disk(&ext, &chain->extents[ci]);
+						chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
 						mark_buffer_dirty(bh);
 						brelse(bh);
 						break;
 					}
-					ci -= chain->num_extents_in_block;
-					chain_block = chain->next_overflow_block;
+					ci -= num_in_block;
+					chain_block = le64_to_cpu(chain->next_overflow_block);
 					brelse(bh);
 				}
 			}
@@ -209,11 +212,13 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			u64 prev_block = 0;
 
 			while (calias && cidx >= 0) {
+				u32 num_in_block;
+
 				tbh = sb_bread(inode->i_sb, calias);
 				if (!tbh)
 					break;
 				tc = (struct briefs_extent_chain *)tbh->b_data;
-				if (tc->checksum != 0 &&
+				if (le64_to_cpu(tc->checksum) != 0 &&
 				    briefs_verify_chain_checksum(tbh->b_data, tc->checksum) != 0) {
 					pr_warn("briefs: truncate ino=%lu chain block %llu checksum mismatch; aborting\n",
 						inode->i_ino, calias);
@@ -221,27 +226,31 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 					break;
 				}
 
-				if (cidx < tc->num_extents_in_block) {
+				num_in_block = le32_to_cpu(tc->num_extents_in_block);
+				if (cidx < num_in_block) {
 					/* Found the block — shift extents down */
 					int j;
-					for (j = cidx; j < tc->num_extents_in_block - 1; j++)
-						tc->extents[j] = tc->extents[j + 1];
-					tc->num_extents_in_block--;
-					tc->checksum = briefs_chain_checksum(tbh->b_data);
+					struct briefs_extent tmp;
+
+					for (j = cidx; j < num_in_block - 1; j++) {
+						briefs_disk_extent_to_cpu(&tc->extents[j + 1], &tmp);
+						briefs_cpu_extent_to_disk(&tmp, &tc->extents[j]);
+					}
+					tc->num_extents_in_block = cpu_to_le32(num_in_block - 1);
+					tc->checksum = cpu_to_le64(briefs_chain_checksum(tbh->b_data));
 
 					mark_buffer_dirty(tbh);
 
 					/* Free empty non-first chain block */
-					if (tc->num_extents_in_block == 0 &&
-					    prev_block != 0) {
+					if (num_in_block - 1 == 0 && prev_block != 0) {
 						struct buffer_head *pbh;
 						struct briefs_extent_chain *pc;
 
 						pbh = sb_bread(inode->i_sb, prev_block);
 						if (pbh) {
 							pc = (struct briefs_extent_chain *)pbh->b_data;
-							pc->next_overflow_block = 0;
-							pc->checksum = briefs_chain_checksum(pbh->b_data);
+							pc->next_overflow_block = cpu_to_le64(0);
+							pc->checksum = cpu_to_le64(briefs_chain_checksum(pbh->b_data));
 							mark_buffer_dirty(pbh);
 							brelse(pbh);
 						}
@@ -253,10 +262,10 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 					break;
 				}
 
-				cidx -= tc->num_extents_in_block;
+				cidx -= num_in_block;
 				prev_block = calias;
 				brelse(tbh);
-				calias = tc->next_overflow_block;
+				calias = le64_to_cpu(tc->next_overflow_block);
 			}
 		}
 

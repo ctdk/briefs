@@ -7,6 +7,7 @@
 #include <linux/types.h>
 #include <linux/stddef.h>
 #include <linux/blk_types.h>
+#include <linux/unaligned.h>
 #include "briefs_alloc.h"
 
 /* BrieFS magic number */
@@ -52,96 +53,96 @@ enum journal_record_type {
 
 /* Journal record header (16 bytes) */
 struct journal_record_hdr {
-	__u32 type;           /* enum journal_record_type */
-	__u32 flags;          /* JRN_FLAG_* */
-	__u32 data_len;       /* bytes of data following header */
-	__u32 checksum;       /* crc32c of type + flags + data_len + data */
+	__le32 type;          /* enum journal_record_type */
+	__le32 flags;         /* JRN_FLAG_* */
+	__le32 data_len;      /* bytes of data following header */
+	__le32 checksum;      /* crc32c of type + flags + data_len + data */
 };
 
-/* Record data structures */
+/* Record data structures (on-disk, little endian) */
 
 /* JRN_EXTENT_ALLOC */
 struct jrn_extent_alloc {
-	__u64 ino;            /* inode being modified */
-	__u64 offset;         /* logical block offset */
-	__u64 length;         /* number of blocks allocated */
-	__u64 phys_start;     /* starting physical block */
-	__u32 extent_index;   /* which extent slot this affects */
+	__le64 ino;           /* inode being modified */
+	__le64 offset;        /* logical block offset */
+	__le64 length;        /* number of blocks allocated */
+	__le64 phys_start;    /* starting physical block */
+	__le32 extent_index;  /* which extent slot this affects */
 	__u8 reserved[44];    /* padding to 64 bytes */
 };
 
 /* JRN_EXTENT_FREE */
 struct jrn_extent_free {
-	__u64 ino;            /* inode being modified */
-	__u64 offset;         /* logical block offset */
-	__u64 phys_start;     /* starting physical block */
-	__u64 length;         /* number of blocks freed */
+	__le64 ino;           /* inode being modified */
+	__le64 offset;        /* logical block offset */
+	__le64 phys_start;    /* starting physical block */
+	__le64 length;        /* number of blocks freed */
 	__u8 reserved[48];    /* padding to 64 bytes */
 };
 
 /* JRN_INODE_UPDATE */
 struct jrn_inode_update {
-	__u64 ino;            /* inode being modified */
-	__u32 mode;
-	__u32 nlink;
-	__u32 uid;
-	__u32 gid;
-	__u64 size;
-	__u64 atime_sec;
-	__u64 atime_nsec;
-	__u64 mtime_sec;
-	__u64 mtime_nsec;
-	__u64 ctime_sec;
-	__u64 ctime_nsec;
-	__u32 flags;
-	__u32 reserved;
+	__le64 ino;           /* inode being modified */
+	__le32 mode;
+	__le32 nlink;
+	__le32 uid;
+	__le32 gid;
+	__le64 size;
+	__le64 atime_sec;
+	__le64 atime_nsec;
+	__le64 mtime_sec;
+	__le64 mtime_nsec;
+	__le64 ctime_sec;
+	__le64 ctime_nsec;
+	__le32 flags;
+	__le32 reserved;
 };
 
 /* JRN_INODE_ALLOC */
 struct jrn_inode_alloc {
-	__u64 ino;            /* inode number being allocated */
-	__u32 mode;
-	__u32 nlink;
-	__u32 uid;
-	__u32 gid;
-	__u32 reserved1;
-	__u64 reserved2;
+	__le64 ino;           /* inode number being allocated */
+	__le32 mode;
+	__le32 nlink;
+	__le32 uid;
+	__le32 gid;
+	__le32 reserved1;
+	__le64 reserved2;
 };
 
 /* JRN_INODE_FREE */
 struct jrn_inode_free {
-	__u64 ino;            /* inode being freed */
-	__u32 reserved[3];
-	__u64 reserved2;
+	__le64 ino;           /* inode being freed */
+	__le32 reserved[3];
+	__le64 reserved2;
 };
 
 /* JRN_BITMAP_UPDATE */
 struct jrn_bitmap_update {
-	__u32 bitmap_type;    /* 0 = free data, 1 = free inode */
-	__u32 reserved1;
-	__u64 offset;         /* bit offset in bitmap */
-	__u64 count;          /* number of consecutive bits */
+	__le32 bitmap_type;   /* 0 = free data, 1 = free inode */
+	__le32 reserved1;
+	__le64 offset;        /* bit offset in bitmap */
+	__le64 count;         /* number of consecutive bits */
 	__u8 flip_to;         /* 0 = mark free, 1 = mark allocated */
 	__u8 reserved2[39];   /* padding to 64 bytes */
 };
 
 /* JRN_TRIE_UPDATE */
 struct jrn_trie_update {
-	__u64 node_offset;    /* block offset of trie node */
-	__u32 range_start;
-	__u32 range_len;
-	__u32 free_count;
-	__u64 left_child;
-	__u64 right_child;
-	__u32 flags;
-	__u32 reserved;
+	__le64 node_offset;   /* block offset of trie node */
+	__le32 range_start;
+	__le32 range_len;
+	__le32 free_count;
+	__le64 left_child;
+	__le64 right_child;
+	__le32 flags;
+	__le32 reserved;
 };
 
 /* JRN_DIR_UPDATE */
 struct jrn_dir_update {
-	__u64 parent_ino;
-	__u64 child_ino;
-	__u32 name_len;
+	__le64 parent_ino;
+	__le64 child_ino;
+	__le32 name_len;
 	__u8 name[251];
 	__u8 op;              /* 0 = add, 1 = delete */
 	__u8 reserved[6];
@@ -149,36 +150,25 @@ struct jrn_dir_update {
 
 /* JRN_CHECKPOINT */
 struct jrn_checkpoint {
-	__u64 checkpoint_seq;
-	__u32 record_count;
-	__u32 reserved1;
-	__u64 log_sequence_end;
-	__u64 trie_root_node;
-	__u64 free_data_count;
-	__u64 free_inode_count;
-	__u64 reserved2;
+	__le64 checkpoint_seq;
+	__le32 record_count;
+	__le32 reserved1;
+	__le64 log_sequence_end;
+	__le64 trie_root_node;
+	__le64 free_data_count;
+	__le64 free_inode_count;
+	__le64 reserved2;
 };
-
-/* Journal record sizes */
-#define JRN_EXTENT_ALLOC_SIZE 64
-#define JRN_EXTENT_FREE_SIZE 32
-#define JRN_INODE_UPDATE_SIZE 80
-#define JRN_INODE_ALLOC_SIZE 40
-#define JRN_INODE_FREE_SIZE 24
-#define JRN_BITMAP_UPDATE_SIZE 64
-#define JRN_TRIE_UPDATE_SIZE 64
-#define JRN_DIR_UPDATE_SIZE 320
-#define JRN_CHECKPOINT_SIZE 80
 
 /* Compute CRC32C checksum */
 __u32 briefs_crc32c(__u32 crc, const void *data, size_t len);
 
 /* Journal block header (16 bytes) */
 struct journal_block_header {
-	__u32 magic;          /* JOURNAL_MAGIC */
-	__u32 block_seq;      /* monotonically increasing */
-	__u32 record_count;   /* number of records in this block */
-	__u32 reserved;
+	__le32 magic;         /* JOURNAL_MAGIC */
+	__le32 block_seq;     /* monotonically increasing */
+	__le32 record_count;  /* number of records in this block */
+	__le32 reserved;
 };
 
 /* Journal block (one block on disk, includes header + records) */
@@ -189,52 +179,52 @@ struct journal_block {
 
 /* Superblock - block 0, 4096 bytes */
 struct briefs_superblock {
-	__u64 magic;
+	__le64 magic;
 
 	/* 8 byte version numbers is a bit ridiculous, but it makes memory
 	 * alignment a lot easier. At least there's tons of extra space in the
 	 * superblock for it.
 	 */
-	__u64 major_version;
-	__u64 minor_version;
-	__u64 patch_version;
+	__le64 major_version;
+	__le64 minor_version;
+	__le64 patch_version;
 
-	__u64 total_blocks;
-	__u64 data_blocks;
-	__u64 block_size;
-	__u64 inode_size;
-	__u64 blocks_per_group;
-	__u64 inodes_per_group;
-	__u64 fs_created;
-	__u64 fs_last_mounted;
-	__u64 fs_last_checkpoint;
+	__le64 total_blocks;
+	__le64 data_blocks;
+	__le64 block_size;
+	__le64 inode_size;
+	__le64 blocks_per_group;
+	__le64 inodes_per_group;
+	__le64 fs_created;
+	__le64 fs_last_mounted;
+	__le64 fs_last_checkpoint;
 	/* tracked by trie root free_count */
-	__u64 free_data_blocks;
-	__u64 free_inodes;
-	__u64 root_inode_number;
-	__u64 feature_compat;
-	__u64 feature_ro_compat;
-	__u64 feature_incompat;
-	
+	__le64 free_data_blocks;
+	__le64 free_inodes;
+	__le64 root_inode_number;
+	__le64 feature_compat;
+	__le64 feature_ro_compat;
+	__le64 feature_incompat;
+
 	/* 128-bit uuid for this volume */
 	__u8 uuid[16];
 
 	/* The below is particularly subject to change */
-	__u64 eat_offset;
-	__u64 eat_blocks;
-	__u64 trie_root_block;
-	__u64 trie_blocks_used;
-	__u64 trie_node_pool_start;
-	__u64 trie_node_pool_size;
-	__u64 inode_bitmap_offset;
-	__u64 inode_bitmap_blocks;
-	__u64 inode_table_offset;
-	__u64 journal_offset;
-	__u64 journal_blocks;
-	__u64 checkpoint_seq;
-	__u64 journal_log_start;
-	__u64 journal_log_end;
-	__u64 reserved_journal[4];
+	__le64 eat_offset;
+	__le64 eat_blocks;
+	__le64 trie_root_block;
+	__le64 trie_blocks_used;
+	__le64 trie_node_pool_start;
+	__le64 trie_node_pool_size;
+	__le64 inode_bitmap_offset;
+	__le64 inode_bitmap_blocks;
+	__le64 inode_table_offset;
+	__le64 journal_offset;
+	__le64 journal_blocks;
+	__le64 checkpoint_seq;
+	__le64 journal_log_start;
+	__le64 journal_log_end;
+	__le64 reserved_journal[4];
 
 	/* utf8, null padded */
 	unsigned char label[64];
@@ -243,15 +233,25 @@ struct briefs_superblock {
 	unsigned char reserved[_BRIEFS_SUPER_RESERVED];
 }; /* 1024 bytes */
 
-/* Extent entry - 32 bytes */
+/* Extent entry - 32 bytes (in-memory, CPU endian) */
 struct briefs_extent {
 	__u64 offset;
 	__u64 phys;
 	__u64 len;
-	__u64 flags;
+	__u32 flags;
+	__u32 pad;
 };
 
-/* Inode - 512 bytes */
+/* On-disk extent entry - 32 bytes (little endian) */
+struct briefs_disk_extent {
+	__le64 offset;
+	__le64 phys;
+	__le64 len;
+	__le32 flags;
+	__le32 pad;
+};
+
+/* Inode - 512 bytes (in-memory, CPU endian) */
 struct briefs_inode {
 	__u64 inode_number;
 	__u64 magic;
@@ -283,13 +283,137 @@ struct briefs_inode {
 	__u8 reserved[80]; /* zero padded to 512 bytes */
 };
 
-/* Extent chain for overflow - 256 extents + header = 272 bytes */
+/* On-disk inode - 512 bytes (little endian) */
+struct briefs_disk_inode {
+	__le64 inode_number;
+	__le64 magic;
+	__le32 filemode;
+	__le32 uid;
+	__le32 gid;
+	__le32 _pad0;
+	__le64 filesize;
+	__le64 ctime_sec;
+	__le64 ctime_nsec;
+	__le64 atime_sec;
+	__le64 atime_nsec;
+	__le64 mtime_sec;
+	__le64 mtime_nsec;
+	__le64 creation_time_sec;
+	__le64 creation_time_nsec;
+	__le32 nlinks;
+	__le32 num_extents_inline;
+	__le64 extent_inline_base;
+	__le64 num_extents_total;
+	struct briefs_disk_extent inline_extents[8];
+	__le64 xattr_offset;
+	__le64 xattr_size;
+	__le64 parent_inode;
+	__le32 unused;
+	__le32 flags;
+	__le64 dir_trie_root;
+	__le64 rdev;
+	__u8 reserved[80];
+};
+
+static inline void briefs_disk_extent_to_cpu(const struct briefs_disk_extent *src,
+                                              struct briefs_extent *dst)
+{
+	dst->offset = le64_to_cpu(src->offset);
+	dst->phys = le64_to_cpu(src->phys);
+	dst->len = le64_to_cpu(src->len);
+	dst->flags = le32_to_cpu(src->flags);
+	dst->pad = le32_to_cpu(src->pad);
+}
+
+static inline void briefs_cpu_extent_to_disk(const struct briefs_extent *src,
+                                              struct briefs_disk_extent *dst)
+{
+	dst->offset = cpu_to_le64(src->offset);
+	dst->phys = cpu_to_le64(src->phys);
+	dst->len = cpu_to_le64(src->len);
+	dst->flags = cpu_to_le32(src->flags);
+	dst->pad = cpu_to_le32(src->pad);
+}
+
+static inline void briefs_disk_inode_to_cpu(const struct briefs_disk_inode *src,
+                                             struct briefs_inode *dst)
+{
+	int i;
+
+	dst->inode_number = le64_to_cpu(src->inode_number);
+	dst->magic = le64_to_cpu(src->magic);
+	dst->filemode = le32_to_cpu(src->filemode);
+	dst->uid = le32_to_cpu(src->uid);
+	dst->gid = le32_to_cpu(src->gid);
+	dst->_pad0 = le32_to_cpu(src->_pad0);
+	dst->filesize = le64_to_cpu(src->filesize);
+	dst->ctime_sec = le64_to_cpu(src->ctime_sec);
+	dst->ctime_nsec = le64_to_cpu(src->ctime_nsec);
+	dst->atime_sec = le64_to_cpu(src->atime_sec);
+	dst->atime_nsec = le64_to_cpu(src->atime_nsec);
+	dst->mtime_sec = le64_to_cpu(src->mtime_sec);
+	dst->mtime_nsec = le64_to_cpu(src->mtime_nsec);
+	dst->creation_time_sec = le64_to_cpu(src->creation_time_sec);
+	dst->creation_time_nsec = le64_to_cpu(src->creation_time_nsec);
+	dst->nlinks = le32_to_cpu(src->nlinks);
+	dst->num_extents_inline = le32_to_cpu(src->num_extents_inline);
+	dst->extent_inline_base = le64_to_cpu(src->extent_inline_base);
+	dst->num_extents_total = le64_to_cpu(src->num_extents_total);
+	for (i = 0; i < 8; i++)
+		briefs_disk_extent_to_cpu(&src->inline_extents[i], &dst->inline_extents[i]);
+	dst->xattr_offset = le64_to_cpu(src->xattr_offset);
+	dst->xattr_size = le64_to_cpu(src->xattr_size);
+	dst->parent_inode = le64_to_cpu(src->parent_inode);
+	dst->unused = le32_to_cpu(src->unused);
+	dst->flags = le32_to_cpu(src->flags);
+	dst->dir_trie_root = le64_to_cpu(src->dir_trie_root);
+	dst->rdev = le64_to_cpu(src->rdev);
+	memcpy(dst->reserved, src->reserved, sizeof(dst->reserved));
+}
+
+static inline void briefs_cpu_inode_to_disk(const struct briefs_inode *src,
+                                             struct briefs_disk_inode *dst)
+{
+	int i;
+
+	dst->inode_number = cpu_to_le64(src->inode_number);
+	dst->magic = cpu_to_le64(src->magic);
+	dst->filemode = cpu_to_le32(src->filemode);
+	dst->uid = cpu_to_le32(src->uid);
+	dst->gid = cpu_to_le32(src->gid);
+	dst->_pad0 = cpu_to_le32(src->_pad0);
+	dst->filesize = cpu_to_le64(src->filesize);
+	dst->ctime_sec = cpu_to_le64(src->ctime_sec);
+	dst->ctime_nsec = cpu_to_le64(src->ctime_nsec);
+	dst->atime_sec = cpu_to_le64(src->atime_sec);
+	dst->atime_nsec = cpu_to_le64(src->atime_nsec);
+	dst->mtime_sec = cpu_to_le64(src->mtime_sec);
+	dst->mtime_nsec = cpu_to_le64(src->mtime_nsec);
+	dst->creation_time_sec = cpu_to_le64(src->creation_time_sec);
+	dst->creation_time_nsec = cpu_to_le64(src->creation_time_nsec);
+	dst->nlinks = cpu_to_le32(src->nlinks);
+	dst->num_extents_inline = cpu_to_le32(src->num_extents_inline);
+	dst->extent_inline_base = cpu_to_le64(src->extent_inline_base);
+	dst->num_extents_total = cpu_to_le64(src->num_extents_total);
+	for (i = 0; i < 8; i++)
+		briefs_cpu_extent_to_disk(&src->inline_extents[i], &dst->inline_extents[i]);
+	dst->xattr_offset = cpu_to_le64(src->xattr_offset);
+	dst->xattr_size = cpu_to_le64(src->xattr_size);
+	dst->parent_inode = cpu_to_le64(src->parent_inode);
+	dst->unused = cpu_to_le32(src->unused);
+	dst->flags = cpu_to_le32(src->flags);
+	dst->dir_trie_root = cpu_to_le64(src->dir_trie_root);
+	dst->rdev = cpu_to_le64(src->rdev);
+	memcpy(dst->reserved, src->reserved, sizeof(dst->reserved));
+}
+
+/* Extent chain for overflow - one block on disk */
 struct briefs_extent_chain {
-	__u64 next_overflow_block;
-	__u32 num_extents_in_block;
-	__u32 pad;
-	struct briefs_extent extents[127];
-	__u64 checksum;
+	__le64 next_overflow_block;
+	__le32 num_extents_in_block;
+	__le32 pad;
+	struct briefs_disk_extent extents[127];
+	__le64 checksum;
 };
 
 /*
@@ -304,11 +428,13 @@ static inline __u64 briefs_chain_checksum(const void *data)
 	return (__u64)briefs_crc32c(0, data, BRIEFS_BLOCK_SIZE - 2 * sizeof(__u64));
 }
 
-static inline int briefs_verify_chain_checksum(const void *data, __u64 stored)
+static inline int briefs_verify_chain_checksum(const void *data, __le64 stored)
 {
-	if (stored == 0)
+	__u64 cpu_stored = le64_to_cpu(stored);
+
+	if (cpu_stored == 0)
 		return 0; /* legacy block with no checksum */
-	return (briefs_chain_checksum(data) == stored) ? 0 : -EIO;
+	return (briefs_chain_checksum(data) == cpu_stored) ? 0 : -EIO;
 }
 
 /* Function headers and the like */
@@ -374,12 +500,12 @@ static inline int briefs_verify_chain_checksum(const void *data, __u64 stored)
  * toward the slot array.
  */
 struct briefs_trie_page {
-	__u32 magic;              /* BRIEFS_TRIE_PAGE_MAGIC */
-	__u32 version;            /* 1 */
-	__u16 live_count;         /* number of allocated slots */
-	__u16 free_name_off;      /* bytes of name heap used, measured from
+	__le32 magic;             /* BRIEFS_TRIE_PAGE_MAGIC */
+	__le32 version;           /* 1 */
+	__le16 live_count;        /* number of allocated slots */
+	__le16 free_name_off;     /* bytes of name heap used, measured from
 				   * the end of the block */
-	__u64 free_slots;         /* bitmap of free slots (bit i == 1 -> free) */
+	__le64 free_slots;        /* bitmap of free slots (bit i == 1 -> free) */
 } __attribute__((packed));
 
 /*
@@ -387,18 +513,50 @@ struct briefs_trie_page {
  * first_child and next_sibling are node references, not block numbers.
  */
 struct briefs_trie_node {
-	__u64 first_child;        /* node reference of first child */
-	__u64 next_sibling;       /* node reference of next sibling */
-	__u64 inode;              /* inode number (leaf entries) */
-	__u16 name_len;           /* full name length + 2-byte prefix, or 0 if free */
-	__u16 name_offset;        /* offset from block end to name bytes, or 0 if free */
+	__le64 first_child;       /* node reference of first child */
+	__le64 next_sibling;      /* node reference of next sibling */
+	__le64 inode;             /* inode number (leaf entries) */
+	__le16 name_len;          /* full name length + 2-byte prefix, or 0 if free */
+	__le16 name_offset;       /* offset from block end to name bytes, or 0 if free */
 	__u8  depth;              /* depth in trie (0 = root) */
 	__u8  node_type;          /* NODE_TYPE_* */
 	__u8  byte_val;           /* the byte value this node represents */
 	__u8  f_type;             /* file type for leaf entries (S_IFMT >> 12) */
-	__u16 flags;              /* NODE_FLAG_* */
-	__u16 child_count;        /* number of children */
+	__le16 flags;             /* NODE_FLAG_* */
+	__le16 child_count;       /* number of children */
 } __attribute__((packed));
+
+/* Endian-aware accessors for packed trie page fields.
+ * get_unaligned_leXX() already returns CPU-endian values and
+ * put_unaligned_leXX() expects a CPU-endian value, so do not wrap
+ * with extra leXX_to_cpu()/cpu_to_leXX() conversions.
+ */
+#define trie_page_magic(p)        get_unaligned_le32(&(p)->magic)
+#define trie_page_version(p)      get_unaligned_le32(&(p)->version)
+#define trie_page_live_count(p)   get_unaligned_le16(&(p)->live_count)
+#define trie_page_free_name_off(p) get_unaligned_le16(&(p)->free_name_off)
+#define trie_page_free_slots(p)   get_unaligned_le64(&(p)->free_slots)
+#define trie_page_set_magic(p, v)       put_unaligned_le32((u32)(v), &(p)->magic)
+#define trie_page_set_version(p, v)     put_unaligned_le32((u32)(v), &(p)->version)
+#define trie_page_set_live_count(p, v)  put_unaligned_le16((u16)(v), &(p)->live_count)
+#define trie_page_set_free_name_off(p, v) put_unaligned_le16((u16)(v), &(p)->free_name_off)
+#define trie_page_set_free_slots(p, v)  put_unaligned_le64((u64)(v), &(p)->free_slots)
+
+/* Endian-aware accessors for packed trie node fields */
+#define trie_node_first_child(n)    get_unaligned_le64(&(n)->first_child)
+#define trie_node_next_sibling(n)   get_unaligned_le64(&(n)->next_sibling)
+#define trie_node_inode(n)          get_unaligned_le64(&(n)->inode)
+#define trie_node_name_len(n)       get_unaligned_le16(&(n)->name_len)
+#define trie_node_name_offset(n)    get_unaligned_le16(&(n)->name_offset)
+#define trie_node_flags(n)          get_unaligned_le16(&(n)->flags)
+#define trie_node_child_count(n)    get_unaligned_le16(&(n)->child_count)
+#define trie_node_set_first_child(n, v)   put_unaligned_le64((u64)(v), &(n)->first_child)
+#define trie_node_set_next_sibling(n, v)  put_unaligned_le64((u64)(v), &(n)->next_sibling)
+#define trie_node_set_inode(n, v)         put_unaligned_le64((u64)(v), &(n)->inode)
+#define trie_node_set_name_len(n, v)      put_unaligned_le16((u16)(v), &(n)->name_len)
+#define trie_node_set_name_offset(n, v)   put_unaligned_le16((u16)(v), &(n)->name_offset)
+#define trie_node_set_flags(n, v)         put_unaligned_le16((u16)(v), &(n)->flags)
+#define trie_node_set_child_count(n, v)   put_unaligned_le16((u16)(v), &(n)->child_count)
 
 /*
  * Helper to get/set the file type stored in f_type.
@@ -413,7 +571,7 @@ struct briefs_trie_node {
  * length prefix lives at (base - 2); the name bytes follow it.
  */
 #define TRIE_NODE_NAME_BASE(page_base, node) \
-	((void *)(page_base) + BRIEFS_BLOCK_SIZE - (node)->name_offset + 2)
+	((void *)(page_base) + BRIEFS_BLOCK_SIZE - trie_node_name_offset(node) + 2)
 
 /* Maximum inline name length a packed trie slot can hold */
 #define TRIE_MAX_NAME_LEN BRIEFS_NAME_LEN
@@ -421,21 +579,22 @@ struct briefs_trie_node {
 /*
  * Legacy single-node-per-block layout is no longer supported as of BrieFS 0.7.0.
  * The old struct is preserved below for reference/debugging of legacy images.
+ * Fields are marked __le* so any future legacy reader is architecture-safe.
  */
 struct briefs_trie_node_legacy {
-	__u32 magic;
-	__u32 child_count;
-	__u64 first_child;
-	__u64 next_sibling;
+	__le32 magic;
+	__le32 child_count;
+	__le64 first_child;
+	__le64 next_sibling;
 	__u8  depth;
 	__u8  node_type;
 	__u8  byte_val;
 	__u8  f_type;
 	__u8  reserved[4];
-	__u64 flags;
-	__u64 inode;
-	__u16 name_len;
-	__u16 name_offset;
+	__le64 flags;
+	__le64 inode;
+	__le16 name_len;
+	__le16 name_offset;
 };
 
 /* Trie operations - directory trie node allocation (uses data block allocator) */
@@ -504,12 +663,12 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter, u64 cu
  *   name_ptr = block + block_size - name_off
  */
 struct briefs_dir_entry {
-	__u64 inode;              /* inode number */
+	__le64 inode;             /* inode number */
 	__u8  type;               /* file type (S_IFMT bits) */
 	__u8  flags;              /* flags */
 	__u8  reserved[2];        /* padding to 16-byte alignment */
-	__u16 name_len;           /* name length (1..BRIEFS_NAME_LEN) */
-	__u16 name_off;           /* offset from block end into name region */
+	__le16 name_len;          /* name length (1..BRIEFS_NAME_LEN) */
+	__le16 name_off;          /* offset from block end into name region */
 };                            /* 16 bytes total */
 
 /*
@@ -538,10 +697,10 @@ struct briefs_dir_entry {
  *            (including the 2-byte length prefix).
  */
 struct briefs_dir_block {
-	__u32 magic;              /* BRIEFS_DIR_MAGIC */
-	__u32 num_entries;        /* number of entries in this block */
-	__u32 data_size;          /* bytes used by entries (header + entries) */
-	__u32 names_size;         /* bytes used by packed name region */
+	__le32 magic;             /* BRIEFS_DIR_MAGIC */
+	__le32 num_entries;       /* number of entries in this block */
+	__le32 data_size;         /* bytes used by entries (header + entries) */
+	__le32 names_size;        /* bytes used by packed name region */
 };
 
 /* Max entries per directory block (rough estimate for safety) */
@@ -601,19 +760,21 @@ static inline struct briefs_inode_info *briefs_i(struct inode *inode) {
 /* Convert data-relative block to absolute block number */
 static inline u64 data_to_abs(struct briefs_superblock *sb, u64 rel_block)
 {
-	return sb->trie_node_pool_start + sb->trie_blocks_used + rel_block;
+	return le64_to_cpu(sb->trie_node_pool_start) +
+	       le64_to_cpu(sb->trie_blocks_used) + rel_block;
 }
 
 /* Convert absolute block number back to data-relative */
 static inline u64 abs_to_data(struct briefs_superblock *sb, u64 abs_block)
 {
-	return abs_block - (sb->trie_node_pool_start + sb->trie_blocks_used);
+	return abs_block - (le64_to_cpu(sb->trie_node_pool_start) +
+	                  le64_to_cpu(sb->trie_blocks_used));
 }
 
 /* Convenience: first block of the inode table on disk */
 static inline u64 briefs_inode_table_start(struct briefs_superblock *sb)
 {
-	return sb->inode_table_offset;
+	return le64_to_cpu(sb->inode_table_offset);
 }
 
 #ifdef __KERNEL__
@@ -657,7 +818,7 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc);
 
 /* Disk inode I/O helpers (briefs_inode.c) */
 struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
-                                             struct briefs_inode **di);
+                                             struct briefs_disk_inode **di);
 int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
                                const struct briefs_inode *src, bool sync);
 struct buffer_head *briefs_get_zero_block(struct super_block *sb, u64 block);
@@ -731,6 +892,33 @@ int briefs_readdir(struct file *file, struct dir_context *ctx);
 int briefs_statfs(struct dentry *dentry, struct kstatfs *buf);
 void briefs_put_super(struct super_block *sb);
 void briefs_kill_sb(struct super_block *sb);
+
+/* Compile-time assertions for on-disk structure sizes.
+ * These sizes must match the Go briefs-utils on-disk layout exactly.
+ */
+static inline void briefs_build_bug_on_sizes(void)
+{
+	BUILD_BUG_ON(sizeof(struct briefs_superblock) != 1024);
+	BUILD_BUG_ON(sizeof(struct briefs_inode) != 512);
+	BUILD_BUG_ON(sizeof(struct briefs_disk_inode) != 512);
+	BUILD_BUG_ON(sizeof(struct briefs_extent) != 32);
+	BUILD_BUG_ON(sizeof(struct briefs_disk_extent) != 32);
+	BUILD_BUG_ON(sizeof(struct briefs_extent_chain) != 4088);
+	BUILD_BUG_ON(sizeof(struct alloc_pool_header) != 48);
+	BUILD_BUG_ON(sizeof(struct briefs_trie_page) != 20);
+	BUILD_BUG_ON(sizeof(struct briefs_trie_node) != 36);
+	BUILD_BUG_ON(sizeof(struct journal_block_header) != 16);
+	BUILD_BUG_ON(sizeof(struct journal_record_hdr) != 16);
+	BUILD_BUG_ON(sizeof(struct jrn_checkpoint) != 56);
+	BUILD_BUG_ON(sizeof(struct jrn_dir_update) != 280);
+	BUILD_BUG_ON(sizeof(struct jrn_inode_update) != 88);
+	BUILD_BUG_ON(sizeof(struct jrn_extent_alloc) != 80);
+	BUILD_BUG_ON(sizeof(struct jrn_extent_free) != 80);
+	BUILD_BUG_ON(sizeof(struct jrn_inode_alloc) != 40);
+	BUILD_BUG_ON(sizeof(struct jrn_bitmap_update) != 64);
+	BUILD_BUG_ON(sizeof(struct jrn_trie_update) != 48);
+	BUILD_BUG_ON(sizeof(struct jrn_inode_free) != 32);
+}
 
 #endif /* __KERNEL__ */
 

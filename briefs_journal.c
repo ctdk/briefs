@@ -21,11 +21,12 @@ int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb) 
 
 	memset(j, 0, sizeof(*j));
 	j->sb = sb;
-	j->journal_start = sb->journal_offset;
-	j->journal_end = sb->journal_offset + sb->journal_blocks;
-	j->checkpoint_block = sb->journal_offset + sb->journal_blocks - 1;
-	j->checkpoint_seq = sb->checkpoint_seq;
-	j->write_pos = sb->journal_log_start;
+	j->journal_start = le64_to_cpu(sb->journal_offset);
+	j->journal_end = le64_to_cpu(sb->journal_offset) + le64_to_cpu(sb->journal_blocks);
+	j->checkpoint_block = le64_to_cpu(sb->journal_offset) +
+		le64_to_cpu(sb->journal_blocks) - 1;
+	j->checkpoint_seq = le64_to_cpu(sb->checkpoint_seq);
+	j->write_pos = le64_to_cpu(sb->journal_log_start);
 	j->dirty = false;
 
 	/* Validate journal geometry */
@@ -40,7 +41,7 @@ int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb) 
 	if (!j->cur_block) return -ENOMEM;
 
 	j->cur_hdr = (struct journal_block_header *)j->cur_block;
-	j->cur_hdr->magic = JOURNAL_MAGIC;
+	j->cur_hdr->magic = cpu_to_le32(JOURNAL_MAGIC);
 	j->write_offset = sizeof(struct journal_block_header); /* 16 bytes */
 
 	pr_debug("briefs: journal initialized (start=%llu, end=%llu, checkpoint=%llu)\n",
@@ -150,11 +151,14 @@ int briefs_journal_write_block(struct briefs_journal *j, u64 block_offset, unsig
  */
 static u32 compute_record_checksum(enum journal_record_type type, u32 flags,
                                     u32 data_len, const void *data) {
+	__le32 le_type = cpu_to_le32((u32)type);
+	__le32 le_flags = cpu_to_le32(flags);
+	__le32 le_data_len = cpu_to_le32(data_len);
 	u32 crc;
 
-	crc = briefs_crc32c(0, &type, sizeof(type));
-	crc = briefs_crc32c(crc, &flags, sizeof(flags));
-	crc = briefs_crc32c(crc, &data_len, sizeof(data_len));
+	crc = briefs_crc32c(0, &le_type, sizeof(le_type));
+	crc = briefs_crc32c(crc, &le_flags, sizeof(le_flags));
+	crc = briefs_crc32c(crc, &le_data_len, sizeof(le_data_len));
 	crc = briefs_crc32c(crc, data, data_len);
 	return crc;
 }
@@ -166,13 +170,16 @@ static u32 compute_record_checksum(enum journal_record_type type, u32 flags,
  */
 static int verify_record_checksum(struct journal_record_hdr *rh, const void *data)
 {
-	u32 computed;
+	u32 computed, stored;
 
-	if (rh->checksum == 0)
+	stored = le32_to_cpu(rh->checksum);
+	if (stored == 0)
 		return 0; /* legacy record with no checksum */
 
-	computed = compute_record_checksum(rh->type, rh->flags, rh->data_len, data);
-	if (computed != rh->checksum)
+	computed = compute_record_checksum(le32_to_cpu(rh->type),
+					   le32_to_cpu(rh->flags),
+					   le32_to_cpu(rh->data_len), data);
+	if (computed != stored)
 		return -EIO;
 
 	return 0;
@@ -214,24 +221,24 @@ int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_ty
 
 		/* Reset block buffer for new records */
 		memset(j->cur_block, 0, JOURNAL_BLOCK_SIZE);
-		j->cur_hdr->magic = JOURNAL_MAGIC;
-		j->cur_hdr->block_seq++;
+		j->cur_hdr->magic = cpu_to_le32(JOURNAL_MAGIC);
+		j->cur_hdr->block_seq = cpu_to_le32(le32_to_cpu(j->cur_hdr->block_seq) + 1);
 		j->write_offset = hdr_size;
 	}
 
 	/* Write record header */
 	struct journal_record_hdr *hdr = (struct journal_record_hdr *)(j->cur_block + j->write_offset);
-	hdr->type = type;
-	hdr->flags = 0;
-	hdr->data_len = data_len;
-	hdr->checksum = compute_record_checksum(type, 0, data_len, data);
+	hdr->type = cpu_to_le32((u32)type);
+	hdr->flags = cpu_to_le32(0);
+	hdr->data_len = cpu_to_le32(data_len);
+	hdr->checksum = cpu_to_le32(compute_record_checksum(type, 0, data_len, data));
 
 	/* Copy record data after header */
 	memcpy(j->cur_block + j->write_offset + hdr_size, data, data_len);
 
 	/* Advance write offset */
 	j->write_offset += total_size;
-	j->cur_hdr->record_count++;
+	j->cur_hdr->record_count = cpu_to_le32(le32_to_cpu(j->cur_hdr->record_count) + 1);
 	j->dirty = true;
 	j->records_since_checkpoint++;
 
@@ -253,9 +260,9 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
 	/* Create checkpoint record */
 	struct jrn_checkpoint cp;
 	memset(&cp, 0, sizeof(cp));
-	cp.checkpoint_seq = ++j->checkpoint_seq;
-	cp.record_count = j->cur_hdr->record_count;
-	cp.log_sequence_end = j->write_pos;
+	cp.checkpoint_seq = cpu_to_le64(++j->checkpoint_seq);
+	cp.record_count = cpu_to_le32(le32_to_cpu(j->cur_hdr->record_count));
+	cp.log_sequence_end = cpu_to_le64(j->write_pos);
 	cp.trie_root_node = j->sb->trie_root_block;
 	cp.free_data_count = j->sb->free_data_blocks;
 	cp.free_inode_count = j->sb->free_inodes;
@@ -265,15 +272,15 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
 	if (!cp_buf) return -ENOMEM;
 
 	struct journal_block_header *cp_hdr = (struct journal_block_header *)cp_buf;
-	cp_hdr->magic = CHECKPOINT_MAGIC;
+	cp_hdr->magic = cpu_to_le32(CHECKPOINT_MAGIC);
 	cp_hdr->block_seq = j->cur_hdr->block_seq;
-	cp_hdr->record_count = 1;
+	cp_hdr->record_count = cpu_to_le32(1);
 
 	struct journal_record_hdr *rec_hdr = (struct journal_record_hdr *)(cp_buf + sizeof(struct journal_block_header));
-	rec_hdr->type = JRN_CHECKPOINT;
-	rec_hdr->flags = 0;
-	rec_hdr->data_len = sizeof(cp);
-	rec_hdr->checksum = compute_record_checksum(JRN_CHECKPOINT, 0, sizeof(cp), &cp);
+	rec_hdr->type = cpu_to_le32(JRN_CHECKPOINT);
+	rec_hdr->flags = cpu_to_le32(0);
+	rec_hdr->data_len = cpu_to_le32(sizeof(cp));
+	rec_hdr->checksum = cpu_to_le32(compute_record_checksum(JRN_CHECKPOINT, 0, sizeof(cp), &cp));
 
 	memcpy(cp_buf + sizeof(struct journal_block_header) + sizeof(*rec_hdr), &cp, sizeof(cp));
 
@@ -288,9 +295,9 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
 	pr_debug("briefs: checkpoint written (seq=%llu, records=%u, log_end=%llu)\n",
 		j->checkpoint_seq, cp.record_count, j->write_pos);
 
-	j->sb->checkpoint_seq = j->checkpoint_seq;
-	j->sb->journal_log_start = j->write_pos;
-	j->sb->journal_log_end = j->write_pos;
+	j->sb->checkpoint_seq = cpu_to_le64(j->checkpoint_seq);
+	j->sb->journal_log_start = cpu_to_le64(j->write_pos);
+	j->sb->journal_log_end = cpu_to_le64(j->write_pos);
 
 	j->dirty = false;
 	j->records_since_checkpoint = 0;
@@ -315,11 +322,14 @@ static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
 	struct inode *parent;
 	struct briefs_inode_info *binfo;
 	int ret;
+	u64 parent_ino = le64_to_cpu(rec->parent_ino);
+	u64 child_ino = le64_to_cpu(rec->child_ino);
+	u32 name_len = le32_to_cpu(rec->name_len);
 
-	parent = briefs_iget(sb, rec->parent_ino);
+	parent = briefs_iget(sb, parent_ino);
 	if (IS_ERR(parent)) {
 		pr_warn("briefs: replay can't iget parent inode %llu (skip)\n",
-			rec->parent_ino);
+			parent_ino);
 		return 0; /* skip — might have been freed already */
 	}
 
@@ -331,24 +341,24 @@ static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
 		u8 ftype = 0;
 
 		/* Read child inode to get file type */
-		struct inode *child = briefs_iget(sb, rec->child_ino);
+		struct inode *child = briefs_iget(sb, child_ino);
 		if (!IS_ERR(child)) {
 			ftype = (child->i_mode & S_IFMT) >> 12;
 			iput(child);
 		} else {
 			pr_warn("briefs: replay can't read child inode %llu, using ftype=0\n",
-				rec->child_ino);
+				child_ino);
 		}
 
 		ret = briefs_trie_insert(sb, &binfo->disk_inode,
-						 rec->name, rec->name_len,
-						 rec->child_ino, ftype);
+						 rec->name, name_len,
+						 child_ino, ftype);
 		if (ret == -EEXIST) {
 			ret = 0;
 		}
 	} else {
 		/* Delete directory entry */
-		ret = briefs_trie_remove(sb, &binfo->disk_inode, rec->name, rec->name_len);
+		ret = briefs_trie_remove(sb, &binfo->disk_inode, rec->name, name_len);
 		if (ret == -ENOENT) {
 			ret = 0;
 		}
@@ -365,36 +375,49 @@ static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
  */
 static int replay_inode_update(struct super_block *sb, struct jrn_inode_update *rec)
 {
-	struct briefs_inode *di;
+	struct briefs_disk_inode *di;
 	struct buffer_head *bh;
+	u64 ino = le64_to_cpu(rec->ino);
+	u32 mode = le32_to_cpu(rec->mode);
+	u32 nlink = le32_to_cpu(rec->nlink);
+	u32 uid = le32_to_cpu(rec->uid);
+	u32 gid = le32_to_cpu(rec->gid);
+	u64 size = le64_to_cpu(rec->size);
+	u64 atime_sec = le64_to_cpu(rec->atime_sec);
+	u64 atime_nsec = le64_to_cpu(rec->atime_nsec);
+	u64 mtime_sec = le64_to_cpu(rec->mtime_sec);
+	u64 mtime_nsec = le64_to_cpu(rec->mtime_nsec);
+	u64 ctime_sec = le64_to_cpu(rec->ctime_sec);
+	u64 ctime_nsec = le64_to_cpu(rec->ctime_nsec);
+	u32 flags = le32_to_cpu(rec->flags);
 
-	bh = briefs_read_inode_block(sb, rec->ino, &di);
+	bh = briefs_read_inode_block(sb, ino, &di);
 	if (IS_ERR(bh)) {
-		pr_warn("briefs: replay can't read inode block for %llu (skip)\n", rec->ino);
+		pr_warn("briefs: replay can't read inode block for %llu (skip)\n", ino);
 		return 0;
 	}
 
-	di->inode_number = rec->ino;
-	di->magic = _BRIEFS_INODE_MAGIC;
-	di->filemode = rec->mode;
-	di->nlinks = rec->nlink;
-	di->uid = rec->uid;
-	di->gid = rec->gid;
-	di->filesize = rec->size;
-	di->atime_sec = rec->atime_sec;
-	di->atime_nsec = rec->atime_nsec;
-	di->mtime_sec = rec->mtime_sec;
-	di->mtime_nsec = rec->mtime_nsec;
-	di->ctime_sec = rec->ctime_sec;
-	di->ctime_nsec = rec->ctime_nsec;
-	di->flags = rec->flags;
+	di->inode_number = cpu_to_le64(ino);
+	di->magic = cpu_to_le64(_BRIEFS_INODE_MAGIC);
+	di->filemode = cpu_to_le32(mode);
+	di->nlinks = cpu_to_le32(nlink);
+	di->uid = cpu_to_le32(uid);
+	di->gid = cpu_to_le32(gid);
+	di->filesize = cpu_to_le64(size);
+	di->atime_sec = cpu_to_le64(atime_sec);
+	di->atime_nsec = cpu_to_le64(atime_nsec);
+	di->mtime_sec = cpu_to_le64(mtime_sec);
+	di->mtime_nsec = cpu_to_le64(mtime_nsec);
+	di->ctime_sec = cpu_to_le64(ctime_sec);
+	di->ctime_nsec = cpu_to_le64(ctime_nsec);
+	di->flags = cpu_to_le32(flags);
 
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
 	brelse(bh);
 
 	pr_debug("briefs: replay restored inode %llu (mode=%o nlink=%u size=%llu)\n",
-		rec->ino, rec->mode, rec->nlink, rec->size);
+		ino, mode, nlink, size);
 	return 0;
 }
 
@@ -405,16 +428,19 @@ static int replay_inode_update(struct super_block *sb, struct jrn_inode_update *
 static int replay_extent_alloc(struct super_block *sb, struct jrn_extent_alloc *rec)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
+	u64 ino = le64_to_cpu(rec->ino);
+	u64 length = le64_to_cpu(rec->length);
+	u64 phys_start = le64_to_cpu(rec->phys_start);
 	u64 b;
 
-	for (b = 0; b < rec->length; b++) {
-		u64 abs_block = rec->phys_start + b;
+	for (b = 0; b < length; b++) {
+		u64 abs_block = phys_start + b;
 		u64 rel_block = abs_to_data(bsi->sb, abs_block);
 		briefs_reserve_block(&bsi->alloc, rel_block);
 	}
 
 	pr_debug("briefs: replay reserved %llu data blocks at phys=%llu for ino=%llu\n",
-		rec->length, rec->phys_start, rec->ino);
+		length, phys_start, ino);
 	return 0;
 }
 
@@ -425,11 +451,13 @@ static int replay_extent_alloc(struct super_block *sb, struct jrn_extent_alloc *
 static int replay_extent_free(struct super_block *sb, struct jrn_extent_free *rec)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
+	u64 length = le64_to_cpu(rec->length);
+	u64 phys_start = le64_to_cpu(rec->phys_start);
 
-	briefs_free_blocks_range(bsi, rec->phys_start, rec->length);
+	briefs_free_blocks_range(bsi, phys_start, length);
 
 	pr_debug("briefs: replay freed %llu data blocks at phys=%llu for ino=%llu\n",
-		 rec->length, rec->phys_start, rec->ino);
+		 length, phys_start, rec->ino);
 	return 0;
 }
 
@@ -442,16 +470,17 @@ static int replay_extent_free(struct super_block *sb, struct jrn_extent_free *re
 int briefs_journal_replay(struct briefs_journal *j) {
 	if (!j) return -EINVAL;
 
-	if (j->sb->journal_log_start == j->sb->journal_log_end) {
+	if (le64_to_cpu(j->sb->journal_log_start) == le64_to_cpu(j->sb->journal_log_end)) {
 		pr_info("briefs: journal is clean (no replay needed)\n");
 		return 0;
 	}
 
 	pr_info("briefs: replaying journal (start=%llu, end=%llu)\n",
-		j->sb->journal_log_start, j->sb->journal_log_end);
+		le64_to_cpu(j->sb->journal_log_start),
+		le64_to_cpu(j->sb->journal_log_end));
 
-	u64 cur = j->sb->journal_log_start;
-	u64 end = j->sb->journal_log_end;
+	u64 cur = le64_to_cpu(j->sb->journal_log_start);
+	u64 end = le64_to_cpu(j->sb->journal_log_end);
 	struct super_block *sb = j->vfs_sb;
 	struct briefs_sb_info *bsi = sb->s_fs_info;
 
@@ -469,9 +498,11 @@ int briefs_journal_replay(struct briefs_journal *j) {
 		blocks_read++;
 
 		struct journal_block_header *hdr = (struct journal_block_header *)bh->b_data;
-		if (hdr->magic != JOURNAL_MAGIC && hdr->magic != CHECKPOINT_MAGIC) {
+		__le32 hdr_magic = hdr->magic;
+		u32 block_magic = le32_to_cpu(hdr_magic);
+		if (block_magic != JOURNAL_MAGIC && block_magic != CHECKPOINT_MAGIC) {
 			pr_warn("briefs: invalid journal magic at block=%llu (got=0x%08x, expected=0x%08x)\n",
-				cur, hdr->magic, JOURNAL_MAGIC);
+				cur, block_magic, JOURNAL_MAGIC);
 			brelse(bh);
 			break;
 		}
@@ -479,19 +510,22 @@ int briefs_journal_replay(struct briefs_journal *j) {
 		/* Walk records by their actual sizes */
 		u64 rec_off = sizeof(struct journal_block_header);
 		bool legacy_checksum_warned = false;
-		for (u32 i = 0; i < hdr->record_count && rec_off < JOURNAL_BLOCK_SIZE; i++) {
+		u32 rec_count = le32_to_cpu(hdr->record_count);
+		for (u32 i = 0; i < rec_count && rec_off < JOURNAL_BLOCK_SIZE; i++) {
 			struct journal_record_hdr *rh = (struct journal_record_hdr *)(bh->b_data + rec_off);
+			u32 rec_type = le32_to_cpu(rh->type);
+			u32 rec_data_len = le32_to_cpu(rh->data_len);
 
-			if (rh->type <= JRN_NONE || rh->type >= JRN_END) {
-				pr_warn("briefs: invalid record type=%u at block=%llu\n", rh->type, cur);
+			if (rec_type <= JRN_NONE || rec_type >= JRN_END) {
+				pr_warn("briefs: invalid record type=%u at block=%llu\n", rec_type, cur);
 				brelse(bh);
 				return -EIO;
 			}
 
 			/* Bounds check the record data */
-			if (rec_off + sizeof(*rh) + rh->data_len > JOURNAL_BLOCK_SIZE) {
+			if (rec_off + sizeof(*rh) + rec_data_len > JOURNAL_BLOCK_SIZE) {
 				pr_err("briefs: journal record overflows block at block=%llu (rec_off=%llu data_len=%u)\n",
-				       cur, rec_off, rh->data_len);
+				       cur, rec_off, rec_data_len);
 				brelse(bh);
 				return -EIO;
 			}
@@ -499,7 +533,7 @@ int briefs_journal_replay(struct briefs_journal *j) {
 			void *rec_data = bh->b_data + rec_off + sizeof(*rh);
 
 			/* Verify record checksum before replaying */
-			if (rh->checksum == 0) {
+			if (le32_to_cpu(rh->checksum) == 0) {
 				if (!legacy_checksum_warned) {
 					pr_warn("briefs: legacy journal record with no checksum at block=%llu; skipping CRC verification for this replay\n",
 					        cur);
@@ -507,19 +541,19 @@ int briefs_journal_replay(struct briefs_journal *j) {
 				}
 			} else if (verify_record_checksum(rh, rec_data) != 0) {
 				pr_err("briefs: journal checksum mismatch at block=%llu record=%u type=%u\n",
-				       cur, i, rh->type);
+				       cur, i, rec_type);
 				brelse(bh);
 				return -EIO;
 			}
 
-			if (rh->type == JRN_CHECKPOINT) {
-				rec_off += sizeof(*rh) + rh->data_len;
+			if (rec_type == JRN_CHECKPOINT) {
+				rec_off += sizeof(*rh) + rec_data_len;
 				continue;
 			}
 
 			int apply_ret = 0;
 
-			switch (rh->type) {
+			switch (rec_type) {
 			case JRN_DIR_UPDATE: {
 				struct jrn_dir_update *du = rec_data;
 				apply_ret = replay_dir_update(sb, du);
@@ -527,7 +561,7 @@ int briefs_journal_replay(struct briefs_journal *j) {
 			}
 			case JRN_INODE_ALLOC: {
 				struct jrn_inode_alloc *ia = rec_data;
-				u64 inum = ia->ino;
+				u64 inum = le64_to_cpu(ia->ino);
 				if (inum > 0)
 					briefs_reserve_block(&bsi->inode_alloc, inum - 1);
 				break;
@@ -548,17 +582,17 @@ int briefs_journal_replay(struct briefs_journal *j) {
 				break;
 			}
 			default:
-				pr_debug("briefs: replay skipping unhandled record type=%u\n", rh->type);
+				pr_debug("briefs: replay skipping unhandled record type=%u\n", rec_type);
 				break;
 			}
 
 			if (apply_ret) {
 				pr_err("briefs: replay error for record type=%u: %d\n",
-				       rh->type, apply_ret);
+				       rec_type, apply_ret);
 				errors++;
 			}
 			records_replayed++;
-			rec_off += sizeof(*rh) + rh->data_len;
+			rec_off += sizeof(*rh) + rec_data_len;
 		}
 
 		brelse(bh);
@@ -570,7 +604,7 @@ int briefs_journal_replay(struct briefs_journal *j) {
 
 	/* Update superblock to mark journal clean */
 	j->sb->journal_log_start = j->sb->journal_log_end;
-	j->sb->checkpoint_seq++;
+	j->sb->checkpoint_seq = cpu_to_le64(le64_to_cpu(j->sb->checkpoint_seq) + 1);
 
 	return errors ? -EIO : 0;
 }
@@ -587,9 +621,9 @@ int briefs_journal_inode_alloc(struct briefs_journal *j, u64 ino,
 		return 0;
 
 	memset(&rec, 0, sizeof(rec));
-	rec.ino = ino;
-	rec.mode = mode & 07777;
-	rec.nlink = nlink;
+	rec.ino = cpu_to_le64(ino);
+	rec.mode = cpu_to_le32(mode & 07777);
+	rec.nlink = cpu_to_le32(nlink);
 
 	return briefs_journal_write_record(j, JRN_INODE_ALLOC, &rec, sizeof(rec));
 }
@@ -609,9 +643,9 @@ int briefs_journal_dir_update(struct briefs_journal *j, u64 parent_ino, u64 chil
 		return -EINVAL;
 
 	memset(&rec, 0, sizeof(rec));
-	rec.parent_ino = parent_ino;
-	rec.child_ino = child_ino;
-	rec.name_len = (u32)name_len;
+	rec.parent_ino = cpu_to_le64(parent_ino);
+	rec.child_ino = cpu_to_le64(child_ino);
+	rec.name_len = cpu_to_le32((u32)name_len);
 	memcpy(rec.name, name, name_len);
 	rec.op = op;
 
@@ -635,11 +669,11 @@ int briefs_journal_extent_alloc(struct briefs_journal *j, u64 ino,
 	if (!j) return 0; /* journal not active */
 
 	memset(&rec, 0, sizeof(rec));
-	rec.ino = ino;
-	rec.offset = offset;
-	rec.length = length;
-	rec.phys_start = phys_start;
-	rec.extent_index = (u32)extent_index;
+	rec.ino = cpu_to_le64(ino);
+	rec.offset = cpu_to_le64(offset);
+	rec.length = cpu_to_le64(length);
+	rec.phys_start = cpu_to_le64(phys_start);
+	rec.extent_index = cpu_to_le32((u32)extent_index);
 
 	return briefs_journal_write_record(j, JRN_EXTENT_ALLOC, &rec, sizeof(rec));
 }
@@ -655,10 +689,10 @@ int briefs_journal_extent_free(struct briefs_journal *j, u64 ino,
 	if (!j) return 0;
 
 	memset(&rec, 0, sizeof(rec));
-	rec.ino = ino;
-	rec.offset = offset;
-	rec.phys_start = phys_start;
-	rec.length = length;
+	rec.ino = cpu_to_le64(ino);
+	rec.offset = cpu_to_le64(offset);
+	rec.phys_start = cpu_to_le64(phys_start);
+	rec.length = cpu_to_le64(length);
 
 	return briefs_journal_write_record(j, JRN_EXTENT_FREE, &rec, sizeof(rec));
 }
@@ -679,19 +713,19 @@ int briefs_journal_inode_update(struct briefs_journal *j,
 	binfo = briefs_i(inode);
 
 	memset(&rec, 0, sizeof(rec));
-	rec.ino = inode->i_ino;
-	rec.mode = inode->i_mode;
-	rec.nlink = inode->i_nlink;
-	rec.uid = from_kuid(&init_user_ns, inode->i_uid);
-	rec.gid = from_kgid(&init_user_ns, inode->i_gid);
-	rec.size = inode->i_size;
-	rec.atime_sec = inode->i_atime_sec;
-	rec.atime_nsec = inode->i_atime_nsec;
-	rec.mtime_sec = inode->i_mtime_sec;
-	rec.mtime_nsec = inode->i_mtime_nsec;
-	rec.ctime_sec = inode->i_ctime_sec;
-	rec.ctime_nsec = inode->i_ctime_nsec;
-	rec.flags = binfo->disk_inode.flags;
+	rec.ino = cpu_to_le64(inode->i_ino);
+	rec.mode = cpu_to_le32(inode->i_mode);
+	rec.nlink = cpu_to_le32(inode->i_nlink);
+	rec.uid = cpu_to_le32(from_kuid(&init_user_ns, inode->i_uid));
+	rec.gid = cpu_to_le32(from_kgid(&init_user_ns, inode->i_gid));
+	rec.size = cpu_to_le64(inode->i_size);
+	rec.atime_sec = cpu_to_le64(inode->i_atime_sec);
+	rec.atime_nsec = cpu_to_le64(inode->i_atime_nsec);
+	rec.mtime_sec = cpu_to_le64(inode->i_mtime_sec);
+	rec.mtime_nsec = cpu_to_le64(inode->i_mtime_nsec);
+	rec.ctime_sec = cpu_to_le64(inode->i_ctime_sec);
+	rec.ctime_nsec = cpu_to_le64(inode->i_ctime_nsec);
+	rec.flags = cpu_to_le32(le32_to_cpu(binfo->disk_inode.flags));
 
 	return briefs_journal_write_record(j, JRN_INODE_UPDATE, &rec, sizeof(rec));
 }
@@ -736,8 +770,8 @@ int briefs_journal_sync(struct briefs_journal *j) {
 
 	/* Reset for next block */
 	memset(j->cur_block, 0, JOURNAL_BLOCK_SIZE);
-	j->cur_hdr->magic = JOURNAL_MAGIC;
-	j->cur_hdr->block_seq++;
+	j->cur_hdr->magic = cpu_to_le32(JOURNAL_MAGIC);
+	j->cur_hdr->block_seq = cpu_to_le32(le32_to_cpu(j->cur_hdr->block_seq) + 1);
 	j->write_offset = sizeof(struct journal_block_header);
 
 	j->dirty = false;

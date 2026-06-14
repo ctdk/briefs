@@ -20,6 +20,7 @@
 #include <linux/buffer_head.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/unaligned.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
 
@@ -150,9 +151,9 @@ struct buffer_head *briefs_trie_read_page(struct super_block *sb, u64 node_ref,
 	*page = (struct briefs_trie_page *)bh->b_data;
 	*node = trie_slot_at(bh->b_data, slot);
 
-	if ((*page)->magic != BRIEFS_TRIE_PAGE_MAGIC) {
+	if (trie_page_magic(*page) != BRIEFS_TRIE_PAGE_MAGIC) {
 		pr_err("briefs: trie page %llu has bad magic 0x%08x\n",
-		       block, (*page)->magic);
+		       block, trie_page_magic(*page));
 		brelse(bh);
 		return ERR_PTR(-EIO);
 	}
@@ -189,9 +190,9 @@ struct buffer_head *briefs_trie_get_page(struct super_block *sb, u64 node_ref,
 	*page = (struct briefs_trie_page *)bh->b_data;
 	*node = trie_slot_at(bh->b_data, slot);
 
-	if ((*page)->magic != BRIEFS_TRIE_PAGE_MAGIC) {
+	if (trie_page_magic(*page) != BRIEFS_TRIE_PAGE_MAGIC) {
 		pr_err("briefs: trie page %llu has bad magic 0x%08x\n",
-		       block, (*page)->magic);
+		       block, trie_page_magic(*page));
 		brelse(bh);
 		return ERR_PTR(-EIO);
 	}
@@ -227,11 +228,11 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 	}
 
 	page = (struct briefs_trie_page *)bh->b_data;
-	page->magic = BRIEFS_TRIE_PAGE_MAGIC;
-	page->version = 1;
-	page->live_count = 1;
-	page->free_name_off = 0;
-	page->free_slots = ~1ULL;       /* slot 0 allocated; rest free */
+	trie_page_set_magic(page, BRIEFS_TRIE_PAGE_MAGIC);
+	trie_page_set_version(page, 1);
+	trie_page_set_live_count(page, 1);
+	trie_page_set_free_name_off(page, 0);
+	trie_page_set_free_slots(page, ~1ULL);       /* slot 0 allocated; rest free */
 
 	node = trie_slot_at(bh->b_data, 0);
 	node->depth = depth;
@@ -261,14 +262,14 @@ static int trie_page_alloc_slot(struct briefs_trie_page *page, u64 *out_slot)
 	u64 slot;
 
 	for (slot = 0; slot < TRIE_SLOTS_PER_BLOCK; slot++) {
-		if (page->free_slots & (1ULL << slot))
+		if (trie_page_free_slots(page) & (1ULL << slot))
 			break;
 	}
 	if (slot >= TRIE_SLOTS_PER_BLOCK)
 		return -ENOSPC;
 
-	page->free_slots &= ~(1ULL << slot);
-	page->live_count++;
+	trie_page_set_free_slots(page, trie_page_free_slots(page) & ~(1ULL << slot));
+	trie_page_set_live_count(page, trie_page_live_count(page) + 1);
 	*out_slot = slot;
 	return 0;
 }
@@ -293,16 +294,16 @@ static int trie_page_alloc_name(struct briefs_trie_page *page,
 		return -ENAMETOOLONG;
 
 	/* If an existing allocation is already large enough, reuse it. */
-	if (node->name_offset > 0 && node->name_len >= 2 + name_len)
+	if (trie_node_name_offset(node) > 0 && trie_node_name_len(node) >= 2 + name_len)
 		return 0;
 
-	name_base = BRIEFS_BLOCK_SIZE - page->free_name_off;
+	name_base = BRIEFS_BLOCK_SIZE - trie_page_free_name_off(page);
 	if (name_base - name_size < data_end)
 		return -ENOSPC;
 
-	page->free_name_off += name_size;
-	node->name_offset = page->free_name_off;
-	node->name_len = 2 + name_len;
+	trie_page_set_free_name_off(page, trie_page_free_name_off(page) + name_size);
+	trie_node_set_name_offset(node, trie_page_free_name_off(page));
+	trie_node_set_name_len(node, 2 + name_len);
 	return 0;
 }
 
@@ -313,7 +314,7 @@ static inline bool trie_page_has_name_heap(struct briefs_trie_page *page, u16 na
 {
 	if (name_size == 0)
 		return true;
-	return page->free_name_off + name_size <=
+	return trie_page_free_name_off(page) + name_size <=
 		BRIEFS_BLOCK_SIZE - trie_page_data_end();
 }
 
@@ -389,7 +390,7 @@ static u64 trie_alloc_from_block(struct super_block *sb, struct briefs_trie_page
 	}
 
 	page = (struct briefs_trie_page *)bh->b_data;
-	if (page->magic != BRIEFS_TRIE_PAGE_MAGIC) {
+	if (trie_page_magic(page) != BRIEFS_TRIE_PAGE_MAGIC) {
 		brelse(bh);
 		return 0;
 	}
@@ -407,16 +408,16 @@ static u64 trie_alloc_from_block(struct super_block *sb, struct briefs_trie_page
 	node = trie_slot_at(bh->b_data, slot);
 	memset(node, 0, sizeof(*node));
 	if (name_size > 0) {
-		page->free_name_off += name_size;
-		node->name_len = name_size;
-		node->name_offset = page->free_name_off;
+		trie_page_set_free_name_off(page, trie_page_free_name_off(page) + name_size);
+		trie_node_set_name_len(node, name_size);
+		trie_node_set_name_offset(node, trie_page_free_name_off(page));
 	}
 	set_buffer_uptodate(bh);
 	mark_buffer_dirty(bh);
 	ref = TRIE_MAKE_REF(block, slot);
 
-	if (page->free_slots == 0 ||
-	    page->free_name_off >=
+	if (trie_page_free_slots(page) == 0 ||
+	    trie_page_free_name_off(page) >=
 	    BRIEFS_BLOCK_SIZE - trie_page_data_end()) {
 		/* Page became full; hot_block will be cleared below. */
 		ref |= (1ULL << 63);
@@ -508,9 +509,9 @@ u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len)
 		if (IS_ERR(bh))
 			return 0;
 		/* Fresh page always has room for the name. */
-		page->free_name_off += name_size;
-		node->name_len = name_size;
-		node->name_offset = page->free_name_off;
+		trie_page_set_free_name_off(page, trie_page_free_name_off(page) + name_size);
+		trie_node_set_name_len(node, name_size);
+		trie_node_set_name_offset(node, trie_page_free_name_off(page));
 		mark_buffer_dirty(bh);
 		brelse(bh);
 	}
@@ -549,16 +550,16 @@ int briefs_trie_node_store_name(struct super_block *sb, u64 node_ref,
 	}
 
 	if (name_len == 0) {
-		node->name_len = 0;
-		node->name_offset = 0;
+		trie_node_set_name_len(node, 0);
+		trie_node_set_name_offset(node, 0);
 		brelse(bh);
 		return 0;
 	}
 
 	dest = TRIE_NODE_NAME_BASE(bh->b_data, node);
-	*(__u16 *)(dest - 2) = (__u16)name_len;
+	put_unaligned_le16((u16)name_len, dest - 2);
 	memcpy(dest, name, name_len);
-	node->name_len = 2 + name_len;
+	trie_node_set_name_len(node, 2 + name_len);
 
 	mark_buffer_dirty(bh);
 	brelse(bh);
@@ -601,16 +602,16 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 
 	mutex_lock(&pages->lock);
 
-	if (!(page->free_slots & (1ULL << slot))) {
-		page->free_slots |= (1ULL << slot);
-		page->live_count--;
+	if (!(trie_page_free_slots(page) & (1ULL << slot))) {
+		trie_page_set_free_slots(page, trie_page_free_slots(page) | (1ULL << slot));
+		trie_page_set_live_count(page, trie_page_live_count(page) - 1);
 		memset(node, 0, sizeof(*node));
 		mark_buffer_dirty(bh);
 	}
 
-	page_empty = (page->live_count == 0);
+	page_empty = (trie_page_live_count(page) == 0);
 
-	if (!page_empty && page->free_slots != 0)
+	if (!page_empty && trie_page_free_slots(page) != 0)
 		__trie_page_add_partial_locked(pages, block);
 
 	if (page_empty) {

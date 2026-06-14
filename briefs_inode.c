@@ -20,7 +20,7 @@
  * ERR_PTR on failure.  The caller must brelse() the buffer head.
  */
 struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
-                                             struct briefs_inode **di)
+                                             struct briefs_disk_inode **di)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
 	u64 inodeTableBlock, inodeIndex, inodeBlock, inodeOffset;
@@ -40,7 +40,7 @@ struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
 		return ERR_PTR(-EIO);
 	}
 
-	*di = (struct briefs_inode *)(bh->b_data + inodeOffset);
+	*di = (struct briefs_disk_inode *)(bh->b_data + inodeOffset);
 	return bh;
 }
 
@@ -52,14 +52,14 @@ struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
 int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
                                const struct briefs_inode *src, bool sync)
 {
-	struct briefs_inode *di;
+	struct briefs_disk_inode *di;
 	struct buffer_head *bh;
 
 	bh = briefs_read_inode_block(sb, ino, &di);
 	if (IS_ERR(bh))
 		return PTR_ERR(bh);
 
-	memcpy(di, src, sizeof(struct briefs_inode));
+	briefs_cpu_inode_to_disk(src, di);
 	mark_buffer_dirty(bh);
 	if (sync)
 		sync_dirty_buffer(bh);
@@ -261,7 +261,7 @@ int briefs_finish_create(struct inode *dir, struct dentry *dentry,
 int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	struct briefs_sb_info *bsi;
 	struct briefs_inode_info *binfo;
-	struct briefs_inode *disk_inode;
+	struct briefs_disk_inode *disk_inode;
 	struct buffer_head *bh;
 	unsigned seq;
 
@@ -281,20 +281,20 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	briefs_sync_inode_times(inode, &binfo->disk_inode);
 
 	/*
-	 * Copy in-memory disk_inode to the on-disk buffer.
-	 * Use a seqcount retry loop to ensure we don't persist a
-	 * partially-updated extent list if briefs_append_extent or
-	 * another extent writer is in progress concurrently.
+	 * Copy in-memory disk_inode to the on-disk buffer, converting to
+	 * little endian. Use a seqcount retry loop to ensure we don't persist
+	 * a partially-updated extent list if briefs_append_extent or another
+	 * extent writer is in progress concurrently.
 	 */
 	do {
 		seq = read_seqcount_begin(&binfo->extent_seq);
-		memcpy(disk_inode, &binfo->disk_inode, sizeof(struct briefs_inode));
+		briefs_cpu_inode_to_disk(&binfo->disk_inode, disk_inode);
 		/* Update VFS-derived fields after the copy */
-		disk_inode->filemode = inode->i_mode;
-		disk_inode->uid = from_kuid(&init_user_ns, inode->i_uid);
-		disk_inode->gid = from_kgid(&init_user_ns, inode->i_gid);
-		disk_inode->filesize = inode->i_size;
-		disk_inode->nlinks = inode->i_nlink;
+		disk_inode->filemode = cpu_to_le32(inode->i_mode);
+		disk_inode->uid = cpu_to_le32(from_kuid(&init_user_ns, inode->i_uid));
+		disk_inode->gid = cpu_to_le32(from_kgid(&init_user_ns, inode->i_gid));
+		disk_inode->filesize = cpu_to_le64(inode->i_size);
+		disk_inode->nlinks = cpu_to_le32(inode->i_nlink);
 	} while (read_seqcount_retry(&binfo->extent_seq, seq));
 
 	mark_buffer_dirty(bh);
@@ -326,7 +326,8 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 	struct inode *inode;
 	struct briefs_inode_info *binfo;
 	struct buffer_head *bh;
-	struct briefs_inode *disk_inode;
+	struct briefs_disk_inode *disk_inode;
+	struct briefs_inode cpu_di;
 	struct briefs_sb_info *bsi;
 
 	pr_debug("briefs: iget inode %llu\n", ino);
@@ -353,8 +354,10 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 			return ERR_PTR(-EIO);
 		}
 
-		if (disk_inode->magic != _BRIEFS_INODE_MAGIC) {
-			pr_err("briefs: invalid inode magic for ino %llu: 0x%08llx\n", ino, disk_inode->magic);
+		briefs_disk_inode_to_cpu(disk_inode, &cpu_di);
+
+		if (cpu_di.magic != _BRIEFS_INODE_MAGIC) {
+			pr_err("briefs: invalid inode magic for ino %llu: 0x%08llx\n", ino, cpu_di.magic);
 			brelse(bh);
 			unlock_new_inode(inode);
 			iput(inode);
@@ -363,24 +366,24 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 
 		/* Copy disk inode to VFS inode */
 		binfo = briefs_i(inode);
-		memcpy(&binfo->disk_inode, disk_inode, sizeof(struct briefs_inode));
+		memcpy(&binfo->disk_inode, &cpu_di, sizeof(struct briefs_inode));
 		binfo->inode_number = ino;
 
 		/* Set VFS inode fields from disk inode */
-		inode->i_mode = disk_inode->filemode;
-		inode->i_uid = make_kuid(&init_user_ns, disk_inode->uid);
-		inode->i_gid = make_kgid(&init_user_ns, disk_inode->gid);
-		inode->i_size = disk_inode->filesize;
-		inode->i_blocks = briefs_compute_i_blocks(disk_inode);
+		inode->i_mode = cpu_di.filemode;
+		inode->i_uid = make_kuid(&init_user_ns, cpu_di.uid);
+		inode->i_gid = make_kgid(&init_user_ns, cpu_di.gid);
+		inode->i_size = cpu_di.filesize;
+		inode->i_blocks = briefs_compute_i_blocks(&cpu_di);
 
-		set_nlink(inode, disk_inode->nlinks);
+		set_nlink(inode, cpu_di.nlinks);
 
-		inode->i_atime_sec = disk_inode->atime_sec;
-		inode->i_atime_nsec = disk_inode->atime_nsec;
-		inode->i_mtime_sec = disk_inode->mtime_sec;
-		inode->i_mtime_nsec = disk_inode->mtime_nsec;
-		inode->i_ctime_sec = disk_inode->ctime_sec;
-		inode->i_ctime_nsec = disk_inode->ctime_nsec;
+		inode->i_atime_sec = cpu_di.atime_sec;
+		inode->i_atime_nsec = cpu_di.atime_nsec;
+		inode->i_mtime_sec = cpu_di.mtime_sec;
+		inode->i_mtime_nsec = cpu_di.mtime_nsec;
+		inode->i_ctime_sec = cpu_di.ctime_sec;
+		inode->i_ctime_nsec = cpu_di.ctime_nsec;
 
 		/* Set VFS operations based on inode type */
 		if (S_ISDIR(inode->i_mode)) {
@@ -395,7 +398,7 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 			/* no i_fop for symlinks */
 		} else if (S_ISBLK(inode->i_mode) || S_ISCHR(inode->i_mode) ||
 			   S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
-			init_special_inode(inode, inode->i_mode, disk_inode->rdev);
+			init_special_inode(inode, inode->i_mode, cpu_di.rdev);
 		}
 
 		pr_info("briefs: inode %llu: mode=0x%04x, uid=%u, gid=%u, size=%llu, nlink=%u\n",

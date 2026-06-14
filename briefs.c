@@ -34,6 +34,9 @@ static int __init briefs_init(void) {
 	pr_info("briefs: magic=0x%016llx, block_size=%d, inode_size=%d\n",
 		(unsigned long long)_BRIEFS_SUPER_MAGIC, BRIEFS_BLOCK_SIZE, BRIEFS_INODE_SIZE);
 
+	/* Catch on-disk structure size drift vs. Go briefs-utils layout */
+	briefs_build_bug_on_sizes();
+
 	/* Create slab cache for inodes */
 	briefs_inode_cachep = kmem_cache_create("briefs_inode_cache",
 		sizeof(struct briefs_inode_info),

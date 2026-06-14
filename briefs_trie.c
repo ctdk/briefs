@@ -15,6 +15,7 @@
 #include <linux/slab.h>
 #include <linux/buffer_head.h>
 #include <linux/vmalloc.h>
+#include <linux/unaligned.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
 
@@ -82,7 +83,7 @@ static int trie_find_child_with_prev(struct super_block *sb, u64 parent_ref,
 	if (trie_read_node(sb, parent_ref, &pbh, &ppage, &pnode) != 0)
 		return -EIO;
 
-	child = pnode->first_child;
+	child = trie_node_first_child(pnode);
 	while (!TRIE_REF_IS_NULL(child)) {
 		cbh = briefs_trie_read_page(sb, child, &cpage, &cnode);
 		if (IS_ERR(cbh))
@@ -95,7 +96,7 @@ static int trie_find_child_with_prev(struct super_block *sb, u64 parent_ref,
 			return 0;
 		}
 		prev = child;
-		child = cnode->next_sibling;
+		child = trie_node_next_sibling(cnode);
 		brelse(cbh);
 	}
 
@@ -129,24 +130,24 @@ static int trie_link_child(struct super_block *sb, u64 parent_ref, u64 child_ref
 	if (trie_get_node(sb, parent_ref, &pbh, &ppage, &pnode) != 0)
 		return -EIO;
 
-	if (TRIE_REF_IS_NULL(pnode->first_child)) {
-		pnode->first_child = child_ref;
-		pnode->child_count++;
+	if (TRIE_REF_IS_NULL(trie_node_first_child(pnode))) {
+		trie_node_set_first_child(pnode, child_ref);
+		trie_node_set_child_count(pnode, trie_node_child_count(pnode) + 1);
 		mark_buffer_dirty(pbh);
 		brelse(pbh);
 		return 0;
 	}
 
 	/* Walk to the last sibling. */
-	last = pnode->first_child;
+	last = trie_node_first_child(pnode);
 	lbh = briefs_trie_get_page(sb, last, &lpage, &last_node);
 	if (IS_ERR(lbh)) {
 		brelse(pbh);
 		return -EIO;
 	}
 
-	while (!TRIE_REF_IS_NULL(last_node->next_sibling)) {
-		u64 next = last_node->next_sibling;
+	while (!TRIE_REF_IS_NULL(trie_node_next_sibling(last_node))) {
+		u64 next = trie_node_next_sibling(last_node);
 		brelse(lbh);
 		lbh = briefs_trie_get_page(sb, next, &lpage, &last_node);
 		if (IS_ERR(lbh)) {
@@ -156,11 +157,11 @@ static int trie_link_child(struct super_block *sb, u64 parent_ref, u64 child_ref
 		last = next;
 	}
 
-	last_node->next_sibling = child_ref;
+	trie_node_set_next_sibling(last_node, child_ref);
 	mark_buffer_dirty(lbh);
 	brelse(lbh);
 
-	pnode->child_count++;
+	trie_node_set_child_count(pnode, trie_node_child_count(pnode) + 1);
 	mark_buffer_dirty(pbh);
 	brelse(pbh);
 	return 0;
@@ -275,10 +276,10 @@ int briefs_trie_lookup(struct super_block *sb, struct briefs_inode *di,
 		if (pos == name_len - 1) {
 			if (TRIE_IS_LEAF(cnode)) {
 				char *ename = trie_node_name(cbh->b_data, cnode);
-				int elen = cnode->name_len - 2;
+				int elen = trie_node_name_len(cnode) - 2;
 
 				if (elen == name_len && memcmp(ename, name, name_len) == 0) {
-					*found_ino = cnode->inode;
+					*found_ino = trie_node_inode(cnode);
 					*found_type = TRIE_NODE_FTYPE(cnode);
 					brelse(cbh);
 					return 0;
@@ -291,11 +292,11 @@ int briefs_trie_lookup(struct super_block *sb, struct briefs_inode *di,
 		if (!(cnode->node_type & NODE_TYPE_INTERM)) {
 			/* Pure leaf where we need an INTERM.  Check full name. */
 			char *ename = trie_node_name(cbh->b_data, cnode);
-			int elen = cnode->name_len - 2;
+			int elen = trie_node_name_len(cnode) - 2;
 
 			brelse(cbh);
 			if (elen == name_len && memcmp(ename, name, name_len) == 0) {
-				*found_ino = cnode->inode;
+				*found_ino = trie_node_inode(cnode);
 				*found_type = TRIE_NODE_FTYPE(cnode);
 				return 0;
 			}
@@ -328,24 +329,24 @@ static void trie_unlink_child(struct super_block *sb, u64 parent_ref,
 		brelse(pbh);
 		return;
 	}
-	next = chnode->next_sibling;
+	next = trie_node_next_sibling(chnode);
 	brelse(chbh);
 
 	if (TRIE_REF_IS_NULL(child_prev)) {
-		pnode->first_child = next;
+		trie_node_set_first_child(pnode, next);
 	} else {
 		struct buffer_head *prev_bh;
 		struct briefs_trie_page *prev_page;
 		struct briefs_trie_node *prev_node;
 
 		if (trie_get_node(sb, child_prev, &prev_bh, &prev_page, &prev_node) == 0) {
-			prev_node->next_sibling = next;
+			trie_node_set_next_sibling(prev_node, next);
 			mark_buffer_dirty(prev_bh);
 			brelse(prev_bh);
 		}
 	}
 
-	pnode->child_count--;
+	trie_node_set_child_count(pnode, trie_node_child_count(pnode) - 1);
 	mark_buffer_dirty(pbh);
 	brelse(pbh);
 }
@@ -367,7 +368,7 @@ static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
 
 	if (trie_read_node(sb, child, &lbh, &lpage, &lnode) != 0)
 		return -EIO;
-	old_name_len = lnode->name_len - 2;
+	old_name_len = trie_node_name_len(lnode) - 2;
 
 	if (old_name_len == pos + 1) {
 		/* Old leaf is a prefix of the new name. */
@@ -379,7 +380,7 @@ static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
 		return 0;
 	}
 
-	old_sibling = lnode->next_sibling;
+	old_sibling = trie_node_next_sibling(lnode);
 	brelse(lbh);
 
 	internal = briefs_trie_create_child(sb, cur, pos + 1, bval,
@@ -390,23 +391,23 @@ static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
 	/* Reparent: find link from cur to child, redirect to internal. */
 	if (trie_get_node(sb, cur, &gbh, &gpage, &gnode) != 0)
 		return -EIO;
-	if (gnode->first_child == child) {
-		gnode->first_child = internal;
+	if (trie_node_first_child(gnode) == child) {
+		trie_node_set_first_child(gnode, internal);
 	} else {
-		u64 prev = gnode->first_child;
+		u64 prev = trie_node_first_child(gnode);
 		while (!TRIE_REF_IS_NULL(prev)) {
 			struct buffer_head *tbh;
 			struct briefs_trie_page *tpage;
 			struct briefs_trie_node *tmp;
 			if (trie_get_node(sb, prev, &tbh, &tpage, &tmp) != 0)
 				break;
-			if (tmp->next_sibling == child) {
-				tmp->next_sibling = internal;
+			if (trie_node_next_sibling(tmp) == child) {
+				trie_node_set_next_sibling(tmp, internal);
 				mark_buffer_dirty(tbh);
 				brelse(tbh);
 				break;
 			}
-			prev = tmp->next_sibling;
+			prev = trie_node_next_sibling(tmp);
 			brelse(tbh);
 		}
 	}
@@ -415,9 +416,9 @@ static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
 
 	/* Link old leaf as child of internal. */
 	if (trie_get_node(sb, internal, &ibh, &ipage, &inode) == 0) {
-		inode->first_child = child;
-		inode->next_sibling = old_sibling;
-		inode->child_count = 1;
+		trie_node_set_first_child(inode, child);
+		trie_node_set_next_sibling(inode, old_sibling);
+		trie_node_set_child_count(inode, 1);
 		mark_buffer_dirty(ibh);
 		brelse(ibh);
 	}
@@ -427,7 +428,7 @@ static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
 		if (trie_get_node(sb, internal, &ibh, &ipage, &inode) == 0) {
 			inode->node_type |= NODE_STATUS_LEAF;
 			TRIE_SET_FTYPE(inode, type);
-			inode->inode = ino;
+			trie_node_set_inode(inode, ino);
 			trie_store_name(sb, internal, name, name_len);
 			mark_buffer_dirty(ibh);
 			brelse(ibh);
@@ -475,7 +476,7 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 				if (cnode->node_type & NODE_TYPE_INTERM) {
 					if (cnode->node_type & NODE_STATUS_LEAF) {
 						char *ename = trie_node_name(cbh->b_data, cnode);
-						int elen = cnode->name_len - 2;
+						int elen = trie_node_name_len(cnode) - 2;
 						if (elen == name_len &&
 						    memcmp(ename, name, name_len) == 0) {
 							brelse(cbh);
@@ -485,7 +486,7 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 
 					cnode->node_type |= NODE_STATUS_LEAF;
 					TRIE_SET_FTYPE(cnode, type);
-					cnode->inode = ino;
+					trie_node_set_inode(cnode, ino);
 					trie_store_name(sb, existing, name, name_len);
 					mark_buffer_dirty(cbh);
 					brelse(cbh);
@@ -495,7 +496,7 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 				/* Existing pure leaf.  Check duplicate then split. */
 				{
 					char *ename = trie_node_name(cbh->b_data, cnode);
-					int elen = cnode->name_len - 2;
+					int elen = trie_node_name_len(cnode) - 2;
 					if (elen == name_len &&
 					    memcmp(ename, name, name_len) == 0) {
 						brelse(cbh);
@@ -523,7 +524,7 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 			}
 			node->node_type = 0;
 			TRIE_SET_FTYPE(node, type);
-			node->inode = ino;
+			trie_node_set_inode(node, ino);
 			trie_store_name(sb, new_leaf, name, name_len);
 			mark_buffer_dirty(bh);
 			brelse(bh);
@@ -588,11 +589,11 @@ int briefs_trie_update_entry(struct super_block *sb, struct briefs_inode *di,
 		if (pos == name_len - 1) {
 			if (TRIE_IS_LEAF(cnode)) {
 				char *ename = trie_node_name(cbh->b_data, cnode);
-				int elen = cnode->name_len - 2;
+				int elen = trie_node_name_len(cnode) - 2;
 
 				if (elen == (int)name_len &&
 				    memcmp(ename, name, name_len) == 0) {
-					cnode->inode = new_ino;
+					trie_node_set_inode(cnode, new_ino);
 					TRIE_SET_FTYPE(cnode, new_type);
 					mark_buffer_dirty(cbh);
 					brelse(cbh);
@@ -606,7 +607,7 @@ int briefs_trie_update_entry(struct super_block *sb, struct briefs_inode *di,
 		if (!(cnode->node_type & NODE_TYPE_INTERM)) {
 			/* Pure leaf where we need an INTERM. */
 			char *ename = trie_node_name(cbh->b_data, cnode);
-			int elen = cnode->name_len - 2;
+			int elen = trie_node_name_len(cnode) - 2;
 
 			brelse(cbh);
 			if (elen == (int)name_len &&
@@ -688,8 +689,8 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 			}
 
 			if (node->node_type & NODE_TYPE_INTERM) {
-				bool has_children = !TRIE_REF_IS_NULL(node->first_child) ||
-				                  node->child_count != 0;
+				bool has_children = !TRIE_REF_IS_NULL(trie_node_first_child(node)) ||
+				                  trie_node_child_count(node) != 0;
 
 				node->node_type &= ~NODE_STATUS_LEAF;
 				if (has_children) {
@@ -742,8 +743,8 @@ collapse:
 
 			if (!(cn2->node_type & NODE_TYPE_INTERM) ||
 			    (cn2->node_type & NODE_STATUS_LEAF) ||
-			    cn2->child_count != 0 ||
-			    !TRIE_REF_IS_NULL(cn2->first_child)) {
+			    trie_node_child_count(cn2) != 0 ||
+			    !TRIE_REF_IS_NULL(trie_node_first_child(cn2))) {
 				brelse(cbh2);
 				break;
 			}
@@ -753,27 +754,27 @@ collapse:
 				break;
 			}
 
-			if (pn2->first_child == check) {
-				pn2->first_child = cn2->next_sibling;
+			if (trie_node_first_child(pn2) == check) {
+				trie_node_set_first_child(pn2, trie_node_next_sibling(cn2));
 			} else {
-				u64 w = pn2->first_child;
+				u64 w = trie_node_first_child(pn2);
 				while (!TRIE_REF_IS_NULL(w)) {
 					struct buffer_head *wbh;
 					struct briefs_trie_page *wpage;
 					struct briefs_trie_node *wn;
 					if (trie_get_node(sb, w, &wbh, &wpage, &wn) != 0)
 						break;
-					if (wn->next_sibling == check) {
-						wn->next_sibling = cn2->next_sibling;
+					if (trie_node_next_sibling(wn) == check) {
+						trie_node_set_next_sibling(wn, trie_node_next_sibling(cn2));
 						mark_buffer_dirty(wbh);
 						brelse(wbh);
 						break;
 					}
-					w = wn->next_sibling;
+					w = trie_node_next_sibling(wn);
 					brelse(wbh);
 				}
 			}
-			pn2->child_count--;
+			trie_node_set_child_count(pn2, trie_node_child_count(pn2) - 1);
 			mark_buffer_dirty(pbh2);
 			brelse(pbh2);
 
@@ -837,7 +838,7 @@ void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di)
 		stack[sp - 1].state = 1;
 
 		{
-			u64 child = node->first_child;
+			u64 child = trie_node_first_child(node);
 			while (!TRIE_REF_IS_NULL(child)) {
 				struct buffer_head *cbh;
 				struct briefs_trie_page *cpage;
@@ -846,7 +847,7 @@ void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di)
 
 				if (trie_read_node(sb, child, &cbh, &cpage, &cn) != 0)
 					break;
-				next = cn->next_sibling;
+				next = trie_node_next_sibling(cn);
 				brelse(cbh);
 
 				if (sp < 512) {
@@ -922,17 +923,17 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 
 		if (TRIE_IS_LEAF(node)) {
 			char *src = trie_node_name(bh->b_data, node);
-			int nlen = node->name_len - 2;
+			int nlen = trie_node_name_len(node) - 2;
 
 			if (nlen > 0 && nlen <= BRIEFS_NAME_LEN) {
-				if (ino) *ino = node->inode;
+				if (ino) *ino = trie_node_inode(node);
 				if (type) *type = TRIE_NODE_FTYPE(node);
 				if (name_buf && name_len) {
 					memcpy(name_buf, src, nlen);
 					*name_len = nlen;
 				}
 
-				if (!TRIE_REF_IS_NULL(node->first_child) && iter->sp < 256) {
+				if (!TRIE_REF_IS_NULL(trie_node_first_child(node)) && iter->sp < 256) {
 					iter->stack[iter->sp] = ref;
 					iter->leaf_emitted[iter->sp] = 1;
 					iter->sp++;
@@ -944,8 +945,8 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 		}
 
 	push_children:
-		if (!TRIE_REF_IS_NULL(node->first_child)) {
-			u64 child = node->first_child;
+		if (!TRIE_REF_IS_NULL(trie_node_first_child(node))) {
+			u64 child = trie_node_first_child(node);
 			int pushed = 0;
 
 			while (!TRIE_REF_IS_NULL(child)) {
@@ -971,7 +972,7 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 					struct briefs_trie_node *cn;
 					if (trie_read_node(sb, child, &cbh, &cpage, &cn) != 0)
 						break;
-					child = cn->next_sibling;
+					child = trie_node_next_sibling(cn);
 					brelse(cbh);
 				}
 			}

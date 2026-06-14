@@ -8,7 +8,6 @@
 
 /* Journal constants */
 #define JOURNAL_BLOCK_SIZE 4096
-#define JRN_RECORD_MAX_SIZE 320  /* max record size (JRN_DIR_UPDATE) */
 
 /* Journal context */
 struct briefs_journal {

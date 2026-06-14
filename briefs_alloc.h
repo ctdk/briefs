@@ -14,14 +14,13 @@ struct super_block;
 #define ALLOC_MAGIC 0x4249544D /* "BITM" */
 
 struct alloc_pool_header {
-	__u32 magic;           /* ALLOC_MAGIC */
-	__u32 version;         /* 1 */
-	__u64 l0_words;        /* number of u64 words in level 0 */
-	__u64 l1_words;        /* number of u64 words in level 1 */
-	__u64 l2_words;        /* number of u64 words in level 2 */
-	__u64 block_count;     /* total data blocks tracked */
-	__u64 free_count;      /* total free blocks */
-	__u64 reserved[6];
+	__le32 magic;          /* ALLOC_MAGIC */
+	__le32 version;        /* 1 */
+	__le64 l0_words;       /* number of u64 words in level 0 */
+	__le64 l1_words;       /* number of u64 words in level 1 */
+	__le64 l2_words;       /* number of u64 words in level 2 */
+	__le64 block_count;    /* total data blocks tracked */
+	__le64 free_count;     /* total free blocks */
 };
 
 /* Allocator context - 3-level bitmap pyramid.

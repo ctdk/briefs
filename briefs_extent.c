@@ -75,12 +75,12 @@ void briefs_free_chain_blocks(struct super_block *sb, u64 chain_block)
 		if (!bh)
 			break;
 		chain = (struct briefs_extent_chain *)bh->b_data;
-		if (chain->checksum != 0 &&
+		if (le64_to_cpu(chain->checksum) != 0 &&
 		    briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
 			pr_warn("briefs: chain block %llu checksum mismatch while freeing; continuing\n",
 				chain_block);
 		}
-		next = chain->next_overflow_block;
+		next = le64_to_cpu(chain->next_overflow_block);
 		brelse(bh);
 
 		briefs_journal_extent_free(bsi->journal, 0, 0, chain_block, 1);
@@ -100,6 +100,7 @@ static int briefs_read_chain_extent(struct super_block *sb, u64 chain_block,
 {
 	struct buffer_head *bh;
 	struct briefs_extent_chain *chain;
+	u32 num_in_block;
 
 	while (chain_block) {
 		bh = sb_bread(sb, chain_block);
@@ -115,14 +116,15 @@ static int briefs_read_chain_extent(struct super_block *sb, u64 chain_block,
 			return -EIO;
 		}
 
-		if (chain_idx < chain->num_extents_in_block) {
-			*ext = chain->extents[chain_idx];
+		num_in_block = le32_to_cpu(chain->num_extents_in_block);
+		if (chain_idx < num_in_block) {
+			briefs_disk_extent_to_cpu(&chain->extents[chain_idx], ext);
 			brelse(bh);
 			return 0;
 		}
 
-		chain_idx -= chain->num_extents_in_block;
-		chain_block = chain->next_overflow_block;
+		chain_idx -= num_in_block;
+		chain_block = le64_to_cpu(chain->next_overflow_block);
 		brelse(bh);
 	}
 
@@ -221,7 +223,7 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 						brelse(bh);
 						return -EIO;
 					}
-					chain_block = chain->next_overflow_block;
+					chain_block = le64_to_cpu(chain->next_overflow_block);
 					brelse(bh);
 					if (chain_block == 0)
 						return -EIO;
@@ -236,8 +238,16 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 					brelse(bh);
 					return -EIO;
 				}
-				chain->extents[block_slot].len++;
-				chain->checksum = briefs_chain_checksum(bh->b_data);
+				{
+					struct briefs_extent tmp;
+
+					briefs_disk_extent_to_cpu(&chain->extents[block_slot],
+								  &tmp);
+					tmp.len++;
+					briefs_cpu_extent_to_disk(&tmp,
+								  &chain->extents[block_slot]);
+				}
+				chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
 				mark_buffer_dirty(bh);
 				sync_dirty_buffer(bh);
 				brelse(bh);
@@ -297,6 +307,8 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 
 	/* Walk to the last chain block */
 	while (1) {
+		u32 num_in_block;
+
 		bh = sb_bread(sb, chain_block);
 		if (!bh) {
 			return -EIO;
@@ -309,12 +321,13 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 			return -EIO;
 		}
 
-		if (chain->num_extents_in_block < CHAIN_EXTENTS) {
+		num_in_block = le32_to_cpu(chain->num_extents_in_block);
+		if (num_in_block < CHAIN_EXTENTS) {
 			/* Room in this block */
-			slot = chain->num_extents_in_block;
-			chain->extents[slot] = *ext;
-			chain->num_extents_in_block++;
-			chain->checksum = briefs_chain_checksum(bh->b_data);
+			slot = num_in_block;
+			briefs_cpu_extent_to_disk(ext, &chain->extents[slot]);
+			chain->num_extents_in_block = cpu_to_le32(num_in_block + 1);
+			chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
 			mark_buffer_dirty(bh);
 			sync_dirty_buffer(bh);
 			brelse(bh);
@@ -331,8 +344,8 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 		}
 
 		/* Chain block full - follow or allocate next */
-		if (chain->next_overflow_block) {
-			chain_block = chain->next_overflow_block;
+		if (le64_to_cpu(chain->next_overflow_block)) {
+			chain_block = le64_to_cpu(chain->next_overflow_block);
 			brelse(bh);
 			continue;
 		}
@@ -343,29 +356,31 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 			brelse(bh);
 			return -ENOSPC;
 		}
-		u64 new_block = data_to_abs(bsi->sb, rel);
-		chain->next_overflow_block = new_block;
-		chain->checksum = briefs_chain_checksum(bh->b_data);
-		mark_buffer_dirty(bh);
-		sync_dirty_buffer(bh);
-		brelse(bh);
+		{
+			u64 new_block = data_to_abs(bsi->sb, rel);
+			chain->next_overflow_block = cpu_to_le64(new_block);
+			chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
+			mark_buffer_dirty(bh);
+			sync_dirty_buffer(bh);
+			brelse(bh);
 
-		/* Journal the new chain block allocation */
-		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
-					    0, new_block, 1, -1);
+			/* Journal the new chain block allocation */
+			briefs_journal_extent_alloc(bsi->journal, di->inode_number,
+						    0, new_block, 1, -1);
 
-		/* Set up new chain block */
-		bh = briefs_get_zero_block(sb, new_block);
-		if (!bh) {
-			briefs_free_block(&bsi->alloc, rel);
-			return -EIO;
+			/* Set up new chain block */
+			bh = briefs_get_zero_block(sb, new_block);
+			if (!bh) {
+				briefs_free_block(&bsi->alloc, rel);
+				return -EIO;
+			}
+			chain = (struct briefs_extent_chain *)bh->b_data;
+			briefs_cpu_extent_to_disk(ext, &chain->extents[0]);
+			chain->num_extents_in_block = cpu_to_le32(1);
+			chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
+			sync_dirty_buffer(bh);
+			brelse(bh);
 		}
-		chain = (struct briefs_extent_chain *)bh->b_data;
-		chain->extents[0] = *ext;
-		chain->num_extents_in_block = 1;
-		chain->checksum = briefs_chain_checksum(bh->b_data);
-		sync_dirty_buffer(bh);
-		brelse(bh);
 
 		write_seqcount_begin(&binfo->extent_seq);
 		di->num_extents_total++;

@@ -68,9 +68,10 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 
 	bsb = (struct briefs_superblock *) bh->b_data;
 
-	pr_info("briefs: superblock magic=0x%016llx, inode_table_offset=%llu\n", bsb->magic, bsb->inode_table_offset);
+	pr_info("briefs: superblock magic=0x%016llx, inode_table_offset=%llu\n",
+	        le64_to_cpu(bsb->magic), le64_to_cpu(bsb->inode_table_offset));
 
-	sb->s_magic = bsb->magic;
+	sb->s_magic = le64_to_cpu(bsb->magic);
 
 	pr_info("briefs: magic=0x%08lx\n", sb->s_magic);
 
@@ -91,7 +92,8 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 	}
 
 	/* Initialize inode allocator */
-	ret = briefs_alloc_init_at(&bsi->inode_alloc, sb, bsb->inode_bitmap_offset);
+	ret = briefs_alloc_init_at(&bsi->inode_alloc, sb,
+	                           le64_to_cpu(bsb->inode_bitmap_offset));
 	if (ret) {
 		pr_err("briefs: failed to initialize inode allocator: %d\n", ret);
 		goto out_no_root;
@@ -134,8 +136,8 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 		goto out_iput;
 	}
 
-	bsi->data_blocks = bsb->data_blocks;
-	bsi->free_data_blocks = bsb->free_data_blocks;
+	bsi->data_blocks = le64_to_cpu(bsb->data_blocks);
+	bsi->free_data_blocks = le64_to_cpu(bsb->free_data_blocks);
 	/* Compute inode counts from the inode allocator pyramid */
 	bsi->num_inodes = bsi->inode_alloc.block_count;
 	bsi->free_inodes = bsi->inode_alloc.free_count;
@@ -211,8 +213,8 @@ void briefs_put_super(struct super_block *sb) {
 				struct buffer_head *sbh = sb_bread(sb, 0);
 				if (sbh) {
 					struct briefs_superblock *bsb = (struct briefs_superblock *)sbh->b_data;
-					bsb->free_data_blocks = bsi->alloc.free_count;
-					bsb->free_inodes = bsi->inode_alloc.free_count;
+					bsb->free_data_blocks = cpu_to_le64(bsi->alloc.free_count);
+					bsb->free_inodes = cpu_to_le64(bsi->inode_alloc.free_count);
 					mark_buffer_dirty(sbh);
 					sync_dirty_buffer(sbh);
 					brelse(sbh);

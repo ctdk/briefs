@@ -28,7 +28,8 @@
 int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb,
                       struct briefs_superblock *sb_disk)
 {
-	return briefs_alloc_init_at(alloc, sb, sb_disk->trie_node_pool_start);
+	return briefs_alloc_init_at(alloc, sb,
+		le64_to_cpu(sb_disk->trie_node_pool_start));
 }
 
 /*
@@ -60,18 +61,18 @@ int briefs_alloc_init_at(struct briefs_alloc *alloc, struct super_block *sb,
 	}
 
 	hdr = (struct alloc_pool_header *)bh->b_data;
-	if (hdr->magic != ALLOC_MAGIC) {
+	if (le32_to_cpu(hdr->magic) != ALLOC_MAGIC) {
 		pr_err("briefs: invalid allocator magic: 0x%08x (expected 0x%08x)\n",
-			hdr->magic, ALLOC_MAGIC);
+			le32_to_cpu(hdr->magic), ALLOC_MAGIC);
 		brelse(bh);
 		return -EINVAL;
 	}
 
-	alloc->l0_words = hdr->l0_words;
-	alloc->l1_words = hdr->l1_words;
-	alloc->l2_words = hdr->l2_words;
-	alloc->block_count = hdr->block_count;
-	alloc->free_count = hdr->free_count;
+	alloc->l0_words = le64_to_cpu(hdr->l0_words);
+	alloc->l1_words = le64_to_cpu(hdr->l1_words);
+	alloc->l2_words = le64_to_cpu(hdr->l2_words);
+	alloc->block_count = le64_to_cpu(hdr->block_count);
+	alloc->free_count = le64_to_cpu(hdr->free_count);
 
 	brelse(bh);
 
@@ -116,7 +117,7 @@ int briefs_alloc_init_at(struct briefs_alloc *alloc, struct super_block *sb,
 			return -EIO;
 		}
 		for (j = 0; j < n; j++)
-			alloc->l0[w + j] = ((u64 *)bh->b_data)[j];
+			alloc->l0[w + j] = le64_to_cpu(((u64 *)bh->b_data)[j]);
 		brelse(bh);
 		w += n;
 	}
@@ -138,7 +139,7 @@ int briefs_alloc_init_at(struct briefs_alloc *alloc, struct super_block *sb,
 			return -EIO;
 		}
 		for (j = 0; j < n; j++)
-			alloc->l1[w + j] = ((u64 *)bh->b_data)[j];
+			alloc->l1[w + j] = le64_to_cpu(((u64 *)bh->b_data)[j]);
 		brelse(bh);
 		w += n;
 	}
@@ -160,7 +161,7 @@ int briefs_alloc_init_at(struct briefs_alloc *alloc, struct super_block *sb,
 			return -EIO;
 		}
 		for (j = 0; j < n; j++)
-			alloc->l2[w + j] = ((u64 *)bh->b_data)[j];
+			alloc->l2[w + j] = le64_to_cpu(((u64 *)bh->b_data)[j]);
 		brelse(bh);
 		w += n;
 	}
@@ -364,8 +365,11 @@ static int briefs_alloc_sync_level(struct briefs_alloc *alloc, u64 *array,
 		}
 
 		for (j = 0; j < n; j++) {
-			if (((u64 *)bh->b_data)[j] != array[start + j]) {
-				((u64 *)bh->b_data)[j] = array[start + j];
+			__le64 *disk_word = (__le64 *)bh->b_data + j;
+			__u64 cur = le64_to_cpu(*disk_word);
+
+			if (cur != array[start + j]) {
+				*disk_word = cpu_to_le64(array[start + j]);
 				dirty = true;
 			}
 		}
@@ -432,7 +436,7 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 		struct buffer_head *bh = sb_bread(alloc->sb, alloc->alloc_pool_start);
 		if (bh) {
 			struct alloc_pool_header *hdr = (struct alloc_pool_header *)bh->b_data;
-			hdr->free_count = alloc->free_count;
+			hdr->free_count = cpu_to_le64(alloc->free_count);
 			mark_buffer_dirty(bh);
 			sync_dirty_buffer(bh);
 			brelse(bh);
