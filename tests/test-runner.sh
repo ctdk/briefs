@@ -122,7 +122,14 @@ check_file "append" "$MNT_POINT/hello" "HelloWorldAppended"
 
 # Hole read (read from sparse file offset — should be zeros)
 dd if=/dev/zero bs=4096 count=1 of="$MNT_POINT/sparse" 2>/dev/null
-check_file "sparse file write" "$MNT_POINT/sparse" ""
+SPARSE_SIZE=$(stat -c%s "$MNT_POINT/sparse" 2>/dev/null || echo 0)
+[ "$SPARSE_SIZE" = "4096" ] && pass "sparse file size" || fail "sparse file size" "(expected 4096, got $SPARSE_SIZE)"
+if od -An -tx1 -N4096 "/sparse" 2>/dev/null | tr -d ' 
+' | tr -d '0' | grep -q '.'; then
+  fail "sparse file all zeros"
+else
+  pass "sparse file all zeros"
+fi
 
 # Truncate
 truncate -s 5 "$MNT_POINT/hello" 2>/dev/null && pass "truncate to 5" || fail "truncate"

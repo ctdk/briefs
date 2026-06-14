@@ -383,7 +383,7 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 
 	/* Update and persist parent directory */
 	ret = briefs_update_parent_dir(dir, bsi,
-						sizeof(struct briefs_dir_entry) + 2 + new_dentry->d_name.len,
+						BRIEFS_DIR_ENTRY_PREFIX_LEN + new_dentry->d_name.len,
 						0);
 	if (ret) {
 		struct briefs_inode_info *binfo = briefs_i(inode);

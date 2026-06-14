@@ -300,7 +300,7 @@ int briefs_finish_create(struct inode *dir, struct dentry *dentry,
 	}
 
 	ret = briefs_update_parent_dir(dir, bsi,
-					sizeof(struct briefs_dir_entry) + 2 + dentry->d_name.len,
+					BRIEFS_DIR_ENTRY_PREFIX_LEN + dentry->d_name.len,
 					link_delta);
 	if (ret) {
 		pr_err("briefs: failed to update parent dir after create: %d\n", ret);

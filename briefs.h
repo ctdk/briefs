@@ -43,10 +43,8 @@ enum journal_record_type {
 	JRN_INODE_UPDATE,
 	JRN_INODE_ALLOC,
 	JRN_INODE_FREE,
-	JRN_BITMAP_UPDATE,
 	JRN_TRIE_ALLOC,
 	JRN_DIR_UPDATE,
-	JRN_SBBLOCK_UPDATE,
 	JRN_CHECKPOINT,
 	JRN_END,
 };
@@ -114,16 +112,6 @@ struct jrn_inode_free {
 	__le64 ino;           /* inode being freed */
 	__le32 reserved[3];
 	__le64 reserved2;
-};
-
-/* JRN_BITMAP_UPDATE */
-struct jrn_bitmap_update {
-	__le32 bitmap_type;   /* 0 = free data, 1 = free inode */
-	__le32 reserved1;
-	__le64 offset;        /* bit offset in bitmap */
-	__le64 count;         /* number of consecutive bits */
-	__u8 flip_to;         /* 0 = mark free, 1 = mark allocated */
-	__u8 reserved2[39];   /* padding to 64 bytes */
 };
 
 /* JRN_TRIE_ALLOC - log allocation/free of a packed directory-trie page */
@@ -647,62 +635,12 @@ void briefs_trie_iter_free(struct trie_iter *iter);
 void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di, u64 gen);
 int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter, u64 current_gen, u64 *ino, u8 *type, char *name_buf, int *name_len);
 
-/* Directory block magic */
-#define BRIEFS_DIR_MAGIC 0x44525952  /* "DRYR" */
-
 /*
- * Directory entry — compact, variable-length name.
- * Names are packed into the trailing name region of the directory block
- * (growing downward from block end). Each DirEntry has a name_len and
- * name_off that points into the name region.
- *
- * A name_off of 0 means "no name" (used for empty/deleted slots).
- * name_off is the byte offset FROM THE END of the block:
- *   name_ptr = block + block_size - name_off
+ * Packed directory-trie entries store only a 2-byte little-endian length
+ * prefix followed by the name bytes.  The constants below describe the
+ * accounting used for directory size updates.
  */
-struct briefs_dir_entry {
-	__le64 inode;             /* inode number */
-	__u8  type;               /* file type (S_IFMT bits) */
-	__u8  flags;              /* flags */
-	__u8  reserved[2];        /* padding to 16-byte alignment */
-	__le16 name_len;          /* name length (1..BRIEFS_NAME_LEN) */
-	__le16 name_off;          /* offset from block end into name region */
-};                            /* 16 bytes total */
-
-/*
- * Directory block header (16 bytes). Followed by a variable-length
- * array of DirEntry structs, then a packed name region that grows
- * downward from block_size.
- *
- *          +----------------+  block_start
- *          | DirBlockHeader |  16 bytes
- *          +----------------+
- *          | DirEntry[0]    |  16 bytes
- *          | DirEntry[1]    |  16 bytes
- *          | ...            |
- *          +----------------+  data_end = sizeof(header) + num_entries * sizeof(DirEntry)
- *          |    unused      |
- *          +----------------+
- *          | name_N  ...    |  names_size bytes
- *          | name_1  ...    |
- *          | name_0  ...    |
- *          +----------------+  block_start + block_size
- *
- * Names are stored with a 2-byte length prefix for forward scanning:
- *   [len:2][name bytes...]
- * The region grows downward, so the newest name is closest to block end.
- * name_off = offset from block end to the start of the name entry
- *            (including the 2-byte length prefix).
- */
-struct briefs_dir_block {
-	__le32 magic;             /* BRIEFS_DIR_MAGIC */
-	__le32 num_entries;       /* number of entries in this block */
-	__le32 data_size;         /* bytes used by entries (header + entries) */
-	__le32 names_size;        /* bytes used by packed name region */
-};
-
-/* Max entries per directory block (rough estimate for safety) */
-#define BRIEFS_DIR_MAX_ENTRIES 300
+#define BRIEFS_DIR_ENTRY_PREFIX_LEN 2
 
 /* VFS inode type macros */
 #define BRIEFS_S_IFMT   0170000  /* type of file */
@@ -916,7 +854,6 @@ static inline void briefs_build_bug_on_sizes(void)
 	BUILD_BUG_ON(sizeof(struct jrn_extent_alloc) != 80);
 	BUILD_BUG_ON(sizeof(struct jrn_extent_free) != 80);
 	BUILD_BUG_ON(sizeof(struct jrn_inode_alloc) != 40);
-	BUILD_BUG_ON(sizeof(struct jrn_bitmap_update) != 64);
 	BUILD_BUG_ON(sizeof(struct jrn_trie_alloc) != 16);
 	BUILD_BUG_ON(sizeof(struct jrn_inode_free) != 32);
 }
