@@ -462,25 +462,35 @@ static int briefs_empty_dir(struct inode *inode, int *ret){
 /* briefs_unlink_common - common unlink/rmdir logic */
 static int briefs_unlink_common(struct inode *dir, struct dentry *dentry) {
 	struct briefs_sb_info *bsi;
-	struct inode *inode = d_inode(dentry);
+	struct inode *inode;
+	struct briefs_inode_info *binfo;
+	unsigned int old_inode_nlink, old_dir_nlink;
+	u8 ftype;
 	int ret;
 
 	pr_debug("briefs: common unlink/rmdir logic %pd\n", dentry);
 
+	inode = d_inode(dentry);
+	if (!inode)
+		return -ENOENT;
+
 	bsi = dir->i_sb->s_fs_info;
+	ftype = (inode->i_mode & S_IFMT) >> 12;
+	old_inode_nlink = inode->i_nlink;
+	old_dir_nlink = dir->i_nlink;
 
-	/* Log directory entry deletion */
-	ret = briefs_journal_dir_del(bsi->journal, dir->i_ino, dentry);
-	if (ret) {
-		pr_debug("journaling %pd failed\n", dentry);
-		return ret;
-	}
-
-	/* Remove the directory entry from the parent */
+	/* Remove the directory entry from the parent first. */
 	ret = briefs_remove_dir_entry(dir, dentry->d_name.name, dentry->d_name.len);
 	if (ret) {
 		pr_debug("removing %pd failed\n", dentry);
 		return ret;
+	}
+
+	/* Log directory entry deletion only after the trie is changed. */
+	ret = briefs_journal_dir_del(bsi->journal, dir->i_ino, dentry);
+	if (ret) {
+		pr_debug("journaling %pd failed\n", dentry);
+		goto restore_entry;
 	}
 
 	/*
@@ -499,23 +509,41 @@ static int briefs_unlink_common(struct inode *dir, struct dentry *dentry) {
 		mark_inode_dirty(inode);
 	}
 
-	/* TODO: double check that this is *actually* the right thing to do. I
-	 * have a sneaking suspicion this was hallucinated or is wrong, but I
-	 * could easily be wrong myself. */
 	/* Journal the target inode nlink change */
 	briefs_journal_inode_update(bsi->journal, inode);
 
 	/* Update parent directory size and persist (nlink was already adjusted) */
 	ret = briefs_update_parent_dir(dir, bsi,
-					-(ssize_t)(2 + dentry->d_name.len),
+					-(ssize_t)(BRIEFS_DIR_ENTRY_PREFIX_LEN + dentry->d_name.len),
 					0);
 	if (ret) {
 		pr_err("briefs: failed to update parent dir after unlink: %d\n", ret);
-		return ret;
+		goto restore_nlink;
 	}
 
 	pr_debug("briefs: leaving common unlink/rmdir logic %pd\n", dentry);
 	return 0;
+
+restore_nlink:
+	/* Restore nlink and persist so the inode matches the restored entry. */
+	binfo = briefs_i(inode);
+	if (S_ISDIR(inode->i_mode)) {
+		set_nlink(dir, old_dir_nlink);
+		set_nlink(inode, old_inode_nlink);
+	} else {
+		set_nlink(inode, old_inode_nlink);
+	}
+	binfo->disk_inode.nlinks = inode->i_nlink;
+	briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+				  &binfo->disk_inode, false);
+
+restore_entry:
+	/* Restore the directory entry and emit a compensating journal record. */
+	if (briefs_add_dir_entry(dir, dentry->d_name.name, dentry->d_name.len,
+				 inode->i_ino, ftype) == 0)
+		briefs_journal_dir_add(bsi->journal, dir->i_ino, inode->i_ino, dentry);
+
+	return ret;
 }
 
 /* briefs_unlink - remove a directory entry */
@@ -566,68 +594,109 @@ int briefs_rmdir(struct inode *dir, struct dentry *dentry) {
 
 /* briefs_rename - rename a directory entry */
 int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
-	                  struct inode *new_dir, struct dentry *new_dentry, unsigned int flags) {
+                  struct inode *new_dir, struct dentry *new_dentry, unsigned int flags) {
 	struct briefs_sb_info *bsi;
-	struct inode *inode = d_inode(old_dentry);
+	struct inode *inode;
+	struct briefs_inode_info *moved_binfo = NULL;
+	unsigned int old_olddir_nlink, old_newdir_nlink;
+	u64 old_parent_ino = 0;
+	u8 ftype;
 	int ret;
+	bool old_removed = false;
+	bool new_added = false;
+	bool crossdir_changed = false;
 
 	pr_debug("briefs: rename %pd -> %pd\n", old_dentry, new_dentry);
 
+	inode = d_inode(old_dentry);
 	if (!inode)
 		return -ENOENT;
 
 	bsi = old_dir->i_sb->s_fs_info;
+	ftype = (inode->i_mode & S_IFMT) >> 12;
+	old_olddir_nlink = old_dir->i_nlink;
+	old_newdir_nlink = new_dir->i_nlink;
 
-	/* Log old entry deletion */
-	ret = briefs_journal_dir_del(bsi->journal, old_dir->i_ino, old_dentry);
-	if (ret)
-		return ret;
-
-	/* Log new entry creation */
-	ret = briefs_journal_dir_add(bsi->journal, new_dir->i_ino, inode->i_ino, new_dentry);
-	if (ret)
-		return ret;
-
-	/* Remove old entry */
+	/* Remove old entry first; only journal after the trie is changed. */
 	ret = briefs_remove_dir_entry(old_dir, old_dentry->d_name.name, old_dentry->d_name.len);
 	if (ret)
 		return ret;
+	old_removed = true;
 
-	/* Add new entry */
-	u8 ftype = (inode->i_mode & S_IFMT) >> 12;
-	ret = briefs_add_dir_entry(new_dir, new_dentry->d_name.name, new_dentry->d_name.len,
-					   inode->i_ino, ftype);
+	ret = briefs_journal_dir_del(bsi->journal, old_dir->i_ino, old_dentry);
 	if (ret)
-		return ret;
+		goto fail;
+
+	/* Add new entry; only journal after the trie is changed. */
+	ret = briefs_add_dir_entry(new_dir, new_dentry->d_name.name, new_dentry->d_name.len,
+				   inode->i_ino, ftype);
+	if (ret)
+		goto fail;
+	new_added = true;
+
+	ret = briefs_journal_dir_add(bsi->journal, new_dir->i_ino, inode->i_ino, new_dentry);
+	if (ret)
+		goto fail;
 
 	/* Handle cross-directory rename: update nlink and parent_inode */
-	if (old_dir != new_dir) {
-		if (S_ISDIR(inode->i_mode)) {
-			drop_nlink(old_dir);
-			briefs_journal_inode_update(bsi->journal, old_dir);
-			inc_nlink(new_dir);
-			briefs_journal_inode_update(bsi->journal, new_dir);
+	if (old_dir != new_dir && S_ISDIR(inode->i_mode)) {
+		moved_binfo = briefs_i(inode);
+		old_parent_ino = moved_binfo->disk_inode.parent_inode;
 
-			/* Update parent_inode in the moved directory's on-disk inode */
-			struct briefs_inode_info *moved_binfo = briefs_i(inode);
-			moved_binfo->disk_inode.parent_inode = new_dir->i_ino;
-			briefs_journal_inode_update(bsi->journal, inode);
-			briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
-						  &moved_binfo->disk_inode, false);
-		}
+		drop_nlink(old_dir);
+		inc_nlink(new_dir);
+		moved_binfo->disk_inode.parent_inode = new_dir->i_ino;
+		crossdir_changed = true;
+
+		briefs_journal_inode_update(bsi->journal, old_dir);
+		briefs_journal_inode_update(bsi->journal, new_dir);
+		briefs_journal_inode_update(bsi->journal, inode);
+
+		ret = briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+					  &moved_binfo->disk_inode, false);
+		if (ret)
+			goto fail;
 	}
 
 	/* Persist parent directory nlink changes */
 	ret = briefs_update_parent_dir(old_dir, bsi, 0, 0);
 	if (ret)
-		return ret;
+		goto fail;
 
 	if (old_dir != new_dir) {
 		ret = briefs_update_parent_dir(new_dir, bsi, 0, 0);
 		if (ret)
-			return ret;
+			goto fail;
 	}
 
 	pr_debug("briefs: renamed %pd -> %pd\n", old_dentry, new_dentry);
 	return 0;
+
+fail:
+	/* Restore cross-directory nlink and parent_inode state. */
+	if (crossdir_changed) {
+		set_nlink(old_dir, old_olddir_nlink);
+		set_nlink(new_dir, old_newdir_nlink);
+		moved_binfo->disk_inode.parent_inode = old_parent_ino;
+		briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+					  &moved_binfo->disk_inode, false);
+		briefs_journal_inode_update(bsi->journal, old_dir);
+		briefs_journal_inode_update(bsi->journal, new_dir);
+		briefs_journal_inode_update(bsi->journal, inode);
+	}
+
+	/* Undo the new entry and its journal record. */
+	if (new_added) {
+		briefs_remove_dir_entry(new_dir, new_dentry->d_name.name, new_dentry->d_name.len);
+		briefs_journal_dir_del(bsi->journal, new_dir->i_ino, new_dentry);
+	}
+
+	/* Restore the old entry and emit a compensating journal record. */
+	if (old_removed) {
+		if (briefs_add_dir_entry(old_dir, old_dentry->d_name.name, old_dentry->d_name.len,
+					 inode->i_ino, ftype) == 0)
+			briefs_journal_dir_add(bsi->journal, old_dir->i_ino, inode->i_ino, old_dentry);
+	}
+
+	return ret;
 }
