@@ -19,6 +19,30 @@
 /* read_folio: wrapper calling mpage_read_folio with our get_block */
 static int briefs_read_folio(struct file *file, struct folio *folio)
 {
+	struct inode *inode = folio->mapping->host;
+	struct briefs_inode_info *binfo = briefs_i(inode);
+
+	if (binfo->disk_inode.flags & InodeFlagInlineData) {
+		loff_t pos = (loff_t)folio->index << PAGE_SHIFT;
+		size_t folio_size = PAGE_SIZE;
+		void *addr = folio_address(folio);
+		size_t copy_len;
+
+		if (pos >= inode->i_size) {
+			memset(addr, 0, folio_size);
+		} else {
+			copy_len = min_t(size_t, inode->i_size - pos, folio_size);
+			memcpy(addr, binfo->disk_inode.inline_data + pos, copy_len);
+			if (copy_len < folio_size)
+				memset((u8 *)addr + copy_len, 0, folio_size - copy_len);
+		}
+
+		flush_dcache_folio(folio);
+		folio_mark_uptodate(folio);
+		folio_unlock(folio);
+		return 0;
+	}
+
 	return mpage_read_folio(folio, briefs_get_block);
 }
 /* cribbing from xiafs rather than use the frankly shocking no-op openclaw
@@ -84,6 +108,183 @@ int briefs_release(struct inode *inode, struct file *file) {
 	pr_debug("briefs: release inode %lu\n", inode->i_ino);
 	return 0;
 }
+
+/*
+ * briefs_promote_inline_data - convert an inline-data inode to extent-backed.
+ *
+ * Allocates a single data block, copies the existing inline content into it,
+ * and updates the inode to reference the block with an inline extent.  The
+ * caller must hold inode_lock and should invalidate the page cache if any
+ * inline folios may be present.
+ */
+static int briefs_promote_inline_data(struct inode *inode)
+{
+	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	u64 old_size = inode->i_size;
+	u64 rel, phys;
+	struct buffer_head *bh;
+
+	if (!(binfo->disk_inode.flags & InodeFlagInlineData))
+		return 0;
+
+	/* Empty inline file: just clear the flag, let the write path allocate. */
+	if (old_size == 0) {
+		write_seqcount_begin(&binfo->extent_seq);
+		binfo->disk_inode.flags &= ~InodeFlagInlineData;
+		write_seqcount_end(&binfo->extent_seq);
+		return 0;
+	}
+
+	rel = briefs_alloc_block(&bsi->alloc);
+	if (rel == 0)
+		return -ENOSPC;
+	phys = data_to_abs(bsi->sb, rel);
+
+	bh = sb_bread(inode->i_sb, phys);
+	if (!bh) {
+		briefs_free_block(&bsi->alloc, rel);
+		return -EIO;
+	}
+	memset(bh->b_data, 0, inode->i_sb->s_blocksize);
+	memcpy(bh->b_data, binfo->disk_inode.inline_data, old_size);
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+
+	write_seqcount_begin(&binfo->extent_seq);
+	binfo->disk_inode.flags &= ~InodeFlagInlineData;
+	memset(binfo->disk_inode.inline_extents, 0,
+	       sizeof(binfo->disk_inode.inline_extents));
+	binfo->disk_inode.inline_extents[0].offset = 0;
+	binfo->disk_inode.inline_extents[0].phys = phys;
+	binfo->disk_inode.inline_extents[0].len = 1;
+	binfo->disk_inode.inline_extents[0].flags = 0;
+	binfo->disk_inode.num_extents_inline = 1;
+	binfo->disk_inode.num_extents_total = 1;
+	binfo->disk_inode.extent_inline_base = 0;
+	write_seqcount_end(&binfo->extent_seq);
+
+	inode->i_blocks = (BRIEFS_BLOCK_SIZE / 512);
+
+	briefs_journal_extent_alloc(bsi->journal, inode->i_ino, 0, phys, 1, 0);
+	{
+		struct briefs_disk_inode disk_di;
+		briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
+		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+	}
+	briefs_persist_disk_inode(inode->i_sb, inode->i_ino, &binfo->disk_inode, false);
+
+	pr_debug("briefs: promoted inline inode %lu to block %llu\n",
+		 inode->i_ino, phys);
+	return 0;
+}
+
+/*
+ * briefs_read_iter - read from a regular file.
+ *
+ * Inline-data inodes are served directly from the inode without touching the
+ * page cache.  Extent-backed files fall back to the generic page-cache path.
+ */
+ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct briefs_inode_info *binfo = briefs_i(inode);
+
+	if (binfo->disk_inode.flags & InodeFlagInlineData) {
+		size_t count = iov_iter_count(to);
+		loff_t pos = iocb->ki_pos;
+		size_t available;
+		size_t copied;
+		u8 tmp[BRIEFS_INODE_INLINE_DATA_SIZE];
+
+		inode_lock(inode);
+		if (pos >= inode->i_size) {
+			inode_unlock(inode);
+			return 0;
+		}
+		available = inode->i_size - pos;
+		copied = min(count, available);
+
+		memcpy(tmp, binfo->disk_inode.inline_data + pos, copied);
+		if (copy_to_iter(tmp, copied, to) != copied) {
+			inode_unlock(inode);
+			return -EFAULT;
+		}
+		iocb->ki_pos += copied;
+		inode_unlock(inode);
+		return copied;
+	}
+
+	return generic_file_read_iter(iocb, to);
+}
+
+/*
+ * briefs_write_iter - write to a regular file.
+ *
+ * Small writes that fit inside the 256-byte inline region are stored directly
+ * in the inode.  Larger writes promote the inode to extent-backed and then use
+ * the generic page-cache path.
+ */
+ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	loff_t pos = iocb->ki_pos;
+	size_t count = iov_iter_count(from);
+	size_t total_size;
+	int ret;
+
+	if (count == 0)
+		return 0;
+
+	/* O_APPEND writes start at the current end of file. */
+	if (iocb->ki_flags & IOCB_APPEND)
+		pos = inode->i_size;
+
+	total_size = pos + count;
+
+	inode_lock(inode);
+
+	if ((binfo->disk_inode.flags & InodeFlagInlineData) || inode->i_size == 0) {
+		if (total_size <= BRIEFS_INODE_INLINE_DATA_SIZE) {
+			u8 tmp[BRIEFS_INODE_INLINE_DATA_SIZE];
+
+			if (copy_from_iter(tmp, count, from) != count) {
+				inode_unlock(inode);
+				return -EFAULT;
+			}
+			memcpy(binfo->disk_inode.inline_data + pos, tmp, count);
+
+			write_seqcount_begin(&binfo->extent_seq);
+			binfo->disk_inode.flags |= InodeFlagInlineData;
+			if (total_size > inode->i_size) {
+				inode->i_size = total_size;
+				binfo->disk_inode.filesize = total_size;
+			}
+			write_seqcount_end(&binfo->extent_seq);
+
+			inode->i_blocks = 0;
+			mark_inode_dirty(inode);
+
+			iocb->ki_pos += count;
+			inode_unlock(inode);
+			return count;
+		}
+
+		/* Write exceeds inline capacity: promote the inode first. */
+		ret = briefs_promote_inline_data(inode);
+		if (ret) {
+			inode_unlock(inode);
+			return ret;
+		}
+		truncate_inode_pages(inode->i_mapping, 0);
+	}
+
+	inode_unlock(inode);
+	return generic_file_write_iter(iocb, from);
+}
+
 /* briefs_setattr - set file attributes (truncate support).
  * Frees data blocks on truncation, updates the inode on disk.
  */
@@ -102,18 +303,89 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	int ci;
 	s64 i;
 
-	/* Only handle truncation (i_attr_valid & ATTR_SIZE, new size < old) */
+	/* Only handle size changes here. */
 	if (!(attr->ia_valid & ATTR_SIZE))
 		goto out_copy;
 
 	new_size = attr->ia_size;
 	old_size = inode->i_size;
 
-	if (new_size >= old_size)
+	if (new_size == old_size)
+		goto out_copy;
+
+	/*
+	 * Growing an inline-data inode: zero-fill the gap and, if the new
+	 * size exceeds the inline region, promote to an extent-backed file.
+	 */
+	if (new_size > old_size && (binfo->disk_inode.flags & InodeFlagInlineData)) {
+		if (new_size <= BRIEFS_INODE_INLINE_DATA_SIZE) {
+			write_seqcount_begin(&binfo->extent_seq);
+			memset(binfo->disk_inode.inline_data + old_size, 0,
+			       new_size - old_size);
+			binfo->disk_inode.filesize = new_size;
+			inode->i_size = new_size;
+			inode->i_blocks = 0;
+			write_seqcount_end(&binfo->extent_seq);
+
+			briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+						  &binfo->disk_inode, false);
+			{
+				struct briefs_disk_inode disk_di;
+				briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
+				briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+			}
+		} else {
+			ret = briefs_promote_inline_data(inode);
+			if (ret)
+				return ret;
+
+			/* Promotion allocated one block; set the new size. */
+			binfo->disk_inode.filesize = new_size;
+			inode->i_size = new_size;
+			inode->i_blocks = (BRIEFS_BLOCK_SIZE / 512);
+			briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+						  &binfo->disk_inode, false);
+			{
+				struct briefs_disk_inode disk_di;
+				briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
+				briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+			}
+		}
+		return 0;
+	}
+
+	/* Only shrinking remains; growth of extent-backed files is unchanged. */
+	if (new_size > old_size)
 		goto out_copy;
 
 	pr_debug("briefs: setattr truncate ino=%lu %llu -> %llu\n",
 		inode->i_ino, old_size, new_size);
+
+	/* Inline-data truncate is handled separately. */
+	if (binfo->disk_inode.flags & InodeFlagInlineData) {
+		write_seqcount_begin(&binfo->extent_seq);
+		if (new_size == 0) {
+			binfo->disk_inode.flags &= ~InodeFlagInlineData;
+			memset(binfo->disk_inode.inline_data, 0,
+			       sizeof(binfo->disk_inode.inline_data));
+		} else {
+			memset(binfo->disk_inode.inline_data + new_size, 0,
+			       old_size - new_size);
+		}
+		binfo->disk_inode.filesize = new_size;
+		inode->i_size = new_size;
+		inode->i_blocks = 0;
+		write_seqcount_end(&binfo->extent_seq);
+
+		briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+					  &binfo->disk_inode, false);
+		{
+			struct briefs_disk_inode disk_di;
+			briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
+			briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+		}
+		return 0;
+	}
 
 	trunc_block = (new_size + BRIEFS_BLOCK_SIZE - 1) / BRIEFS_BLOCK_SIZE;
 
@@ -340,8 +612,11 @@ int briefs_getattr(struct mnt_idmap *idmap, const struct path *path,
 
 	generic_fillattr(idmap, request_mask, inode, stat);
 
-	/* Recompute i_blocks from all extents (inline + chain) */
-	{
+	/* Inline-data files consume no data blocks. */
+	if (binfo->disk_inode.flags & InodeFlagInlineData) {
+		i_blocks = 0;
+	} else {
+		/* Recompute i_blocks from all extents (inline + chain) */
 		struct briefs_extent ext;
 		u64 total_blocks = 0;
 		int j;
@@ -383,11 +658,22 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	briefs_i(inode)->disk_inode.filesize = len;
 
 	/*
-	 * Store the symlink target as file data.  Use the same
-	 * data-block + extent mechanism as regular file writes.
-	 * For short targets this fits in a single inline extent.
+	 * Store the symlink target.  Short targets (<= 256 bytes) are kept
+	 * directly in the inode inline_data region; larger targets use a
+	 * data block and extent as before.
 	 */
-	if (len > 0) {
+	if (len > 0 && len <= BRIEFS_INODE_INLINE_DATA_SIZE) {
+		struct briefs_inode_info *binfo = briefs_i(inode);
+
+		memset(binfo->disk_inode.inline_data, 0,
+		       sizeof(binfo->disk_inode.inline_data));
+		memcpy(binfo->disk_inode.inline_data, symname, len);
+		binfo->disk_inode.flags |= InodeFlagInlineData;
+		inode->i_blocks = 0;
+
+		/* Persist updated inode with inline target */
+		briefs_persist_disk_inode(dir->i_sb, inode->i_ino, &binfo->disk_inode, false);
+	} else if (len > BRIEFS_INODE_INLINE_DATA_SIZE) {
 		struct buffer_head *bh;
 		u64 rel = briefs_alloc_block(&bsi->alloc);
 		if (rel == 0) {
@@ -499,8 +785,11 @@ const char *briefs_get_link(struct dentry *dentry, struct inode *inode,
 	if (!link)
 		return ERR_PTR(-ENOMEM);
 
-	/* Read the target from the first extent */
-	if (binfo->disk_inode.num_extents_total > 0) {
+	/* Read the target from inline data or the first extent. */
+	if (binfo->disk_inode.flags & InodeFlagInlineData) {
+		memcpy(link, binfo->disk_inode.inline_data, inode->i_size);
+		link[inode->i_size] = '\0';
+	} else if (binfo->disk_inode.num_extents_total > 0) {
 		struct briefs_extent ext;
 		int ret;
 

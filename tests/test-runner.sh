@@ -140,6 +140,55 @@ dd if=/dev/zero bs=4096 count=20 of="$MNT_POINT/large" 2>/dev/null
 FSIZE=$(stat -c%s "$MNT_POINT/large" 2>/dev/null || echo 0)
 [ "$FSIZE" = 81920 ] && pass "large file (20 blocks, $FSIZE bytes)" || fail "large file size" "(expected 81920, got $FSIZE)"
 
+# Inline data tests
+SMALL="$(printf 'x%.0s' $(seq 1 100))"
+echo -n "$SMALL" > "$MNT_POINT/inline_small"
+[ "$(stat -c%s "$MNT_POINT/inline_small")" -eq 100 ] && pass "inline file size 100" || fail "inline file size" "(got $(stat -c%s "$MNT_POINT/inline_small"))"
+check_file "inline file readback" "$MNT_POINT/inline_small" "$SMALL"
+
+# Append within the inline region
+echo -n " tail" >> "$MNT_POINT/inline_small"
+[ "$(stat -c%s "$MNT_POINT/inline_small")" -eq 105 ] && pass "inline append size" || fail "inline append size" "(got $(stat -c%s "$MNT_POINT/inline_small"))"
+check_file "inline append readback" "$MNT_POINT/inline_small" "${SMALL} tail"
+
+# Truncate an inline file to a smaller inline size and to zero
+truncate -s 50 "$MNT_POINT/inline_small"
+[ "$(stat -c%s "$MNT_POINT/inline_small")" -eq 50 ] && pass "inline truncate to 50" || fail "inline truncate to 50" "(got $(stat -c%s "$MNT_POINT/inline_small"))"
+check_file "inline truncate readback" "$MNT_POINT/inline_small" "$(printf 'x%.0s' $(seq 1 50))"
+
+truncate -s 0 "$MNT_POINT/inline_small"
+[ "$(stat -c%s "$MNT_POINT/inline_small")" -eq 0 ] && pass "inline truncate to zero" || fail "inline truncate to zero" "(got $(stat -c%s "$MNT_POINT/inline_small"))"
+echo -n "reborn" > "$MNT_POINT/inline_small"
+check_file "inline file after rewrite" "$MNT_POINT/inline_small" "reborn"
+
+LONGER="$(printf 'y%.0s' $(seq 1 260))"
+echo -n "$LONGER" > "$MNT_POINT/inline_promote"
+[ "$(stat -c%s "$MNT_POINT/inline_promote")" -eq 260 ] && pass "promoted inline file size 260" || fail "promoted inline file size" "(got $(stat -c%s "$MNT_POINT/inline_promote"))"
+check_file "promoted inline file readback" "$MNT_POINT/inline_promote" "$LONGER"
+
+# Promotion via append: start small and append past the 256-byte threshold
+APPEND_BASE="$(printf 'z%.0s' $(seq 1 200))"
+echo -n "$APPEND_BASE" > "$MNT_POINT/inline_append_promote"
+echo -n "$(printf 'z%.0s' $(seq 1 100))" >> "$MNT_POINT/inline_append_promote"
+[ "$(stat -c%s "$MNT_POINT/inline_append_promote")" -eq 300 ] && pass "append-promote file size 300" || fail "append-promote file size" "(got $(stat -c%s "$MNT_POINT/inline_append_promote"))"
+check_file "append-promote readback" "$MNT_POINT/inline_append_promote" "$(printf 'z%.0s' $(seq 1 300))"
+
+# Truncate an inline file past the inline threshold: should promote and zero-fill.
+TRUNC_BASE="$(printf 'w%.0s' $(seq 1 200))"
+echo -n "$TRUNC_BASE" > "$MNT_POINT/inline_trunc_promote"
+truncate -s 300 "$MNT_POINT/inline_trunc_promote"
+[ "$(stat -c%s "$MNT_POINT/inline_trunc_promote")" -eq 300 ] && pass "truncate-promote size 300" || fail "truncate-promote size" "(got $(stat -c%s "$MNT_POINT/inline_trunc_promote"))"
+printf '%s' "$TRUNC_BASE" > "$MNT_POINT/expected_trunc"
+dd if=/dev/zero bs=1 count=100 >> "$MNT_POINT/expected_trunc" 2>/dev/null
+cmp "$MNT_POINT/expected_trunc" "$MNT_POINT/inline_trunc_promote" && pass "truncate-promote content" || fail "truncate-promote content"
+
+sync
+umount "$MNT_POINT" 2>/dev/null || true
+mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for inline replay" || fail "remount for inline replay"
+check_file "inline file after replay" "$MNT_POINT/inline_small" "reborn"
+check_file "promoted inline file after replay" "$MNT_POINT/inline_promote" "$LONGER"
+check_file "append-promote file after replay" "$MNT_POINT/inline_append_promote" "$(printf 'z%.0s' $(seq 1 300))"
+
 # Phase 4: Directory operations
 echo ""
 echo "=== Phase 4: Directory Operations ==="
@@ -176,12 +225,19 @@ mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount after rmdir"
 # Phase 6b: Symlink content survives replay
 echo ""
 echo "=== Phase 6b: Symlinks ==="
-ln -s "hello-briefs-symlink" "$MNT_POINT/slink" 2>/dev/null && pass "create symlink" || fail "symlink create"
-[ "$(readlink "$MNT_POINT/slink" 2>/dev/null || true)" = "hello-briefs-symlink" ] && pass "symlink readback" || fail "symlink readback"
+ln -s "hello-briefs-symlink" "$MNT_POINT/slink" 2>/dev/null && pass "create small inline symlink" || fail "symlink create"
+[ "$(readlink "$MNT_POINT/slink" 2>/dev/null || true)" = "hello-briefs-symlink" ] && pass "small inline symlink readback" || fail "symlink readback"
+
+# Max-length inline symlink target (256 bytes)
+MAX_INLINE_TARGET="$(printf 't%.0s' $(seq 1 256))"
+ln -s "$MAX_INLINE_TARGET" "$MNT_POINT/slink_max" 2>/dev/null && pass "create max inline symlink" || fail "max inline symlink create"
+[ "$(readlink "$MNT_POINT/slink_max" 2>/dev/null || true)" = "$MAX_INLINE_TARGET" ] && pass "max inline symlink readback" || fail "max inline symlink readback"
+
 sync
 umount "$MNT_POINT" 2>/dev/null || true
 mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount after symlink" || fail "remount after symlink"
-[ "$(readlink "$MNT_POINT/slink" 2>/dev/null || true)" = "hello-briefs-symlink" ] && pass "symlink after replay" || fail "symlink after replay"
+[ "$(readlink "$MNT_POINT/slink" 2>/dev/null || true)" = "hello-briefs-symlink" ] && pass "small inline symlink after replay" || fail "symlink after replay"
+[ "$(readlink "$MNT_POINT/slink_max" 2>/dev/null || true)" = "$MAX_INLINE_TARGET" ] && pass "max inline symlink after replay" || fail "max inline symlink after replay"
 
 # Phase 7: Executables
 echo ""

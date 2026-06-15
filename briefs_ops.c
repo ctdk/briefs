@@ -50,8 +50,8 @@ const struct file_operations briefs_dir_operations = {
 /* File operations for regular files */
 const struct file_operations briefs_file_operations = {
 	.llseek = generic_file_llseek,
-	.read_iter = generic_file_read_iter,
-	.write_iter = generic_file_write_iter,
+	.read_iter = briefs_read_iter,
+	.write_iter = briefs_write_iter,
 	.open = briefs_open,
 	.release = briefs_release,
 	.mmap = generic_file_mmap,

@@ -23,13 +23,14 @@
 /* Default values */
 #define BRIEFS_BLOCK_SIZE 4096
 #define BRIEFS_INODE_SIZE 512
+#define BRIEFS_INODE_INLINE_DATA_SIZE 256
 #define BRIEFS_MAX_LINKS 65535
 #define BRIEFS_NAME_LEN 255
 
 /* Semantic versioning, yo */
 #define _BRIEFS_MAJOR_VER 0
-#define _BRIEFS_MINOR_VER 7
-#define _BRIEFS_PATCH_VER 5
+#define _BRIEFS_MINOR_VER 8
+#define _BRIEFS_PATCH_VER 0
 
 /* Journal magic */
 #define JOURNAL_MAGIC 0x4A4E4C5A  /* "JNLZ" */
@@ -251,6 +252,12 @@ struct briefs_disk_extent {
 	__le32 pad;
 };
 
+/* Inode flags */
+#define InodeFlagReserved    0x00000001
+#define InodeFlagCompressed  0x00000002
+#define InodeFlagIndexed     0x00000004
+#define InodeFlagInlineData  0x00000008
+
 /* Inode - 512 bytes (in-memory, CPU endian) */
 struct briefs_inode {
 	__u64 inode_number;
@@ -272,7 +279,10 @@ struct briefs_inode {
 	__u32 num_extents_inline;
 	__u64 extent_inline_base;
 	__u64 num_extents_total; /* inline + overflow */
-	struct briefs_extent inline_extents[8];
+	union {
+		struct briefs_extent inline_extents[8];
+		__u8 inline_data[256];
+	};
 	__u64 xattr_offset;
 	__u64 xattr_size;
 	__u64 parent_inode;
@@ -304,7 +314,10 @@ struct briefs_disk_inode {
 	__le32 num_extents_inline;
 	__le64 extent_inline_base;
 	__le64 num_extents_total;
-	struct briefs_disk_extent inline_extents[8];
+	union {
+		struct briefs_disk_extent inline_extents[8];
+		__u8 inline_data[256];
+	};
 	__le64 xattr_offset;
 	__le64 xattr_size;
 	__le64 parent_inode;
@@ -359,8 +372,11 @@ static inline void briefs_disk_inode_to_cpu(const struct briefs_disk_inode *src,
 	dst->num_extents_inline = le32_to_cpu(src->num_extents_inline);
 	dst->extent_inline_base = le64_to_cpu(src->extent_inline_base);
 	dst->num_extents_total = le64_to_cpu(src->num_extents_total);
-	for (i = 0; i < 8; i++)
-		briefs_disk_extent_to_cpu(&src->inline_extents[i], &dst->inline_extents[i]);
+	if (le32_to_cpu(src->flags) & InodeFlagInlineData)
+		memcpy(dst->inline_data, src->inline_data, sizeof(dst->inline_data));
+	else
+		for (i = 0; i < 8; i++)
+			briefs_disk_extent_to_cpu(&src->inline_extents[i], &dst->inline_extents[i]);
 	dst->xattr_offset = le64_to_cpu(src->xattr_offset);
 	dst->xattr_size = le64_to_cpu(src->xattr_size);
 	dst->parent_inode = le64_to_cpu(src->parent_inode);
@@ -395,8 +411,11 @@ static inline void briefs_cpu_inode_to_disk(const struct briefs_inode *src,
 	dst->num_extents_inline = cpu_to_le32(src->num_extents_inline);
 	dst->extent_inline_base = cpu_to_le64(src->extent_inline_base);
 	dst->num_extents_total = cpu_to_le64(src->num_extents_total);
-	for (i = 0; i < 8; i++)
-		briefs_cpu_extent_to_disk(&src->inline_extents[i], &dst->inline_extents[i]);
+	if (src->flags & InodeFlagInlineData)
+		memcpy(dst->inline_data, src->inline_data, sizeof(dst->inline_data));
+	else
+		for (i = 0; i < 8; i++)
+			briefs_cpu_extent_to_disk(&src->inline_extents[i], &dst->inline_extents[i]);
 	dst->xattr_offset = cpu_to_le64(src->xattr_offset);
 	dst->xattr_size = cpu_to_le64(src->xattr_size);
 	dst->parent_inode = cpu_to_le64(src->parent_inode);

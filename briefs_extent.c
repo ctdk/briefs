@@ -485,6 +485,14 @@ int briefs_get_block(struct inode *inode, sector_t iblock,
 	unsigned seq;
 
 	/*
+	 * Inline-data inodes are served directly from the inode, not through
+	 * the block mapping path.  They must be promoted to extent-backed in
+	 * briefs_write_iter before generic_file_write_iter is called.
+	 */
+	if (binfo->disk_inode.flags & InodeFlagInlineData)
+		return create ? -EIO : 0;
+
+	/*
 	 * Snapshot extent metadata under seqcount so we iterate a
 	 * consistent view even if briefs_append_extent runs concurrently.
 	 */
@@ -627,6 +635,22 @@ void briefs_free_inode_data(struct inode *inode)
 		}
 
 		mutex_unlock(&binfo->trie_lock);
+		return;
+	}
+
+	/* Inline-data files have no allocated data blocks to free. */
+	if (binfo->disk_inode.flags & InodeFlagInlineData) {
+		write_seqcount_begin(&binfo->extent_seq);
+		binfo->disk_inode.flags &= ~InodeFlagInlineData;
+		memset(binfo->disk_inode.inline_data, 0,
+		       sizeof(binfo->disk_inode.inline_data));
+		binfo->disk_inode.filesize = 0;
+		write_seqcount_end(&binfo->extent_seq);
+
+		briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
+		briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+					&binfo->disk_inode, false);
+		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
 		return;
 	}
 
