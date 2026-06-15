@@ -599,7 +599,34 @@ void briefs_free_inode_data(struct inode *inode)
 
 	/* For directories, free the trie instead of file extents */
 	if (S_ISDIR(inode->i_mode)) {
-		briefs_trie_free_all(inode->i_sb, &binfo->disk_inode);
+		u64 old_root;
+
+		mutex_lock(&binfo->trie_lock);
+
+		old_root = binfo->disk_inode.dir_trie_root;
+
+		/*
+		 * Zero dir_trie_root and persist+log the cleared inode before freeing
+		 * any trie pages.  This guarantees replay never sees an inode pointing
+		 * at blocks that are about to be marked free.
+		 */
+		binfo->disk_inode.dir_trie_root = 0;
+		briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
+		briefs_persist_disk_inode(inode->i_sb, inode->i_ino, &binfo->disk_inode, false);
+		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+
+		/*
+		 * Free the trie pages using the saved root.  briefs_trie_free_all
+		 * expects the root in disk_inode.dir_trie_root, so restore it
+		 * temporarily and clear it again afterward.
+		 */
+		if (!TRIE_REF_IS_NULL(old_root)) {
+			binfo->disk_inode.dir_trie_root = old_root;
+			briefs_trie_free_all(inode->i_sb, &binfo->disk_inode);
+			binfo->disk_inode.dir_trie_root = 0;
+		}
+
+		mutex_unlock(&binfo->trie_lock);
 		return;
 	}
 

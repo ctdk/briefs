@@ -156,11 +156,22 @@ mv "$MNT_POINT/hello" "$MNT_POINT/goodbye" 2>/dev/null && pass "rename file" || 
 [ ! -f "$MNT_POINT/hello" ] && [ -f "$MNT_POINT/goodbye" ] && pass "rename target exists, source gone" || fail "rename check"
 check_file "renamed content" "$MNT_POINT/goodbye" "Hello"
 
-# Phase 6: Unlink
+# Phase 6: Unlink and rmdir with remount/fsck
 echo ""
 echo "=== Phase 6: Unlink ==="
 rm "$MNT_POINT/goodbye" 2>/dev/null && pass "unlink file" || fail "unlink"
 [ ! -f "$MNT_POINT/goodbye" ] && pass "unlinked file gone" || fail "unlinked file still exists"
+
+mkdir "$MNT_POINT/rmdir_test" && mkdir "$MNT_POINT/rmdir_test/nested" && echo -n "x" > "$MNT_POINT/rmdir_test/nested/file"
+sync
+umount "$MNT_POINT" 2>/dev/null || true
+mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for rmdir replay" || fail "remount for rmdir"
+rm -rf "$MNT_POINT/rmdir_test" 2>/dev/null && pass "rmdir nested directory" || fail "rmdir"
+[ ! -d "$MNT_POINT/rmdir_test" ] && pass "rmdir target gone" || fail "rmdir target still exists"
+sync
+umount "$MNT_POINT" 2>/dev/null || true
+mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount after rmdir" || fail "remount after rmdir"
+[ ! -d "$MNT_POINT/rmdir_test" ] && pass "rmdir target still gone after remount" || fail "rmdir target resurrected"
 
 # Phase 7: Executables
 echo ""

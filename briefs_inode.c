@@ -525,6 +525,12 @@ void briefs_free_inode_num(struct super_block *sb, u64 ino) {
 	 */
 	briefs_persist_disk_inode(sb, ino, &zero_di, false);
 
+	/*
+	 * Log the inode free before recycling the number.  This lets replay free
+	 * the inode bitmap bit even if the later zero/persist is lost.
+	 */
+	briefs_journal_inode_free(bsi->journal, ino);
+
 	briefs_free_block(&bsi->inode_alloc, ino - 1);
 	pr_debug("briefs: freed inode %llu\n", ino);
 }
