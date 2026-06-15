@@ -605,6 +605,8 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 	bool old_removed = false;
 	bool new_added = false;
 	bool crossdir_changed = false;
+	bool target_removed = false;
+	u8 old_target_ftype = 0;
 
 	pr_debug("briefs: rename %pd -> %pd\n", old_dentry, new_dentry);
 
@@ -616,6 +618,69 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 	ftype = (inode->i_mode & S_IFMT) >> 12;
 	old_olddir_nlink = old_dir->i_nlink;
 	old_newdir_nlink = new_dir->i_nlink;
+
+	if (flags & RENAME_NOREPLACE) {
+		if (d_really_is_positive(new_dentry))
+			return -EEXIST;
+	}
+
+	/*
+	 * If the target exists, we must remove it before adding the new name.
+	 * The caller has already validated that the operation is permitted
+	 * (directory targets are rejected by the VFS, etc.).
+	 */
+	if (d_really_is_positive(new_dentry)) {
+		struct inode *old_target = d_inode(new_dentry);
+		struct briefs_inode_info *old_target_binfo = NULL;
+
+		if (old_target) {
+			old_target_binfo = briefs_i(old_target);
+			old_target_ftype = (old_target->i_mode & S_IFMT) >> 12;
+		}
+
+		ret = briefs_remove_dir_entry(new_dir, new_dentry->d_name.name,
+					      new_dentry->d_name.len);
+		if (ret)
+			return ret;
+		target_removed = true;
+
+		ret = briefs_journal_dir_del(bsi->journal, new_dir->i_ino, new_dentry);
+		if (ret)
+			goto fail_target;
+
+		/*
+		 * Drop the target's link count. For non-directories this may bring
+		 * nlink to 0, in which case the VFS will evict the inode and free its
+		 * data. For directories we also need to clear the parent's extra
+		 * link. Note: the VFS has already checked that the target is empty
+		 * for directory renames.
+		 */
+		if (old_target) {
+			if (S_ISDIR(old_target->i_mode)) {
+				drop_nlink(new_dir);
+				clear_nlink(old_target);
+			} else {
+				drop_nlink(old_target);
+				mark_inode_dirty(old_target);
+			}
+			old_target_binfo->disk_inode.nlinks = old_target->i_nlink;
+			briefs_journal_inode_update(bsi->journal, old_target);
+			ret = briefs_persist_disk_inode(old_target->i_sb,
+							old_target->i_ino,
+							&old_target_binfo->disk_inode,
+							false);
+			if (ret)
+				goto fail_target;
+		}
+
+		ret = briefs_update_parent_dir(new_dir, bsi, 0, 0);
+		if (ret)
+			goto fail_target;
+
+		/* Drop the caller's reference so eviction can proceed. */
+		if (old_target)
+			iput(old_target);
+	}
 
 	/* Remove old entry first; only journal after the trie is changed. */
 	ret = briefs_remove_dir_entry(old_dir, old_dentry->d_name.name, old_dentry->d_name.len);
@@ -698,5 +763,16 @@ fail:
 			briefs_journal_dir_add(bsi->journal, old_dir->i_ino, inode->i_ino, old_dentry);
 	}
 
+	return ret;
+
+fail_target:
+	if (target_removed) {
+		if (briefs_add_dir_entry(new_dir, new_dentry->d_name.name, new_dentry->d_name.len,
+					 new_dentry->d_inode ? new_dentry->d_inode->i_ino : 0,
+					 old_target_ftype) == 0)
+			briefs_journal_dir_add(bsi->journal, new_dir->i_ino,
+					       new_dentry->d_inode ? new_dentry->d_inode->i_ino : 0,
+					       new_dentry);
+	}
 	return ret;
 }
