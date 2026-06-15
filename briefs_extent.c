@@ -25,8 +25,13 @@
  */
 /*
  * briefs_compute_i_blocks - compute number of 512-byte sectors used
- * by the inline extents in an inode. This only covers inline extents;
- * chain blocks are handled by briefs_getattr which has sb context.
+ * by the data blocks described by an inode's extents. This covers both
+ * inline extents and the extents stored in overflow chain blocks.
+ *
+ * Note: this helper is used from contexts without a struct super_block, so
+ * it reads the chain directly using the on-disk absolute block numbers
+ * stored in the inode.  A NULL super_block or a read failure simply stops
+ * the accumulation for that inode.
  */
 inline u64 briefs_compute_i_blocks(struct briefs_inode *di)
 {
@@ -34,6 +39,37 @@ inline u64 briefs_compute_i_blocks(struct briefs_inode *di)
 	int i;
 	for (i = 0; i < di->num_extents_inline; i++)
 		blocks += di->inline_extents[i].len;
+	for (i = 0; i < di->num_extents_total - di->num_extents_inline; i++) {
+		struct briefs_extent ext;
+		struct buffer_head *bh;
+		struct briefs_extent_chain *chain;
+		int chain_idx = i;
+		u64 chain_block = di->extent_inline_base;
+		bool found = false;
+
+		while (chain_block) {
+			bh = sb_bread((struct super_block *)NULL, chain_block);
+			if (!bh)
+				break;
+			chain = (struct briefs_extent_chain *)bh->b_data;
+			if (briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
+				brelse(bh);
+				break;
+			}
+			if ((u32)chain_idx < le32_to_cpu(chain->num_extents_in_block)) {
+				briefs_disk_extent_to_cpu(&chain->extents[chain_idx], &ext);
+				found = true;
+				brelse(bh);
+				break;
+			}
+			chain_idx -= le32_to_cpu(chain->num_extents_in_block);
+			chain_block = le64_to_cpu(chain->next_overflow_block);
+			brelse(bh);
+		}
+		if (!found)
+			break;
+		blocks += ext.len;
+	}
 	return blocks * (BRIEFS_BLOCK_SIZE / 512);
 }
 
