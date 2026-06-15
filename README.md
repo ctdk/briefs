@@ -74,6 +74,7 @@ DEFINITELY MISSING OR BROKEN
 ----------------------------
 
 * Some journal functionality is missing.
+* Data journaling is not implemented. Metadata (allocations, inode updates, directory changes, etc.) is journaled and replayed on mount, but ordinary file writeback goes through the page cache and is only durable after `sync`/`fsync`/flush. A crash after a buffered write but before flush may lose data. This is the same trade-off most filesystems make by default; full data journaling is not currently planned.
 * FUSE implementation (requires less commitment than the kernel module). This is in progress.
 * Thorough annotations - Annotating the source code thoroughly will wait until tings settle down. Right now everything's still in constant flux, so there's no point thoroughly annotating something that may change unrecognizably or flat out disappear soon.
 * Refactoring. Since BrieFS is partly a project to learn about using AI assistance while coding, even though I've been reviewing what it's doing there's definitely some weirdness and clunkiness that needs to be gussied up and organized so it's easier to understand. This will go nicely hand in hand with the annotation project above.
