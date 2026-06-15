@@ -759,6 +759,29 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	pr_info("briefs: journal replay complete (blocks=%u, records=%u, errors=%u)\n",
 		blocks_read, records_replayed, errors);
 
+	/*
+	 * Replay only updated the leaf bitmaps.  Recompute the allocator summary
+	 * levels from the leaves and persist them so the on-disk allocator is
+	 * consistent with the replayed state.
+	 */
+	{
+		struct briefs_sb_info *bsi = j->vfs_sb->s_fs_info;
+		if (bsi) {
+			int data_ret, inode_ret;
+
+			briefs_alloc_recompute_summaries(&bsi->alloc);
+			briefs_alloc_recompute_summaries(&bsi->inode_alloc);
+
+			data_ret = briefs_alloc_sync(&bsi->alloc);
+			if (data_ret)
+				pr_err("briefs: failed to sync data allocator after replay: %d\n", data_ret);
+
+			inode_ret = briefs_alloc_sync(&bsi->inode_alloc);
+			if (inode_ret)
+				pr_err("briefs: failed to sync inode allocator after replay: %d\n", inode_ret);
+		}
+	}
+
 	/* Update superblock to mark journal clean */
 	j->sb->journal_log_start = j->sb->journal_log_end;
 	j->sb->checkpoint_seq = cpu_to_le64(le64_to_cpu(j->sb->checkpoint_seq) + 1);

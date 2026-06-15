@@ -219,6 +219,23 @@ done
 FCOUNT=$(ls "$MNT_POINT/many" 2>/dev/null | wc -l)
 [ "$FCOUNT" = 50 ] && pass "readdir 50 entries" || fail "readdir 50 entries" "(got $FCOUNT)"
 
+# Phase 8b: allocator consistency after replay
+echo ""
+echo "=== Phase 8b: Allocator Consistency ==="
+mkdir "$MNT_POINT/alloc_test"
+for i in $(seq 1 30); do
+  echo -n "x" > "$MNT_POINT/alloc_test/file_$i" 2>/dev/null || true
+done
+rm $(seq 1 10 | sed "s|^|$MNT_POINT/alloc_test/file_|") 2>/dev/null || true
+sync
+umount "$MNT_POINT" 2>/dev/null || true
+mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for allocator replay" || fail "remount for allocator replay"
+for i in $(seq 31 50); do
+  echo -n "y" > "$MNT_POINT/alloc_test/file_$i" 2>/dev/null || true
+done
+LATER_COUNT=$(ls "$MNT_POINT/alloc_test" 2>/dev/null | wc -l)
+[ "$LATER_COUNT" -eq 40 ] && pass "create files after allocator replay" || fail "create files after allocator replay" "(got $LATER_COUNT)"
+
 # Phase 9: chown/chmod
 echo ""
 echo "=== Phase 9: Permissions ==="

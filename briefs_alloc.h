@@ -62,6 +62,13 @@ void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block);
 /* Sync the in-memory bitmap back to disk */
 int briefs_alloc_sync(struct briefs_alloc *alloc);
 
+/*
+ * Recompute L1/L0 summary levels and free_count from the L2 leaf bitmap.
+ * Used after journal replay to ensure on-disk allocator headers are consistent
+ * with the replayed bitmap state.
+ */
+void briefs_alloc_recompute_summaries(struct briefs_alloc *alloc);
+
 /* Cleanup allocator (free vmalloc'd arrays) */
 void briefs_alloc_cleanup(struct briefs_alloc *alloc);
 

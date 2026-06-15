@@ -449,6 +449,71 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 }
 
 /*
+ * Recompute L1/L0 summary levels and free_count from the L2 leaf bitmap.
+ * Used after journal replay to ensure allocator headers are consistent with
+ * the replayed leaf bitmap state.
+ */
+void briefs_alloc_recompute_summaries(struct briefs_alloc *alloc)
+{
+	u64 i;
+	u64 l2_valid_bits;
+
+	mutex_lock(&alloc->lock);
+	if (!alloc || !alloc->l0 || !alloc->l1 || !alloc->l2) {
+		mutex_unlock(&alloc->lock);
+		return;
+	}
+
+	/* Clear summary levels; they will be rebuilt from L2. */
+	memset(alloc->l0, 0, alloc->l0_words * sizeof(u64));
+	memset(alloc->l1, 0, alloc->l1_words * sizeof(u64));
+
+	/*
+	 * Mask trailing bits in the last L2 word that are beyond block_count.
+	 * These bits are outside the tracked range and must not be counted.
+	 */
+	l2_valid_bits = alloc->block_count % 64;
+	if (l2_valid_bits == 0)
+		l2_valid_bits = 64;
+	if (alloc->l2_words > 0) {
+		u64 mask = (l2_valid_bits == 64) ? ~0ULL : ((1ULL << l2_valid_bits) - 1);
+		alloc->l2[alloc->l2_words - 1] &= mask;
+	}
+
+	alloc->free_count = 0;
+
+	/* Rebuild L1/L0 and count free bits. */
+	for (i = 0; i < alloc->l2_words; i++) {
+		u64 word = alloc->l2[i];
+		u64 l1_idx;
+
+		alloc->free_count += hweight64(word);
+
+		if (word == 0)
+			continue;
+
+		l1_idx = i / 64;
+		if (l1_idx < alloc->l1_words)
+			alloc->l1[l1_idx] |= (1ULL << (i % 64));
+	}
+
+	/* Rebuild L0 from L1. */
+	for (i = 0; i < alloc->l1_words; i++) {
+		u64 l0_idx;
+
+		if (alloc->l1[i] == 0)
+			continue;
+
+		l0_idx = i / 64;
+		if (l0_idx < alloc->l0_words)
+			alloc->l0[l0_idx] |= (1ULL << (i % 64));
+	}
+
+	pr_debug("briefs: allocator recomputed: %llu free blocks\n", alloc->free_count);
+	mutex_unlock(&alloc->lock);
+}
+
+/*
  * Cleanup allocator - free vmalloc'd arrays.
  */
 void briefs_alloc_cleanup(struct briefs_alloc *alloc)
