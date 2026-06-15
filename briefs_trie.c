@@ -932,6 +932,12 @@ static int trie_iter_grow(struct trie_iter *iter, int need)
 			kfree(new_emitted);
 			return -ENOMEM;
 		}
+		/*
+		 * On success, krealloc may have freed the old arrays already. Update
+		 * both pointers and the capacity atomically so an allocation failure
+		 * in the second krealloc cannot leave the iterator with a dangling
+		 * pointer. (Both succeeded above.)
+		 */
 		iter->stack = new_stack;
 		iter->leaf_emitted = new_emitted;
 		iter->cap = new_cap;
@@ -966,9 +972,11 @@ void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di, u64 
 	iter->pending = false;
 	iter->gen = gen;
 	if (!TRIE_REF_IS_NULL(di->dir_trie_root)) {
-		iter->stack[0] = di->dir_trie_root;
-		iter->sp = 1;
-		iter->leaf_emitted[0] = 0;
+		if (iter->cap > 0) {
+			iter->stack[0] = di->dir_trie_root;
+			iter->sp = 1;
+			iter->leaf_emitted[0] = 0;
+		}
 	}
 }
 
