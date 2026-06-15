@@ -217,6 +217,8 @@ struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
 	briefs_set_new_inode_times(inode, &binfo->disk_inode);
 
 	if (is_dir) {
+		binfo->disk_inode.parent_inode = dir->i_ino;
+
 		inode->i_op = &briefs_dir_inode_ops;
 		inode->i_fop = &briefs_dir_operations;
 	} else if (S_ISREG(mode)) {
