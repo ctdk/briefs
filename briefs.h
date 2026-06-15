@@ -786,6 +786,14 @@ static inline void briefs_sync_inode_times(struct inode *inode,
 	di->mtime_nsec = inode->i_mtime_nsec;
 	di->ctime_sec = inode->i_ctime_sec;
 	di->ctime_nsec = inode->i_ctime_nsec;
+}
+
+/* Mirror VFS timestamps into a brand new disk inode. This sets
+ * creation_time_sec and creation_time_nsec, unlike briefs_sync_inode_times. */
+static inline void briefs_set_new_inode_times(struct inode *inode,
+                                            struct briefs_inode *di)
+{
+	briefs_sync_inode_times(inode, di);
 	di->creation_time_sec = inode->i_ctime_sec;
 	di->creation_time_nsec = inode->i_ctime_nsec;
 }

@@ -214,7 +214,7 @@ struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
 	binfo->disk_inode.nlinks = is_dir ? 2 : 1;
 	binfo->disk_inode.num_extents_inline = 0;
 	binfo->disk_inode.num_extents_total = 0;
-	briefs_sync_inode_times(inode, &binfo->disk_inode);
+	briefs_set_new_inode_times(inode, &binfo->disk_inode);
 
 	if (is_dir) {
 		inode->i_op = &briefs_dir_inode_ops;
