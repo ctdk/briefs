@@ -82,6 +82,7 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 		goto out_no_fs;
 	}
 
+	bsi->sb_bh = bh;
 	bsi->sb = bsb;
 
 	/* Initialize data block allocator */
@@ -168,6 +169,8 @@ out_no_fs:
 	pr_err("VFS: Can't find a BrieFS filesystem on device %s.\n", sb->s_id);
 
 out_release:
+	if (bsi)
+		bsi->sb_bh = NULL;
 	brelse(bh);
 	goto out;
 
@@ -191,6 +194,7 @@ out:
 	pr_info("briefs: fill_super returning %d\n", ret);
 	return ret;
 }
+
 /* briefs_put_super - cleanup superblock */
 void briefs_put_super(struct super_block *sb) {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
@@ -230,6 +234,12 @@ void briefs_put_super(struct super_block *sb) {
 		briefs_alloc_cleanup(&bsi->alloc);
 		briefs_alloc_cleanup(&bsi->inode_alloc);
 		pr_info("briefs: alloc_cleanup done\n");
+
+		if (bsi->sb_bh) {
+			brelse(bsi->sb_bh);
+			bsi->sb_bh = NULL;
+			bsi->sb = NULL;
+		}
 	}
 
 	briefs_trie_cleanup_state(sb);

@@ -703,6 +703,7 @@ struct briefs_sb_info {
 	__u64 num_inodes;
 	__u64 free_inodes;
 	struct briefs_superblock *sb;
+	struct buffer_head *sb_bh;       /* superblock buffer_head, released on unmount */
 	struct block_device *bdev;
 	struct briefs_alloc alloc;          /* data block allocator (3-level bitmap pyramid) */
 	struct briefs_alloc inode_alloc;    /* inode allocator (3-level bitmap pyramid) */
