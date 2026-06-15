@@ -118,4 +118,7 @@ int briefs_journal_symlink_data(struct briefs_journal *j, u64 ino,
                                 u64 phys, const char *target,
                                 size_t target_len);
 
+/* Persist in-memory superblock fields back to the on-disk superblock */
+int briefs_journal_sync_superblock(struct briefs_journal *j);
+
 #endif /* _BRIEFS_JOURNAL_H */

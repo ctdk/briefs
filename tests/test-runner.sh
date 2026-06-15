@@ -251,6 +251,20 @@ echo "=== Phase 10: statfs ==="
 STAT=$(stat -f "$MNT_POINT" 2>/dev/null)
 [ -n "$STAT" ] && pass "statfs returns output" || fail "statfs"
 
+# Phase 10b: superblock free counts after replay
+echo ""
+echo "=== Phase 10b: Superblock Free Counts ==="
+FREE_BEFORE=$(stat -f "$MNT_POINT" 2>/dev/null | grep -o 'Free: [0-9]*' | awk '{print $2}' || echo "")
+for i in $(seq 1 10); do
+  echo -n "z" > "$MNT_POINT/statfs_test_$i" 2>/dev/null || true
+done
+rm "$MNT_POINT"/statfs_test_* 2>/dev/null || true
+sync
+umount "$MNT_POINT" 2>/dev/null || true
+mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for statfs replay" || fail "remount for statfs"
+FREE_AFTER=$(stat -f "$MNT_POINT" 2>/dev/null | grep -o 'Free: [0-9]*' | awk '{print $2}' || echo "")
+[ "$FREE_BEFORE" = "$FREE_AFTER" ] && pass "free counts consistent after replay" || fail "free counts inconsistent after replay" "(before=$FREE_BEFORE after=$FREE_AFTER)"
+
 # Phase 11: fsck CRC/structure check
 echo ""
 echo "=== Phase 11: fsck ==="

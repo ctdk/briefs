@@ -208,18 +208,12 @@ void briefs_put_super(struct super_block *sb) {
 			pr_info("briefs: syncing allocation trie\n");
 			briefs_alloc_sync(&bsi->alloc);
 
-			/* Update superblock free counts on disk */
-			{
-				struct buffer_head *sbh = sb_bread(sb, 0);
-				if (sbh) {
-					struct briefs_superblock *bsb = (struct briefs_superblock *)sbh->b_data;
-					bsb->free_data_blocks = cpu_to_le64(bsi->alloc.free_count);
-					bsb->free_inodes = cpu_to_le64(bsi->inode_alloc.free_count);
-					mark_buffer_dirty(sbh);
-					sync_dirty_buffer(sbh);
-					brelse(sbh);
-				}
-			}
+			/*
+			 * Persist superblock free counts. briefs_journal_sync_superblock
+			 * refreshes them from the allocator state first.
+			 */
+			if (bsi->journal)
+				briefs_journal_sync_superblock(bsi->journal);
 		}
 
 		pr_info("briefs: cleaning up journal\n");
@@ -249,6 +243,10 @@ int briefs_statfs(struct dentry *dentry, struct kstatfs *buf) {
 	u64 id = huge_encode_dev(sb->s_bdev->bd_dev);
 	buf->f_type = sb->s_magic;
 	buf->f_bsize = sb->s_blocksize;
+	/*
+	 * The allocator state is authoritative for free space; the superblock
+	 * cached values may be stale between checkpoints.
+	 */
 	buf->f_blocks = sbi->alloc.block_count;
 	buf->f_bfree = sbi->alloc.free_count;
 	buf->f_bavail = sbi->alloc.free_count;

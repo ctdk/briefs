@@ -248,12 +248,24 @@ int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_ty
  * Write a checkpoint
  */
 int briefs_journal_checkpoint(struct briefs_journal *j) {
+	struct briefs_sb_info *bsi;
+
 	if (!j) return -EINVAL;
 
 	/* Flush any pending records first */
 	if (j->dirty) {
 		int ret = briefs_journal_sync(j);
 		if (ret) return ret;
+	}
+
+	/*
+	 * Refresh superblock free counts from the authoritative allocator state
+	 * before writing the checkpoint.
+	 */
+	bsi = j->vfs_sb->s_fs_info;
+	if (bsi) {
+		j->sb->free_data_blocks = cpu_to_le64(bsi->alloc.free_count);
+		j->sb->free_inodes = cpu_to_le64(bsi->inode_alloc.free_count);
 	}
 
 	/* Create checkpoint record */
@@ -301,7 +313,8 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
 	j->dirty = false;
 	j->records_since_checkpoint = 0;
 
-	return 0;
+	/* Persist the updated superblock so free counts are not stale. */
+	return briefs_journal_sync_superblock(j);
 }
 
 /**********************************************************************
@@ -487,7 +500,7 @@ static int replay_trie_alloc(struct super_block *sb, struct jrn_trie_alloc *rec)
  * back to the on-disk superblock buffer.  Called after journal replay so a
  * second crash does not force redundant replay.
  */
-static int briefs_journal_sync_superblock(struct briefs_journal *j)
+int briefs_journal_sync_superblock(struct briefs_journal *j)
 {
 	struct super_block *vfs_sb = j->vfs_sb;
 	struct buffer_head *bh;
