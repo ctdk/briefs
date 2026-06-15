@@ -405,6 +405,20 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		memset(bh->b_data, 0, dir->i_sb->s_blocksize);
 		memcpy(bh->b_data, symname, len);
 		mark_buffer_dirty(bh);
+
+		/*
+		 * Journal the symlink target bytes so replay can restore them even
+		 * if the data block was not flushed before a crash.
+		 */
+		ret = briefs_journal_symlink_data(bsi->journal, inode->i_ino, phys,
+						symname, len);
+		if (ret) {
+			brelse(bh);
+			briefs_free_block(&bsi->alloc, rel);
+			briefs_create_abort(dir->i_sb, dir, inode, &dentry->d_name, false);
+			return ret;
+		}
+
 		brelse(bh);
 
 		struct briefs_extent ext;

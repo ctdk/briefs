@@ -539,6 +539,64 @@ static int replay_inode_full(struct super_block *sb, struct jrn_inode_full *rec)
 }
 
 /*
+ * Replay a JRN_SYMLINK_DATA record.
+ * Writes the inline target bytes back into the symlink data block if the
+ * inode still exists and its first extent still points at the recorded block.
+ */
+static int replay_symlink_data(struct super_block *sb, struct jrn_symlink_data *rec)
+{
+	struct inode *inode;
+	struct briefs_inode_info *binfo;
+	struct briefs_extent ext;
+	struct buffer_head *bh;
+	u64 ino, phys;
+	u32 len;
+
+	ino = le64_to_cpu(rec->ino);
+	phys = le64_to_cpu(rec->phys);
+	len = le32_to_cpu(rec->target_len);
+
+	if (len == 0 || len > BRIEFS_BLOCK_SIZE)
+		return 0;
+
+	inode = briefs_iget(sb, ino);
+	if (IS_ERR(inode)) {
+		pr_debug("briefs: symlink replay skipping freed inode %llu\n", ino);
+		return 0;
+	}
+
+	if (!S_ISLNK(inode->i_mode)) {
+		iput(inode);
+		return 0;
+	}
+
+	binfo = briefs_i(inode);
+	if (binfo->disk_inode.num_extents_total == 0 ||
+	    briefs_read_extent(sb, &binfo->disk_inode, 0, &ext) != 0 ||
+	    ext.phys != phys || ext.len == 0) {
+		iput(inode);
+		return 0;
+	}
+
+	bh = sb_bread(sb, phys);
+	if (!bh) {
+		iput(inode);
+		return -EIO;
+	}
+
+	memset(bh->b_data, 0, sb->s_blocksize);
+	memcpy(bh->b_data, rec->target, len);
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+	iput(inode);
+
+	pr_debug("briefs: replay restored symlink target ino=%llu phys=%llu len=%u\n",
+		 ino, phys, len);
+	return 0;
+}
+
+/*
  * Mount/recovery: replay journal from last checkpoint.
  *
  * Walks the journal from journal_log_start to journal_log_end and re-applies
@@ -673,6 +731,11 @@ int briefs_journal_replay(struct briefs_journal *j) {
 			case JRN_INODE_FULL: {
 				struct jrn_inode_full *inf = rec_data;
 				apply_ret = replay_inode_full(sb, inf);
+				break;
+			}
+			case JRN_SYMLINK_DATA: {
+				struct jrn_symlink_data *sd = rec_data;
+				apply_ret = replay_symlink_data(sb, sd);
 				break;
 			}
 			default:
@@ -971,4 +1034,33 @@ int briefs_journal_inode_full(struct briefs_journal *j, u64 ino,
 	memcpy(rec.inode_data, di, sizeof(struct briefs_disk_inode));
 
 	return briefs_journal_write_record(j, JRN_INODE_FULL, &rec, sizeof(rec));
+}
+
+/*
+ * Log symlink target content inline in the journal.
+ */
+int briefs_journal_symlink_data(struct briefs_journal *j, u64 ino,
+                                u64 phys, const char *target,
+                                size_t target_len)
+{
+	struct jrn_symlink_data *rec;
+	size_t rec_size;
+	int ret;
+
+	if (!j || !target || target_len == 0 || target_len > BRIEFS_BLOCK_SIZE)
+		return -EINVAL;
+
+	rec_size = sizeof(struct jrn_symlink_data) + target_len;
+	rec = kmalloc(rec_size, GFP_KERNEL);
+	if (!rec)
+		return -ENOMEM;
+
+	rec->ino = cpu_to_le64(ino);
+	rec->phys = cpu_to_le64(phys);
+	rec->target_len = cpu_to_le32((u32)target_len);
+	memcpy(rec->target, target, target_len);
+
+	ret = briefs_journal_write_record(j, JRN_SYMLINK_DATA, rec, rec_size);
+	kfree(rec);
+	return ret;
 }

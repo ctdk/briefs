@@ -173,6 +173,16 @@ umount "$MNT_POINT" 2>/dev/null || true
 mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount after rmdir" || fail "remount after rmdir"
 [ ! -d "$MNT_POINT/rmdir_test" ] && pass "rmdir target still gone after remount" || fail "rmdir target resurrected"
 
+# Phase 6b: Symlink content survives replay
+echo ""
+echo "=== Phase 6b: Symlinks ==="
+ln -s "hello-briefs-symlink" "$MNT_POINT/slink" 2>/dev/null && pass "create symlink" || fail "symlink create"
+[ "$(readlink "$MNT_POINT/slink" 2>/dev/null || true)" = "hello-briefs-symlink" ] && pass "symlink readback" || fail "symlink readback"
+sync
+umount "$MNT_POINT" 2>/dev/null || true
+mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount after symlink" || fail "remount after symlink"
+[ "$(readlink "$MNT_POINT/slink" 2>/dev/null || true)" = "hello-briefs-symlink" ] && pass "symlink after replay" || fail "symlink after replay"
+
 # Phase 7: Executables
 echo ""
 echo "=== Phase 7: Executables ==="

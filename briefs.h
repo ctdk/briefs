@@ -47,6 +47,7 @@ enum journal_record_type {
 	JRN_DIR_UPDATE,
 	JRN_CHECKPOINT,
 	JRN_INODE_FULL,
+	JRN_SYMLINK_DATA,
 	JRN_END,
 };
 
@@ -137,6 +138,14 @@ struct jrn_inode_full {
 	__le64 ino;               /* inode number */
 	__u8 inode_data[512];     /* raw little-endian disk inode */
 	__u8 reserved[40];        /* padding to 560 bytes */
+};
+
+/* JRN_SYMLINK_DATA - inline symlink target bytes */
+struct jrn_symlink_data {
+	__le64 ino;           /* symlink inode */
+	__le64 phys;          /* physical block holding the target */
+	__le32 target_len;    /* number of target bytes that follow */
+	__u8   target[];      /* symlink target bytes (no trailing NUL) */
 };
 
 /* JRN_CHECKPOINT */
