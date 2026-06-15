@@ -402,14 +402,22 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
                          struct briefs_extent *ext)
 {
+	struct briefs_sb_info *bsi = sb->s_fs_info;
 	struct briefs_inode_info *binfo;
+	struct briefs_disk_inode disk_di;
 	int ret;
 
 	binfo = container_of(di, struct briefs_inode_info, disk_inode);
 	mutex_lock(&binfo->extent_lock);
 	ret = __briefs_append_extent(sb, di, ext);
 	mutex_unlock(&binfo->extent_lock);
-	return ret;
+	if (ret)
+		return ret;
+
+	/* Log a full snapshot so replay restores extent metadata exactly. */
+	briefs_cpu_inode_to_disk(di, &disk_di);
+	briefs_journal_inode_full(bsi->journal, di->inode_number, &disk_di);
+	return 0;
 }
 
 /*
@@ -586,6 +594,7 @@ void briefs_free_inode_data(struct inode *inode)
 	struct briefs_inode_info *binfo = briefs_i(inode);
 	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
 	struct briefs_extent ext;
+	struct briefs_disk_inode disk_di;
 	int i;
 
 	/* For directories, free the trie instead of file extents */
@@ -614,4 +623,8 @@ void briefs_free_inode_data(struct inode *inode)
 	binfo->disk_inode.extent_inline_base = 0;
 	memset(binfo->disk_inode.inline_extents, 0, sizeof(binfo->disk_inode.inline_extents));
 	write_seqcount_end(&binfo->extent_seq);
+
+	/* Log the cleared inode so replay does not resurrect old extent pointers. */
+	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
+	briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
 }

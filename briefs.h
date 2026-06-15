@@ -46,6 +46,7 @@ enum journal_record_type {
 	JRN_TRIE_ALLOC,
 	JRN_DIR_UPDATE,
 	JRN_CHECKPOINT,
+	JRN_INODE_FULL,
 	JRN_END,
 };
 
@@ -129,6 +130,13 @@ struct jrn_dir_update {
 	__u8 name[251];
 	__u8 op;              /* 0 = add, 1 = delete */
 	__u8 reserved[6];
+};
+
+/* JRN_INODE_FULL - complete 512-byte on-disk inode snapshot */
+struct jrn_inode_full {
+	__le64 ino;               /* inode number */
+	__u8 inode_data[512];     /* raw little-endian disk inode */
+	__u8 reserved[40];        /* padding to 560 bytes */
 };
 
 /* JRN_CHECKPOINT */
@@ -856,6 +864,7 @@ static inline void briefs_build_bug_on_sizes(void)
 	BUILD_BUG_ON(sizeof(struct jrn_inode_alloc) != 40);
 	BUILD_BUG_ON(sizeof(struct jrn_trie_alloc) != 16);
 	BUILD_BUG_ON(sizeof(struct jrn_inode_free) != 32);
+	BUILD_BUG_ON(sizeof(struct jrn_inode_full) != 560);
 }
 
 #endif /* __KERNEL__ */

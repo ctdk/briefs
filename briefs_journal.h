@@ -109,4 +109,8 @@ int briefs_journal_inode_update(struct briefs_journal *j,
 int briefs_journal_trie_alloc(struct briefs_journal *j, u64 abs_block);
 int briefs_journal_trie_free(struct briefs_journal *j, u64 abs_block);
 
+/* Log a complete 512-byte on-disk inode snapshot */
+int briefs_journal_inode_full(struct briefs_journal *j, u64 ino,
+                              const struct briefs_disk_inode *di);
+
 #endif /* _BRIEFS_JOURNAL_H */

@@ -125,18 +125,22 @@ int briefs_update_parent_dir(struct inode *dir, struct briefs_sb_info *bsi,
 	pbinfo->disk_inode.filesize = new_size;
 	pbinfo->disk_inode.nlinks = new_nlink;
 
-	ret = briefs_journal_inode_update(bsi->journal, dir);
+	ret = briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
 	if (ret) {
 		pbinfo->disk_inode.filesize = old_size;
 		pbinfo->disk_inode.nlinks = old_nlink;
 		return ret;
 	}
 
-	ret = briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
-	if (ret) {
-		pbinfo->disk_inode.filesize = old_size;
-		pbinfo->disk_inode.nlinks = old_nlink;
-		return ret;
+	/*
+	 * Log the full parent-directory snapshot. briefs_update_parent_dir does
+	 * not mark the inode dirty, so briefs_write_inode() is not called for
+	 * this persistence path.
+	 */
+	{
+		struct briefs_disk_inode disk_di;
+		briefs_cpu_inode_to_disk(&pbinfo->disk_inode, &disk_di);
+		briefs_journal_inode_full(bsi->journal, dir->i_ino, &disk_di);
 	}
 
 	/* Commit the updates to VFS state only after successful persistence. */
@@ -351,6 +355,13 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 		disk_inode->filesize = cpu_to_le64(inode->i_size);
 		disk_inode->nlinks = cpu_to_le32(inode->i_nlink);
 	} while (read_seqcount_retry(&binfo->extent_seq, seq));
+
+	/*
+	 * Log the complete on-disk inode snapshot for crash recovery.
+	 * This captures extent metadata, timestamps, mode, nlink, and the
+	 * trie root in a single record.
+	 */
+	briefs_journal_inode_full(bsi->journal, inode->i_ino, disk_inode);
 
 	mark_buffer_dirty(bh);
 	brelse(bh);

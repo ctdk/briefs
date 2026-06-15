@@ -311,6 +311,16 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	/* Persist the inode to disk */
 	briefs_persist_disk_inode(inode->i_sb, inode->i_ino, &binfo->disk_inode, false);
 
+	/*
+	 * Log a full snapshot after truncate so replay restores the exact
+	 * extent list and size, not just the freed bitmap bits.
+	 */
+	{
+		struct briefs_disk_inode disk_di;
+		briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
+		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+	}
+
 	return 0;
 
 out_copy:

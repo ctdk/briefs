@@ -514,6 +514,31 @@ static int briefs_journal_sync_superblock(struct briefs_journal *j)
 }
 
 /*
+ * Replay a JRN_INODE_FULL record.
+ * Writes the embedded 512-byte on-disk inode back into the inode table.
+ */
+static int replay_inode_full(struct super_block *sb, struct jrn_inode_full *rec)
+{
+	struct briefs_disk_inode *di;
+	struct buffer_head *bh;
+	u64 ino = le64_to_cpu(rec->ino);
+
+	bh = briefs_read_inode_block(sb, ino, &di);
+	if (IS_ERR(bh)) {
+		pr_warn("briefs: replay can't read inode block for %llu (skip)\n", ino);
+		return 0;
+	}
+
+	memcpy(di, rec->inode_data, sizeof(struct briefs_disk_inode));
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+
+	pr_debug("briefs: replay restored full inode %llu\n", ino);
+	return 0;
+}
+
+/*
  * Mount/recovery: replay journal from last checkpoint.
  *
  * Walks the journal from journal_log_start to journal_log_end and re-applies
@@ -643,6 +668,11 @@ int briefs_journal_replay(struct briefs_journal *j) {
 			case JRN_TRIE_ALLOC: {
 				struct jrn_trie_alloc *ta = rec_data;
 				apply_ret = replay_trie_alloc(sb, ta);
+				break;
+			}
+			case JRN_INODE_FULL: {
+				struct jrn_inode_full *inf = rec_data;
+				apply_ret = replay_inode_full(sb, inf);
 				break;
 			}
 			default:
@@ -923,4 +953,22 @@ int briefs_journal_trie_free(struct briefs_journal *j, u64 abs_block)
 	rec.op = cpu_to_le32(1);
 
 	return briefs_journal_write_record(j, JRN_TRIE_ALLOC, &rec, sizeof(rec));
+}
+
+/*
+ * Log a complete 512-byte on-disk inode snapshot.
+ */
+int briefs_journal_inode_full(struct briefs_journal *j, u64 ino,
+                              const struct briefs_disk_inode *di)
+{
+	struct jrn_inode_full rec;
+
+	if (!j)
+		return 0;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.ino = cpu_to_le64(ino);
+	memcpy(rec.inode_data, di, sizeof(struct briefs_disk_inode));
+
+	return briefs_journal_write_record(j, JRN_INODE_FULL, &rec, sizeof(rec));
 }
