@@ -129,9 +129,9 @@ struct jrn_dir_update {
 	__le64 parent_ino;
 	__le64 child_ino;
 	__le32 name_len;
-	__u8 name[251];
+	__u8 name[255];
 	__u8 op;              /* 0 = add, 1 = delete */
-	__u8 reserved[6];
+	__u8 reserved[2];
 };
 
 /* JRN_INODE_FULL - complete 512-byte on-disk inode snapshot */

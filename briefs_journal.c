@@ -865,7 +865,7 @@ int briefs_journal_dir_update(struct briefs_journal *j, u64 parent_ino, u64 chil
 {
 	struct jrn_dir_update rec;
 
-	if (!j || !name || name_len == 0 || name_len > 251)
+	if (!j || !name || name_len == 0 || name_len > 255)
 		return -EINVAL;
 
 	if (op > 1)
