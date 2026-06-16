@@ -13,7 +13,7 @@ BrieFS: A Linux filesystem that solely uses [extents](https://en.wikipedia.org/w
 RELATED
 -------
 
-* [github.com/ctdk/briefs-utils](github.com/ctdk/briefs-utils): The briefs utilities, written in Golang, composed of `mkfs.briefs`, `fsck.briefs`, and `fuse.briefs`. These are unsurprisingly in progress, but `mkfs.briefs` creates BrieFS volumes while `fsck.briefs` checks but does not repair BrieFS volumes and `fuse.briefs` provides a read-only FUSE bridge for those same BrieFS volumes.
+* [github.com/ctdk/briefs-utils](github.com/ctdk/briefs-utils): The briefs utilities, written in Golang, composed of `mkfs.briefs`, `fsck.briefs`, and `fuse.briefs`. `mkfs.briefs` creates BrieFS volumes, `fsck.briefs` checks and repairs BrieFS volumes, and `fuse.briefs` provides a read-only FUSE bridge for those same BrieFS volumes.
 * [github.com/ctdk/modern-xiafs](github.com/ctdk/modern-xiafs): Computer filesystem archaeology. A port of an ancient Linux filesystem to modern kernels, updated as I get around to it.
 
 RATIONALE
@@ -47,7 +47,7 @@ WORKS
 * Kernel module unloading
 * Mounting a filesystem created by `mkfs.briefs`.
 * Unmounting a filesystem.
-* Scanning a filesystem with fsck and reporting errors. Filesystem repair is still unimplemented, unfortunately.
+* Scanning a filesystem with fsck, reporting errors, and repairing them.
 * Listing the root directory.
 * touching files
 * mkdir creates directories
@@ -66,7 +66,7 @@ WORKS
 * rm -r works
 * Directory trie synchronization
 * Stale iterator detection
-* Packed directory trie pages (BrieFS 0.7.0+), storing up to 64 nodes per 4 KiB block
+* Packed directory trie pages (BrieFS 0.8.0+), storing up to 64 nodes per 4 KiB block
 * inode reuse
 * CRC32C checksum verification for journal records and extent chain blocks
 
