@@ -22,9 +22,9 @@
 
 /* Default values */
 #define BRIEFS_BLOCK_SIZE 4096
+#define BRIEFS_BLOCK_SHIFT 12
 #define BRIEFS_INODE_SIZE 512
 #define BRIEFS_INODE_INLINE_DATA_SIZE 256
-#define BRIEFS_MAX_LINKS 65535
 #define BRIEFS_NAME_LEN 255
 
 /* Semantic versioning, yo */
@@ -782,9 +782,11 @@ void briefs_free_inode(struct inode *inode);
 u64 briefs_alloc_inode(struct super_block *sb);
 void briefs_free_inode_num(struct super_block *sb, u64 ino);
 void briefs_free_inode_data(struct inode *inode);
-u64 briefs_compute_i_blocks(struct briefs_inode *di);
+u64 briefs_compute_i_blocks(struct super_block *sb, struct briefs_inode *di);
 int briefs_read_extent(struct super_block *sb, struct briefs_inode *di, int index, struct briefs_extent *ext);
 int briefs_append_extent(struct super_block *sb, struct briefs_inode *di, struct briefs_extent *ext);
+int briefs_append_extent_nojournal(struct super_block *sb, struct briefs_inode *di,
+                                    struct briefs_extent *ext);
 void briefs_free_blocks_range(struct briefs_sb_info *bsi, u64 phys_start, u64 len);
 void briefs_free_chain_blocks(struct super_block *sb, u64 chain_block);
 int briefs_write_inode(struct inode *inode, struct writeback_control *wbc);
@@ -857,6 +859,9 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *new
 int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, const char *symname);
 int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, dev_t rdev);
 const char *briefs_get_link(struct dentry *dentry, struct inode *inode, struct delayed_call *done);
+
+/* File operations */
+long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len);
 
 /* File operations */
 ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to);

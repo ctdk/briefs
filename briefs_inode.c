@@ -197,7 +197,7 @@ struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
 	inode->i_uid = current_fsuid();
 	inode->i_gid = current_fsgid();
 	inode->i_size = 0;
-	inode->i_blocks = briefs_compute_i_blocks(&binfo->disk_inode);
+	inode->i_blocks = briefs_compute_i_blocks(dir->i_sb, &binfo->disk_inode);
 	set_nlink(inode, is_dir ? 2 : 1);
 
 	ktime_get_real_ts64(&now);
@@ -442,7 +442,7 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 		inode->i_uid = make_kuid(&init_user_ns, cpu_di.uid);
 		inode->i_gid = make_kgid(&init_user_ns, cpu_di.gid);
 		inode->i_size = cpu_di.filesize;
-		inode->i_blocks = briefs_compute_i_blocks(&cpu_di);
+		inode->i_blocks = briefs_compute_i_blocks(sb, &cpu_di);
 
 		set_nlink(inode, cpu_di.nlinks);
 

@@ -4,6 +4,7 @@
 
 #include <linux/module.h>
 #include <linux/fs.h>
+#include <linux/falloc.h>
 #include <linux/statfs.h>
 #include <linux/slab.h>
 #include <linux/buffer_head.h>
@@ -631,6 +632,167 @@ int briefs_getattr(struct mnt_idmap *idmap, const struct path *path,
 	pr_debug("briefs: getattr ino=%lu i_blocks=%llu\n", inode->i_ino, i_blocks);
 	return 0;
 }
+
+/*
+ * briefs_block_mapped - return true if logical block @iblock already has a
+ * physical mapping in the inode's extent list.
+ */
+static bool briefs_block_mapped(struct inode *inode, u64 iblock)
+{
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct briefs_extent ext;
+	int i;
+
+	for (i = 0; i < binfo->disk_inode.num_extents_total; i++) {
+		if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext) != 0)
+			continue;
+		if (iblock >= ext.offset && iblock < ext.offset + ext.len)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * briefs_zero_block - ensure the on-disk block at @abs_block is zero-filled.
+ */
+static int briefs_zero_block(struct super_block *sb, u64 abs_block)
+{
+	struct buffer_head *bh;
+
+	bh = briefs_get_zero_block(sb, abs_block);
+	if (!bh)
+		return -EIO;
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+	return 0;
+}
+
+/*
+ * briefs_fallocate - VFS fallocate implementation.
+ *
+ * Supports plain pre-allocation (mode == 0) and FALLOC_FL_KEEP_SIZE.
+ * All other flags, including FALLOC_FL_PUNCH_HOLE, are rejected for now.
+ */
+long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
+{
+	struct inode *inode = file_inode(file);
+	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct briefs_disk_inode disk_di;
+	struct timespec64 now;
+	loff_t end;
+	u64 start_blk, end_blk, blk;
+	u64 rel, phys;
+	struct briefs_extent ext;
+	bool changed = false;
+	bool grew_size = false;
+	int ret = 0;
+
+	if (mode & ~(FALLOC_FL_KEEP_SIZE))
+		return -EOPNOTSUPP;
+
+	if (offset < 0 || len <= 0)
+		return -EINVAL;
+
+	end = offset + len;
+	if (end > inode->i_sb->s_maxbytes)
+		return -EFBIG;
+
+	inode_lock(inode);
+
+	/*
+	 * Inline-data files don't consume real blocks.  If the requested range
+	 * fits entirely inside the inline region we only need to possibly grow
+	 * i_size.  Otherwise we must promote to an extent-backed file first.
+	 */
+	if (binfo->disk_inode.flags & InodeFlagInlineData) {
+		if (end <= BRIEFS_INODE_INLINE_DATA_SIZE) {
+			if (!(mode & FALLOC_FL_KEEP_SIZE) && end > inode->i_size) {
+				write_seqcount_begin(&binfo->extent_seq);
+				inode->i_size = end;
+				binfo->disk_inode.filesize = end;
+				write_seqcount_end(&binfo->extent_seq);
+				changed = true;
+				grew_size = true;
+			}
+			goto out_update;
+		}
+
+		ret = briefs_promote_inline_data(inode);
+		if (ret)
+			goto out_unlock;
+		truncate_inode_pages(inode->i_mapping, 0);
+		changed = true;
+	}
+
+	start_blk = offset >> BRIEFS_BLOCK_SHIFT;
+	end_blk = (end + BRIEFS_BLOCK_SIZE - 1) >> BRIEFS_BLOCK_SHIFT;
+
+	for (blk = start_blk; blk < end_blk; blk++) {
+		if (briefs_block_mapped(inode, blk))
+			continue;
+
+		rel = briefs_alloc_block(&bsi->alloc);
+		if (rel == 0) {
+			ret = -ENOSPC;
+			break;
+		}
+		phys = data_to_abs(bsi->sb, rel);
+
+		ret = briefs_zero_block(inode->i_sb, phys);
+		if (ret) {
+			briefs_free_block(&bsi->alloc, rel);
+			break;
+		}
+
+		ext.offset = blk;
+		ext.phys = phys;
+		ext.len = 1;
+		ext.flags = 0;
+
+		ret = briefs_append_extent_nojournal(inode->i_sb,
+						    &binfo->disk_inode,
+						    &ext);
+		if (ret) {
+			briefs_free_block(&bsi->alloc, rel);
+			break;
+		}
+		changed = true;
+	}
+
+	if (!(mode & FALLOC_FL_KEEP_SIZE) && end > inode->i_size) {
+		inode->i_size = end;
+		binfo->disk_inode.filesize = end;
+		changed = true;
+		grew_size = true;
+	}
+
+	inode->i_blocks = briefs_compute_i_blocks(inode->i_sb, &binfo->disk_inode);
+
+	briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+				  &binfo->disk_inode, false);
+	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
+	briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+
+out_update:
+	if (changed) {
+		ktime_get_real_ts64(&now);
+		inode->i_ctime_sec = now.tv_sec;
+		inode->i_ctime_nsec = now.tv_nsec;
+		if (grew_size) {
+			inode->i_mtime_sec = now.tv_sec;
+			inode->i_mtime_nsec = now.tv_nsec;
+		}
+		briefs_sync_inode_times(inode, &binfo->disk_inode);
+		mark_inode_dirty(inode);
+	}
+
+out_unlock:
+	inode_unlock(inode);
+	return ret;
+}
+
 /*
  * briefs_symlink - create a symbolic link.
  * Stores the symlink target path as file data using the normal

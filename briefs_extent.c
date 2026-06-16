@@ -24,56 +24,6 @@
  * block numbers for sb_bread/sb_getblk using this helper.
  */
 /*
- * briefs_compute_i_blocks - compute number of 512-byte sectors used
- * by the data blocks described by an inode's extents. This covers both
- * inline extents and the extents stored in overflow chain blocks.
- *
- * Note: this helper is used from contexts without a struct super_block, so
- * it reads the chain directly using the on-disk absolute block numbers
- * stored in the inode.  A NULL super_block or a read failure simply stops
- * the accumulation for that inode.
- */
-inline u64 briefs_compute_i_blocks(struct briefs_inode *di)
-{
-	u64 blocks = 0;
-	int i;
-	for (i = 0; i < di->num_extents_inline; i++)
-		blocks += di->inline_extents[i].len;
-	for (i = 0; i < di->num_extents_total - di->num_extents_inline; i++) {
-		struct briefs_extent ext;
-		struct buffer_head *bh;
-		struct briefs_extent_chain *chain;
-		int chain_idx = i;
-		u64 chain_block = di->extent_inline_base;
-		bool found = false;
-
-		while (chain_block) {
-			bh = sb_bread((struct super_block *)NULL, chain_block);
-			if (!bh)
-				break;
-			chain = (struct briefs_extent_chain *)bh->b_data;
-			if (briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
-				brelse(bh);
-				break;
-			}
-			if ((u32)chain_idx < le32_to_cpu(chain->num_extents_in_block)) {
-				briefs_disk_extent_to_cpu(&chain->extents[chain_idx], &ext);
-				found = true;
-				brelse(bh);
-				break;
-			}
-			chain_idx -= le32_to_cpu(chain->num_extents_in_block);
-			chain_block = le64_to_cpu(chain->next_overflow_block);
-			brelse(bh);
-		}
-		if (!found)
-			break;
-		blocks += ext.len;
-	}
-	return blocks * (BRIEFS_BLOCK_SIZE / 512);
-}
-
-/*
  * Free a contiguous run of data blocks.  Applies the same sanity cap on
  * length that the inline free paths use to avoid infinite loops on corrupt
  * extents.
@@ -455,6 +405,47 @@ int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 	briefs_journal_inode_full(bsi->journal, di->inode_number, &disk_di);
 	return 0;
 }
+
+/*
+ * briefs_append_extent_nojournal - append an extent without immediately
+ * journaling.  The caller is responsible for logging a full inode snapshot
+ * after a batch of appends (e.g. briefs_fallocate).  Otherwise identical to
+ * briefs_append_extent.
+ */
+int briefs_append_extent_nojournal(struct super_block *sb, struct briefs_inode *di,
+                                    struct briefs_extent *ext)
+{
+	struct briefs_inode_info *binfo;
+	int ret;
+
+	binfo = container_of(di, struct briefs_inode_info, disk_inode);
+	mutex_lock(&binfo->extent_lock);
+	ret = __briefs_append_extent(sb, di, ext);
+	mutex_unlock(&binfo->extent_lock);
+	return ret;
+}
+
+/*
+ * briefs_compute_i_blocks - compute number of 512-byte sectors used
+ * by the data blocks described by an inode's extents. This covers both
+ * inline extents and the extents stored in overflow chain blocks.
+ */
+inline u64 briefs_compute_i_blocks(struct super_block *sb, struct briefs_inode *di)
+{
+	u64 blocks = 0;
+	int i;
+	for (i = 0; i < di->num_extents_inline; i++)
+		blocks += di->inline_extents[i].len;
+	for (i = 0; i < di->num_extents_total - di->num_extents_inline; i++) {
+		struct briefs_extent ext;
+		int ret = briefs_read_chain_extent(sb, di->extent_inline_base, i, &ext);
+		if (ret)
+			break;
+		blocks += ext.len;
+	}
+	return blocks * (BRIEFS_BLOCK_SIZE / 512);
+}
+
 
 /*
  * briefs_read_extent_chain - read an extent from the chain portion only,

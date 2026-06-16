@@ -56,6 +56,7 @@ const struct file_operations briefs_file_operations = {
 	.release = briefs_release,
 	.mmap = generic_file_mmap,
 	.fsync = briefs_fsync,
+	.fallocate = briefs_fallocate,
 };
 
 /* Superblock operations */
