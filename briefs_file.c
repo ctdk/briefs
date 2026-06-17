@@ -5,11 +5,13 @@
 #include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/falloc.h>
+#include <linux/fiemap.h>
 #include <linux/statfs.h>
 #include <linux/slab.h>
 #include <linux/buffer_head.h>
 #include <linux/mpage.h>
 #include <linux/seqlock.h>
+#include <linux/sort.h>
 #include <linux/pagemap.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
@@ -652,6 +654,116 @@ int briefs_getattr(struct mnt_idmap *idmap, const struct path *path,
 	stat->blocks = i_blocks;
 	pr_debug("briefs: getattr ino=%lu i_blocks=%llu\n", inode->i_ino, i_blocks);
 	return 0;
+}
+
+/* Compare two briefs_extents by logical offset, for sort(). */
+static int briefs_extent_cmp_offset(const void *a, const void *b)
+{
+	const struct briefs_extent *ea = a, *eb = b;
+
+	if (ea->offset < eb->offset)
+		return -1;
+	if (ea->offset > eb->offset)
+		return 1;
+	return 0;
+}
+
+/* briefs_fiemap - report the file extent map (FS_IOC_FIEMAP).
+ *
+ * BrieFS has no hole extents: punch-hole removes extents and frees their
+ * blocks, so holes are gaps in logical coverage. We emit only the real
+ * allocated extents in ascending logical order; holes are implied by the
+ * gaps between them (per the fiemap spec). Preallocated blocks are normal
+ * extents (flags == 0). Inline-data inodes report a single DATA_INLINE extent.
+ */
+int briefs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
+		  u64 start, u64 len)
+{
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct briefs_inode *di = &binfo->disk_inode;
+	struct super_block *sb = inode->i_sb;
+	u64 isize = i_size_read(inode);
+	u64 snap_total, end;
+	struct briefs_extent *arr;
+	unsigned int seq;
+	int ret, i;
+
+	/* Validate/clip the range; flush dirty pages if FIEMAP_FLAG_SYNC was
+	 * requested. supported_flags = 0 means we accept only FIEMAP_FLAG_SYNC
+	 * (added by fiemap_prep); FIEMAP_FLAG_XATTR requests get -EBADR since
+	 * BrieFS has no xattrs. */
+	ret = fiemap_prep(inode, fieinfo, start, &len, 0);
+	if (ret)
+		return ret;
+	end = start + len;   /* len is now clipped by fiemap_prep */
+
+	/* Inline-data inode: a single inline extent covers [0, isize). */
+	if (di->flags & InodeFlagInlineData) {
+		if (start < isize) {
+			ret = fiemap_fill_next_extent(fieinfo, 0, 0, isize,
+				FIEMAP_EXTENT_DATA_INLINE | FIEMAP_EXTENT_LAST);
+			/* helper also sets FIEMAP_EXTENT_NOT_ALIGNED for us */
+			if (ret < 0)
+				return ret;
+		}
+		return 0;   /* ret == 1 (done) -> return 0; never return 1 */
+	}
+
+	/* Snapshot the extent count under seqcount (briefs_get_block style):
+	 * chain blocks are append-only for the inode's lifetime, so walking
+	 * by index within snap_total is safe against concurrent appends. */
+	do {
+		seq = read_seqcount_begin(&binfo->extent_seq);
+		snap_total = di->num_extents_total;
+	} while (read_seqcount_retry(&binfo->extent_seq, seq));
+
+	if (snap_total == 0)
+		return 0;   /* fully sparse / empty extent-backed file */
+
+	arr = kmalloc_array(snap_total, sizeof(*arr), GFP_NOFS);
+	if (!arr)
+		return -ENOMEM;
+
+	/* Collect every extent (reuse briefs_read_extent, as
+	 * briefs_free_inode_data does at briefs_extent.c:700-712). */
+	for (i = 0; i < snap_total; i++) {
+		if (briefs_read_extent(sb, di, i, &arr[i])) {
+			ret = -EIO;
+			goto out;
+		}
+	}
+
+	/* fiemap requires ascending logical order; the on-disk list is in
+	 * append order and may be unsorted after out-of-order writes. */
+	sort(arr, snap_total, sizeof(arr[0]), briefs_extent_cmp_offset, NULL);
+
+	for (i = 0; i < snap_total; i++) {
+		u64 logical   = arr[i].offset << BRIEFS_BLOCK_SHIFT;
+		u64 ext_bytes = arr[i].len    << BRIEFS_BLOCK_SHIFT;
+		u64 ext_end   = logical + ext_bytes;
+		u32 flags = 0;
+
+		if (ext_end <= start)
+			continue;          /* entirely before the query range */
+		if (logical >= end)
+			break;             /* sorted -> no more overlap */
+
+		if (i + 1 == snap_total)
+			flags |= FIEMAP_EXTENT_LAST;
+
+		ret = fiemap_fill_next_extent(fieinfo, logical,
+			arr[i].phys << BRIEFS_BLOCK_SHIFT, ext_bytes, flags);
+		if (ret < 0)
+			goto out;          /* -EFAULT: propagate */
+		if (ret == 1)
+			goto done;         /* buffer full or LAST emitted: success */
+		/* ret == 0: continue */
+	}
+done:
+	ret = 0;
+out:
+	kfree(arr);
+	return ret;
 }
 
 /*

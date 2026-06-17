@@ -871,6 +871,8 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
                    struct iattr *attr);
 int briefs_getattr(struct mnt_idmap *idmap, const struct path *path,
                    struct kstat *stat, u32 request_mask, unsigned int query_flags);
+int briefs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
+                  u64 start, u64 len);
 int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync);
 int briefs_open(struct inode *inode, struct file *file);
 int briefs_release(struct inode *inode, struct file *file);

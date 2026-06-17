@@ -395,6 +395,108 @@ mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount after punch 
 INLINE_HEX2=$(od -An -tx1 -N10 "$PUNCH_INLINE" | tr -d ' \n')
 [ "$INLINE_HEX2" = "4142000000004748494a" ] && pass "inline punch survives replay" || fail "inline punch survives replay"
 
+# Phase 11c: fiemap (FS_IOC_FIEMAP) exposes the file extent map. BrieFS has no
+# hole extents, so a punched hole shows up as a *gap* between two real extents
+# (the fiemap convention). The probe is embedded so the suite stays
+# self-contained when piped to the VM over SSH; it is skipped if there is no
+# compiler to build it with.
+echo ""
+echo "=== Phase 11c: fiemap ==="
+FIEMAP_C=/tmp/briefs_fiemap_probe_$$.c
+FIEMAP_BIN=/tmp/briefs_fiemap_probe_$$
+if ! command -v gcc >/dev/null 2>&1; then
+  echo "  (skipped: gcc not available to build the fiemap probe)"
+else
+  cat > "$FIEMAP_C" <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/fiemap.h>
+#include <linux/fs.h>
+
+static void dump_flags(unsigned int f)
+{
+	if (f & FIEMAP_EXTENT_LAST)        printf(" LAST");
+	if (f & FIEMAP_EXTENT_UNKNOWN)     printf(" UNKNOWN");
+	if (f & FIEMAP_EXTENT_DATA_INLINE) printf(" DATA_INLINE");
+	if (f & FIEMAP_EXTENT_NOT_ALIGNED) printf(" NOT_ALIGNED");
+	if (f & FIEMAP_EXTENT_UNWRITTEN)   printf(" UNWRITTEN");
+}
+
+int main(int argc, char **argv)
+{
+	int fd;
+	enum { MAXEXT = 512 };
+	size_t sz = sizeof(struct fiemap) + MAXEXT * sizeof(struct fiemap_extent);
+	struct fiemap *f;
+	unsigned int i;
+	long got, expect = -1;
+
+	if (argc < 2) { fprintf(stderr, "usage: %s file [expect_count]\n", argv[0]); return 2; }
+	if (argc >= 3) expect = strtol(argv[2], NULL, 10);
+	fd = open(argv[1], O_RDONLY);
+	if (fd < 0) { perror("open"); return 1; }
+	f = malloc(sz);
+	if (!f) { perror("malloc"); close(fd); return 1; }
+	memset(f, 0, sz);
+	f->fm_start = 0;
+	f->fm_length = FIEMAP_MAX_OFFSET;
+	f->fm_flags = 0;
+	f->fm_extent_count = MAXEXT;
+	if (ioctl(fd, FS_IOC_FIEMAP, f) < 0) { perror("ioctl"); free(f); close(fd); return 1; }
+	got = (long)f->fm_mapped_extents;
+	printf("%ld extent(s)\n", got);
+	for (i = 0; i < f->fm_mapped_extents; i++) {
+		struct fiemap_extent *e = &f->fm_extents[i];
+		printf("  [%u] logical=%llu physical=%llu length=%llu flags=0x%x",
+		       i, (unsigned long long)e->fe_logical,
+		       (unsigned long long)e->fe_physical,
+		       (unsigned long long)e->fe_length, e->fe_flags);
+		dump_flags(e->fe_flags);
+		printf("\n");
+	}
+	free(f);
+	close(fd);
+	if (expect >= 0 && got != expect) return 2;
+	return 0;
+}
+EOF
+  if gcc -O2 -o "$FIEMAP_BIN" "$FIEMAP_C" 2>/dev/null; then
+    pass "fiemap probe builds"
+
+    # (a) A contiguous multi-block file is exactly one extent.
+    dd if=/dev/zero bs=4096 count=4 of="$MNT_POINT/fiemap_contig" 2>/dev/null
+    "$FIEMAP_BIN" "$MNT_POINT/fiemap_contig" 1 >/dev/null 2>&1 \
+      && pass "fiemap: contiguous file is 1 extent" \
+      || fail "fiemap: contiguous file is 1 extent" "(expected 1)"
+
+    # (b) Punch the middle block of a 4-block file. With no hole extents the
+    #     file drops from 1 extent to 2 with a gap at logical 4096..8192; size
+    #     is unchanged (KEEP_SIZE).
+    dd if=/dev/zero bs=4096 count=4 of="$MNT_POINT/fiemap_punch" 2>/dev/null
+    fallocate -p -o 4096 -l 4096 "$MNT_POINT/fiemap_punch" 2>/dev/null
+    [ "$(stat -c%s "$MNT_POINT/fiemap_punch" 2>/dev/null)" = "16384" ] \
+      && pass "fiemap: punch keeps size (KEEP_SIZE)" \
+      || fail "fiemap: punch keeps size" "(got $(stat -c%s "$MNT_POINT/fiemap_punch" 2>/dev/null || echo '?'))"
+    "$FIEMAP_BIN" "$MNT_POINT/fiemap_punch" 2 >/dev/null 2>&1 \
+      && pass "fiemap: punched file is 2 extents (hole is a gap)" \
+      || fail "fiemap: punched file is 2 extents" "(expected 2)"
+
+    # (c) An inline-data file (<256 bytes) reports one DATA_INLINE extent.
+    head -c 100 /dev/zero | tr '\0' 'I' > "$MNT_POINT/fiemap_inline" 2>/dev/null
+    FIEMAP_OUT="$("$FIEMAP_BIN" "$MNT_POINT/fiemap_inline" 1 2>/dev/null || true)"
+    echo "$FIEMAP_OUT" | grep -q "DATA_INLINE" \
+      && pass "fiemap: inline-data extent is DATA_INLINE" \
+      || fail "fiemap: inline-data extent is DATA_INLINE" "(got: $(echo "$FIEMAP_OUT" | tail -1))"
+  else
+    fail "fiemap probe build failed"
+  fi
+  rm -f "$FIEMAP_C" "$FIEMAP_BIN"
+fi
+
 # Phase 12: fsck CRC/structure check
 echo ""
 echo "=== Phase 12: fsck ==="

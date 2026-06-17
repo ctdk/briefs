@@ -31,6 +31,7 @@ const struct inode_operations briefs_dir_inode_ops = {
 const struct inode_operations briefs_file_inode_ops = {
 	.setattr = briefs_setattr,
 	.getattr = briefs_getattr,
+	.fiemap = briefs_fiemap,
 };
 
 /* Inode operations for symlinks */
