@@ -321,9 +321,63 @@ mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for statfs r
 FREE_AFTER=$(stat -f "$MNT_POINT" 2>/dev/null | grep -o 'Free: [0-9]*' | awk '{print $2}' || echo "")
 [ "$FREE_BEFORE" = "$FREE_AFTER" ] && pass "free counts consistent after replay" || fail "free counts inconsistent after replay" "(before=$FREE_BEFORE after=$FREE_AFTER)"
 
-# Phase 11: fsck CRC/structure check
+# Phase 11: Punch hole (fallocate -p)
 echo ""
-echo "=== Phase 11: fsck ==="
+echo "=== Phase 11: Punch Hole ==="
+
+# Helper to emit @n copies of a single character.
+mkblock() {
+  local ch="$1"
+  local n="$2"
+  printf "$ch%.0s" $(seq 1 "$n")
+}
+
+# Aligned punch hole in a 4-block file.
+PUNCH_FILE="$MNT_POINT/punch_aligned"
+{ mkblock A 4096; mkblock B 4096; mkblock C 4096; mkblock D 4096; } > "$PUNCH_FILE"
+PUNCH_SIZE=$(stat -c%s "$PUNCH_FILE")
+fallocate -p -o 4096 -l 4096 "$PUNCH_FILE" 2>/dev/null && pass "aligned punch hole" || fail "aligned punch hole"
+[ "$(stat -c%s "$PUNCH_FILE")" = "$PUNCH_SIZE" ] && pass "size unchanged after aligned punch" || fail "size unchanged after aligned punch"
+[ -z "$(head -c 4096 "$PUNCH_FILE" | tr -d 'A')" ] && pass "pre-hole block preserved" || fail "pre-hole block preserved"
+[ -z "$(dd if="$PUNCH_FILE" bs=4096 skip=1 count=1 2>/dev/null | tr -d '\0')" ] && pass "punched block is zero" || fail "punched block is zero"
+[ -z "$(dd if="$PUNCH_FILE" bs=4096 skip=2 count=1 2>/dev/null | tr -d 'C')" ] && pass "post-hole block preserved" || fail "post-hole block preserved"
+
+# Unaligned punch hole spanning part of two blocks.
+PUNCH_FILE2="$MNT_POINT/punch_unaligned"
+{ mkblock A 4096; mkblock B 4096; } > "$PUNCH_FILE2"
+fallocate -p -o 100 -l 200 "$PUNCH_FILE2" 2>/dev/null && pass "unaligned punch hole" || fail "unaligned punch hole"
+[ -z "$(head -c 100 "$PUNCH_FILE2" | tr -d 'A')" ] && pass "unaligned prefix preserved" || fail "unaligned prefix preserved"
+[ -z "$(dd if="$PUNCH_FILE2" bs=1 skip=100 count=200 2>/dev/null | tr -d '\0')" ] && pass "unaligned hole is zero" || fail "unaligned hole is zero"
+[ -z "$(dd if="$PUNCH_FILE2" bs=1 skip=300 count=3796 2>/dev/null | tr -d 'A')" ] && pass "unaligned suffix preserved" || fail "unaligned suffix preserved"
+[ -z "$(tail -c 4096 "$PUNCH_FILE2" | tr -d 'B')" ] && pass "unaligned second block preserved" || fail "unaligned second block preserved"
+
+# Punch hole that removes an entire single-block extent.
+PUNCH_WHOLE="$MNT_POINT/punch_whole"
+mkblock X 4096 > "$PUNCH_WHOLE"
+PUNCH_WHOLE_SIZE=$(stat -c%s "$PUNCH_WHOLE")
+fallocate -p -o 0 -l 4096 "$PUNCH_WHOLE" 2>/dev/null && pass "whole block punch hole" || fail "whole block punch hole"
+[ "$(stat -c%s "$PUNCH_WHOLE")" = "$PUNCH_WHOLE_SIZE" ] && pass "size unchanged after whole-block punch" || fail "size unchanged after whole-block punch"
+[ -z "$(dd if="$PUNCH_WHOLE" bs=4096 count=1 2>/dev/null | tr -d '\0')" ] && pass "whole-block hole is zero" || fail "whole-block hole is zero"
+
+# Punch hole on an inline-data file.
+PUNCH_INLINE="$MNT_POINT/punch_inline"
+printf 'ABCDEFGHIJ' > "$PUNCH_INLINE"
+fallocate -p -o 2 -l 4 "$PUNCH_INLINE" 2>/dev/null && pass "inline punch hole" || fail "inline punch hole"
+INLINE_HEX=$(od -An -tx1 -N10 "$PUNCH_INLINE" | tr -d ' \n')
+[ "$INLINE_HEX" = "4142000000004748494a" ] && pass "inline hole content" || fail "inline hole content" "(got $INLINE_HEX)"
+
+sync
+umount "$MNT_POINT" 2>/dev/null || true
+mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount after punch hole" || fail "remount after punch hole"
+[ -z "$(dd if="$PUNCH_FILE" bs=4096 skip=1 count=1 2>/dev/null | tr -d '\0')" ] && pass "aligned punch survives replay" || fail "aligned punch survives replay"
+[ -z "$(dd if="$PUNCH_FILE2" bs=1 skip=100 count=200 2>/dev/null | tr -d '\0')" ] && pass "unaligned punch survives replay" || fail "unaligned punch survives replay"
+[ -z "$(dd if="$PUNCH_WHOLE" bs=4096 count=1 2>/dev/null | tr -d '\0')" ] && pass "whole-block punch survives replay" || fail "whole-block punch survives replay"
+INLINE_HEX2=$(od -An -tx1 -N10 "$PUNCH_INLINE" | tr -d ' \n')
+[ "$INLINE_HEX2" = "4142000000004748494a" ] && pass "inline punch survives replay" || fail "inline punch survives replay"
+
+# Phase 12: fsck CRC/structure check
+echo ""
+echo "=== Phase 12: fsck ==="
 sync
 # Unmount before fsck so the checker sees a quiescent, consistent image.
 umount "$MNT_POINT" 2>/dev/null || true

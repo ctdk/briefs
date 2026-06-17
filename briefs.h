@@ -26,6 +26,7 @@
 #define BRIEFS_INODE_SIZE 512
 #define BRIEFS_INODE_INLINE_DATA_SIZE 256
 #define BRIEFS_NAME_LEN 255
+#define BRIEFS_CHAIN_EXTENTS 127
 
 /* Semantic versioning, yo */
 #define _BRIEFS_MAJOR_VER 0

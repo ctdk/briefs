@@ -60,6 +60,7 @@ WORKS
 * statfs
 * journal replay on mount
 * truncate
+* fallocate pre-allocation and punch-hole (FALLOC_FL_PUNCH_HOLE)
 * cp -r works properly
 * symlinks and other special files
 * a set of tests

@@ -14,10 +14,6 @@
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
 
-
-/* Extents per chain block (see struct briefs_extent_chain) */
-#define CHAIN_EXTENTS 127
-
 /*
  * Data region start: the allocator trie uses data-relative block numbers
  * with block 0 being the first data block on disk.  Convert to absolute
@@ -195,8 +191,8 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 				write_seqcount_end(&binfo->extent_seq);
 			} else {
 				chain_idx = last_idx - di->num_extents_inline;
-				block_slot = chain_idx % CHAIN_EXTENTS;
-				blocks_to_skip = chain_idx / CHAIN_EXTENTS;
+				block_slot = chain_idx % BRIEFS_CHAIN_EXTENTS;
+				blocks_to_skip = chain_idx / BRIEFS_CHAIN_EXTENTS;
 				chain_block = di->extent_inline_base;
 
 				while (blocks_to_skip-- > 0) {
@@ -308,7 +304,7 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 		}
 
 		num_in_block = le32_to_cpu(chain->num_extents_in_block);
-		if (num_in_block < CHAIN_EXTENTS) {
+		if (num_in_block < BRIEFS_CHAIN_EXTENTS) {
 			/* Room in this block */
 			slot = num_in_block;
 			briefs_cpu_extent_to_disk(ext, &chain->extents[slot]);

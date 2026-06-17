@@ -669,10 +669,360 @@ static int briefs_zero_block(struct super_block *sb, u64 abs_block)
 }
 
 /*
+ * briefs_zero_block_range - zero bytes [start, end) inside the physical
+ * block at @abs_block.  Used by punch-hole to zero the portion of a
+ * partially-holed block that remains allocated.
+ */
+static int briefs_zero_block_range(struct super_block *sb, u64 abs_block,
+                                   u32 start, u32 end)
+{
+	struct buffer_head *bh;
+
+	if (start >= end)
+		return 0;
+	if (end > sb->s_blocksize)
+		return -EINVAL;
+
+	bh = sb_bread(sb, abs_block);
+	if (!bh)
+		return -EIO;
+
+	memset(bh->b_data + start, 0, end - start);
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+	return 0;
+}
+
+/*
+ * briefs_replace_extent_list - atomically replace an inode's entire extent
+ * list with @new_count extents from @new_exts.  Allocates and writes new
+ * chain blocks if needed, updates the in-memory disk_inode, and returns the
+ * old chain base in *@old_chain_base_out so the caller can free it after the
+ * new inode has been persisted.
+ *
+ * Returns 0 on success or a negative errno.  On error the inode's extent
+ * metadata is unchanged and no data blocks have been freed.
+ */
+static int briefs_replace_extent_list(struct super_block *sb,
+                                      struct briefs_inode *di,
+                                      int new_count,
+                                      struct briefs_extent *new_exts,
+                                      u64 *old_chain_base_out)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct briefs_inode_info *binfo = container_of(di,
+						       struct briefs_inode_info,
+						       disk_inode);
+	struct briefs_extent_chain *chain;
+	struct buffer_head *bh;
+	u64 *chain_blocks = NULL;
+	int chain_count = 0;
+	int num_inline;
+	int i, j, ret = 0;
+
+	*old_chain_base_out = di->extent_inline_base;
+
+	if (new_count > 8) {
+		chain_count = (new_count - 8 + BRIEFS_CHAIN_EXTENTS - 1)
+			      / BRIEFS_CHAIN_EXTENTS;
+		chain_blocks = kmalloc_array(chain_count, sizeof(*chain_blocks),
+					     GFP_KERNEL);
+		if (!chain_blocks)
+			return -ENOMEM;
+
+		/* Allocate new chain blocks first; if we run out of space the
+		 * caller can back out without having modified anything. */
+		for (i = 0; i < chain_count; i++) {
+			u64 rel = briefs_alloc_block(&bsi->alloc);
+
+			if (rel == 0) {
+				ret = -ENOSPC;
+				goto free_chain_blocks;
+			}
+			chain_blocks[i] = data_to_abs(bsi->sb, rel);
+		}
+
+		/* Write the new chain blocks before making them reachable. */
+		for (i = 0; i < chain_count; i++) {
+			int ext_idx = 8 + i * BRIEFS_CHAIN_EXTENTS;
+			int extents_in_block = min(new_count - ext_idx,
+						   BRIEFS_CHAIN_EXTENTS);
+			u64 next_block = (i < chain_count - 1)
+					 ? chain_blocks[i + 1] : 0;
+
+			bh = briefs_get_zero_block(sb, chain_blocks[i]);
+			if (!bh) {
+				ret = -EIO;
+				goto free_chain_blocks;
+			}
+			chain = (struct briefs_extent_chain *)bh->b_data;
+			chain->next_overflow_block = cpu_to_le64(next_block);
+			chain->num_extents_in_block =
+				cpu_to_le32(extents_in_block);
+			for (j = 0; j < extents_in_block; j++)
+				briefs_cpu_extent_to_disk(&new_exts[ext_idx + j],
+							  &chain->extents[j]);
+			chain->checksum =
+				cpu_to_le64(briefs_chain_checksum(bh->b_data));
+			sync_dirty_buffer(bh);
+			brelse(bh);
+		}
+	}
+
+	mutex_lock(&binfo->extent_lock);
+
+	write_seqcount_begin(&binfo->extent_seq);
+	num_inline = min(new_count, 8);
+	di->num_extents_inline = num_inline;
+	di->num_extents_total = new_count;
+	di->extent_inline_base = chain_blocks ? chain_blocks[0] : 0;
+	memset(di->inline_extents, 0, sizeof(di->inline_extents));
+	for (i = 0; i < num_inline; i++)
+		di->inline_extents[i] = new_exts[i];
+	write_seqcount_end(&binfo->extent_seq);
+
+	mutex_unlock(&binfo->extent_lock);
+
+	/* Journal the chain-block allocations so replay marks them used. */
+	for (i = 0; i < chain_count; i++)
+		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
+					    0, chain_blocks[i], 1, -1);
+
+	kfree(chain_blocks);
+	return 0;
+
+free_chain_blocks:
+	for (i = 0; i < chain_count; i++) {
+		if (chain_blocks[i]) {
+			briefs_journal_extent_free(bsi->journal, 0, 0,
+						   chain_blocks[i], 1);
+			briefs_free_block(&bsi->alloc,
+					abs_to_data(bsi->sb, chain_blocks[i]));
+		}
+	}
+	kfree(chain_blocks);
+	return ret;
+}
+
+/*
+ * briefs_do_punch_hole - create a hole in a regular file.
+ *
+ * Caller must hold inode_lock.  The file size must not change.
+ */
+static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
+{
+	struct inode *inode = file_inode(file);
+	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct briefs_disk_inode disk_di;
+	struct timespec64 now;
+	loff_t end = offset + len;
+	u64 start_blk = offset >> BRIEFS_BLOCK_SHIFT;
+	u64 end_blk = (end + BRIEFS_BLOCK_SIZE - 1) >> BRIEFS_BLOCK_SHIFT;
+	struct briefs_extent *old_exts = NULL;
+	struct briefs_extent *new_exts = NULL;
+	int old_count, new_count = 0;
+	u64 old_chain_base = 0;
+	bool changed = false;
+	bool need_partial_start, need_partial_end;
+	u32 partial_start_off, partial_end_off;
+	int ret = 0;
+	int i;
+
+	need_partial_start = (offset & (BRIEFS_BLOCK_SIZE - 1)) != 0;
+	need_partial_end = (end & (BRIEFS_BLOCK_SIZE - 1)) != 0;
+	partial_start_off = offset & (BRIEFS_BLOCK_SIZE - 1);
+	partial_end_off = end & (BRIEFS_BLOCK_SIZE - 1);
+
+	if (binfo->disk_inode.flags & InodeFlagInlineData) {
+		loff_t punch_start = max_t(loff_t, offset, 0);
+		loff_t punch_end = min_t(loff_t, end, inode->i_size);
+
+		if (punch_start < punch_end) {
+			memset(binfo->disk_inode.inline_data + punch_start, 0,
+			       punch_end - punch_start);
+			changed = true;
+		}
+
+		if (changed) {
+			briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+						  &binfo->disk_inode, false);
+			briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
+			briefs_journal_inode_full(bsi->journal, inode->i_ino,
+						  &disk_di);
+		}
+		goto out_update;
+	}
+
+	if (binfo->disk_inode.num_extents_total > INT_MAX / 2) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
+	old_count = (int)binfo->disk_inode.num_extents_total;
+	if (old_count == 0)
+		goto out_update;
+
+	old_exts = kmalloc_array(old_count, sizeof(*old_exts), GFP_KERNEL);
+	new_exts = kmalloc_array(old_count * 2, sizeof(*new_exts), GFP_KERNEL);
+	if (!old_exts || !new_exts) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
+
+	for (i = 0; i < old_count; i++) {
+		if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, i,
+				       &old_exts[i]) != 0) {
+			ret = -EIO;
+			goto out_free;
+		}
+	}
+
+	/*
+	 * Build the new extent list and zero any partially-holed boundary
+	 * blocks that remain allocated.
+	 */
+	for (i = 0; i < old_count; i++) {
+		struct briefs_extent ext = old_exts[i];
+		u64 ext_end = ext.offset + ext.len;
+		u64 free_start, free_end;
+
+		if (ext_end <= start_blk || ext.offset >= end_blk) {
+			new_exts[new_count++] = ext;
+			continue;
+		}
+
+		free_start = max(ext.offset, start_blk);
+		free_end = min(ext_end, end_blk);
+
+		if (need_partial_start && free_start == start_blk &&
+		    free_start < free_end)
+			free_start++;
+
+		if (need_partial_end && free_end == end_blk &&
+		    free_start < free_end)
+			free_end--;
+
+		if (need_partial_start && start_blk >= ext.offset &&
+		    start_blk < ext_end) {
+			u64 abs_block = ext.phys + (start_blk - ext.offset);
+
+			ret = briefs_zero_block_range(inode->i_sb, abs_block,
+						      partial_start_off,
+						      BRIEFS_BLOCK_SIZE);
+			if (ret)
+				goto out_free;
+		}
+
+		if (need_partial_end && (end_blk - 1) >= ext.offset &&
+		    (end_blk - 1) < ext_end) {
+			u64 abs_block = ext.phys + ((end_blk - 1) - ext.offset);
+
+			ret = briefs_zero_block_range(inode->i_sb, abs_block,
+						      0,
+						      partial_end_off);
+			if (ret)
+				goto out_free;
+		}
+
+		if (free_start > ext.offset) {
+			struct briefs_extent left = ext;
+
+			left.len = free_start - ext.offset;
+			new_exts[new_count++] = left;
+		}
+
+		if (free_end < ext_end) {
+			struct briefs_extent right = ext;
+
+			right.offset = free_end;
+			right.phys = ext.phys + (free_end - ext.offset);
+			right.len = ext_end - free_end;
+			new_exts[new_count++] = right;
+		}
+
+		if (free_start > ext.offset || free_end < ext_end)
+			changed = true;
+	}
+
+	/*
+	 * Replace the extent list atomically.  This allocates chain blocks if
+	 * necessary, writes them, and updates the in-memory inode metadata.
+	 * No data blocks have been freed yet, so failure here is harmless.
+	 */
+	ret = briefs_replace_extent_list(inode->i_sb, &binfo->disk_inode,
+					 new_count, new_exts, &old_chain_base);
+	if (ret)
+		goto out_free;
+
+	/*
+	 * The inode now references only kept blocks.  It is safe to free the
+	 * removed data blocks and the old chain blocks.
+	 */
+	for (i = 0; i < old_count; i++) {
+		struct briefs_extent ext = old_exts[i];
+		u64 ext_end = ext.offset + ext.len;
+		u64 free_start, free_end;
+
+		if (ext_end <= start_blk || ext.offset >= end_blk)
+			continue;
+
+		free_start = max(ext.offset, start_blk);
+		free_end = min(ext_end, end_blk);
+
+		if (need_partial_start && free_start == start_blk &&
+		    free_start < free_end)
+			free_start++;
+
+		if (need_partial_end && free_end == end_blk &&
+		    free_start < free_end)
+			free_end--;
+
+		if (free_start < free_end) {
+			u64 free_phys = ext.phys + (free_start - ext.offset);
+			u64 free_len = free_end - free_start;
+
+			briefs_journal_extent_free(bsi->journal, inode->i_ino,
+						   free_start, free_phys,
+						   free_len);
+			briefs_free_blocks_range(bsi, free_phys, free_len);
+			changed = true;
+		}
+	}
+
+	if (old_chain_base)
+		briefs_free_chain_blocks(inode->i_sb, old_chain_base);
+
+	inode->i_blocks = briefs_compute_i_blocks(inode->i_sb,
+						 &binfo->disk_inode);
+
+	briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+				  &binfo->disk_inode, false);
+	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
+	briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+
+out_update:
+	if (changed) {
+		ktime_get_real_ts64(&now);
+		inode->i_ctime_sec = now.tv_sec;
+		inode->i_ctime_nsec = now.tv_nsec;
+		briefs_sync_inode_times(inode, &binfo->disk_inode);
+		mark_inode_dirty(inode);
+		truncate_pagecache_range(inode, offset, end - 1);
+	}
+
+out_free:
+	kfree(old_exts);
+	kfree(new_exts);
+	inode_unlock(inode);
+	return ret;
+}
+
+/*
  * briefs_fallocate - VFS fallocate implementation.
  *
- * Supports plain pre-allocation (mode == 0) and FALLOC_FL_KEEP_SIZE.
- * All other flags, including FALLOC_FL_PUNCH_HOLE, are rejected for now.
+ * Supports plain pre-allocation (mode == 0), FALLOC_FL_KEEP_SIZE, and
+ * FALLOC_FL_PUNCH_HOLE (which must be combined with FALLOC_FL_KEEP_SIZE).
  */
 long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 {
@@ -689,7 +1039,7 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	bool grew_size = false;
 	int ret = 0;
 
-	if (mode & ~(FALLOC_FL_KEEP_SIZE))
+	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE))
 		return -EOPNOTSUPP;
 
 	if (offset < 0 || len <= 0)
@@ -699,7 +1049,15 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	if (end > inode->i_sb->s_maxbytes)
 		return -EFBIG;
 
+	if ((mode & FALLOC_FL_PUNCH_HOLE) && !(mode & FALLOC_FL_KEEP_SIZE))
+		return -EINVAL;
+
 	inode_lock(inode);
+
+	if (mode & FALLOC_FL_PUNCH_HOLE) {
+		ret = briefs_do_punch_hole(file, offset, len);
+		return ret;
+	}
 
 	/*
 	 * Inline-data files don't consume real blocks.  If the requested range
