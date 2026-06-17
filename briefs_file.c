@@ -315,6 +315,14 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		goto out_copy;
 
 	/*
+	 * From this point on we may manipulate the extent list or the chain
+	 * blocks that back it.  Hold the per-inode extent lock to serialize
+	 * with concurrent appends (briefs_append_extent / briefs_get_block)
+	 * and with writeback that maps blocks through the extent list.
+	 */
+	mutex_lock(&binfo->extent_lock);
+
+	/*
 	 * Growing an inline-data inode: zero-fill the gap and, if the new
 	 * size exceeds the inline region, promote to an extent-backed file.
 	 */
@@ -338,7 +346,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		} else {
 			ret = briefs_promote_inline_data(inode);
 			if (ret)
-				return ret;
+				goto out_unlock;
 
 			/* Promotion allocated one block; set the new size. */
 			binfo->disk_inode.filesize = new_size;
@@ -352,12 +360,15 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 				briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
 			}
 		}
+		mutex_unlock(&binfo->extent_lock);
 		return 0;
 	}
 
 	/* Only shrinking remains; growth of extent-backed files is unchanged. */
-	if (new_size > old_size)
+	if (new_size > old_size) {
+		mutex_unlock(&binfo->extent_lock);
 		goto out_copy;
+	}
 
 	pr_debug("briefs: setattr truncate ino=%lu %llu -> %llu\n",
 		inode->i_ino, old_size, new_size);
@@ -385,6 +396,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
 			briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
 		}
+		mutex_unlock(&binfo->extent_lock);
 		return 0;
 	}
 
@@ -392,7 +404,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 	/* Nothing to do if the inode has no extents. */
 	if (binfo->disk_inode.num_extents_total == 0)
-		goto out_copy;
+		goto out_unlock;
 
 	/* Iterate extents in reverse; trunc_block may fall inside an extent
 	 * or before it. Remove or shorten affected extents. */
@@ -449,7 +461,9 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 					if (ci < num_in_block) {
 						briefs_cpu_extent_to_disk(&ext, &chain->extents[ci]);
 						chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
+						write_seqcount_begin(&binfo->extent_seq);
 						mark_buffer_dirty(bh);
+						write_seqcount_end(&binfo->extent_seq);
 						brelse(bh);
 						break;
 					}
@@ -516,7 +530,9 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 					tc->num_extents_in_block = cpu_to_le32(num_in_block - 1);
 					tc->checksum = cpu_to_le64(briefs_chain_checksum(tbh->b_data));
 
+					write_seqcount_begin(&binfo->extent_seq);
 					mark_buffer_dirty(tbh);
+					write_seqcount_end(&binfo->extent_seq);
 
 					/* Free empty non-first chain block */
 					if (num_in_block - 1 == 0 && prev_block != 0) {
@@ -528,7 +544,9 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 							pc = (struct briefs_extent_chain *)pbh->b_data;
 							pc->next_overflow_block = cpu_to_le64(0);
 							pc->checksum = cpu_to_le64(briefs_chain_checksum(pbh->b_data));
+							write_seqcount_begin(&binfo->extent_seq);
 							mark_buffer_dirty(pbh);
+							write_seqcount_end(&binfo->extent_seq);
 							brelse(pbh);
 						}
 						briefs_free_block(&bsi->alloc,
@@ -594,8 +612,11 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
 	}
 
+	mutex_unlock(&binfo->extent_lock);
 	return 0;
 
+out_unlock:
+	mutex_unlock(&binfo->extent_lock);
 out_copy:
 	/* For non-size changes, just copy attributes */
 	setattr_copy(idmap, inode, attr);

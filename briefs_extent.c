@@ -230,7 +230,9 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 								  &chain->extents[block_slot]);
 				}
 				chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
+				write_seqcount_begin(&binfo->extent_seq);
 				mark_buffer_dirty(bh);
+				write_seqcount_end(&binfo->extent_seq);
 				sync_dirty_buffer(bh);
 				brelse(bh);
 			}
@@ -270,6 +272,21 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 		}
 		chain_block = data_to_abs(bsi->sb, rel);
 
+		/*
+		 * Initialize the new chain block before making it reachable from
+		 * the inode.  If initialization fails we can still free the block
+		 * and leave the extent metadata unchanged.
+		 */
+		bh = briefs_get_zero_block(sb, chain_block);
+		if (!bh) {
+			briefs_journal_extent_free(bsi->journal, 0, 0,
+						   chain_block, 1);
+			briefs_free_block(&bsi->alloc, rel);
+			return -EIO;
+		}
+		sync_dirty_buffer(bh);
+		brelse(bh);
+
 		write_seqcount_begin(&binfo->extent_seq);
 		di->extent_inline_base = chain_block;
 		write_seqcount_end(&binfo->extent_seq);
@@ -277,14 +294,6 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 		/* Journal the chain block allocation */
 		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
 					    0, chain_block, 1, -1);
-
-		bh = briefs_get_zero_block(sb, chain_block);
-		if (!bh) {
-			briefs_free_block(&bsi->alloc, rel);
-			return -EIO;
-		}
-		sync_dirty_buffer(bh);
-		brelse(bh);
 	}
 
 	/* Walk to the last chain block */
@@ -310,7 +319,9 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 			briefs_cpu_extent_to_disk(ext, &chain->extents[slot]);
 			chain->num_extents_in_block = cpu_to_le32(num_in_block + 1);
 			chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
+			write_seqcount_begin(&binfo->extent_seq);
 			mark_buffer_dirty(bh);
+			write_seqcount_end(&binfo->extent_seq);
 			sync_dirty_buffer(bh);
 			brelse(bh);
 
@@ -342,7 +353,9 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 			u64 new_block = data_to_abs(bsi->sb, rel);
 			chain->next_overflow_block = cpu_to_le64(new_block);
 			chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
+			write_seqcount_begin(&binfo->extent_seq);
 			mark_buffer_dirty(bh);
+			write_seqcount_end(&binfo->extent_seq);
 			sync_dirty_buffer(bh);
 			brelse(bh);
 
@@ -353,6 +366,8 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 			/* Set up new chain block */
 			bh = briefs_get_zero_block(sb, new_block);
 			if (!bh) {
+				briefs_journal_extent_free(bsi->journal, 0, 0,
+							   new_block, 1);
 				briefs_free_block(&bsi->alloc, rel);
 				return -EIO;
 			}
@@ -360,6 +375,9 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 			briefs_cpu_extent_to_disk(ext, &chain->extents[0]);
 			chain->num_extents_in_block = cpu_to_le32(1);
 			chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
+			write_seqcount_begin(&binfo->extent_seq);
+			mark_buffer_dirty(bh);
+			write_seqcount_end(&binfo->extent_seq);
 			sync_dirty_buffer(bh);
 			brelse(bh);
 		}
@@ -573,8 +591,10 @@ int briefs_get_block(struct inode *inode, sector_t iblock,
 
 	for (i = 0; i < binfo->disk_inode.num_extents_total; i++) {
 		ret = briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext);
-		if (ret != 0)
-			continue;
+		if (ret != 0) {
+			mutex_unlock(&binfo->extent_lock);
+			return ret;
+		}
 		if ((u64)iblock >= ext.offset &&
 		    (u64)iblock < ext.offset + ext.len) {
 			phys = ext.phys + ((u64)iblock - ext.offset);

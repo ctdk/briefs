@@ -140,6 +140,26 @@ dd if=/dev/zero bs=4096 count=20 of="$MNT_POINT/large" 2>/dev/null
 FSIZE=$(stat -c%s "$MNT_POINT/large" 2>/dev/null || echo 0)
 [ "$FSIZE" = 81920 ] && pass "large file (20 blocks, $FSIZE bytes)" || fail "large file size" "(expected 81920, got $FSIZE)"
 
+# Regression test: force overflow to a chain block by writing 9 non-contiguous
+# single-block extents, then extend one of them and remount. This exercises
+# the append path on an inode that has chain blocks, which is where the
+# checksum-mismatch race was observed.
+CHAIN_TEST="$MNT_POINT/chain_extents"
+for chain_off in 0 2 4 6 8 10 12 14 16; do
+  dd if=/dev/urandom bs=4096 count=1 of="$CHAIN_TEST" seek="$chain_off" conv=notrunc 2>/dev/null || true
+done
+FSIZE=$(stat -c%s "$CHAIN_TEST" 2>/dev/null || echo 0)
+[ "$FSIZE" = 69632 ] && pass "chain-block file size" || fail "chain-block file size" "(expected 69632, got $FSIZE)"
+# Append a block just past the last sparse offset to exercise chain-block append.
+echo -n "tail-block" >> "$CHAIN_TEST"
+FSIZE=$(stat -c%s "$CHAIN_TEST" 2>/dev/null || echo 0)
+[ "$FSIZE" = 69642 ] && pass "chain-block append size" || fail "chain-block append size" "(expected 69642, got $FSIZE)"
+sync
+umount "$MNT_POINT" 2>/dev/null || true
+mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for chain-block replay" || fail "remount for chain-block replay"
+FSIZE=$(stat -c%s "$CHAIN_TEST" 2>/dev/null || echo 0)
+[ "$FSIZE" = 69642 ] && pass "chain-block file survives replay" || fail "chain-block file survives replay" "(got $FSIZE)"
+
 # Inline data tests
 SMALL="$(printf 'x%.0s' $(seq 1 100))"
 echo -n "$SMALL" > "$MNT_POINT/inline_small"
