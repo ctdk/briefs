@@ -469,7 +469,7 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 			init_special_inode(inode, inode->i_mode, cpu_di.rdev);
 		}
 
-		pr_info("briefs: inode %llu: mode=0x%04x, uid=%u, gid=%u, size=%llu, nlink=%u\n",
+		pr_info("briefs: inode %llu: mode=0o%06o, uid=%u, gid=%u, size=%llu, nlink=%u\n",
 			ino, inode->i_mode, from_kuid(&init_user_ns, inode->i_uid),
 			from_kgid(&init_user_ns, inode->i_gid), inode->i_size, inode->i_nlink);
 
