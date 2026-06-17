@@ -677,10 +677,17 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 		if (ret)
 			goto fail_target;
 
-		/* Drop the caller's reference so eviction can proceed. */
-		if (old_target)
-			iput(old_target);
 	}
+
+	/*
+	 * Do NOT iput(old_target) here. The VFS owns that inode reference
+	 * (new_dentry holds it) and drops it via dput -> __dentry_kill -> iput
+	 * after ->rename returns, which is what drives eviction of the
+	 * nlink==0 target. Calling iput ourselves is a double-put: it evicts
+	 * the inode prematurely, and the VFS's later iput then hits
+	 * BUG_ON(inode->i_state & I_CLEAR) in iput() (kernel BUG at
+	 * fs/inode.c:1893), which is what crashed `make menuconfig` saves.
+	 */
 
 	/* Remove old entry first; only journal after the trie is changed. */
 	ret = briefs_remove_dir_entry(old_dir, old_dentry->d_name.name, old_dentry->d_name.len);

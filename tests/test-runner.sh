@@ -225,6 +225,16 @@ mv "$MNT_POINT/hello" "$MNT_POINT/goodbye" 2>/dev/null && pass "rename file" || 
 [ ! -f "$MNT_POINT/hello" ] && [ -f "$MNT_POINT/goodbye" ] && pass "rename target exists, source gone" || fail "rename check"
 check_file "renamed content" "$MNT_POINT/goodbye" "Hello"
 
+# Replace-rename: rename over an existing file. This is the case kconfig's
+# conf_write hits (rename .config -> .config.old) and the one that used to
+# oops in iput() (BUG_ON(i_state & I_CLEAR)) because briefs_rename did a
+# stray iput() of the replaced target's inode.
+printf 'replace-source' > "$MNT_POINT/repl_src"
+printf 'replace-target' > "$MNT_POINT/repl_tgt"
+mv "$MNT_POINT/repl_src" "$MNT_POINT/repl_tgt" 2>/dev/null && pass "rename over existing file" || fail "rename over existing file"
+[ ! -f "$MNT_POINT/repl_src" ] && pass "replace-rename source gone" || fail "replace-rename source gone"
+check_file "replace-rename target has source content" "$MNT_POINT/repl_tgt" "replace-source"
+
 # Phase 6: Unlink and rmdir with remount/fsck
 echo ""
 echo "=== Phase 6: Unlink ==="
