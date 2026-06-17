@@ -17,6 +17,7 @@ struct briefs_journal {
 	struct journal_block_header *cur_hdr; /* cast to block header */
 	u64 write_offset;                 /* byte offset for next record in cur_block */
 	u64 write_pos;                    /* current journal block number on disk */
+	u64 synced_pos;                   /* blocks before this (since last sync) are durably on disk */
 	u64 journal_start;                /* first journal block */
 	u64 journal_end;                  /* last journal block */
 	u64 checkpoint_block;             /* checkpoint area (last journal block) */

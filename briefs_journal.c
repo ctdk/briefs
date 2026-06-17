@@ -27,6 +27,7 @@ int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb) 
 		le64_to_cpu(sb->journal_blocks) - 1;
 	j->checkpoint_seq = le64_to_cpu(sb->checkpoint_seq);
 	j->write_pos = le64_to_cpu(sb->journal_log_start);
+	j->synced_pos = j->write_pos;   /* nothing written yet -> nothing to sync */
 	j->dirty = false;
 
 	/* Validate journal geometry */
@@ -301,6 +302,21 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
 	if (ret) {
 		pr_err("briefs: checkpoint write failed (err=%d)\n", ret);
 		return ret;
+	}
+
+	/*
+	 * Force the checkpoint block to disk before the superblock records the
+	 * new log boundaries below, so recovery never sees a superblock whose
+	 * checkpoint_seq / log_end run past an unwritten checkpoint block.
+	 * briefs_journal_write_block() only marks it dirty.
+	 */
+	{
+		struct buffer_head *cpbh = sb_bread(j->vfs_sb, j->checkpoint_block);
+		if (cpbh) {
+			if (buffer_dirty(cpbh))
+				sync_dirty_buffer(cpbh);
+			brelse(cpbh);
+		}
 	}
 
 	pr_debug("briefs: checkpoint written (seq=%llu, records=%u, log_end=%llu)\n",
@@ -977,10 +993,26 @@ void briefs_journal_cleanup(struct briefs_journal *j) {
  * Flushes the current block, advances write_pos.
  */
 int briefs_journal_sync(struct briefs_journal *j) {
+	u64 sync_start, sync_end, pos;
 	int ret;
 
 	if (!j || !j->dirty)
 		return 0;
+
+	/*
+	 * Capture the range of journal blocks dirtied since the last durable
+	 * sync: every filled block flushed by briefs_journal_write_record()
+	 * (from synced_pos up to write_pos) plus the partial block we are about
+	 * to write at write_pos.  briefs_journal_write_block() only marks these
+	 * buffers dirty; on the per-file fsync(2) path nothing else reaches the
+	 * journal block -- it lives on s_bdev's mapping, which
+	 * sync_inode_metadata() (inode block) and file_write_and_wait_range()
+	 * (file data) do not touch -- so without syncing them here fsync(2)
+	 * would not durably persist metadata.  (sync(2)/syncfs/umount already
+	 * flush the journal via the VFS __sync_blockdev(); fsync was the gap.)
+	 */
+	sync_start = j->synced_pos;
+	sync_end = j->write_pos;
 
 	/* Write current block to disk */
 	ret = briefs_journal_write_block(j, j->write_pos, j->cur_block);
@@ -1003,6 +1035,24 @@ int briefs_journal_sync(struct briefs_journal *j) {
 	j->write_offset = sizeof(struct journal_block_header);
 
 	j->dirty = false;
+
+	/*
+	 * Force every journal block dirtied since the last sync to disk.  Each
+	 * sb_bread() is a cache hit returning the uptodate buffer that
+	 * briefs_journal_write_block() left dirty; sync_dirty_buffer() submits
+	 * the write and waits.  This is the durable flush fsync(2) was missing.
+	 */
+	for (pos = sync_start; ; pos = briefs_journal_next_block(j, pos)) {
+		struct buffer_head *bh = sb_bread(j->vfs_sb, pos);
+		if (bh) {
+			if (buffer_dirty(bh))
+				sync_dirty_buffer(bh);
+			brelse(bh);
+		}
+		if (pos == sync_end)
+			break;
+	}
+	j->synced_pos = j->write_pos;
 
 	pr_debug("briefs: journal synced, write_pos=%llu\n", j->write_pos);
 
