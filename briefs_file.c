@@ -13,6 +13,8 @@
 #include <linux/seqlock.h>
 #include <linux/sort.h>
 #include <linux/pagemap.h>
+#include <linux/writeback.h>
+#include <linux/blkdev.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
@@ -48,12 +50,254 @@ static int briefs_read_folio(struct file *file, struct folio *folio)
 
 	return mpage_read_folio(folio, briefs_get_block);
 }
-/* cribbing from xiafs rather than use the frankly shocking no-op openclaw
- * suggested. I don't think briefs actually has trouble with running on loopback
- * devices. o_O */
-static int briefs_writepages(struct address_space *mapping, struct writeback_control *wbc)
+/*
+ * #6 Step 3: run-allocating writepages.
+ *
+ * write_begin defers allocation (BH_Delay); this writepages coalesces the
+ * resulting dirty delayed folios into contiguous runs and allocates each run
+ * with ONE briefs_alloc_blocks(run) call and ONE extent append -- which emits
+ * ONE JRN_EXTENT_ALLOC(len=run) journal record instead of one per block.  On a
+ * fresh/unfragmented fs the per-run extents also merge into a single extent
+ * for the whole sequential write (the alloc blocks come back contiguous, so
+ * __briefs_append_extent's merge branch grows the last extent by `run`).
+ *
+ * writeback_iter() hands us the dirty folios of the wbc range one at a time,
+ * ascending, locked and with the pagecache dirty tag already cleared (ready to
+ * write).  We accumulate a maximal run of consecutive single-block delayed
+ * folios (blocksize == PAGE_SIZE -> 1 block/folio), holding them locked, then
+ * flush the run: allocate a contiguous physical run, append one extent for it,
+ * and write each folio back bound to phys_run+i.  Folios that are not run
+ * candidates (already-mapped overwrites, multi-block folios, or non-delay
+ * dirty buffers) break the run and are written via the normal buffer path.
+ *
+ * Crash ordering is unchanged from Step 2: allocation + extent append happen
+ * here in .writepages, strictly before briefs_write_inode (->journal_inode_full)
+ * runs; fsync does file_write_and_wait_range (writeback) before
+ * sync_inode_metadata.  Every block of a run is written in the same writeback
+ * pass that appends its extent, so the extent is never journaled ahead of its
+ * data.  mark_inode_dirty is called once per writeback (after all runs), not
+ * per block.
+ *
+ * Bounding the run caps the number of folios held locked at once; on kmalloc
+ * failure we fall back to mpage_writepages (the Step 2 per-block path).
+ */
+#define BRIEFS_DELALLOC_RUN_MAX	256
+
+/* block_write_full_folio() isn't exported to modules (only __block_write_full_
+ * folio is), so replicate its i_size handling around the exported primitive.
+ * Used for the non-run writeback path (overwrites / multi-block folios). */
+static int briefs_block_write_full_folio(struct folio *folio,
+					 struct writeback_control *wbc,
+					 get_block_t get_block)
 {
-	return mpage_writepages(mapping, wbc, briefs_get_block);
+	struct inode *inode = folio->mapping->host;
+	loff_t i_size = i_size_read(inode);
+
+	if (folio_pos(folio) + folio_size(folio) <= i_size)
+		return __block_write_full_folio(inode, folio, get_block, wbc);
+	if (folio_pos(folio) >= i_size) {
+		folio_unlock(folio);
+		return 0;
+	}
+	folio_zero_segment(folio, offset_in_folio(folio, i_size),
+			   folio_size(folio));
+	return __block_write_full_folio(inode, folio, get_block, wbc);
+}
+
+/* Write a folio whose single buffer has already been mapped to @phys (no
+ * get_block call).  The folio data (user bytes + zeroed tails from
+ * briefs_write_begin) is correct, so we must not zero -- only invalidate any
+ * stale blockdev alias for the freshly allocated physical block, mirroring what
+ * __block_write_full_folio does in its get_block path (set_buffer_new +
+ * clean_bdev_bh_alias).  __block_write_full_folio then sees a mapped, !delay
+ * buffer and submits it directly.  Run folios are delayed write folios, hence
+ * within i_size with tails already zeroed by write_begin, so the i_size-straddle
+ * wrapper isn't needed here.  It unlocks the folio. */
+static int briefs_write_folio_mapped(struct inode *inode,
+				     struct writeback_control *wbc,
+				     struct folio *folio, sector_t phys)
+{
+	struct buffer_head *bh = folio_buffers(folio);
+
+	map_bh(bh, inode->i_sb, phys);
+	clear_buffer_delay(bh);
+	set_buffer_new(bh);
+	clean_bdev_bh_alias(bh);
+	clear_buffer_new(bh);
+	return __block_write_full_folio(inode, folio, briefs_get_block, wbc);
+}
+
+/* Per-block fallback: allocate one block, append a len=1 extent, map, and write
+ * the folio.  This is the Step 2 writeback path (one JRN_EXTENT_ALLOC(len=1)
+ * per block), used when no contiguous run of `n` could be allocated or when a
+ * run extent append failed.  On ENOSPC the folio is redirtied so writeback
+ * retries later and the error is stashed via mapping_set_error. */
+static int briefs_write_folio_alloc_one(struct inode *inode,
+					struct writeback_control *wbc,
+					struct folio *folio, bool *any_alloc)
+{
+	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	u64 rel, phys, iblock;
+	struct briefs_extent ext;
+	int ret;
+
+	iblock = folio_pos(folio) >> BRIEFS_BLOCK_SHIFT;
+	rel = briefs_alloc_block(&bsi->alloc);
+	if (rel == 0) {
+		folio_redirty_for_writepage(wbc, folio);
+		folio_unlock(folio);
+		mapping_set_error(inode->i_mapping, -ENOSPC);
+		return -ENOSPC;
+	}
+	phys = data_to_abs(bsi->sb, rel);
+	ext.offset = iblock;
+	ext.phys = phys;
+	ext.len = 1;
+	ext.flags = 0;
+	ret = briefs_append_extent_nojournal(inode->i_sb, &binfo->disk_inode, &ext);
+	if (ret) {
+		briefs_free_block(&bsi->alloc, rel);
+		folio_redirty_for_writepage(wbc, folio);
+		folio_unlock(folio);
+		mapping_set_error(inode->i_mapping, ret);
+		return ret;
+	}
+	*any_alloc = true;
+	return briefs_write_folio_mapped(inode, wbc, folio, phys);
+}
+
+/* Flush one accumulated run of `n` consecutive dirty delayed folios starting at
+ * logical block blk0.  Try to allocate the whole run contiguously and append a
+ * single len=n extent; on success write each folio bound to phys_run+i.  If no
+ * contiguous run of n fits, or the extent append fails, fall back to the
+ * per-block path for every folio (never regresses on ENOSPC/fragmentation). */
+static int briefs_flush_run(struct inode *inode, struct address_space *mapping,
+			    struct writeback_control *wbc,
+			    struct folio **run, int n, bool *any_alloc)
+{
+	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	u64 blk0 = folio_pos(run[0]) >> BRIEFS_BLOCK_SHIFT;
+	u64 rel, phys_run;
+	struct briefs_extent ext;
+	int ret = 0, i, r;
+
+	rel = briefs_alloc_blocks(&bsi->alloc, (u64)n);
+	if (rel != 0) {
+		phys_run = data_to_abs(bsi->sb, rel);
+		ext.offset = blk0;
+		ext.phys = phys_run;
+		ext.len = (u64)n;
+		ext.flags = 0;
+		r = briefs_append_extent_nojournal(inode->i_sb,
+						   &binfo->disk_inode, &ext);
+		if (r == 0) {
+			*any_alloc = true;
+			for (i = 0; i < n; i++) {
+				r = briefs_write_folio_mapped(inode, wbc,
+							      run[i],
+							      phys_run + (u64)i);
+				if (r) {
+					mapping_set_error(mapping, r);
+					if (!ret)
+						ret = r;
+				}
+			}
+			return ret;
+		}
+		/* Append failed (e.g. chain block ENOSPC): free the run
+		 * per-block and fall through to the per-block path. */
+		for (i = 0; i < n; i++)
+			briefs_free_block(&bsi->alloc, rel + (u64)i);
+	}
+
+	/* Per-block fallback. */
+	for (i = 0; i < n; i++) {
+		r = briefs_write_folio_alloc_one(inode, wbc, run[i], any_alloc);
+		if (r == -ENOSPC) {
+			/* Redirty the rest so writeback retries later. */
+			while (++i < n) {
+				folio_redirty_for_writepage(wbc, run[i]);
+				folio_unlock(run[i]);
+			}
+			mapping_set_error(mapping, -ENOSPC);
+			return -ENOSPC;
+		} else if (r) {
+			mapping_set_error(mapping, r);
+			if (!ret)
+				ret = r;
+		}
+	}
+	return ret;
+}
+
+static int briefs_writepages(struct address_space *mapping,
+			     struct writeback_control *wbc)
+{
+	struct inode *inode = mapping->host;
+	struct folio *folio = NULL;
+	struct folio **run;
+	int run_n = 0, error = 0, r;
+	bool any_alloc = false;
+	struct blk_plug plug;
+
+	run = kmalloc_array(BRIEFS_DELALLOC_RUN_MAX, sizeof(*run), GFP_KERNEL);
+	if (!run) {
+		/* No memory for the run buffer: fall back to the Step 2
+		 * per-block writeback path (mpage_writepages). */
+		return mpage_writepages(mapping, wbc, briefs_get_block);
+	}
+
+	blk_start_plug(&plug);
+	while ((folio = writeback_iter(mapping, wbc, folio, &error))) {
+		struct buffer_head *bh = folio_buffers(folio);
+
+		if (folio_order(folio) == 0 && bh && buffer_delay(bh)) {
+			/* Run candidate: a delayed single-block folio. */
+			if (run_n > 0 &&
+			    folio->index == run[run_n - 1]->index + 1 &&
+			    run_n < BRIEFS_DELALLOC_RUN_MAX) {
+				run[run_n++] = folio;
+				error = 0;
+				continue;
+			}
+			/* Gap or run full: flush, then start a new run. */
+			if (run_n > 0) {
+				error = briefs_flush_run(inode, mapping, wbc,
+							 run, run_n, &any_alloc);
+				run_n = 0;
+			}
+			run[run_n++] = folio;
+			error = 0;
+			continue;
+		}
+
+		/* Not a run candidate: flush any open run, then write via the
+		 * normal buffer path.  For a mapped !delay buffer
+		 * block_write_full_folio skips get_block and just submits; for
+		 * a delayed buffer it calls briefs_get_block (one-block alloc). */
+		if (run_n > 0) {
+			error = briefs_flush_run(inode, mapping, wbc,
+						 run, run_n, &any_alloc);
+			run_n = 0;
+		}
+		error = briefs_block_write_full_folio(folio, wbc, briefs_get_block);
+		if (error)
+			mapping_set_error(mapping, error);
+	}
+	if (run_n > 0) {
+		r = briefs_flush_run(inode, mapping, wbc, run, run_n, &any_alloc);
+		if (!error)
+			error = r;
+	}
+	blk_finish_plug(&plug);
+
+	if (any_alloc)
+		mark_inode_dirty(inode);
+
+	kfree(run);
+	return error;
 }
 /* bmap: map file block to physical block */
 static sector_t briefs_bmap(struct address_space *mapping, sector_t block)
