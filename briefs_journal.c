@@ -224,6 +224,60 @@ int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_ty
 		j->cur_hdr->magic = cpu_to_le32(JOURNAL_MAGIC);
 		j->cur_hdr->block_seq = cpu_to_le32(le32_to_cpu(j->cur_hdr->block_seq) + 1);
 		j->write_offset = hdr_size;
+		/*
+		 * cur_block is now empty and the just-flushed block lives only in
+		 * the buffer cache (mark_buffer_dirty, written back by pdflush /
+		 * sync).  Mirror briefs_journal_sync()'s post-flush state so the
+		 * back-pressure checkpoint below sees nothing pending and skips
+		 * its internal sync (which would otherwise re-trigger the periodic
+		 * checkpoint and recurse).  The record we are about to append
+		 * re-sets this true at the bottom of this function.
+		 */
+		j->dirty = false;
+
+		/*
+		 * Back-pressure (0a): the live, un-checkpointed region is
+		 * [journal_log_start, write_pos).  journal_log_start advances only
+		 * at a checkpoint, and checkpoints otherwise fire solely on
+		 * fsync/sync/umount (the periodic one lives inside
+		 * briefs_journal_sync).  A metadata-heavy workload that does none of
+		 * those can therefore fill the entire ring before any checkpoint
+		 * retires records, and the next write would silently clobber the
+		 * oldest un-checkpointed block -- broken replay / silent data loss.
+		 *
+		 * Having just advanced write_pos, write_pos == journal_log_start
+		 * holds ONLY when the ring has wrapped completely full: in the
+		 * empty state (right after a checkpoint, or at fresh mount)
+		 * journal_log_start == write_pos but next_block(write_pos) !=
+		 * write_pos, so the condition above is never taken there.  Force a
+		 * checkpoint, which advances journal_log_start to write_pos and
+		 * frees the ring, instead of overwriting live records.  This
+		 * retires the same way the existing periodic checkpoint does; it
+		 * takes no BrieFS lock, so it is safe to call from within any
+		 * write_record caller (including under alloc->lock).
+		 */
+		if (j->write_pos == le64_to_cpu(j->sb->journal_log_start)) {
+			pr_info("briefs: journal ring full (back-pressure), checkpointing at write_pos=%llu\n",
+				j->write_pos);
+			ret = briefs_journal_checkpoint(j);
+			if (ret) {
+				pr_err("briefs: journal back-pressure checkpoint failed: %d\n",
+				       ret);
+				return ret;
+			}
+			/*
+			 * A ring with >= 2 usable blocks is now clear
+			 * (journal_log_start == write_pos, next_block != write_pos).
+			 * Only a degenerate 1-block ring stays collidable; refuse
+			 * rather than corrupt the log.
+			 */
+			if (briefs_journal_next_block(j, j->write_pos) ==
+			    le64_to_cpu(j->sb->journal_log_start)) {
+				pr_err("briefs: journal ring exhausted (size=%llu blocks)\n",
+				       j->journal_end - j->journal_start);
+				return -ENOSPC;
+			}
+		}
 	}
 
 	/* Write record header */
@@ -530,6 +584,30 @@ int briefs_journal_sync_superblock(struct briefs_journal *j)
 		return -EIO;
 
 	disk_sb = (struct briefs_superblock *)bh->b_data;
+
+	/*
+	 * Refresh the free counts from the authoritative in-memory allocators
+	 * before persisting.  The superblock's free_data_blocks / free_inodes are
+	 * otherwise only refreshed inside briefs_journal_checkpoint() (and at the
+	 * end of replay).  But on a clean unmount the VFS calls sync_fs() ->
+	 * briefs_journal_sync() first, which clears j->dirty *without* writing a
+	 * checkpoint whenever fewer than JRN_CHECKPOINT_INTERVAL records have
+	 * accumulated; put_super() then sees a clean journal, skips its
+	 * checkpoint, and calls us directly -- so without this refresh the
+	 * on-disk superblock free counts would stay stale (whatever the last
+	 * checkpoint wrote) while briefs_alloc_sync() writes the correct bitmap,
+	 * and fsck would flag a free-count mismatch.  Refreshing here on every
+	 * persist keeps the superblock consistent with the bitmap.  This mirrors
+	 * the refresh already done in briefs_journal_replay() and checkpoint().
+	 */
+	{
+		struct briefs_sb_info *bsi = vfs_sb->s_fs_info;
+		if (bsi) {
+			j->sb->free_data_blocks = cpu_to_le64(bsi->alloc.free_count);
+			j->sb->free_inodes = cpu_to_le64(bsi->inode_alloc.free_count);
+		}
+	}
+
 	disk_sb->checkpoint_seq = j->sb->checkpoint_seq;
 	disk_sb->journal_log_start = j->sb->journal_log_start;
 	disk_sb->journal_log_end = j->sb->journal_log_end;
