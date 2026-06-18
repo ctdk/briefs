@@ -219,7 +219,11 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 		    ext->phys == last.phys + last.len) {
 			if (last_idx < di->num_extents_inline) {
 				write_seqcount_begin(&binfo->extent_seq);
-				di->inline_extents[last_idx].len++;
+				/* Grow by ext->len (a multi-block run can merge
+				 * here, e.g. a second contiguous fallocate call or
+				 * a run allocated at writeback); +1 would corrupt
+				 * the on-disk length for len>1. */
+				di->inline_extents[last_idx].len += ext->len;
 				write_seqcount_end(&binfo->extent_seq);
 			} else {
 				chain_idx = last_idx - di->num_extents_inline;
@@ -257,7 +261,9 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 
 					briefs_disk_extent_to_cpu(&chain->extents[block_slot],
 								  &tmp);
-					tmp.len++;
+					/* Grow by ext->len, not 1: a multi-block run may
+					 * merge into a chain-resident last extent. */
+					tmp.len += ext->len;
 					briefs_cpu_extent_to_disk(&tmp,
 								  &chain->extents[block_slot]);
 				}
@@ -703,6 +709,80 @@ do_alloc:
 		mutex_unlock(&binfo->extent_lock);
 		return 0;
 	}
+}
+
+/*
+ * briefs_get_block_write - the write-path (block_write_begin) get_block.
+ *
+ * Unlike briefs_get_block (which allocates a block on a miss under create=1),
+ * this defers allocation: on a miss it sets BH_Delay on the buffer and returns
+ * 0 without mapping or allocating anything.  The actual allocation + extent
+ * append + journal record happen later, at writeback, when mpage /
+ * __block_write_full_folio call briefs_get_block (the allocating variant) to
+ * convert the delayed buffer.  This moves block allocation off the write() hot
+ * path and onto writeback (#6: one allocation per block at writeback instead of
+ * at write_begin; contiguous runs are coalesced later by the merge logic).
+ *
+ * On a hit the block is already mapped (an overwrite of an existing block, or a
+ * write into a previously-fallocated region): map_bh it with no buffer_new so
+ * the kernel reads the existing block for a partial overwrite, exactly as the
+ * create=0 read path does.
+ *
+ * No extent_lock is taken: setting BH_Delay is a buffer-local bit, and a
+ * concurrent allocator's mapping is reconciled at writeback (briefs_get_block's
+ * locked re-check finds the now-mapped block and map_bh's it without
+ * re-allocating).  The unlocked chain scan is safe because the chain is
+ * append-only.
+ */
+int briefs_get_block_write(struct inode *inode, sector_t iblock,
+                           struct buffer_head *bh_result, int create)
+{
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct briefs_extent ext;
+	u64 phys;
+	int i, ret;
+	unsigned seq;
+	u64 snap_total, snap_inline, snap_chain_base, snap_max_end;
+
+	/* Inline-data inodes must be promoted before the block path is used. */
+	if (binfo->disk_inode.flags & InodeFlagInlineData)
+		return -EIO;
+
+	do {
+		seq = read_seqcount_begin(&binfo->extent_seq);
+		snap_total = binfo->disk_inode.num_extents_total;
+		snap_inline = binfo->disk_inode.num_extents_inline;
+		snap_chain_base = binfo->disk_inode.extent_inline_base;
+		snap_max_end = binfo->cached_max_end;
+	} while (read_seqcount_retry(&binfo->extent_seq, seq));
+
+	/* Extent-tail fast path: anything at/after the cached max is unmapped. */
+	if (snap_max_end != 0 && (u64)iblock >= snap_max_end) {
+		set_buffer_delay(bh_result);
+		return 0;
+	}
+
+	for (i = 0; i < snap_total; i++) {
+		if (i < snap_inline)
+			ret = briefs_read_extent(inode->i_sb, &binfo->disk_inode,
+			                         i, &ext);
+		else
+			ret = briefs_read_extent_chain(inode->i_sb, i,
+			                               snap_inline,
+			                               snap_chain_base, &ext);
+		if (ret != 0)
+			return ret;
+		if ((u64)iblock >= ext.offset &&
+		    (u64)iblock < ext.offset + ext.len) {
+			phys = ext.phys + ((u64)iblock - ext.offset);
+			map_bh(bh_result, inode->i_sb, phys);
+			return 0;
+		}
+	}
+
+	/* Not mapped: defer allocation to writeback. */
+	set_buffer_delay(bh_result);
+	return 0;
 }
 /* briefs_free_inode_data - free all data blocks owned by an inode */
 void briefs_free_inode_data(struct inode *inode)

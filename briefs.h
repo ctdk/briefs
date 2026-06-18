@@ -790,6 +790,7 @@ extern const struct address_space_operations briefs_aops;
 
 /* get_block callback - maps inode+iblock to buffer_head */
 int briefs_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create);
+int briefs_get_block_write(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create);
 
 /* super_operations */
 extern const struct super_operations briefs_super_ops;

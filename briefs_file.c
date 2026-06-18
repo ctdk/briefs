@@ -60,10 +60,28 @@ static sector_t briefs_bmap(struct address_space *mapping, sector_t block)
 {
 	return generic_block_bmap(mapping, block, briefs_get_block);
 }
-/* cribbed from xiafs, at least for now. */
+/* cribbed from xiafs, at least for now.
+ *
+ * Uses briefs_get_block_write, which DEFERS block allocation: an unmapped
+ * block is marked BH_Delay (no allocation, no extent append, no journal record)
+ * and is allocated later at writeback by briefs_get_block via mpage /
+ * __block_write_full_folio.  This moves the per-block alloc/extent-append/
+ * journal off the write() path and onto writeback (#6 delayed allocation).
+ *
+ * __block_write_begin_int suppresses both the read and the buffer_new partial-
+ * tail zeroing for a BH_Delay buffer.  A partial write to a fresh (delayed)
+ * block would otherwise leave stale folio bytes in the unwritten head/tail,
+ * which writeback would then persist.  Zero those segments here, mirroring the
+ * kernel's buffer_new zeroing (fs/buffer.c __block_write_begin_int).  Guarded
+ * by !uptodate: if the folio is already uptodate its contents are valid.
+ */
 static int briefs_write_begin(struct file *file, struct address_space *mapping, loff_t pos, unsigned len, struct folio **foliop, void **fsdata) {
+	struct folio *folio;
+	struct buffer_head *bh, *head;
+	size_t from, to, block_start, block_end, blocksize;
 	int ret;
-	ret = block_write_begin(mapping, pos, len, foliop, briefs_get_block);
+
+	ret = block_write_begin(mapping, pos, len, foliop, briefs_get_block_write);
 
 	/*
 	 * Don't free data on error — the VFS / caller will handle cleanup
@@ -77,8 +95,34 @@ static int briefs_write_begin(struct file *file, struct address_space *mapping, 
 	 * until the inode itself is evicted, at which point
 	 * briefs_evict_inode will free them properly.
 	 */
+	if (ret)
+		return ret;
 
-	return ret;
+	folio = *foliop;
+	if (folio_test_uptodate(folio))
+		return 0;		/* existing data is valid, no tails to zero */
+
+	from = offset_in_folio(folio, pos);
+	to = from + len;
+
+	head = folio_buffers(folio);
+	if (!head)
+		return 0;
+	blocksize = head->b_size;
+
+	bh = head;
+	block_start = 0;
+	do {
+		block_end = block_start + blocksize;
+		if (buffer_delay(bh) &&
+		    (block_end > to || block_start < from))
+			folio_zero_segments(folio, to, block_end,
+			                    block_start, from);
+		block_start = block_end;
+		bh = bh->b_this_page;
+	} while (bh != head);
+
+	return 0;
 }
 /* briefs_fsync - sync file data and metadata to disk */
 int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
@@ -718,6 +762,18 @@ int briefs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 		return 0;   /* ret == 1 (done) -> return 0; never return 1 */
 	}
 
+	/* Delayed allocation (#6): written-but-not-yet-written-back blocks are
+	 * BH_Delay in the page cache and absent from the extent list, so without
+	 * this flush fiemap would report them as holes.  BrieFS has no
+	 * extent-status tree (like ext4_es) to describe delayed extents, so --
+	 * unlike ext4, which synthesizes DELALLOC extents -- we force writeback
+	 * of the queried range first and then report the now-allocated physical
+	 * extents.  This makes fiemap reflect the real post-writeback layout.
+	 */
+	ret = filemap_write_and_wait_range(inode->i_mapping, start, end - 1);
+	if (ret)
+		return ret;
+
 	/* Snapshot the extent count under seqcount (briefs_get_block style):
 	 * chain blocks are append-only for the inode's lifetime, so walking
 	 * by index within snap_total is safe against concurrent appends. */
@@ -1010,6 +1066,20 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 		goto out_update;
 	}
 
+	/* With delayed allocation (#6), freshly-written blocks may still be
+	 * BH_Delay in the page cache and not yet present in the extent list.
+	 * Punch consults the extent list to decide what to free/zero, so a
+	 * delayed block in the punch range would be missed -- the hole would
+	 * never be zeroed and its (still-dirty) page would be written back
+	 * later with the original data, leaking it past the punch.  ext4 solves
+	 * this by writing the range back first to convert delalloc to real
+	 * extents; do the same.  inode_lock is held, which is fine: writeback
+	 * takes only the allocator spinlock and extent_seq, not inode_lock.
+	 */
+	ret = filemap_write_and_wait_range(inode->i_mapping, offset, end - 1);
+	if (ret)
+		goto out_free;
+
 	if (binfo->disk_inode.num_extents_total > INT_MAX / 2) {
 		ret = -ENOMEM;
 		goto out_free;
@@ -1239,6 +1309,18 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 		truncate_inode_pages(inode->i_mapping, 0);
 		changed = true;
 	}
+
+	/* Flush delayed allocation in the range before consulting the extent
+	 * list: briefs_block_mapped() below skips blocks already in the list,
+	 * but with #6 a written-but-unsynced block is BH_Delay and not yet in
+	 * the list, so without this flush fallocate would allocate a *new*
+	 * physical block for it while the delayed page is still bound for a
+	 * different (later) allocation -- a double-alloc / data-placement
+	 * mismatch.  Write the range back first so the skip logic sees reality.
+	 */
+	ret = filemap_write_and_wait_range(inode->i_mapping, offset, end - 1);
+	if (ret)
+		goto out_unlock;
 
 	start_blk = offset >> BRIEFS_BLOCK_SHIFT;
 	end_blk = (end + BRIEFS_BLOCK_SIZE - 1) >> BRIEFS_BLOCK_SHIFT;

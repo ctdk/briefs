@@ -332,7 +332,15 @@ u64 briefs_alloc_blocks(struct briefs_alloc *alloc, u64 n)
 			}
 			if (run_len >= n)
 				goto found;
-			bits &= ~(((1ULL << cnt) - 1) << b);
+			/* Clear the consumed run bits.  When cnt == 64 the whole
+			 * word is one run from bit b; bits below b are already 0
+			 * (b = ctzll(bits)), so clearing the entire word is
+			 * equivalent and avoids the (1ULL << 64) UB that would
+			 * otherwise leave `bits' unchanged and spin forever. */
+			if (cnt >= 64)
+				bits = 0;
+			else
+				bits &= ~(((1ULL << cnt) - 1) << b);
 		}
 	}
 
