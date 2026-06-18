@@ -78,7 +78,8 @@ void briefs_free_chain_blocks(struct super_block *sb, u64 chain_block)
  * not found.
  */
 static int briefs_read_chain_extent(struct super_block *sb, u64 chain_block,
-                                      int chain_idx, struct briefs_extent *ext)
+                                      int chain_idx, struct briefs_extent *ext,
+                                      bool trust_verified)
 {
 	struct buffer_head *bh;
 	struct briefs_extent_chain *chain;
@@ -92,10 +93,22 @@ static int briefs_read_chain_extent(struct super_block *sb, u64 chain_block,
 		}
 		chain = (struct briefs_extent_chain *)bh->b_data;
 
-		if (briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
-			pr_err("briefs: chain block %llu checksum mismatch\n", chain_block);
-			brelse(bh);
-			return -EIO;
+		/*
+		 * Skip the 4088-byte CRC32C when this buffer's CRC has already been
+		 * validated and not evicted since (the BH_Verified bit auto-clears on
+		 * buffer_head reallocation). trust_verified is set only by callers that
+		 * hold a lock excluding concurrent chain-block modifiers, so a cached,
+		 * verified buffer cannot be torn in memory; a torn disk read can only
+		 * surface on the first sb_bread after eviction, when the bit is clear.
+		 */
+		if (!trust_verified || !buffer_verified(bh)) {
+			if (briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
+				pr_err("briefs: chain block %llu checksum mismatch\n", chain_block);
+				brelse(bh);
+				return -EIO;
+			}
+			if (trust_verified)
+				set_buffer_verified(bh);
 		}
 
 		num_in_block = le32_to_cpu(chain->num_extents_in_block);
@@ -144,7 +157,8 @@ int briefs_read_extent(struct super_block *sb, struct briefs_inode *di,
 		return -ENOENT;
 
 	chain_idx = idx - di->num_extents_inline;
-	return briefs_read_chain_extent(sb, di->extent_inline_base, chain_idx, ext);
+	return briefs_read_chain_extent(sb, di->extent_inline_base, chain_idx, ext,
+					   true);
 }
 /*
  * __briefs_append_extent - internal append helper.  Caller must hold
@@ -248,6 +262,7 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 								  &chain->extents[block_slot]);
 				}
 				chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
+				set_buffer_verified(bh);
 				write_seqcount_begin(&binfo->extent_seq);
 				mark_buffer_dirty(bh);
 				write_seqcount_end(&binfo->extent_seq);
@@ -324,10 +339,15 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 		}
 		chain = (struct briefs_extent_chain *)bh->b_data;
 
-		if (briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
-			pr_err("briefs: chain block %llu checksum mismatch on append\n", chain_block);
-			brelse(bh);
-			return -EIO;
+		/* Under extent_lock: no concurrent modifier, so the memoized
+		 * BH_Verified bit lets us skip the CRC on cached re-reads. */
+		if (!buffer_verified(bh)) {
+			if (briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
+				pr_err("briefs: chain block %llu checksum mismatch on append\n", chain_block);
+				brelse(bh);
+				return -EIO;
+			}
+			set_buffer_verified(bh);
 		}
 
 		num_in_block = le32_to_cpu(chain->num_extents_in_block);
@@ -337,6 +357,7 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 			briefs_cpu_extent_to_disk(ext, &chain->extents[slot]);
 			chain->num_extents_in_block = cpu_to_le32(num_in_block + 1);
 			chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
+			set_buffer_verified(bh);
 			write_seqcount_begin(&binfo->extent_seq);
 			mark_buffer_dirty(bh);
 			write_seqcount_end(&binfo->extent_seq);
@@ -371,6 +392,7 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 			u64 new_block = data_to_abs(bsi->sb, rel);
 			chain->next_overflow_block = cpu_to_le64(new_block);
 			chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
+			set_buffer_verified(bh);
 			write_seqcount_begin(&binfo->extent_seq);
 			mark_buffer_dirty(bh);
 			write_seqcount_end(&binfo->extent_seq);
@@ -393,6 +415,7 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 			briefs_cpu_extent_to_disk(ext, &chain->extents[0]);
 			chain->num_extents_in_block = cpu_to_le32(1);
 			chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
+			set_buffer_verified(bh);
 			write_seqcount_begin(&binfo->extent_seq);
 			mark_buffer_dirty(bh);
 			write_seqcount_end(&binfo->extent_seq);
@@ -470,7 +493,8 @@ inline u64 briefs_compute_i_blocks(struct super_block *sb, struct briefs_inode *
 		blocks += di->inline_extents[i].len;
 	for (i = 0; i < di->num_extents_total - di->num_extents_inline; i++) {
 		struct briefs_extent ext;
-		int ret = briefs_read_chain_extent(sb, di->extent_inline_base, i, &ext);
+		int ret = briefs_read_chain_extent(sb, di->extent_inline_base, i,
+						    &ext, false);
 		if (ret)
 			break;
 		blocks += ext.len;
@@ -501,7 +525,8 @@ static int briefs_read_extent_chain(struct super_block *sb, int idx,
 		return -ENOENT;
 
 	chain_idx = idx - snap_inline;
-	return briefs_read_chain_extent(sb, snap_chain_base, chain_idx, ext);
+	return briefs_read_chain_extent(sb, snap_chain_base, chain_idx, ext,
+					   false);
 }
 
 /*

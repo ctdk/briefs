@@ -7,6 +7,7 @@
 #include <linux/types.h>
 #include <linux/stddef.h>
 #include <linux/blk_types.h>
+#include <linux/buffer_head.h>
 #include <linux/unaligned.h>
 #include "briefs_alloc.h"
 
@@ -456,6 +457,19 @@ static inline int briefs_verify_chain_checksum(const void *data, __le64 stored)
 		return 0; /* legacy block with no checksum */
 	return (briefs_chain_checksum(data) == cpu_stored) ? 0 : -EIO;
 }
+
+/*
+ * Per-buffer_head "CRC already verified" bit, allocated from BH_PrivateStart
+ * (the first bit reserved for filesystems). Once a chain block's CRC has been
+ * checked, we memoize it here so cached re-reads skip the 4088-byte CRC32C.
+ * The bit lives in bh->b_state, which is zeroed when a fresh buffer_head is
+ * allocated, so it auto-clears on eviction -> a re-read after eviction (the
+ * only window for a torn disk read) re-verifies. Only used on read paths that
+ * hold a lock excluding concurrent chain-block modifiers (see
+ * briefs_read_chain_extent's trust_verified argument).
+ */
+enum { BH_Verified = BH_PrivateStart };
+BUFFER_FNS(Verified, verified)
 
 /* Function headers and the like */
 

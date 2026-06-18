@@ -467,6 +467,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 					if (ci < num_in_block) {
 						briefs_cpu_extent_to_disk(&ext, &chain->extents[ci]);
 						chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
+						set_buffer_verified(bh);
 						write_seqcount_begin(&binfo->extent_seq);
 						mark_buffer_dirty(bh);
 						write_seqcount_end(&binfo->extent_seq);
@@ -535,6 +536,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 					}
 					tc->num_extents_in_block = cpu_to_le32(num_in_block - 1);
 					tc->checksum = cpu_to_le64(briefs_chain_checksum(tbh->b_data));
+					set_buffer_verified(tbh);
 
 					write_seqcount_begin(&binfo->extent_seq);
 					mark_buffer_dirty(tbh);
@@ -550,6 +552,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 							pc = (struct briefs_extent_chain *)pbh->b_data;
 							pc->next_overflow_block = cpu_to_le64(0);
 							pc->checksum = cpu_to_le64(briefs_chain_checksum(pbh->b_data));
+							set_buffer_verified(pbh);
 							write_seqcount_begin(&binfo->extent_seq);
 							mark_buffer_dirty(pbh);
 							write_seqcount_end(&binfo->extent_seq);
@@ -904,6 +907,7 @@ static int briefs_replace_extent_list(struct super_block *sb,
 							  &chain->extents[j]);
 			chain->checksum =
 				cpu_to_le64(briefs_chain_checksum(bh->b_data));
+			set_buffer_verified(bh);
 			sync_dirty_buffer(bh);
 			brelse(bh);
 		}
