@@ -82,6 +82,26 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 		goto out_no_fs;
 	}
 
+	/* On-disk format gate (clean break, v0.9.0 B+ tree extent index). */
+	if (le64_to_cpu(bsb->minor_version) != _BRIEFS_MINOR_VER) {
+		pr_err("briefs: incompatible on-disk minor version %llu (need %d)\n",
+		       le64_to_cpu(bsb->minor_version), _BRIEFS_MINOR_VER);
+		ret = -EINVAL;
+		goto out_release;
+	}
+	if (!(le64_to_cpu(bsb->feature_incompat) & BRIEFS_FEATURE_INCOMPAT_BTREE)) {
+		pr_err("briefs: image is not B-tree formatted (feature_incompat 0x%llx)\n",
+		       le64_to_cpu(bsb->feature_incompat));
+		ret = -EINVAL;
+		goto out_release;
+	}
+	if (le64_to_cpu(bsb->feature_incompat) & ~BRIEFS_FEATURE_INCOMPAT_BTREE) {
+		pr_err("briefs: unknown incompatible feature bits 0x%llx\n",
+		       le64_to_cpu(bsb->feature_incompat) & ~BRIEFS_FEATURE_INCOMPAT_BTREE);
+		ret = -EINVAL;
+		goto out_release;
+	}
+
 	bsi->sb_bh = bh;
 	bsi->sb = bsb;
 

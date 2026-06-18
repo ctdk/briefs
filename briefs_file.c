@@ -11,10 +11,10 @@
 #include <linux/buffer_head.h>
 #include <linux/mpage.h>
 #include <linux/seqlock.h>
-#include <linux/sort.h>
 #include <linux/pagemap.h>
 #include <linux/writeback.h>
 #include <linux/blkdev.h>
+#include <linux/mm.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
@@ -59,7 +59,7 @@ static int briefs_read_folio(struct file *file, struct folio *folio)
  * ONE JRN_EXTENT_ALLOC(len=run) journal record instead of one per block.  On a
  * fresh/unfragmented fs the per-run extents also merge into a single extent
  * for the whole sequential write (the alloc blocks come back contiguous, so
- * __briefs_append_extent's merge branch grows the last extent by `run`).
+ * briefs_btree_insert_locked's merge-with-neighbor branch grows the last extent by `run`).
  *
  * writeback_iter() hands us the dirty folios of the wbc range one at a time,
  * ascending, locked and with the pagecache dirty tag already cleared (ready to
@@ -454,7 +454,7 @@ static int briefs_promote_inline_data(struct inode *inode)
 	binfo->disk_inode.num_extents_inline = 1;
 	binfo->disk_inode.num_extents_total = 1;
 	binfo->disk_inode.extent_inline_base = 0;
-	/* Promotion bypasses __briefs_append_extent, so update the tail cache
+	/* Promotion bypasses briefs_btree_insert_locked, so update the tail cache
 	 * here: the promoted extent is {offset 0, len 1} -> end 1. */
 	if (binfo->cached_max_end < 1)
 		binfo->cached_max_end = 1;
@@ -580,6 +580,102 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	return generic_file_write_iter(iocb, from);
 }
 
+/*
+ * Collect+rebuild helpers, shared by truncate and punch hole (the P2
+ * stand-ins for the P4 tree-range operations).
+ *
+ * briefs_collect_all_extents: walk the index in offset order (inline array or
+ * B+ tree leaves via next_leaf) into a freshly kvmalloc'd array. Returns 0
+ * with exts/n set (exts is NULL iff n == 0), or -ENOMEM/-EIO.
+ */
+static int briefs_count_cb(const struct briefs_extent *ext, void *ctx)
+{
+	(*(int *)ctx)++;
+	return 0;
+}
+
+struct briefs_fill_ctx {
+	struct briefs_extent *arr;
+	int n;
+};
+
+static int briefs_fill_cb(const struct briefs_extent *ext, void *ctx)
+{
+	struct briefs_fill_ctx *c = ctx;
+	c->arr[c->n++] = *ext;
+	return 0;
+}
+
+static int briefs_collect_all_extents(struct super_block *sb,
+				      struct briefs_inode *di,
+				      struct briefs_extent **exts, int *n)
+{
+	int count = 0, ret;
+	struct briefs_fill_ctx ctx;
+
+	*exts = NULL;
+	*n = 0;
+
+	ret = briefs_btree_for_each_extent(sb, di, briefs_count_cb, &count);
+	if (ret)
+		return ret;
+	if (count == 0)
+		return 0;
+
+	ctx.arr = kvmalloc_array(count, sizeof(struct briefs_extent),
+				 GFP_KERNEL);
+	if (!ctx.arr)
+		return -ENOMEM;
+	ctx.n = 0;
+
+	ret = briefs_btree_for_each_extent(sb, di, briefs_fill_cb, &ctx);
+	if (ret) {
+		kvfree(ctx.arr);
+		return ret;
+	}
+	*exts = ctx.arr;
+	*n = ctx.n;
+	return 0;
+}
+
+/*
+ * briefs_rebuild_extent_list - rebuild an inode's extent index from @exts[0..n-1]
+ * (which MUST be sorted by offset and non-overlapping). Caller holds
+ * extent_lock. Frees the old tree NODE blocks (the data blocks referenced by
+ * kept extents are left allocated and re-inserted; the caller frees removed
+ * data separately), resets the inode to empty inline-only, then re-inserts each
+ * kept extent via the tree/inline mutator (which restores InodeFlagIndexed on
+ * spill and raises cached_max_end). Returns 0 or -errno.
+ */
+static int briefs_rebuild_extent_list(struct super_block *sb,
+				       struct briefs_inode_info *binfo,
+				       struct briefs_extent *exts, int n)
+{
+	struct briefs_inode *di = &binfo->disk_inode;
+	int i, ret;
+
+	/* Free old tree nodes (no-op for inline-only). Data blocks survive. */
+	briefs_btree_free_nodes_only(sb, di);
+
+	/* Reset to empty inline-only. */
+	write_seqcount_begin(&binfo->extent_seq);
+	di->flags &= ~InodeFlagIndexed;
+	di->extent_inline_base = 0;
+	di->num_extents_inline = 0;
+	di->num_extents_total = 0;
+	memset(di->inline_extents, 0, sizeof(di->inline_extents));
+	binfo->cached_max_end = 0;
+	write_seqcount_end(&binfo->extent_seq);
+
+	/* Re-insert kept extents in offset order. */
+	for (i = 0; i < n; i++) {
+		ret = briefs_btree_insert_locked(sb, di, &exts[i]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 /* briefs_setattr - set file attributes (truncate support).
  * Frees data blocks on truncation, updates the inode on disk.
  */
@@ -589,14 +685,8 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	struct inode *inode = d_inode(dentry);
 	struct briefs_inode_info *binfo = briefs_i(inode);
 	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
-	struct briefs_extent ext;
 	u64 new_size, old_size, trunc_block;
 	int ret;
-	struct buffer_head *bh;
-	struct briefs_extent_chain *chain;
-	u64 chain_block;
-	int ci;
-	s64 i;
 
 	/* Only handle size changes here. */
 	if (!(attr->ia_valid & ATTR_SIZE))
@@ -696,204 +786,100 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 	trunc_block = (new_size + BRIEFS_BLOCK_SIZE - 1) / BRIEFS_BLOCK_SIZE;
 
-	/* Nothing to do if the inode has no extents. */
-	if (binfo->disk_inode.num_extents_total == 0)
-		goto out_unlock;
-
-	/* Iterate extents in reverse; trunc_block may fall inside an extent
-	 * or before it. Remove or shorten affected extents. */
-	for (i = (s64)binfo->disk_inode.num_extents_total - 1; i >= 0; i--) {
-		ret = briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext);
-		if (ret != 0)
-			break;
-
-		u64 ext_start = ext.offset;
-		u64 ext_end = ext.offset + ext.len;
-
-		if (trunc_block >= ext_end) {
-			/* Extent is entirely before truncation point - keep */
-			continue;
-		}
-
-		if (trunc_block > ext_start && trunc_block < ext_end) {
-			/* Truncation falls inside this extent - shorten it */
-			u64 blocks_to_free = ext_end - trunc_block;
-
-			/* Journal the partial extent free */
-			briefs_journal_extent_free(bsi->journal, inode->i_ino,
-					   ext.offset + ext.len - blocks_to_free,
-					   ext.phys + ext.len - blocks_to_free,
-					   blocks_to_free);
-
-			briefs_free_blocks_range(bsi,
-						 ext.phys + ext.len - blocks_to_free,
-						 blocks_to_free);
-
-			ext.len -= blocks_to_free;
-
-			/* Update the extent in place (inline or chain) */
-			write_seqcount_begin(&binfo->extent_seq);
-			if (i < binfo->disk_inode.num_extents_inline) {
-				binfo->disk_inode.inline_extents[i] = ext;
-			} else {
-				ci = i - binfo->disk_inode.num_extents_inline;
-				chain_block = binfo->disk_inode.extent_inline_base;
-				while (chain_block && ci >= 0) {
-					u32 num_in_block;
-
-					bh = sb_bread(inode->i_sb, chain_block);
-					if (!bh) break;
-					chain = (struct briefs_extent_chain *)bh->b_data;
-					if (le64_to_cpu(chain->checksum) != 0 &&
-					    briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
-						pr_warn("briefs: truncate ino=%lu chain block %llu checksum mismatch; aborting\n",
-							inode->i_ino, chain_block);
-						brelse(bh);
-						break;
-					}
-					num_in_block = le32_to_cpu(chain->num_extents_in_block);
-					if (ci < num_in_block) {
-						briefs_cpu_extent_to_disk(&ext, &chain->extents[ci]);
-						chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
-						set_buffer_verified(bh);
-						write_seqcount_begin(&binfo->extent_seq);
-						mark_buffer_dirty(bh);
-						write_seqcount_end(&binfo->extent_seq);
-						brelse(bh);
-						break;
-					}
-					ci -= num_in_block;
-					chain_block = le64_to_cpu(chain->next_overflow_block);
-					brelse(bh);
-				}
-			}
-			write_seqcount_end(&binfo->extent_seq);
-			/* Done - all later extents already removed */
-			break;
-		}
-
-		/* trunc_block <= ext_start - free the entire extent */
-		{
-			/* Journal the full extent free */
-			briefs_journal_extent_free(bsi->journal, inode->i_ino,
-					   ext.offset, ext.phys, ext.len);
-			briefs_free_blocks_range(bsi, ext.phys, ext.len);
-		}
-
-		/* Remove the extent: shift remaining extents down */
-		write_seqcount_begin(&binfo->extent_seq);
-		if (i < binfo->disk_inode.num_extents_inline) {
-			/* Extent is inline - remove it */
-			int j;
-			for (j = i; j < binfo->disk_inode.num_extents_inline - 1; j++)
-				binfo->disk_inode.inline_extents[j] = binfo->disk_inode.inline_extents[j + 1];
-			binfo->disk_inode.num_extents_inline--;
+	/* Nothing to do if the inode has no extents (just update size below). */
+	if (binfo->disk_inode.num_extents_total != 0) {
+		/*
+		 * Tree-backed inodes: truncate is a range delete of [trunc_block,
+		 * +inf). briefs_btree_delete_range frees the data blocks beyond
+		 * trunc_block, shortens the straddler in place, drops emptied
+		 * leaves, and recomputes cached_max_end — no collect+rebuild, no
+		 * full tree teardown. If every extent is removed (truncate to 0)
+		 * it clears InodeFlagIndexed / extent_inline_base / counts itself.
+		 */
+		if (binfo->disk_inode.flags & InodeFlagIndexed) {
+			ret = briefs_btree_delete_range(inode->i_sb,
+							&binfo->disk_inode,
+							trunc_block, U64_MAX);
+			if (ret)
+				goto out_unlock;
 		} else {
-			/* Extent is in a chain block — remove it and
-			 * shift remaining extents in the block down. */
-			struct buffer_head *tbh;
-			struct briefs_extent_chain *tc;
-			u64 calias = binfo->disk_inode.extent_inline_base;
-			int cidx = i - binfo->disk_inode.num_extents_inline;
-			u64 prev_block = 0;
+			/*
+			 * Inline-only truncate: walk extents in offset order, build
+			 * the kept list (extents entirely before trunc_block kept
+			 * whole; the straddler shortened; extents at/after
+			 * trunc_block dropped), free the data blocks beyond
+			 * trunc_block, then rebuild the inline index from the kept
+			 * extents.
+			 */
+			struct briefs_extent *old, *kept;
+			int n_ext, n_kept = 0, j;
 
-			while (calias && cidx >= 0) {
-				u32 num_in_block;
+			ret = briefs_collect_all_extents(inode->i_sb,
+							 &binfo->disk_inode,
+							 &old, &n_ext);
+			if (ret)
+				goto out_unlock;
 
-				tbh = sb_bread(inode->i_sb, calias);
-				if (!tbh)
-					break;
-				tc = (struct briefs_extent_chain *)tbh->b_data;
-				if (le64_to_cpu(tc->checksum) != 0 &&
-				    briefs_verify_chain_checksum(tbh->b_data, tc->checksum) != 0) {
-					pr_warn("briefs: truncate ino=%lu chain block %llu checksum mismatch; aborting\n",
-						inode->i_ino, calias);
-					brelse(tbh);
-					break;
-				}
-
-				num_in_block = le32_to_cpu(tc->num_extents_in_block);
-				if (cidx < num_in_block) {
-					/* Found the block — shift extents down */
-					int j;
-					struct briefs_extent tmp;
-
-					for (j = cidx; j < num_in_block - 1; j++) {
-						briefs_disk_extent_to_cpu(&tc->extents[j + 1], &tmp);
-						briefs_cpu_extent_to_disk(&tmp, &tc->extents[j]);
-					}
-					tc->num_extents_in_block = cpu_to_le32(num_in_block - 1);
-					tc->checksum = cpu_to_le64(briefs_chain_checksum(tbh->b_data));
-					set_buffer_verified(tbh);
-
-					write_seqcount_begin(&binfo->extent_seq);
-					mark_buffer_dirty(tbh);
-					write_seqcount_end(&binfo->extent_seq);
-
-					/* Free empty non-first chain block */
-					if (num_in_block - 1 == 0 && prev_block != 0) {
-						struct buffer_head *pbh;
-						struct briefs_extent_chain *pc;
-
-						pbh = sb_bread(inode->i_sb, prev_block);
-						if (pbh) {
-							pc = (struct briefs_extent_chain *)pbh->b_data;
-							pc->next_overflow_block = cpu_to_le64(0);
-							pc->checksum = cpu_to_le64(briefs_chain_checksum(pbh->b_data));
-							set_buffer_verified(pbh);
-							write_seqcount_begin(&binfo->extent_seq);
-							mark_buffer_dirty(pbh);
-							write_seqcount_end(&binfo->extent_seq);
-							brelse(pbh);
-						}
-						briefs_free_block(&bsi->alloc,
-							abs_to_data(bsi->sb, calias));
-					}
-
-					brelse(tbh);
-					break;
-				}
-
-				cidx -= num_in_block;
-				prev_block = calias;
-				brelse(tbh);
-				calias = le64_to_cpu(tc->next_overflow_block);
+			kept = kvmalloc_array(n_ext ? n_ext : 1, sizeof(*kept),
+					      GFP_KERNEL);
+			if (!kept) {
+				kvfree(old);
+				ret = -ENOMEM;
+				goto out_unlock;
 			}
+
+			for (j = 0; j < n_ext; j++) {
+				struct briefs_extent *e = &old[j];
+				u64 ext_start = e->offset;
+				u64 ext_end = e->offset + e->len;
+
+				if (ext_end <= trunc_block) {
+					/* Entirely before truncation - keep whole. */
+					kept[n_kept++] = *e;
+				} else if (ext_start < trunc_block) {
+					/* Straddler - keep the head, free the tail. */
+					u64 keep_len = trunc_block - ext_start;
+					u64 free_phys = e->phys + keep_len;
+					u64 free_len = e->len - keep_len;
+
+					briefs_journal_extent_free(bsi->journal,
+								   inode->i_ino,
+								   e->offset + keep_len,
+								   free_phys, free_len);
+					briefs_free_blocks_range(bsi, free_phys, free_len);
+
+					kept[n_kept].offset = e->offset;
+					kept[n_kept].phys = e->phys;
+					kept[n_kept].len = keep_len;
+					kept[n_kept].flags = e->flags;
+					n_kept++;
+				} else {
+					/* Entirely at/after truncation - drop, free data. */
+					briefs_journal_extent_free(bsi->journal,
+								   inode->i_ino,
+								   e->offset, e->phys,
+								   e->len);
+					briefs_free_blocks_range(bsi, e->phys, e->len);
+				}
+			}
+
+			/* Rebuild the index from the kept extents. Frees old tree
+			 * nodes (none for inline-only), resets the inode, re-inserts
+			 * kept (raising cached_max_end). */
+			ret = briefs_rebuild_extent_list(inode->i_sb, binfo,
+							 kept, n_kept);
+			kvfree(kept);
+			kvfree(old);
+			if (ret)
+				goto out_unlock;
 		}
-
-		binfo->disk_inode.num_extents_total--;
-		write_seqcount_end(&binfo->extent_seq);
-	}
-
-	/* If trunc_block is 0 (truncate to empty), use the full cleanup path */
-	if (new_size == 0) {
-		/* Free all remaining chain blocks */
-		briefs_free_chain_blocks(inode->i_sb, binfo->disk_inode.extent_inline_base);
-		write_seqcount_begin(&binfo->extent_seq);
-		binfo->disk_inode.extent_inline_base = 0;
-		binfo->disk_inode.num_extents_inline = 0;
-		binfo->disk_inode.num_extents_total = 0;
-		memset(binfo->disk_inode.inline_extents, 0, sizeof(binfo->disk_inode.inline_extents));
-		/* All extents gone -> invalidate the tail cache (0 = unknown). */
-		binfo->cached_max_end = 0;
-		write_seqcount_end(&binfo->extent_seq);
 	}
 
 	/* Update inode metadata */
 	inode->i_size = new_size;
 	binfo->disk_inode.filesize = new_size;
-
-	/* Recompute i_blocks */
-	{
-		u64 total_blocks = 0;
-		struct briefs_extent ee;
-		int j;
-		for (j = 0; j < binfo->disk_inode.num_extents_total; j++) {
-			if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, j, &ee) == 0)
-				total_blocks += ee.len;
-		}
-		inode->i_blocks = total_blocks * (BRIEFS_BLOCK_SIZE / 512);
-	}
+	inode->i_blocks = briefs_compute_i_blocks(inode->i_sb,
+						  &binfo->disk_inode);
 
 	/* Let VFS handle page cache truncation */
 	truncate_setsize(inode, new_size);
@@ -937,31 +923,12 @@ int briefs_getattr(struct mnt_idmap *idmap, const struct path *path,
 	if (binfo->disk_inode.flags & InodeFlagInlineData) {
 		i_blocks = 0;
 	} else {
-		/* Recompute i_blocks from all extents (inline + chain) */
-		struct briefs_extent ext;
-		u64 total_blocks = 0;
-		int j;
-		for (j = 0; j < binfo->disk_inode.num_extents_total; j++) {
-			if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, j, &ext) == 0)
-				total_blocks += ext.len;
-		}
-		i_blocks = total_blocks * (BRIEFS_BLOCK_SIZE / 512);
+		/* Recompute i_blocks from all extents in a single in-order walk. */
+		i_blocks = briefs_compute_i_blocks(inode->i_sb, &binfo->disk_inode);
 	}
 	inode->i_blocks = i_blocks;
 	stat->blocks = i_blocks;
 	pr_debug("briefs: getattr ino=%lu i_blocks=%llu\n", inode->i_ino, i_blocks);
-	return 0;
-}
-
-/* Compare two briefs_extents by logical offset, for sort(). */
-static int briefs_extent_cmp_offset(const void *a, const void *b)
-{
-	const struct briefs_extent *ea = a, *eb = b;
-
-	if (ea->offset < eb->offset)
-		return -1;
-	if (ea->offset > eb->offset)
-		return 1;
 	return 0;
 }
 
@@ -980,10 +947,9 @@ int briefs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 	struct briefs_inode *di = &binfo->disk_inode;
 	struct super_block *sb = inode->i_sb;
 	u64 isize = i_size_read(inode);
-	u64 snap_total, end;
+	u64 end;
 	struct briefs_extent *arr;
-	unsigned int seq;
-	int ret, i;
+	int snap_total, ret, i;
 
 	/* Validate/clip the range; flush dirty pages if FIEMAP_FLAG_SYNC was
 	 * requested. supported_flags = 0 means we accept only FIEMAP_FLAG_SYNC
@@ -1018,33 +984,14 @@ int briefs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 	if (ret)
 		return ret;
 
-	/* Snapshot the extent count under seqcount (briefs_get_block style):
-	 * chain blocks are append-only for the inode's lifetime, so walking
-	 * by index within snap_total is safe against concurrent appends. */
-	do {
-		seq = read_seqcount_begin(&binfo->extent_seq);
-		snap_total = di->num_extents_total;
-	} while (read_seqcount_retry(&binfo->extent_seq, seq));
-
+	/* Collect every extent in ascending offset order. The B+ tree (and the
+	 * inline array) keep extents sorted by offset, so no sort() is needed
+	 * — the headline complexity win of the tree conversion. */
+	ret = briefs_collect_all_extents(sb, di, &arr, &snap_total);
+	if (ret)
+		return ret;
 	if (snap_total == 0)
 		return 0;   /* fully sparse / empty extent-backed file */
-
-	arr = kmalloc_array(snap_total, sizeof(*arr), GFP_NOFS);
-	if (!arr)
-		return -ENOMEM;
-
-	/* Collect every extent (reuse briefs_read_extent, as
-	 * briefs_free_inode_data does at briefs_extent.c:700-712). */
-	for (i = 0; i < snap_total; i++) {
-		if (briefs_read_extent(sb, di, i, &arr[i])) {
-			ret = -EIO;
-			goto out;
-		}
-	}
-
-	/* fiemap requires ascending logical order; the on-disk list is in
-	 * append order and may be unsorted after out-of-order writes. */
-	sort(arr, snap_total, sizeof(arr[0]), briefs_extent_cmp_offset, NULL);
 
 	for (i = 0; i < snap_total; i++) {
 		u64 logical   = arr[i].offset << BRIEFS_BLOCK_SHIFT;
@@ -1071,27 +1018,25 @@ int briefs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 done:
 	ret = 0;
 out:
-	kfree(arr);
+	kvfree(arr);
 	return ret;
 }
 
 /*
  * briefs_block_mapped - return true if logical block @iblock already has a
- * physical mapping in the inode's extent list.
+ * physical mapping in the inode's extent index. O(log E) tree lookup (or inline
+ * scan for inline-only inodes); verifies CRCs since this runs unlocked under
+ * fallocate's inode_lock (not extent_lock). A torn read surfaces as "not
+ * mapped", which is conservative (fallocate may re-zero an already-mapped
+ * block — harmless) rather than a false positive.
  */
 static bool briefs_block_mapped(struct inode *inode, u64 iblock)
 {
 	struct briefs_inode_info *binfo = briefs_i(inode);
 	struct briefs_extent ext;
-	int i;
 
-	for (i = 0; i < binfo->disk_inode.num_extents_total; i++) {
-		if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext) != 0)
-			continue;
-		if (iblock >= ext.offset && iblock < ext.offset + ext.len)
-			return true;
-	}
-	return false;
+	return briefs_inode_lookup_iblock(inode->i_sb, binfo, iblock, &ext,
+					   false) == 0;
 }
 
 /*
@@ -1137,130 +1082,6 @@ static int briefs_zero_block_range(struct super_block *sb, u64 abs_block,
 }
 
 /*
- * briefs_replace_extent_list - atomically replace an inode's entire extent
- * list with @new_count extents from @new_exts.  Allocates and writes new
- * chain blocks if needed, updates the in-memory disk_inode, and returns the
- * old chain base in *@old_chain_base_out so the caller can free it after the
- * new inode has been persisted.
- *
- * Returns 0 on success or a negative errno.  On error the inode's extent
- * metadata is unchanged and no data blocks have been freed.
- */
-static int briefs_replace_extent_list(struct super_block *sb,
-                                      struct briefs_inode *di,
-                                      int new_count,
-                                      struct briefs_extent *new_exts,
-                                      u64 *old_chain_base_out)
-{
-	struct briefs_sb_info *bsi = sb->s_fs_info;
-	struct briefs_inode_info *binfo = container_of(di,
-						       struct briefs_inode_info,
-						       disk_inode);
-	struct briefs_extent_chain *chain;
-	struct buffer_head *bh;
-	u64 *chain_blocks = NULL;
-	int chain_count = 0;
-	int num_inline;
-	int i, j, ret = 0;
-
-	*old_chain_base_out = di->extent_inline_base;
-
-	if (new_count > 8) {
-		chain_count = (new_count - 8 + BRIEFS_CHAIN_EXTENTS - 1)
-			      / BRIEFS_CHAIN_EXTENTS;
-		chain_blocks = kmalloc_array(chain_count, sizeof(*chain_blocks),
-					     GFP_KERNEL);
-		if (!chain_blocks)
-			return -ENOMEM;
-
-		/* Allocate new chain blocks first; if we run out of space the
-		 * caller can back out without having modified anything. */
-		for (i = 0; i < chain_count; i++) {
-			u64 rel = briefs_alloc_block(&bsi->alloc);
-
-			if (rel == 0) {
-				ret = -ENOSPC;
-				goto free_chain_blocks;
-			}
-			chain_blocks[i] = data_to_abs(bsi->sb, rel);
-		}
-
-		/* Write the new chain blocks before making them reachable. */
-		for (i = 0; i < chain_count; i++) {
-			int ext_idx = 8 + i * BRIEFS_CHAIN_EXTENTS;
-			int extents_in_block = min(new_count - ext_idx,
-						   BRIEFS_CHAIN_EXTENTS);
-			u64 next_block = (i < chain_count - 1)
-					 ? chain_blocks[i + 1] : 0;
-
-			bh = briefs_get_zero_block(sb, chain_blocks[i]);
-			if (!bh) {
-				ret = -EIO;
-				goto free_chain_blocks;
-			}
-			chain = (struct briefs_extent_chain *)bh->b_data;
-			chain->next_overflow_block = cpu_to_le64(next_block);
-			chain->num_extents_in_block =
-				cpu_to_le32(extents_in_block);
-			for (j = 0; j < extents_in_block; j++)
-				briefs_cpu_extent_to_disk(&new_exts[ext_idx + j],
-							  &chain->extents[j]);
-			chain->checksum =
-				cpu_to_le64(briefs_chain_checksum(bh->b_data));
-			set_buffer_verified(bh);
-			sync_dirty_buffer(bh);
-			brelse(bh);
-		}
-	}
-
-	mutex_lock(&binfo->extent_lock);
-
-	write_seqcount_begin(&binfo->extent_seq);
-	num_inline = min(new_count, 8);
-	di->num_extents_inline = num_inline;
-	di->num_extents_total = new_count;
-	di->extent_inline_base = chain_blocks ? chain_blocks[0] : 0;
-	memset(di->inline_extents, 0, sizeof(di->inline_extents));
-	for (i = 0; i < num_inline; i++)
-		di->inline_extents[i] = new_exts[i];
-	/* The extent list was rebuilt from new_exts[]; recompute the tail cache
-	 * exactly from the in-memory list (cheap, no I/O) so the fast path stays
-	 * accurate after compaction. */
-	{
-		u64 mx = 0;
-		for (i = 0; i < new_count; i++) {
-			u64 end = new_exts[i].offset + new_exts[i].len;
-			if (end > mx)
-				mx = end;
-		}
-		binfo->cached_max_end = mx;
-	}
-	write_seqcount_end(&binfo->extent_seq);
-
-	mutex_unlock(&binfo->extent_lock);
-
-	/* Journal the chain-block allocations so replay marks them used. */
-	for (i = 0; i < chain_count; i++)
-		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
-					    0, chain_blocks[i], 1, -1);
-
-	kfree(chain_blocks);
-	return 0;
-
-free_chain_blocks:
-	for (i = 0; i < chain_count; i++) {
-		if (chain_blocks[i]) {
-			briefs_journal_extent_free(bsi->journal, 0, 0,
-						   chain_blocks[i], 1);
-			briefs_free_block(&bsi->alloc,
-					abs_to_data(bsi->sb, chain_blocks[i]));
-		}
-	}
-	kfree(chain_blocks);
-	return ret;
-}
-
-/*
  * briefs_do_punch_hole - create a hole in a regular file.
  *
  * Caller must hold inode_lock.  The file size must not change.
@@ -1278,7 +1099,6 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 	struct briefs_extent *old_exts = NULL;
 	struct briefs_extent *new_exts = NULL;
 	int old_count, new_count = 0;
-	u64 old_chain_base = 0;
 	bool changed = false;
 	bool need_partial_start, need_partial_end;
 	u32 partial_start_off, partial_end_off;
@@ -1328,28 +1148,112 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 		ret = -ENOMEM;
 		goto out_free;
 	}
-	old_count = (int)binfo->disk_inode.num_extents_total;
-	if (old_count == 0)
-		goto out_update;
 
-	old_exts = kmalloc_array(old_count, sizeof(*old_exts), GFP_KERNEL);
-	new_exts = kmalloc_array(old_count * 2, sizeof(*new_exts), GFP_KERNEL);
-	if (!old_exts || !new_exts) {
-		ret = -ENOMEM;
-		goto out_free;
-	}
+	/*
+	 * Collect+rebuild punch stand-in (formalized as delete_range + insert
+	 * remainders in P4). fallocate holds inode_lock but NOT extent_lock, so
+	 * take extent_lock around the collect+rebuild+free to serialize against
+	 * concurrent get_block inserters. The writeback flush above ran before
+	 * the lock (writeback calls get_block, which takes extent_lock -> would
+	 * self-deadlock if we held it here).
+	 */
+	mutex_lock(&binfo->extent_lock);
 
-	for (i = 0; i < old_count; i++) {
-		if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, i,
-				       &old_exts[i]) != 0) {
-			ret = -EIO;
-			goto out_free;
+	if (binfo->disk_inode.flags & InodeFlagIndexed) {
+		/*
+		 * Tree-backed punch: delete the fully-punched interior blocks
+		 * via briefs_btree_delete_range, then zero the partially-punched
+		 * boundary blocks (which remain allocated as left/right
+		 * straddlers). No collect+rebuild, no full tree teardown.
+		 *
+		 * The interior range is [start_blk, end_blk) with the boundary
+		 * blocks excluded when the punch is not block-aligned: a partial
+		 * start block (start_blk) and/or partial end block (end_blk-1)
+		 * stay allocated and are zeroed in their punched portion only.
+		 */
+		u64 del_start = start_blk + (need_partial_start ? 1 : 0);
+		u64 del_end = end_blk - (need_partial_end ? 1 : 0);
+		u64 total_before = binfo->disk_inode.num_extents_total;
+
+		if (total_before != 0) {
+			if (del_start < del_end) {
+				ret = briefs_btree_delete_range(inode->i_sb,
+								&binfo->disk_inode,
+								del_start, del_end);
+				if (ret)
+					goto out_unlock;
+			}
+
+			/*
+			 * Zero the partially-punched boundary blocks. They remain
+			 * allocated (delete_range kept them as straddlers), so look
+			 * them up and zero the punched portion. -ENOENT means the
+			 * boundary was already a hole: nothing to zero.
+			 */
+			if (need_partial_start) {
+				struct briefs_extent pext;
+
+				ret = briefs_inode_lookup_iblock(inode->i_sb, binfo,
+								 start_blk, &pext,
+								 true);
+				if (ret == 0) {
+					u64 ab = pext.phys + (start_blk - pext.offset);
+
+					ret = briefs_zero_block_range(inode->i_sb, ab,
+								      partial_start_off,
+								      BRIEFS_BLOCK_SIZE);
+					if (ret)
+						goto out_unlock;
+					changed = true;
+				} else if (ret == -ENOENT) {
+					ret = 0;
+				} else {
+					goto out_unlock;
+				}
+			}
+			if (need_partial_end) {
+				struct briefs_extent pext;
+				u64 pblk = end_blk - 1;
+
+				ret = briefs_inode_lookup_iblock(inode->i_sb, binfo,
+								 pblk, &pext,
+								 true);
+				if (ret == 0) {
+					u64 ab = pext.phys + (pblk - pext.offset);
+
+					ret = briefs_zero_block_range(inode->i_sb, ab,
+								      0, partial_end_off);
+					if (ret)
+						goto out_unlock;
+					changed = true;
+				} else if (ret == -ENOENT) {
+					ret = 0;
+				} else {
+					goto out_unlock;
+				}
+			}
+
+			if (binfo->disk_inode.num_extents_total != total_before)
+				changed = true;
 		}
+	} else {
+	ret = briefs_collect_all_extents(inode->i_sb, &binfo->disk_inode,
+					 &old_exts, &old_count);
+	if (ret)
+		goto out_unlock;
+	if (old_count == 0)
+		goto out_unlock;
+
+	new_exts = kvmalloc_array(old_count * 2, sizeof(*new_exts), GFP_KERNEL);
+	if (!new_exts) {
+		ret = -ENOMEM;
+		goto out_unlock;
 	}
 
 	/*
 	 * Build the new extent list and zero any partially-holed boundary
-	 * blocks that remain allocated.
+	 * blocks that remain allocated. Extents arrive already sorted by offset
+	 * (the tree maintains order), so the resulting new_exts is sorted too.
 	 */
 	for (i = 0; i < old_count; i++) {
 		struct briefs_extent ext = old_exts[i];
@@ -1380,7 +1284,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 						      partial_start_off,
 						      BRIEFS_BLOCK_SIZE);
 			if (ret)
-				goto out_free;
+				goto out_unlock;
 		}
 
 		if (need_partial_end && (end_blk - 1) >= ext.offset &&
@@ -1391,7 +1295,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 						      0,
 						      partial_end_off);
 			if (ret)
-				goto out_free;
+				goto out_unlock;
 		}
 
 		if (free_start > ext.offset) {
@@ -1415,18 +1319,19 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 	}
 
 	/*
-	 * Replace the extent list atomically.  This allocates chain blocks if
-	 * necessary, writes them, and updates the in-memory inode metadata.
-	 * No data blocks have been freed yet, so failure here is harmless.
+	 * Rebuild the index from new_exts. Frees the old tree nodes, resets the
+	 * inode, and re-inserts the kept extents (left/right remainders + the
+	 * untouched extents). Kept extents' data blocks stay allocated and are
+	 * re-referenced by the new index.
 	 */
-	ret = briefs_replace_extent_list(inode->i_sb, &binfo->disk_inode,
-					 new_count, new_exts, &old_chain_base);
+	ret = briefs_rebuild_extent_list(inode->i_sb, binfo, new_exts, new_count);
 	if (ret)
-		goto out_free;
+		goto out_unlock;
 
 	/*
 	 * The inode now references only kept blocks.  It is safe to free the
-	 * removed data blocks and the old chain blocks.
+	 * removed data blocks.  briefs_rebuild_extent_list already freed the
+	 * old tree node blocks (the old chain blocks, in chain terms).
 	 */
 	for (i = 0; i < old_count; i++) {
 		struct briefs_extent ext = old_exts[i];
@@ -1458,9 +1363,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 			changed = true;
 		}
 	}
-
-	if (old_chain_base)
-		briefs_free_chain_blocks(inode->i_sb, old_chain_base);
+	} /* end inline-only punch */
 
 	inode->i_blocks = briefs_compute_i_blocks(inode->i_sb,
 						 &binfo->disk_inode);
@@ -1469,6 +1372,9 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 				  &binfo->disk_inode, false);
 	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
 	briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+
+out_unlock:
+	mutex_unlock(&binfo->extent_lock);
 
 out_update:
 	if (changed) {
@@ -1481,8 +1387,8 @@ out_update:
 	}
 
 out_free:
-	kfree(old_exts);
-	kfree(new_exts);
+	kvfree(old_exts);
+	kvfree(new_exts);
 	inode_unlock(inode);
 	return ret;
 }

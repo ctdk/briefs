@@ -27,11 +27,10 @@
 #define BRIEFS_INODE_SIZE 512
 #define BRIEFS_INODE_INLINE_DATA_SIZE 256
 #define BRIEFS_NAME_LEN 255
-#define BRIEFS_CHAIN_EXTENTS 127
 
 /* Semantic versioning, yo */
 #define _BRIEFS_MAJOR_VER 0
-#define _BRIEFS_MINOR_VER 8
+#define _BRIEFS_MINOR_VER 9
 #define _BRIEFS_PATCH_VER 0
 
 /* Journal magic */
@@ -236,6 +235,14 @@ struct briefs_superblock {
 	unsigned char reserved[_BRIEFS_SUPER_RESERVED];
 }; /* 1024 bytes */
 
+/*
+ * feature_incompat bits (superblock field feature_incompat at offset 144).
+ * A clean break gates the on-disk format: mkfs sets the bits for the features
+ * it writes; mount/fsck reject an image whose incompat bits are not all
+ * understood. The v0.9.0 B+ tree extent index is the first one.
+ */
+#define BRIEFS_FEATURE_INCOMPAT_BTREE 0x0000000000000001ULL /* B+ tree extent index (v0.9.0) */
+
 /* Extent entry - 32 bytes (in-memory, CPU endian) */
 struct briefs_extent {
 	__u64 offset;
@@ -428,19 +435,11 @@ static inline void briefs_cpu_inode_to_disk(const struct briefs_inode *src,
 	memcpy(dst->reserved, src->reserved, sizeof(dst->reserved));
 }
 
-/* Extent chain for overflow - one block on disk */
-struct briefs_extent_chain {
-	__le64 next_overflow_block;
-	__le32 num_extents_in_block;
-	__le32 pad;
-	struct briefs_disk_extent extents[127];
-	__le64 checksum;
-};
-
 /*
- * Extent chain block checksum helpers.
+ * Metadata-block checksum helpers (originally for the extent chain block;
+ * now also cover the B+ tree node — see struct briefs_extent_btree_node).
  * The checksum covers bytes [0, block_size-16), i.e. the header and all
- * 127 extents but not the 8-byte checksum field itself (nor the 8 bytes of
+ * payload but not the 8-byte checksum field itself (nor the 8 bytes of
  * trailing padding). A stored value of zero is treated as legacy (no
  * checksum) and always verifies.
  */
@@ -457,6 +456,63 @@ static inline int briefs_verify_chain_checksum(const void *data, __le64 stored)
 		return 0; /* legacy block with no checksum */
 	return (briefs_chain_checksum(data) == cpu_stored) ? 0 : -EIO;
 }
+
+/*
+ * On-disk B+ tree extent index node — one block (4096 bytes).
+ *
+ * Replaces the flat singly-linked chain list (struct briefs_extent_chain,
+ * now removed). The tree is keyed
+ * by briefs_disk_extent.offset (logical offset in blocks); every entry is
+ * maintained sorted by offset. Leaves carry the extent records; internal nodes
+ * carry separator keys plus absolute child block pointers. next_leaf threads
+ * the leaves for O(E) forward in-order traversal (fiemap, compute_i_blocks,
+ * free_inode_data); there is no prev_leaf — no path iterates backward.
+ *
+ * The 8-byte checksum lives at offset 4080 and the 8 trailing bytes are slack,
+ * identical to the chain block, so briefs_chain_checksum() (which CRC32C's
+ * bytes [0, BLOCK_SIZE - 2*sizeof(u64)) = [0, 4080)) covers this node verbatim.
+ * A magic distinguishes a B-tree node from a stray/freed block (the chain
+ * block had none).
+ *
+ * An inode with <= 8 extents keeps them inline in the inode (no tree). On the
+ * 9th extent the inode spills to a B-tree: the root leaf block is allocated,
+ * the inline extents are copied in sorted, inline_extents[] is zeroed,
+ * InodeFlagIndexed is set, and extent_inline_base becomes the root block.
+ */
+#define BRIEFS_BTREE_MAGIC   0x42545245u  /* "BTRE" */
+#define BRIEFS_BTREE_LEAF    0x0001u      /* hdr.flags bit0: leaf vs internal */
+
+struct briefs_btree_header {
+	__le32 magic;      /* BRIEFS_BTREE_MAGIC */
+	__le32 flags;      /* bit0 = BRIEFS_BTREE_LEAF */
+	__le16 level;      /* 0 = leaf */
+	__le16 num_keys;   /* leaf: #extent records; internal: #separator keys */
+	__le64 next_leaf;  /* abs block of next leaf, 0 if none (leaf only) */
+};                     /* 24 bytes (4 bytes padding before next_leaf) */
+
+/* Payload = 4096 - 24 (header) - 16 (checksum + trailing slack) = 4056 bytes. */
+#define BRIEFS_BTREE_LEAF_FANOUT 126   /* 126 * 32 = 4032; 24 bytes pad to 4056 */
+struct briefs_btree_idx_entry {
+	__le64 child;      /* absolute block number of child node */
+	__le64 high_key;   /* keys in child[] are < high_key; 0 => +inf (rightmost) */
+};                     /* 16 bytes */
+#define BRIEFS_BTREE_IDX_KEYS 253       /* 253 * 16 = 4048; + 8 (trailing_child) = 4056 */
+
+struct briefs_extent_btree_node {
+	struct briefs_btree_header hdr;        /* 24 bytes */
+	union {
+		struct {
+			struct briefs_disk_extent extents[BRIEFS_BTREE_LEAF_FANOUT]; /* 4032 */
+			__u8 _pad[24];                                                /* 4056 */
+		} leaf;
+		struct {
+			struct briefs_btree_idx_entry idx[BRIEFS_BTREE_IDX_KEYS];     /* 4048 */
+			__le64 trailing_child;                                         /* 4056 */
+		} internal;
+	} u;                                    /* 4056 bytes */
+	__le64 checksum;                        /* offset 4080 */
+	__le64 _slack;                          /* offset 4088, not covered */
+};                                          /* 4096 bytes */
 
 /*
  * Per-buffer_head "CRC already verified" bit, allocated from BH_PrivateStart
@@ -809,12 +865,79 @@ void briefs_free_inode_num(struct super_block *sb, u64 ino);
 void briefs_free_inode_data(struct inode *inode);
 u64 briefs_compute_i_blocks(struct super_block *sb, struct briefs_inode *di);
 int briefs_read_extent(struct super_block *sb, struct briefs_inode *di, int index, struct briefs_extent *ext);
+
+/* Find the extent covering logical block @iblock. Dispatches on InodeFlagIndexed
+ * (B+ tree lookup) vs inline-only (inline array scan). @trust_verified forwards
+ * to the tree node read: a caller holding extent_lock may skip CRCs on cached,
+ * already-verified buffers; an unlocked scanner passes false to verify each read.
+ * Returns 0 and fills *ext, -ENOENT if no extent covers @iblock, -EIO on a
+ * read/checksum failure. */
+int briefs_inode_lookup_iblock(struct super_block *sb, struct briefs_inode_info *binfo,
+			       u64 iblock, struct briefs_extent *ext, bool trust_verified);
 int briefs_append_extent(struct super_block *sb, struct briefs_inode *di, struct briefs_extent *ext);
 int briefs_append_extent_nojournal(struct super_block *sb, struct briefs_inode *di,
                                     struct briefs_extent *ext);
 void briefs_free_blocks_range(struct briefs_sb_info *bsi, u64 phys_start, u64 len);
-void briefs_free_chain_blocks(struct super_block *sb, u64 chain_block);
 int briefs_write_inode(struct inode *inode, struct writeback_control *wbc);
+
+/*
+ * Offset-keyed B+ tree extent index (briefs_btree.c).
+ *
+ * An inode is either inline-only (InodeFlagIndexed clear, extent_inline_base==0,
+ * up to 8 extents kept sorted in inline_extents[]) or tree-backed (InodeFlagIndexed
+ * set, extent_inline_base == root block, num_extents_inline==0, all extents live in
+ * the leaves of a B+ tree keyed by briefs_disk_extent.offset). The 9th extent
+ * spills inline->tree.
+ *
+ * All mutators require the caller to hold binfo->extent_lock; the tree's root
+ * pointer (extent_inline_base) and the inline array are published under
+ * binfo->extent_seq. Every split marks all affected node buffers dirty BEFORE
+ * publishing a new root pointer, so the lock-free drain (briefs_btree_drain)
+ * that runs before the JRN_INODE_FULL snapshot syncs a complete, consistent tree.
+ */
+
+/* Lookup the extent covering logical block @iblock. Returns 0 and fills *ext,
+ * -ENOENT if no extent covers it, -EIO on read/checksum failure. trust_verified
+ * is forwarded to the node read (locked callers may skip CRC on cached buffers,
+ * unlocked scanners verify every time). */
+int briefs_btree_lookup(struct super_block *sb, u64 root_block, u64 iblock,
+			struct briefs_extent *ext, bool trust_verified);
+
+/* Insert @ext into the index (caller holds extent_lock). Performs sorted insert
+ * (inline or tree), merge-with-offset-neighbor, inline->tree spill, and B+ tree
+ * split with root growth. Updates cached_max_end. Returns 0 or -errno. */
+int briefs_btree_insert_locked(struct super_block *sb, struct briefs_inode *di,
+				struct briefs_extent *ext);
+
+/* Visit every extent in ascending offset order. For inline-only inodes walks the
+ * inline array; for tree-backed inodes descends to the leftmost leaf and follows
+ * next_leaf. Stops early if @cb returns negative. Returns 0 or -errno. */
+int briefs_btree_for_each_extent(struct super_block *sb, struct briefs_inode *di,
+				 int (*cb)(const struct briefs_extent *ext,
+					   void *ctx),
+				 void *ctx);
+
+/* Remove every extent overlapping [start,end) from a tree-backed inode, freeing
+ * the data blocks in the overlap. Empty leaves are freed and dropped from their
+ * parents (no rebalancing). An extent straddling @end is split: its head removed,
+ * its tail [end, ...) re-inserted with data kept. Recomputes cached_max_end.
+ * Caller holds extent_lock. No-op (returns 0) for inline-only inodes. */
+int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
+			      u64 start, u64 end);
+
+/* Free every data block referenced by the inode's extents AND every tree node
+ * block (leaves + internal levels). Caller holds extent_lock. */
+void briefs_btree_free_all(struct super_block *sb, struct briefs_inode *di);
+
+/* Free every B-tree NODE block (leaves + internal levels) but leave the data
+ * extent blocks allocated, so a truncate/punch rebuild can re-insert the kept
+ * extents. No-op for inline-only inodes. Caller holds extent_lock. */
+void briefs_btree_free_nodes_only(struct super_block *sb, struct briefs_inode *di);
+
+/* Lock-free: sync every dirty B-tree node reachable from @root_block. Used by
+ * the journal snapshot ordering (must run before JRN_INODE_FULL). Bounded by
+ * @max_nodes as a guard against corrupt/cyclic trees. */
+void briefs_btree_drain(struct super_block *sb, u64 root_block, u64 max_nodes);
 
 /* Disk inode I/O helpers (briefs_inode.c) */
 struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
@@ -919,7 +1042,8 @@ static inline void briefs_build_bug_on_sizes(void)
 	BUILD_BUG_ON(sizeof(struct briefs_disk_inode) != 512);
 	BUILD_BUG_ON(sizeof(struct briefs_extent) != 32);
 	BUILD_BUG_ON(sizeof(struct briefs_disk_extent) != 32);
-	BUILD_BUG_ON(sizeof(struct briefs_extent_chain) != 4088);
+	BUILD_BUG_ON(sizeof(struct briefs_extent_btree_node) != 4096);
+	BUILD_BUG_ON(offsetof(struct briefs_extent_btree_node, checksum) != 4080);
 	BUILD_BUG_ON(sizeof(struct alloc_pool_header) != 48);
 	BUILD_BUG_ON(sizeof(struct briefs_trie_page) != 20);
 	BUILD_BUG_ON(sizeof(struct briefs_trie_node) != 36);

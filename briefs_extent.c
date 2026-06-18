@@ -42,404 +42,97 @@ void briefs_free_blocks_range(struct briefs_sb_info *bsi, u64 phys_start, u64 le
 }
 
 /*
- * Free all chain blocks starting at chain_block.  Logs each chain block free
- * to the journal and returns the data blocks to the allocator.
- */
-void briefs_free_chain_blocks(struct super_block *sb, u64 chain_block)
-{
-	struct briefs_sb_info *bsi = sb->s_fs_info;
-	struct buffer_head *bh;
-	struct briefs_extent_chain *chain;
-	u64 next;
-
-	while (chain_block) {
-		bh = sb_bread(sb, chain_block);
-		if (!bh)
-			break;
-		chain = (struct briefs_extent_chain *)bh->b_data;
-		if (le64_to_cpu(chain->checksum) != 0 &&
-		    briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
-			pr_warn("briefs: chain block %llu checksum mismatch while freeing; continuing\n",
-				chain_block);
-		}
-		next = le64_to_cpu(chain->next_overflow_block);
-		brelse(bh);
-
-		briefs_journal_extent_free(bsi->journal, 0, 0, chain_block, 1);
-		briefs_free_block(&bsi->alloc, abs_to_data(bsi->sb, chain_block));
-		chain_block = next;
-	}
-}
-
-/*
- * Walk the chain starting at chain_block to find the extent at chain-relative
- * index chain_idx.  On success, fills *ext and returns 0 with the buffer head
- * released.  Returns -EIO on read/checksum failure, -ENOENT if the index is
- * not found.
- */
-static int briefs_read_chain_extent(struct super_block *sb, u64 chain_block,
-                                      int chain_idx, struct briefs_extent *ext,
-                                      bool trust_verified)
-{
-	struct buffer_head *bh;
-	struct briefs_extent_chain *chain;
-	u32 num_in_block;
-
-	while (chain_block) {
-		bh = sb_bread(sb, chain_block);
-		if (!bh) {
-			pr_err("briefs: failed to read chain block %llu\n", chain_block);
-			return -EIO;
-		}
-		chain = (struct briefs_extent_chain *)bh->b_data;
-
-		/*
-		 * Skip the 4088-byte CRC32C when this buffer's CRC has already been
-		 * validated and not evicted since (the BH_Verified bit auto-clears on
-		 * buffer_head reallocation). trust_verified is set only by callers that
-		 * hold a lock excluding concurrent chain-block modifiers, so a cached,
-		 * verified buffer cannot be torn in memory; a torn disk read can only
-		 * surface on the first sb_bread after eviction, when the bit is clear.
-		 */
-		if (!trust_verified || !buffer_verified(bh)) {
-			if (briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
-				pr_err("briefs: chain block %llu checksum mismatch\n", chain_block);
-				brelse(bh);
-				return -EIO;
-			}
-			if (trust_verified)
-				set_buffer_verified(bh);
-		}
-
-		num_in_block = le32_to_cpu(chain->num_extents_in_block);
-		if (chain_idx < num_in_block) {
-			briefs_disk_extent_to_cpu(&chain->extents[chain_idx], ext);
-			brelse(bh);
-			return 0;
-		}
-
-		chain_idx -= num_in_block;
-		chain_block = le64_to_cpu(chain->next_overflow_block);
-		brelse(bh);
-	}
-
-	return -ENOENT;
-}
-
-/*
- * briefs_read_extent - read an extent by logical index from inline extents,
- * walking chain blocks as needed. Returns the extent data in *ext.
- * Returns 0 on success, -ENOENT if index >= num_extents_total.
+ * briefs_read_extent - read an INLINE extent by logical index.
+ *
+ * After the B+ tree conversion this only serves the symlink paths (journal
+ * replay of symlink data, and briefs_get_link), which always read index 0 of
+ * a single inline extent (symlinks are never tree-backed). Tree-backed and
+ * chain-backed extent access goes through briefs_btree_lookup /
+ * briefs_btree_for_each_extent instead. Any idx >= num_extents_inline returns
+ * -ENOENT.
  */
 int briefs_read_extent(struct super_block *sb, struct briefs_inode *di,
                                int idx, struct briefs_extent *ext)
 {
 	struct briefs_inode_info *binfo;
-	int chain_idx;
+	unsigned seq;
 
-	if (idx < 0 || idx >= di->num_extents_total)
+	if (idx < 0 || idx >= di->num_extents_inline)
 		return -ENOENT;
 
 	binfo = container_of(di, struct briefs_inode_info, disk_inode);
 
-	/* Check if the extent is inline — read under seqcount protection */
-	if (idx < di->num_extents_inline) {
+	do {
+		seq = read_seqcount_begin(&binfo->extent_seq);
+		*ext = di->inline_extents[idx];
+	} while (read_seqcount_retry(&binfo->extent_seq, seq));
+	return 0;
+}
+/*
+ * briefs_inode_lookup_iblock - find the extent covering logical block @iblock.
+ *
+ * Dispatches on InodeFlagIndexed: tree-backed inodes descend the B+ tree from a
+ * freshly-snapped root (O(log E)); inline-only inodes snapshot the inline array
+ * under extent_seq and scan it (<=8 entries). @trust_verified is forwarded to
+ * the tree read: a caller holding extent_lock may skip the CRC on cached,
+ * already-verified buffers (no concurrent modifier can have torn them); an
+ * unlocked scanner passes false to verify each read (a torn read surfaces as
+ * -EIO, which the get_block locked re-check recovers from).
+ *
+ * Returns 0 and fills *ext, -ENOENT if no extent covers @iblock, -EIO on a
+ * read/checksum failure.
+ */
+int briefs_inode_lookup_iblock(struct super_block *sb,
+			       struct briefs_inode_info *binfo,
+			       u64 iblock, struct briefs_extent *ext,
+			       bool trust_verified)
+{
+	struct briefs_inode *di = &binfo->disk_inode;
+
+	if (di->flags & InodeFlagIndexed) {
+		u64 base;
 		unsigned seq;
+
 		do {
 			seq = read_seqcount_begin(&binfo->extent_seq);
-			*ext = di->inline_extents[idx];
+			base = di->extent_inline_base;
 		} while (read_seqcount_retry(&binfo->extent_seq, seq));
-		return 0;
+		if (base == 0)
+			return -ENOENT;
+		return briefs_btree_lookup(sb, base, iblock, ext, trust_verified);
 	}
 
-	/* Walk chain blocks */
-	if (di->extent_inline_base == 0)
-		return -ENOENT;
-
-	chain_idx = idx - di->num_extents_inline;
-	return briefs_read_chain_extent(sb, di->extent_inline_base, chain_idx, ext,
-					   true);
-}
-/*
- * __briefs_append_extent - internal append helper.  Caller must hold
- * binfo->extent_lock.  Appends an extent to the list, creating chain blocks
- * if the 8 inline slots are full.
- * Returns 0 on success, -ENOSPC if no blocks available for chain.
- */
-static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
-                                 struct briefs_extent *ext)
-{
-	struct briefs_sb_info *bsi = sb->s_fs_info;
-	struct briefs_inode_info *binfo;
-	struct buffer_head *bh;
-	struct briefs_extent_chain *chain;
-	struct briefs_extent last;
-	u64 rel, chain_block;
-	int slot, ret, chain_idx, block_slot, blocks_to_skip;
-
-	/* Get the inode info from the embedded disk_inode */
-	binfo = container_of(di, struct briefs_inode_info, disk_inode);
-
-	/*
-	 * Maintain the extent-tail cache. The new extent's end (offset+len) is,
-	 * for both the merge and append branches, the only value that can raise
-	 * the running max: a merge is only taken when the new extent is
-	 * contiguous with the last one (last.offset+last.len == ext.offset), so
-	 * the merged extent's end equals ext.offset+ext.len. This single update
-	 * therefore covers every growth path through this function. Done in its
-	 * own seqcount write section BEFORE the branch logic below, because
-	 * seqcount_t is not nestable and each branch takes its own section.
-	 */
 	{
-		u64 new_end = ext->offset + ext->len;
-		write_seqcount_begin(&binfo->extent_seq);
-		if (new_end > binfo->cached_max_end)
-			binfo->cached_max_end = new_end;
-		write_seqcount_end(&binfo->extent_seq);
-	}
+		struct briefs_extent snap[8];
+		unsigned seq;
+		int n, k;
 
-	/*
-	 * All modifications to extent fields are done inside a write_seqcount
-	 * critical section so that briefs_write_inode (called by VFS writeback)
-	 * never sees a partially-updated extent list.
-	 */
+		do {
+			seq = read_seqcount_begin(&binfo->extent_seq);
+			n = di->num_extents_inline;
+			if (n > 8)
+				n = 8;
+			for (k = 0; k < n; k++)
+				snap[k] = di->inline_extents[k];
+		} while (read_seqcount_retry(&binfo->extent_seq, seq));
 
-	/*
-	 * If the new extent is contiguous with the last one, merge it instead
-	 * of creating a new extent.  Sequential writes therefore build a single
-	 * large extent rather than thousands of single-block extents, which
-	 * keeps extent lookup O(1) instead of O(n).
-	 */
-	if (di->num_extents_total > 0) {
-		int last_idx = di->num_extents_total - 1;
-
-		ret = briefs_read_extent(sb, di, last_idx, &last);
-		if (ret == 0 &&
-		    ext->offset == last.offset + last.len &&
-		    ext->phys == last.phys + last.len) {
-			if (last_idx < di->num_extents_inline) {
-				write_seqcount_begin(&binfo->extent_seq);
-				/* Grow by ext->len (a multi-block run can merge
-				 * here, e.g. a second contiguous fallocate call or
-				 * a run allocated at writeback); +1 would corrupt
-				 * the on-disk length for len>1. */
-				di->inline_extents[last_idx].len += ext->len;
-				write_seqcount_end(&binfo->extent_seq);
-			} else {
-				chain_idx = last_idx - di->num_extents_inline;
-				block_slot = chain_idx % BRIEFS_CHAIN_EXTENTS;
-				blocks_to_skip = chain_idx / BRIEFS_CHAIN_EXTENTS;
-				chain_block = di->extent_inline_base;
-
-				while (blocks_to_skip-- > 0) {
-					bh = sb_bread(sb, chain_block);
-					if (!bh)
-						return -EIO;
-					chain = (struct briefs_extent_chain *)bh->b_data;
-					if (briefs_verify_chain_checksum(bh->b_data,
-						    chain->checksum) != 0) {
-						brelse(bh);
-						return -EIO;
-					}
-					chain_block = le64_to_cpu(chain->next_overflow_block);
-					brelse(bh);
-					if (chain_block == 0)
-						return -EIO;
-				}
-
-				bh = sb_bread(sb, chain_block);
-				if (!bh)
-					return -EIO;
-				chain = (struct briefs_extent_chain *)bh->b_data;
-				if (briefs_verify_chain_checksum(bh->b_data,
-					    chain->checksum) != 0) {
-					brelse(bh);
-					return -EIO;
-				}
-				{
-					struct briefs_extent tmp;
-
-					briefs_disk_extent_to_cpu(&chain->extents[block_slot],
-								  &tmp);
-					/* Grow by ext->len, not 1: a multi-block run may
-					 * merge into a chain-resident last extent. */
-					tmp.len += ext->len;
-					briefs_cpu_extent_to_disk(&tmp,
-								  &chain->extents[block_slot]);
-				}
-				chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
-				set_buffer_verified(bh);
-				write_seqcount_begin(&binfo->extent_seq);
-				mark_buffer_dirty(bh);
-				write_seqcount_end(&binfo->extent_seq);
-				brelse(bh);
+		for (k = 0; k < n; k++) {
+			if (iblock >= snap[k].offset &&
+			    iblock < snap[k].offset + snap[k].len) {
+				*ext = snap[k];
+				return 0;
 			}
-
-			/* Journal the new block allocation for bitmap recovery */
-			briefs_journal_extent_alloc(bsi->journal, di->inode_number,
-						    ext->offset, ext->phys,
-						    ext->len, -1);
-			return 0;
 		}
-	}
-
-	if (di->num_extents_inline < 8) {
-		/* Still fits inline */
-		write_seqcount_begin(&binfo->extent_seq);
-		int n = di->num_extents_inline;
-		di->inline_extents[n] = *ext;
-		di->num_extents_inline++;
-		di->num_extents_total++;
-		write_seqcount_end(&binfo->extent_seq);
-
-		/* Journal the extent allocation */
-		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
-					    ext->offset, ext->phys,
-					    ext->len, n);
-		return 0;
-	}
-
-	/* Inline is full - append to chain blocks */
-
-	/* Allocate first chain block if needed */
-	chain_block = di->extent_inline_base;
-	if (chain_block == 0) {
-		rel = briefs_alloc_block(&bsi->alloc);
-		if (rel == 0) {
-			return -ENOSPC;
-		}
-		chain_block = data_to_abs(bsi->sb, rel);
-
-		/*
-		 * Initialize the new chain block before making it reachable from
-		 * the inode.  If initialization fails we can still free the block
-		 * and leave the extent metadata unchanged.
-		 */
-		bh = briefs_get_zero_block(sb, chain_block);
-		if (!bh) {
-			briefs_journal_extent_free(bsi->journal, 0, 0,
-						   chain_block, 1);
-			briefs_free_block(&bsi->alloc, rel);
-			return -EIO;
-		}
-		brelse(bh);
-
-		write_seqcount_begin(&binfo->extent_seq);
-		di->extent_inline_base = chain_block;
-		write_seqcount_end(&binfo->extent_seq);
-
-		/* Journal the chain block allocation */
-		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
-					    0, chain_block, 1, -1);
-	}
-
-	/* Walk to the last chain block */
-	while (1) {
-		u32 num_in_block;
-
-		bh = sb_bread(sb, chain_block);
-		if (!bh) {
-			return -EIO;
-		}
-		chain = (struct briefs_extent_chain *)bh->b_data;
-
-		/* Under extent_lock: no concurrent modifier, so the memoized
-		 * BH_Verified bit lets us skip the CRC on cached re-reads. */
-		if (!buffer_verified(bh)) {
-			if (briefs_verify_chain_checksum(bh->b_data, chain->checksum) != 0) {
-				pr_err("briefs: chain block %llu checksum mismatch on append\n", chain_block);
-				brelse(bh);
-				return -EIO;
-			}
-			set_buffer_verified(bh);
-		}
-
-		num_in_block = le32_to_cpu(chain->num_extents_in_block);
-		if (num_in_block < BRIEFS_CHAIN_EXTENTS) {
-			/* Room in this block */
-			slot = num_in_block;
-			briefs_cpu_extent_to_disk(ext, &chain->extents[slot]);
-			chain->num_extents_in_block = cpu_to_le32(num_in_block + 1);
-			chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
-			set_buffer_verified(bh);
-			write_seqcount_begin(&binfo->extent_seq);
-			mark_buffer_dirty(bh);
-			write_seqcount_end(&binfo->extent_seq);
-			brelse(bh);
-
-			write_seqcount_begin(&binfo->extent_seq);
-			di->num_extents_total++;
-			write_seqcount_end(&binfo->extent_seq);
-
-			/* Journal the extent addition to chain */
-			briefs_journal_extent_alloc(bsi->journal, di->inode_number,
-						    ext->offset, ext->phys,
-						    ext->len, -1);
-			return 0;
-		}
-
-		/* Chain block full - follow or allocate next */
-		if (le64_to_cpu(chain->next_overflow_block)) {
-			chain_block = le64_to_cpu(chain->next_overflow_block);
-			brelse(bh);
-			continue;
-		}
-
-		/* Allocate a new chain block */
-		rel = briefs_alloc_block(&bsi->alloc);
-		if (rel == 0) {
-			brelse(bh);
-			return -ENOSPC;
-		}
-		{
-			u64 new_block = data_to_abs(bsi->sb, rel);
-			chain->next_overflow_block = cpu_to_le64(new_block);
-			chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
-			set_buffer_verified(bh);
-			write_seqcount_begin(&binfo->extent_seq);
-			mark_buffer_dirty(bh);
-			write_seqcount_end(&binfo->extent_seq);
-			brelse(bh);
-
-			/* Journal the new chain block allocation */
-			briefs_journal_extent_alloc(bsi->journal, di->inode_number,
-						    0, new_block, 1, -1);
-
-			/* Set up new chain block */
-			bh = briefs_get_zero_block(sb, new_block);
-			if (!bh) {
-				briefs_journal_extent_free(bsi->journal, 0, 0,
-							   new_block, 1);
-				briefs_free_block(&bsi->alloc, rel);
-				return -EIO;
-			}
-			chain = (struct briefs_extent_chain *)bh->b_data;
-			briefs_cpu_extent_to_disk(ext, &chain->extents[0]);
-			chain->num_extents_in_block = cpu_to_le32(1);
-			chain->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
-			set_buffer_verified(bh);
-			write_seqcount_begin(&binfo->extent_seq);
-			mark_buffer_dirty(bh);
-			write_seqcount_end(&binfo->extent_seq);
-			brelse(bh);
-		}
-
-		write_seqcount_begin(&binfo->extent_seq);
-		di->num_extents_total++;
-		write_seqcount_end(&binfo->extent_seq);
-
-		/* Journal the extent addition to chain */
-		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
-					    ext->offset, ext->phys,
-					    ext->len, -1);
-		return 0;
+		return -ENOENT;
 	}
 }
 
 /*
- * briefs_append_extent - append an extent to the extent list.  Takes the
- * per-inode extent lock and calls the internal helper.  This is the
- * entry point for callers that are not already holding the lock.
+ * briefs_append_extent - insert an extent into the index.  Takes the per-inode
+ * extent lock and calls the locked tree/inline mutator.  This is the entry
+ * point for callers that are not already holding the lock.  Returns 0 or
+ * -errno; on success logs a full inode snapshot so replay restores the extent
+ * metadata exactly.
  */
 int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
                          struct briefs_extent *ext)
@@ -451,7 +144,7 @@ int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 
 	binfo = container_of(di, struct briefs_inode_info, disk_inode);
 	mutex_lock(&binfo->extent_lock);
-	ret = __briefs_append_extent(sb, di, ext);
+	ret = briefs_btree_insert_locked(sb, di, ext);
 	mutex_unlock(&binfo->extent_lock);
 	if (ret)
 		return ret;
@@ -463,9 +156,9 @@ int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 }
 
 /*
- * briefs_append_extent_nojournal - append an extent without immediately
+ * briefs_append_extent_nojournal - insert an extent without immediately
  * journaling.  The caller is responsible for logging a full inode snapshot
- * after a batch of appends (e.g. briefs_fallocate).  Otherwise identical to
+ * after a batch of inserts (e.g. briefs_fallocate).  Otherwise identical to
  * briefs_append_extent.
  */
 int briefs_append_extent_nojournal(struct super_block *sb, struct briefs_inode *di,
@@ -476,59 +169,35 @@ int briefs_append_extent_nojournal(struct super_block *sb, struct briefs_inode *
 
 	binfo = container_of(di, struct briefs_inode_info, disk_inode);
 	mutex_lock(&binfo->extent_lock);
-	ret = __briefs_append_extent(sb, di, ext);
+	ret = briefs_btree_insert_locked(sb, di, ext);
 	mutex_unlock(&binfo->extent_lock);
 	return ret;
 }
 
+/* briefs_sum_len_cb - for_each callback accumulating extent length (in blocks)
+ * into the u64 @ctx points at. */
+static int briefs_sum_len_cb(const struct briefs_extent *ext, void *ctx)
+{
+	u64 *blocks = ctx;
+	*blocks += ext->len;
+	return 0;
+}
+
 /*
- * briefs_compute_i_blocks - compute number of 512-byte sectors used
- * by the data blocks described by an inode's extents. This covers both
- * inline extents and the extents stored in overflow chain blocks.
+ * briefs_compute_i_blocks - compute number of 512-byte sectors used by the
+ * data blocks described by an inode's extents. Sums each extent's length in a
+ * single in-order walk of the B+ tree (or the inline array for inline-only
+ * inodes): O(E), no per-extent chain re-walk.
  */
 inline u64 briefs_compute_i_blocks(struct super_block *sb, struct briefs_inode *di)
 {
-	u64 blocks = 0;
-	int i;
-	for (i = 0; i < di->num_extents_inline; i++)
-		blocks += di->inline_extents[i].len;
-	for (i = 0; i < di->num_extents_total - di->num_extents_inline; i++) {
-		struct briefs_extent ext;
-		int ret = briefs_read_chain_extent(sb, di->extent_inline_base, i,
-						    &ext, false);
-		if (ret)
-			break;
-		blocks += ext.len;
-	}
-	return blocks * (BRIEFS_BLOCK_SIZE / 512);
+	struct { u64 blocks; } acc = { .blocks = 0 };
+
+	briefs_btree_for_each_extent(sb, di, briefs_sum_len_cb, &acc);
+	return acc.blocks * (BRIEFS_BLOCK_SIZE / 512);
 }
 
 
-/*
- * briefs_read_extent_chain - read an extent from the chain portion only,
- * using caller-supplied snapshot values for num_extents_inline and
- * extent_inline_base.  This avoids the seqcount inside briefs_read_extent
- * and allows the caller (briefs_get_block) to iterate the extent list
- * using a single metadata snapshot taken before the loop.
- *
- * Returns 0 on success with *ext filled, -ENOENT if not found.
- */
-static int briefs_read_extent_chain(struct super_block *sb, int idx,
-                                    u64 snap_inline, u64 snap_chain_base,
-                                    struct briefs_extent *ext)
-{
-	int chain_idx;
-
-	if (idx < snap_inline)
-		return -ENOENT;
-
-	if (snap_chain_base == 0)
-		return -ENOENT;
-
-	chain_idx = idx - snap_inline;
-	return briefs_read_chain_extent(sb, snap_chain_base, chain_idx, ext,
-					   false);
-}
 
 /*
  * briefs_get_block - get_block callback for block-based page cache helpers.
@@ -566,8 +235,9 @@ int briefs_get_block(struct inode *inode, sector_t iblock,
 	struct briefs_inode_info *binfo = briefs_i(inode);
 	struct briefs_extent ext;
 	u64 phys;
-	int i, ret;
+	int ret;
 	unsigned seq;
+	u64 snap_max_end;
 
 	/*
 	 * Inline-data inodes are served directly from the inode, not through
@@ -577,17 +247,10 @@ int briefs_get_block(struct inode *inode, sector_t iblock,
 	if (binfo->disk_inode.flags & InodeFlagInlineData)
 		return create ? -EIO : 0;
 
-	/*
-	 * Snapshot extent metadata under seqcount so we iterate a
-	 * consistent view even if briefs_append_extent runs concurrently.
-	 */
-	u64 snap_total, snap_inline, snap_chain_base, snap_max_end;
-
+	/* Snapshot only the tail cache; the lookup helper snapshots the root
+	 * pointer/inline array itself under extent_seq. */
 	do {
 		seq = read_seqcount_begin(&binfo->extent_seq);
-		snap_total = binfo->disk_inode.num_extents_total;
-		snap_inline = binfo->disk_inode.num_extents_inline;
-		snap_chain_base = binfo->disk_inode.extent_inline_base;
 		snap_max_end = binfo->cached_max_end;
 	} while (read_seqcount_retry(&binfo->extent_seq, seq));
 
@@ -595,83 +258,63 @@ int briefs_get_block(struct inode *inode, sector_t iblock,
 	 * Extent-tail fast path: cached_max_end is the running max of
 	 * (offset+len) over all extents, so any block at or beyond it is
 	 * definitively unmapped.  0 means "unknown/empty" -> never use the fast
-	 * path (fall through to the scan, which is the ground truth).  This turns
-	 * the append/EOF and read-beyond-EOF cases from O(E^2) to O(1) per block.
+	 * path (fall through to the lookup, which is the ground truth).  This turns
+	 * the append/EOF and read-beyond-EOF cases from O(E) to O(1) per block.
 	 */
 	if (snap_max_end != 0 && (u64)iblock >= snap_max_end) {
 		if (!create)
 			return 0;		/* definitively unmapped -> sparse/zero */
-		goto locked_create;	/* skip the unlocked O(E^2) scan */
+		goto locked_create;	/* skip the unlocked O(log E) lookup */
 	}
 
-	/* Look up iblock in the snapped extent view */
-	for (i = 0; i < snap_total; i++) {
-		if (i < snap_inline) {
-			/*
-			 * Inline extent — read under seqcount protection.
-			 * briefs_read_extent handles this correctly.
-			 */
-			ret = briefs_read_extent(inode->i_sb, &binfo->disk_inode,
-			                         i, &ext);
-		} else {
-			/*
-			 * Chain extent — walk from our snapped chain base.
-			 * The chain blocks are append-only (never freed until
-			 * eviction), so addressing into them by snapped index
-			 * is safe even if a concurrent writer adds new blocks.
-			 */
-			ret = briefs_read_extent_chain(inode->i_sb, i,
-			                               snap_inline,
-			                               snap_chain_base, &ext);
-		}
-		if (ret != 0)
-			break;
-		if ((u64)iblock >= ext.offset &&
-		    (u64)iblock < ext.offset + ext.len) {
-			phys = ext.phys + ((u64)iblock - ext.offset);
-			map_bh(bh_result, inode->i_sb, phys);
-			return 0;
-		}
+	/* Look up iblock in the snapped extent view (unlocked: verify CRCs). */
+	ret = briefs_inode_lookup_iblock(inode->i_sb, binfo, (u64)iblock, &ext, false);
+	if (ret == 0) {
+		phys = ext.phys + ((u64)iblock - ext.offset);
+		map_bh(bh_result, inode->i_sb, phys);
+		return 0;
 	}
+	/* -ENOENT: not mapped.  -EIO: torn/corrupt read -> fall through to the
+	 * locked re-check, which re-reads under the lock and recovers if the
+	 * tear is gone, or returns the error. */
 
 	/* Not mapped */
 	if (!create)
 		return 0;
 
 	/*
-	 * Allocate and append a new single-block extent.  Take the extent
-	 * lock and re-check the mapping: another thread may have appended the
-	 * block while we were doing the unlocked lookup above.  Without the
-	 * re-check, two threads can both append an extent for the same iblock,
-	 * leaving the first allocated block unreachable (leaked).
+	 * Allocate and insert a new single-block extent.  Take the extent lock
+	 * and re-check the mapping: another thread may have inserted the block
+	 * while we were doing the unlocked lookup above.  Without the re-check,
+	 * two threads can both insert an extent for the same iblock, leaving the
+	 * first allocated block unreachable (leaked).
 	 */
 locked_create:
 	mutex_lock(&binfo->extent_lock);
 
 	/*
-	 * Under extent_lock the tail cache is authoritative: every append that
+	 * Under extent_lock the tail cache is authoritative: every insert that
 	 * can raise cached_max_end runs under this mutex (and updates the field
-	 * before releasing it), so any concurrent appender's contribution is
+	 * before releasing it), so any concurrent inserter's contribution is
 	 * already visible to us here.  If iblock is still beyond the cached max,
-	 * the block is definitely not yet mapped and the O(E^2) re-scan below
-	 * cannot find it -> skip straight to allocation.  0 = unknown -> scan.
+	 * the block is definitely not yet mapped and the lookup below cannot
+	 * find it -> skip straight to allocation.  0 = unknown -> lookup.
 	 */
 	if (binfo->cached_max_end != 0 && (u64)iblock >= binfo->cached_max_end)
 		goto do_alloc;
 
-	for (i = 0; i < binfo->disk_inode.num_extents_total; i++) {
-		ret = briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext);
-		if (ret != 0) {
-			mutex_unlock(&binfo->extent_lock);
-			return ret;
-		}
-		if ((u64)iblock >= ext.offset &&
-		    (u64)iblock < ext.offset + ext.len) {
-			phys = ext.phys + ((u64)iblock - ext.offset);
-			map_bh(bh_result, inode->i_sb, phys);
-			mutex_unlock(&binfo->extent_lock);
-			return 0;
-		}
+	/* Locked re-check: trust BH_Verified (no concurrent modifier can have
+	 * torn a buffer we cached under this same lock). */
+	ret = briefs_inode_lookup_iblock(inode->i_sb, binfo, (u64)iblock, &ext, true);
+	if (ret == 0) {
+		phys = ext.phys + ((u64)iblock - ext.offset);
+		map_bh(bh_result, inode->i_sb, phys);
+		mutex_unlock(&binfo->extent_lock);
+		return 0;
+	}
+	if (ret != -ENOENT) {
+		mutex_unlock(&binfo->extent_lock);
+		return ret;		/* -EIO */
 	}
 
 do_alloc:
@@ -690,7 +333,8 @@ do_alloc:
 		new_ext.len = 1;
 		new_ext.flags = 0;
 
-		ret = __briefs_append_extent(inode->i_sb, &binfo->disk_inode, &new_ext);
+		ret = briefs_btree_insert_locked(inode->i_sb, &binfo->disk_inode,
+						  &new_ext);
 		if (ret != 0) {
 			briefs_free_block(&bsi->alloc, rel);
 			mutex_unlock(&binfo->extent_lock);
@@ -731,8 +375,10 @@ do_alloc:
  * No extent_lock is taken: setting BH_Delay is a buffer-local bit, and a
  * concurrent allocator's mapping is reconciled at writeback (briefs_get_block's
  * locked re-check finds the now-mapped block and map_bh's it without
- * re-allocating).  The unlocked chain scan is safe because the chain is
- * append-only.
+ * re-allocating).  The unlocked lookup is safe because the tree is immutable
+ * below a freshly-published root: a concurrent insert publishes a new root last
+ * under extent_seq, and the old root it replaced remains valid (its children
+ * are on disk / being synced).
  */
 int briefs_get_block_write(struct inode *inode, sector_t iblock,
                            struct buffer_head *bh_result, int create)
@@ -740,9 +386,9 @@ int briefs_get_block_write(struct inode *inode, sector_t iblock,
 	struct briefs_inode_info *binfo = briefs_i(inode);
 	struct briefs_extent ext;
 	u64 phys;
-	int i, ret;
+	int ret;
 	unsigned seq;
-	u64 snap_total, snap_inline, snap_chain_base, snap_max_end;
+	u64 snap_max_end;
 
 	/* Inline-data inodes must be promoted before the block path is used. */
 	if (binfo->disk_inode.flags & InodeFlagInlineData)
@@ -750,9 +396,6 @@ int briefs_get_block_write(struct inode *inode, sector_t iblock,
 
 	do {
 		seq = read_seqcount_begin(&binfo->extent_seq);
-		snap_total = binfo->disk_inode.num_extents_total;
-		snap_inline = binfo->disk_inode.num_extents_inline;
-		snap_chain_base = binfo->disk_inode.extent_inline_base;
 		snap_max_end = binfo->cached_max_end;
 	} while (read_seqcount_retry(&binfo->extent_seq, seq));
 
@@ -762,23 +405,16 @@ int briefs_get_block_write(struct inode *inode, sector_t iblock,
 		return 0;
 	}
 
-	for (i = 0; i < snap_total; i++) {
-		if (i < snap_inline)
-			ret = briefs_read_extent(inode->i_sb, &binfo->disk_inode,
-			                         i, &ext);
-		else
-			ret = briefs_read_extent_chain(inode->i_sb, i,
-			                               snap_inline,
-			                               snap_chain_base, &ext);
-		if (ret != 0)
-			return ret;
-		if ((u64)iblock >= ext.offset &&
-		    (u64)iblock < ext.offset + ext.len) {
-			phys = ext.phys + ((u64)iblock - ext.offset);
-			map_bh(bh_result, inode->i_sb, phys);
-			return 0;
-		}
+	/* Unlocked lookup (verify CRCs): a hit means the block is already mapped. */
+	ret = briefs_inode_lookup_iblock(inode->i_sb, binfo, (u64)iblock, &ext, false);
+	if (ret == 0) {
+		phys = ext.phys + ((u64)iblock - ext.offset);
+		map_bh(bh_result, inode->i_sb, phys);
+		return 0;
 	}
+	/* -ENOENT or -EIO (torn read): treat as not-yet-mapped and defer.  A
+	 * spurious -EIO here is harmless: the writeback-time get_block re-lookup
+	 * under extent_lock recovers the real mapping (or allocates). */
 
 	/* Not mapped: defer allocation to writeback. */
 	set_buffer_delay(bh_result);
@@ -789,9 +425,7 @@ void briefs_free_inode_data(struct inode *inode)
 {
 	struct briefs_inode_info *binfo = briefs_i(inode);
 	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
-	struct briefs_extent ext;
 	struct briefs_disk_inode disk_di;
-	int i;
 
 	/* For directories, free the trie instead of file extents */
 	if (S_ISDIR(inode->i_mode)) {
@@ -842,21 +476,20 @@ void briefs_free_inode_data(struct inode *inode)
 		return;
 	}
 
-	/* Walk all extents (inline + chain) */
-	for (i = 0; i < binfo->disk_inode.num_extents_total; i++) {
-		if (briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext) != 0)
-			break;
-
-		/* Journal the extent free */
-		briefs_journal_extent_free(bsi->journal, inode->i_ino,
-					   ext.offset, ext.phys, ext.len);
-		briefs_free_blocks_range(bsi, ext.phys, ext.len);
-	}
-
-	/* Free chain blocks */
-	briefs_free_chain_blocks(inode->i_sb, binfo->disk_inode.extent_inline_base);
+	/*
+	 * Free every data block and every tree node block the inode owns.
+	 * briefs_btree_free_all dispatches on InodeFlagIndexed (inline-only walks
+	 * the inline array; tree-backed frees data extents at the leaves and all
+	 * node blocks recursively) and journals each free. Both call sites (evict
+	 * with nlink==0, create-abort) run after the page cache is drained, so no
+	 * concurrent get_block can race the free; take extent_lock anyway to honor
+	 * the tree mutators' lock contract.
+	 */
+	mutex_lock(&binfo->extent_lock);
+	briefs_btree_free_all(inode->i_sb, &binfo->disk_inode);
 
 	write_seqcount_begin(&binfo->extent_seq);
+	binfo->disk_inode.flags &= ~InodeFlagIndexed;
 	binfo->disk_inode.num_extents_inline = 0;
 	binfo->disk_inode.num_extents_total = 0;
 	binfo->disk_inode.extent_inline_base = 0;
@@ -864,6 +497,7 @@ void briefs_free_inode_data(struct inode *inode)
 	/* All extents freed -> invalidate the tail cache (0 = unknown). */
 	binfo->cached_max_end = 0;
 	write_seqcount_end(&binfo->extent_seq);
+	mutex_unlock(&binfo->extent_lock);
 
 	/* Log the cleared inode so replay does not resurrect old extent pointers. */
 	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);

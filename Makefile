@@ -10,14 +10,14 @@
 obj-m += briefs_fs.o
 
 # Add C files as they appear.
-briefs_fs-objs := briefs.o briefs_alloc.o briefs_journal.o crc32c.o briefs_ops.o briefs_trie.o briefs_trie_page.o briefs_super.o briefs_inode.o briefs_dir.o briefs_file.o briefs_extent.o
+briefs_fs-objs := briefs.o briefs_alloc.o briefs_journal.o crc32c.o briefs_ops.o briefs_trie.o briefs_trie_page.o briefs_super.o briefs_inode.o briefs_dir.o briefs_file.o briefs_extent.o briefs_btree.o
 
 # Kernel build directory (change as needed)
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 # VM SSH command — used by `make test`
 VAGRANT_KEY ?= $(PWD)/.vagrant/machines/default/libvirt/private_key
-SSH ?= ssh vagrant@192.168.121.163 -p 22 \
+SSH ?= ssh vagrant@192.168.121.234 -p 22 \
 	-o LogLevel=FATAL \
 	-o Compression=yes \
 	-o DSAAuthentication=yes \
