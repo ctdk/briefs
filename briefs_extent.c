@@ -167,6 +167,24 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 	binfo = container_of(di, struct briefs_inode_info, disk_inode);
 
 	/*
+	 * Maintain the extent-tail cache. The new extent's end (offset+len) is,
+	 * for both the merge and append branches, the only value that can raise
+	 * the running max: a merge is only taken when the new extent is
+	 * contiguous with the last one (last.offset+last.len == ext.offset), so
+	 * the merged extent's end equals ext.offset+ext.len. This single update
+	 * therefore covers every growth path through this function. Done in its
+	 * own seqcount write section BEFORE the branch logic below, because
+	 * seqcount_t is not nestable and each branch takes its own section.
+	 */
+	{
+		u64 new_end = ext->offset + ext->len;
+		write_seqcount_begin(&binfo->extent_seq);
+		if (new_end > binfo->cached_max_end)
+			binfo->cached_max_end = new_end;
+		write_seqcount_end(&binfo->extent_seq);
+	}
+
+	/*
 	 * All modifications to extent fields are done inside a write_seqcount
 	 * critical section so that briefs_write_inode (called by VFS writeback)
 	 * never sees a partially-updated extent list.
@@ -537,14 +555,28 @@ int briefs_get_block(struct inode *inode, sector_t iblock,
 	 * Snapshot extent metadata under seqcount so we iterate a
 	 * consistent view even if briefs_append_extent runs concurrently.
 	 */
-	u64 snap_total, snap_inline, snap_chain_base;
+	u64 snap_total, snap_inline, snap_chain_base, snap_max_end;
 
 	do {
 		seq = read_seqcount_begin(&binfo->extent_seq);
 		snap_total = binfo->disk_inode.num_extents_total;
 		snap_inline = binfo->disk_inode.num_extents_inline;
 		snap_chain_base = binfo->disk_inode.extent_inline_base;
+		snap_max_end = binfo->cached_max_end;
 	} while (read_seqcount_retry(&binfo->extent_seq, seq));
+
+	/*
+	 * Extent-tail fast path: cached_max_end is the running max of
+	 * (offset+len) over all extents, so any block at or beyond it is
+	 * definitively unmapped.  0 means "unknown/empty" -> never use the fast
+	 * path (fall through to the scan, which is the ground truth).  This turns
+	 * the append/EOF and read-beyond-EOF cases from O(E^2) to O(1) per block.
+	 */
+	if (snap_max_end != 0 && (u64)iblock >= snap_max_end) {
+		if (!create)
+			return 0;		/* definitively unmapped -> sparse/zero */
+		goto locked_create;	/* skip the unlocked O(E^2) scan */
+	}
 
 	/* Look up iblock in the snapped extent view */
 	for (i = 0; i < snap_total; i++) {
@@ -587,7 +619,19 @@ int briefs_get_block(struct inode *inode, sector_t iblock,
 	 * re-check, two threads can both append an extent for the same iblock,
 	 * leaving the first allocated block unreachable (leaked).
 	 */
+locked_create:
 	mutex_lock(&binfo->extent_lock);
+
+	/*
+	 * Under extent_lock the tail cache is authoritative: every append that
+	 * can raise cached_max_end runs under this mutex (and updates the field
+	 * before releasing it), so any concurrent appender's contribution is
+	 * already visible to us here.  If iblock is still beyond the cached max,
+	 * the block is definitely not yet mapped and the O(E^2) re-scan below
+	 * cannot find it -> skip straight to allocation.  0 = unknown -> scan.
+	 */
+	if (binfo->cached_max_end != 0 && (u64)iblock >= binfo->cached_max_end)
+		goto do_alloc;
 
 	for (i = 0; i < binfo->disk_inode.num_extents_total; i++) {
 		ret = briefs_read_extent(inode->i_sb, &binfo->disk_inode, i, &ext);
@@ -604,6 +648,7 @@ int briefs_get_block(struct inode *inode, sector_t iblock,
 		}
 	}
 
+do_alloc:
 	{
 		struct briefs_extent new_ext;
 		u64 rel = briefs_alloc_block(&bsi->alloc);
@@ -716,6 +761,8 @@ void briefs_free_inode_data(struct inode *inode)
 	binfo->disk_inode.num_extents_total = 0;
 	binfo->disk_inode.extent_inline_base = 0;
 	memset(binfo->disk_inode.inline_extents, 0, sizeof(binfo->disk_inode.inline_extents));
+	/* All extents freed -> invalidate the tail cache (0 = unknown). */
+	binfo->cached_max_end = 0;
 	write_seqcount_end(&binfo->extent_seq);
 
 	/* Log the cleared inode so replay does not resurrect old extent pointers. */

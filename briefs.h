@@ -720,6 +720,15 @@ struct briefs_inode_info {
 	struct mutex trie_lock;    /* protects directory trie structure */
 	struct mutex extent_lock;  /* serializes extent list appends */
 	u64 trie_gen;            /* generation counter for trie modifications */
+	/*
+	 * cached_max_end: running max of (extent.offset + extent.len) over all
+	 * extents, in blocks. Protected by extent_seq (same as the disk_inode
+	 * extent fields). 0 means "unknown/empty" -> briefs_get_block must NOT
+	 * use the fast path. Overstatement is safe (fast path just fires less);
+	 * understatement would make a mapped block look unmapped (read returns
+	 * 0 = data loss), so it must be updated at every extent-growth site.
+	 */
+	u64 cached_max_end;
 };
 
 /* yanked from the xiafs module, which in turn was yanked from minix */

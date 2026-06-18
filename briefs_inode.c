@@ -382,6 +382,12 @@ struct inode *briefs_alloc_vfs_inode(struct super_block *sb) {
 	mutex_init(&binfo->trie_lock);
 	mutex_init(&binfo->extent_lock);
 	binfo->trie_gen = 0;
+	/*
+	 * The slab ctor (briefs_init_once) only inits the VFS inode; it does not
+	 * zero the rest of briefs_inode_info, so on slab reuse cached_max_end would
+	 * be stale. 0 = unknown/empty -> briefs_get_block skips the fast path.
+	 */
+	binfo->cached_max_end = 0;
 	return &binfo->vfs_inode;
 }
 /* briefs_free_inode - free a VFS inode (called by VFS inode cache) */

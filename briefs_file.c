@@ -166,6 +166,10 @@ static int briefs_promote_inline_data(struct inode *inode)
 	binfo->disk_inode.num_extents_inline = 1;
 	binfo->disk_inode.num_extents_total = 1;
 	binfo->disk_inode.extent_inline_base = 0;
+	/* Promotion bypasses __briefs_append_extent, so update the tail cache
+	 * here: the promoted extent is {offset 0, len 1} -> end 1. */
+	if (binfo->cached_max_end < 1)
+		binfo->cached_max_end = 1;
 	write_seqcount_end(&binfo->extent_seq);
 
 	inode->i_blocks = (BRIEFS_BLOCK_SIZE / 512);
@@ -579,6 +583,8 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		binfo->disk_inode.num_extents_inline = 0;
 		binfo->disk_inode.num_extents_total = 0;
 		memset(binfo->disk_inode.inline_extents, 0, sizeof(binfo->disk_inode.inline_extents));
+		/* All extents gone -> invalidate the tail cache (0 = unknown). */
+		binfo->cached_max_end = 0;
 		write_seqcount_end(&binfo->extent_seq);
 	}
 
@@ -913,6 +919,18 @@ static int briefs_replace_extent_list(struct super_block *sb,
 	memset(di->inline_extents, 0, sizeof(di->inline_extents));
 	for (i = 0; i < num_inline; i++)
 		di->inline_extents[i] = new_exts[i];
+	/* The extent list was rebuilt from new_exts[]; recompute the tail cache
+	 * exactly from the in-memory list (cheap, no I/O) so the fast path stays
+	 * accurate after compaction. */
+	{
+		u64 mx = 0;
+		for (i = 0; i < new_count; i++) {
+			u64 end = new_exts[i].offset + new_exts[i].len;
+			if (end > mx)
+				mx = end;
+		}
+		binfo->cached_max_end = mx;
+	}
 	write_seqcount_end(&binfo->extent_seq);
 
 	mutex_unlock(&binfo->extent_lock);
