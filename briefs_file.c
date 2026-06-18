@@ -1188,7 +1188,8 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	struct timespec64 now;
 	loff_t end;
 	u64 start_blk, end_blk, blk;
-	u64 rel, phys;
+	u64 rel, phys, run_len, rel_run, phys_run;
+	u64 i, j;
 	struct briefs_extent ext;
 	bool changed = false;
 	bool grew_size = false;
@@ -1242,37 +1243,92 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	start_blk = offset >> BRIEFS_BLOCK_SHIFT;
 	end_blk = (end + BRIEFS_BLOCK_SIZE - 1) >> BRIEFS_BLOCK_SHIFT;
 
-	for (blk = start_blk; blk < end_blk; blk++) {
-		if (briefs_block_mapped(inode, blk))
+	/*
+	 * Pre-allocate blocks for the requested range.  Skip blocks already
+	 * mapped; for each maximal run of unmapped blocks, try to allocate the
+	 * whole run contiguously with one briefs_alloc_blocks() call and one
+	 * extent append (its merge logic handles len=k).  If no contiguous run
+	 * of that length fits (or run_len == 1), fall back to the original
+	 * per-block allocation so fragmented fallocate still succeeds and we
+	 * never regress on ENOSPC.  Free per-block (not briefs_free_blocks_range,
+	 * which 1M-caps) in error paths so large runs can't hit the cap.
+	 */
+	blk = start_blk;
+	while (blk < end_blk) {
+		if (briefs_block_mapped(inode, blk)) {
+			blk++;
 			continue;
-
-		rel = briefs_alloc_block(&bsi->alloc);
-		if (rel == 0) {
-			ret = -ENOSPC;
-			break;
 		}
-		phys = data_to_abs(bsi->sb, rel);
+		run_len = 1;
+		while (blk + run_len < end_blk &&
+		       !briefs_block_mapped(inode, blk + run_len))
+			run_len++;
 
-		ret = briefs_zero_block(inode->i_sb, phys);
-		if (ret) {
-			briefs_free_block(&bsi->alloc, rel);
-			break;
+		if (run_len > 1) {
+			rel_run = briefs_alloc_blocks(&bsi->alloc, run_len);
+			if (rel_run != 0) {
+				phys_run = data_to_abs(bsi->sb, rel_run);
+				for (i = 0; i < run_len; i++) {
+					ret = briefs_zero_block(inode->i_sb,
+							       phys_run + i);
+					if (ret) {
+						for (j = 0; j < run_len; j++)
+							briefs_free_block(&bsi->alloc,
+									  rel_run + j);
+						goto falloc_loop_done;
+					}
+				}
+				ext.offset = blk;
+				ext.phys = phys_run;
+				ext.len = run_len;
+				ext.flags = 0;
+				ret = briefs_append_extent_nojournal(inode->i_sb,
+								     &binfo->disk_inode,
+								     &ext);
+				if (ret) {
+					for (j = 0; j < run_len; j++)
+						briefs_free_block(&bsi->alloc,
+								  rel_run + j);
+					goto falloc_loop_done;
+				}
+				changed = true;
+				blk += run_len;
+				continue;
+			}
 		}
 
-		ext.offset = blk;
-		ext.phys = phys;
-		ext.len = 1;
-		ext.flags = 0;
+		/* per-block fallback: run_len == 1, or no contiguous run fit */
+		for (i = 0; i < run_len; i++) {
+			rel = briefs_alloc_block(&bsi->alloc);
+			if (rel == 0) {
+				ret = -ENOSPC;
+				goto falloc_loop_done;
+			}
+			phys = data_to_abs(bsi->sb, rel);
 
-		ret = briefs_append_extent_nojournal(inode->i_sb,
-						    &binfo->disk_inode,
-						    &ext);
-		if (ret) {
-			briefs_free_block(&bsi->alloc, rel);
-			break;
+			ret = briefs_zero_block(inode->i_sb, phys);
+			if (ret) {
+				briefs_free_block(&bsi->alloc, rel);
+				goto falloc_loop_done;
+			}
+
+			ext.offset = blk + i;
+			ext.phys = phys;
+			ext.len = 1;
+			ext.flags = 0;
+
+			ret = briefs_append_extent_nojournal(inode->i_sb,
+							     &binfo->disk_inode,
+							     &ext);
+			if (ret) {
+				briefs_free_block(&bsi->alloc, rel);
+				goto falloc_loop_done;
+			}
+			changed = true;
 		}
-		changed = true;
+		blk += run_len;
 	}
+falloc_loop_done:
 
 	if (!(mode & FALLOC_FL_KEEP_SIZE) && end > inode->i_size) {
 		inode->i_size = end;

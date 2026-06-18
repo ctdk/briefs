@@ -36,6 +36,9 @@ struct briefs_alloc {
 	__u64 block_count;              /* total data blocks tracked */
 	__u64 free_count;               /* total free blocks */
 	u64 alloc_pool_start;           /* first block of allocator pool on disk */
+	u64 rover_w0;                   /* next-fit hint: L0 word to start the next
+					 * single-block scan at (in-memory only,
+					 * not persisted; wraps around) */
 	struct mutex lock;               /* protects bitmaps and free_count */
 };
 
@@ -49,6 +52,15 @@ int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb,
 
 /* Allocate a single free block (returns data-relative block number, or 0 on ENOSPC) */
 u64 briefs_alloc_block(struct briefs_alloc *alloc);
+
+/*
+ * Allocate a contiguous run of @n free data blocks under one alloc->lock
+ * acquisition.  Returns the starting data-relative block number, or 0 on
+ * ENOSPC / no contiguous run of length @n / @n == 0.  Block 0 is the failure
+ * sentinel (same convention as briefs_alloc_block); a run starting at block 0
+ * cannot be distinguished from failure.  Updates the rover.
+ */
+u64 briefs_alloc_blocks(struct briefs_alloc *alloc, u64 n);
 
 /*
  * Reserve a specific block (mark it as allocated without searching).

@@ -178,7 +178,7 @@ int briefs_alloc_init_at(struct briefs_alloc *alloc, struct super_block *sb,
  */
 u64 briefs_alloc_block(struct briefs_alloc *alloc)
 {
-	u64 w0, b0, w1_idx, l1_word, b1, w2_idx, l2_word, b2, block;
+	u64 w0, b0, w1_idx, l1_word, b1, w2_idx, l2_word, b2, block, i;
 
 	mutex_lock(&alloc->lock);
 	if (!alloc || alloc->free_count == 0 || !alloc->l0) {
@@ -186,7 +186,12 @@ u64 briefs_alloc_block(struct briefs_alloc *alloc)
 		return 0;
 	}
 
-	for (w0 = 0; w0 < alloc->l0_words; w0++) {
+	/* Next-fit: start the L0 scan at the rover and wrap around, so a
+	 * mostly-allocated device doesn't rescans exhausted low L0 words every
+	 * call.  The wrap visits every L0 word exactly once, so a free block is
+	 * found iff one exists (coverage identical to scanning from 0). */
+	for (i = 0; i < alloc->l0_words; i++) {
+		w0 = (alloc->rover_w0 + i) % alloc->l0_words;
 		if (alloc->l0[w0] == 0)
 			continue;
 		b0 = __builtin_ctzll(alloc->l0[w0]);
@@ -238,6 +243,7 @@ u64 briefs_alloc_block(struct briefs_alloc *alloc)
 				alloc->l0[w0] &= ~(1ULL << b0);
 		}
 
+		alloc->rover_w0 = w0;
 		mutex_unlock(&alloc->lock);
 		return block;
 	}
@@ -245,6 +251,115 @@ u64 briefs_alloc_block(struct briefs_alloc *alloc)
 	pr_err("briefs: allocator returned 0 despite free_count=%llu\n", alloc->free_count);
 	mutex_unlock(&alloc->lock);
 	return 0;
+}
+
+/*
+ * Clear the L1/L0 summary bits for a single L2 word that just became all-zero.
+ * Caller holds alloc->lock and has already verified alloc->l2[w2] == 0.
+ * (briefs_alloc_block and briefs_reserve_block keep their own inline copies of
+ * this propagation to avoid touching the hot single-block path; this helper is
+ * used by briefs_alloc_blocks, which clears a run and may zero several words.)
+ */
+static void briefs_propagate_l2_zero(struct briefs_alloc *alloc, u64 w2)
+{
+	u64 w1 = w2 / 64, b1 = w2 % 64, w0, b0;
+
+	alloc->l1[w1] &= ~(1ULL << b1);
+	if (alloc->l1[w1] == 0) {
+		w0 = w1 / 64;
+		b0 = w1 % 64;
+		alloc->l0[w0] &= ~(1ULL << b0);
+	}
+}
+
+/*
+ * briefs_alloc_blocks - allocate a contiguous run of @n free blocks under one
+ * alloc->lock.  Returns the starting data-relative block, or 0 on ENOSPC / no
+ * contiguous run of length @n / @n == 0.  Block 0 is the failure sentinel
+ * (inherited from briefs_alloc_block's convention; not fixed here).
+ *
+ * First-fit from the start of the bitmap: scan L2 words for a maximal run of
+ * set (free) bits at least @n long, possibly spanning word boundaries.  The
+ * last L2 word is masked to block_count bits so a run cannot run past the end.
+ */
+u64 briefs_alloc_blocks(struct briefs_alloc *alloc, u64 n)
+{
+	u64 w2, run_start = 0, run_len = 0, i;
+
+	if (!alloc || !alloc->l0 || n == 0)
+		return 0;
+
+	mutex_lock(&alloc->lock);
+	if (n > alloc->free_count || n > alloc->block_count) {
+		mutex_unlock(&alloc->lock);
+		return 0;
+	}
+
+	for (w2 = 0; w2 < alloc->l2_words; w2++) {
+		u64 word = alloc->l2[w2];
+		u64 base = w2 * 64;
+		u64 bits, b, s, cnt;
+
+		/* mask trailing bits beyond block_count in the last word */
+		if (w2 == alloc->l2_words - 1) {
+			u64 rem = alloc->block_count % 64;
+			if (rem != 0)
+				word &= (1ULL << rem) - 1;
+		}
+
+		if (word == 0) {
+			run_len = 0;
+			continue;
+		}
+
+		/* walk each maximal run of set bits within this word */
+		bits = word;
+		while (bits) {
+			u64 shifted, inv;
+			b = __builtin_ctzll(bits);
+			s = base + b;
+			/* count consecutive set bits from b within this word;
+			 * ~0 when the run reaches bit 63 would make ctzll(0) UB,
+			 * so fall back to (64 - b) in that all-ones case. */
+			shifted = bits >> b;
+			inv = ~shifted;
+			cnt = inv ? __builtin_ctzll(inv) : (64 - b);
+			if (run_len > 0 && s == run_start + run_len)
+				run_len += cnt;		/* contiguous with prev word's run */
+			else {
+				run_start = s;
+				run_len = cnt;
+			}
+			if (run_len >= n)
+				goto found;
+			bits &= ~(((1ULL << cnt) - 1) << b);
+		}
+	}
+
+	/* no contiguous run of length n */
+	mutex_unlock(&alloc->lock);
+	return 0;
+
+found:
+	/* clear the n bits */
+	for (i = 0; i < n; i++) {
+		u64 blk = run_start + i;
+		alloc->l2[blk / 64] &= ~(1ULL << (blk % 64));
+	}
+	alloc->free_count -= n;
+
+	/* propagate L2 -> L1 -> L0 for every L2 word that became all-zero */
+	{
+		u64 w2_first = run_start / 64;
+		u64 w2_last = (run_start + n - 1) / 64;
+		for (w2 = w2_first; w2 <= w2_last; w2++)
+			if (alloc->l2[w2] == 0)
+				briefs_propagate_l2_zero(alloc, w2);
+	}
+
+	alloc->rover_w0 = run_start / (64 * 64 * 64);
+	mutex_unlock(&alloc->lock);
+	return run_start;
 }
 
 /*
