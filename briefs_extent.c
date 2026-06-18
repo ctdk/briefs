@@ -266,7 +266,6 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 				write_seqcount_begin(&binfo->extent_seq);
 				mark_buffer_dirty(bh);
 				write_seqcount_end(&binfo->extent_seq);
-				sync_dirty_buffer(bh);
 				brelse(bh);
 			}
 
@@ -317,7 +316,6 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 			briefs_free_block(&bsi->alloc, rel);
 			return -EIO;
 		}
-		sync_dirty_buffer(bh);
 		brelse(bh);
 
 		write_seqcount_begin(&binfo->extent_seq);
@@ -361,7 +359,6 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 			write_seqcount_begin(&binfo->extent_seq);
 			mark_buffer_dirty(bh);
 			write_seqcount_end(&binfo->extent_seq);
-			sync_dirty_buffer(bh);
 			brelse(bh);
 
 			write_seqcount_begin(&binfo->extent_seq);
@@ -396,7 +393,6 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 			write_seqcount_begin(&binfo->extent_seq);
 			mark_buffer_dirty(bh);
 			write_seqcount_end(&binfo->extent_seq);
-			sync_dirty_buffer(bh);
 			brelse(bh);
 
 			/* Journal the new chain block allocation */
@@ -419,7 +415,6 @@ static int __briefs_append_extent(struct super_block *sb, struct briefs_inode *d
 			write_seqcount_begin(&binfo->extent_seq);
 			mark_buffer_dirty(bh);
 			write_seqcount_end(&binfo->extent_seq);
-			sync_dirty_buffer(bh);
 			brelse(bh);
 		}
 

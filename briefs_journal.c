@@ -1183,6 +1183,72 @@ int briefs_journal_trie_free(struct briefs_journal *j, u64 abs_block)
 }
 
 /*
+ * briefs_drain_inode_chain_buffers - make every chain block the snapshot
+ * references durable before we write the JRN_INODE_FULL record.
+ *
+ * Crash-safety invariant: journal replay restores the inode snapshot (inline
+ * extents, counts, extent_inline_base) and the allocation bitmap, but NOT
+ * chain-block contents. So before any snapshot record is written, every chain
+ * block reachable from extent_inline_base must already be on disk, else a
+ * crash leaves the snapshot pointing at a stale/pre-modification chain block.
+ *
+ * This is the ordered-commit step for #3 (lazy chain writeback): the append
+ * path only mark_buffer_dirty()s chain blocks now, and they are flushed here,
+ * once per writeback/commit cycle, instead of synchronously per appended
+ * block. It also fixes a pre-existing latent bug: truncate's in-place chain
+ * writes were mark_buffer_dirty-only with no sync before the snapshot journal.
+ *
+ * Lock-free. briefs_journal_inode_full is called both with extent_lock held
+ * (truncate/setattr/promote -- no concurrent modifier) and without
+ * (writeback/append/fallocate). Taking extent_lock here would self-deadlock
+ * the truncate path, and taking it in briefs_write_inode would recurse via
+ * writeback reclaim -> briefs_get_block. The lock-free walk is safe because
+ * syncing a dirty buffer early (the worst case under a concurrent truncate)
+ * only persists valid dirty data; it never introduces corruption the
+ * pre-existing write_inode-vs-truncate snapshot race does not already permit.
+ * Best-effort: an sb_bread failure warns and stops but does not abort the
+ * journal write (it cannot fail for a recently-dirtied cached buffer).
+ */
+static void briefs_drain_inode_chain_buffers(struct briefs_journal *j,
+					     const struct briefs_disk_inode *di)
+{
+	u64 block;
+	u64 total, inline_n, chain_extents, cap;
+
+	if (!di)
+		return;
+
+	block = le64_to_cpu(di->extent_inline_base);
+	if (block == 0)
+		return;	/* inline-only / directory / fresh promote */
+
+	total = le64_to_cpu(di->num_extents_total);
+	inline_n = le32_to_cpu(di->num_extents_inline);
+	chain_extents = (total > inline_n) ? (total - inline_n) : 0;
+	/* one chain block per 127 extents, +1 for the partial/current block,
+	 * hard-capped as a guard against a corrupt next_overflow_block cycle. */
+	cap = chain_extents / BRIEFS_CHAIN_EXTENTS + 2;
+	if (cap > (1u << 20))
+		cap = 1u << 20;
+
+	while (block != 0 && cap--) {
+		struct buffer_head *bh = sb_bread(j->vfs_sb, block);
+		struct briefs_extent_chain *ch;
+
+		if (!bh) {
+			pr_warn("briefs: drain: sb_bread chain block %llu failed\n",
+				block);
+			break;
+		}
+		if (buffer_dirty(bh))
+			sync_dirty_buffer(bh);
+		ch = (struct briefs_extent_chain *)bh->b_data;
+		block = le64_to_cpu(ch->next_overflow_block);
+		brelse(bh);
+	}
+}
+
+/*
  * Log a complete 512-byte on-disk inode snapshot.
  */
 int briefs_journal_inode_full(struct briefs_journal *j, u64 ino,
@@ -1192,6 +1258,9 @@ int briefs_journal_inode_full(struct briefs_journal *j, u64 ino,
 
 	if (!j)
 		return 0;
+
+	/* Make the chain blocks the snapshot references durable first (#3). */
+	briefs_drain_inode_chain_buffers(j, di);
 
 	memset(&rec, 0, sizeof(rec));
 	rec.ino = cpu_to_le64(ino);
