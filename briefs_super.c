@@ -148,6 +148,15 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 	 * allocator returns ENOSPC well before this binds. */
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 
+	/* On-disk timestamps are __le64 sec + __le64 nsec (briefs.h:314-321) and
+	 * every conversion preserves nanoseconds, so match that granularity here.
+	 * The inherited default (NSEC_PER_SEC = 1 s) truncates the generic VFS
+	 * timestamp updates (atime/mtime/ctime via current_time()) to whole
+	 * seconds, while BrieFS's own write sites (new inode, punch, fallocate)
+	 * already store full ns via ktime_get_real_ts64 — s_time_gran = 1 makes
+	 * the two consistent. ext4/xfs/btrfs/f2fs use the same value. */
+	sb->s_time_gran = 1;
+
 	root_inode = briefs_iget(sb, _BRIEFS_ROOT_INO);
 	if (IS_ERR(root_inode)) {
 		pr_err("BrieFS: error getting root inode.\n");
