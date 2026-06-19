@@ -302,7 +302,8 @@ struct briefs_inode {
 	__u32 flags;
 	__u64 dir_trie_root;       /* packed trie node reference: (block << 6) | slot (dirs only) */
 	__u64 rdev;                /* device number (block/char special files) */
-	__u8 reserved[80]; /* zero padded to 512 bytes */
+	__u64 generation;         /* inode generation for stable NFS file handles */
+	__u8 reserved[72]; /* zero padded to 512 bytes */
 };
 
 /* On-disk inode - 512 bytes (little endian) */
@@ -337,7 +338,8 @@ struct briefs_disk_inode {
 	__le32 flags;
 	__le64 dir_trie_root;
 	__le64 rdev;
-	__u8 reserved[80];
+	__le64 generation;
+	__u8 reserved[72];
 };
 
 static inline void briefs_disk_extent_to_cpu(const struct briefs_disk_extent *src,
@@ -396,6 +398,7 @@ static inline void briefs_disk_inode_to_cpu(const struct briefs_disk_inode *src,
 	dst->flags = le32_to_cpu(src->flags);
 	dst->dir_trie_root = le64_to_cpu(src->dir_trie_root);
 	dst->rdev = le64_to_cpu(src->rdev);
+	dst->generation = le64_to_cpu(src->generation);
 	memcpy(dst->reserved, src->reserved, sizeof(dst->reserved));
 }
 
@@ -435,6 +438,7 @@ static inline void briefs_cpu_inode_to_disk(const struct briefs_inode *src,
 	dst->flags = cpu_to_le32(src->flags);
 	dst->dir_trie_root = cpu_to_le64(src->dir_trie_root);
 	dst->rdev = cpu_to_le64(src->rdev);
+	dst->generation = cpu_to_le64(src->generation);
 	memcpy(dst->reserved, src->reserved, sizeof(dst->reserved));
 }
 
@@ -886,6 +890,7 @@ int briefs_get_block_write(struct inode *inode, sector_t iblock, struct buffer_h
 
 /* super_operations */
 extern const struct super_operations briefs_super_ops;
+extern const struct export_operations briefs_export_ops;
 
 /* Fill superblock - entry point for mount */
 int briefs_fill_super(struct super_block *sb, void *data, int flags);
@@ -926,6 +931,7 @@ unsigned int briefs_trie_pool_depth(struct super_block *sb);
 
 /* Inode operation prototypes */
 struct inode *briefs_iget(struct super_block *sb, u64 ino);
+struct inode *briefs_iget_with_gen(struct super_block *sb, u64 ino, u32 gen);
 struct inode *briefs_alloc_vfs_inode(struct super_block *sb);
 void briefs_free_inode(struct inode *inode);
 u64 briefs_alloc_inode(struct super_block *sb);

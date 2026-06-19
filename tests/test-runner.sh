@@ -681,6 +681,38 @@ fi
 rm -f "$DBG_IMG"
 rmdir "$DBG_MNT" 2>/dev/null || true
 
+# Phase 11f: NFS export_operations (generation-based file handles). Exercises
+# encode_fh / fh_to_dentry directly via name_to_handle_at + open_by_handle_at
+# (no nfsd required) and confirms stale handles are rejected. Runs against the
+# live $MNT_POINT (still mounted from earlier phases); it leaves hsub/inner
+# behind, which Phase 12 fscks without issue.
+echo ""
+echo "=== Phase 11f: export_operations (file handles) ==="
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+HANDLE_SRC="$SCRIPT_DIR/handle_test.c"
+HANDLE_BIN="${TMPDIR:-/tmp}/briefs-handle-test-$$"
+HANDLE_OUT="${TMPDIR:-/tmp}/briefs-handle-out-$$"
+if ! command -v gcc >/dev/null 2>&1; then
+  echo "  SKIP: gcc unavailable — handle test skipped"
+elif [ ! -f "$HANDLE_SRC" ]; then
+  fail "handle test source missing" "($HANDLE_SRC)"
+else
+  if gcc -O2 -o "$HANDLE_BIN" "$HANDLE_SRC" 2>/dev/null; then
+    pass "compile handle test"
+  else
+    fail "compile handle test"
+  fi
+  if [ -x "$HANDLE_BIN" ]; then
+    if "$HANDLE_BIN" "$MNT_POINT" >"$HANDLE_OUT" 2>&1; then
+      pass "handle test: encode/fh_to_dentry/stale reject"
+    else
+      fail "handle test: encode/fh_to_dentry/stale reject" "(see $HANDLE_OUT)"
+      sed 's/^/    /' "$HANDLE_OUT" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$HANDLE_BIN" "$HANDLE_OUT"
+fi
+
 # Phase 12: fsck CRC/structure check
 echo ""
 echo "=== Phase 12: fsck ==="

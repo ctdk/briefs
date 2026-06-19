@@ -10,6 +10,7 @@
 #include <linux/mpage.h>
 #include <linux/seqlock.h>
 #include <linux/pagemap.h>
+#include <linux/random.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
@@ -215,6 +216,14 @@ struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
 	binfo->disk_inode.nlinks = is_dir ? 2 : 1;
 	binfo->disk_inode.num_extents_inline = 0;
 	binfo->disk_inode.num_extents_total = 0;
+	/*
+	 * Assign a random generation for stable NFS file handles. Stored in
+	 * the on-disk inode (low 32 bits) and mirrored to the VFS inode so
+	 * export_operations can validate handles against inode reuse. The
+	 * full 64-bit field is journaled verbatim via JRN_INODE_FULL.
+	 */
+	binfo->disk_inode.generation = get_random_u32();
+	inode->i_generation = (u32)binfo->disk_inode.generation;
 	briefs_set_new_inode_times(inode, &binfo->disk_inode);
 
 	if (is_dir) {
@@ -397,12 +406,121 @@ void briefs_free_inode(struct inode *inode) {
 	kmem_cache_free(briefs_inode_cachep, binfo);
 }
 /* briefs_iget - get an inode by number */
-struct inode *briefs_iget(struct super_block *sb, u64 ino) {
-	struct inode *inode;
+/*
+ * briefs_read_and_fill_inode - read a freshly-allocated (I_NEW) inode from disk
+ * and populate its VFS fields. Does not call unlock_new_inode; the caller owns
+ * that. Returns 0 on success or a negative errno on failure.
+ */
+static int briefs_read_and_fill_inode(struct inode *inode)
+{
 	struct briefs_inode_info *binfo;
 	struct buffer_head *bh;
 	struct briefs_disk_inode *disk_inode;
 	struct briefs_inode cpu_di;
+	struct super_block *sb = inode->i_sb;
+	u64 ino = inode->i_ino;
+
+	/* Read inode from disk */
+	bh = briefs_read_inode_block(sb, ino, &disk_inode);
+	if (IS_ERR(bh)) {
+		pr_err("briefs: unable to read inode block for ino %llu\n", ino);
+		return -EIO;
+	}
+
+	briefs_disk_inode_to_cpu(disk_inode, &cpu_di);
+
+	if (cpu_di.magic != _BRIEFS_INODE_MAGIC) {
+		/* magic == 0 means the inode number is free (the block was zeroed
+		 * by briefs_free_inode_num). That is a legitimate condition for a
+		 * stale NFS file handle, not corruption — stay silent. Only a
+		 * nonzero-garbage magic indicates real on-disk corruption. */
+		if (cpu_di.magic != 0)
+			pr_err("briefs: invalid inode magic for ino %llu: 0x%08llx\n", ino, cpu_di.magic);
+		brelse(bh);
+		return -EINVAL;
+	}
+
+	/* Copy disk inode to VFS inode */
+	binfo = briefs_i(inode);
+	memcpy(&binfo->disk_inode, &cpu_di, sizeof(struct briefs_inode));
+	binfo->inode_number = ino;
+
+	/* Set VFS inode fields from disk inode */
+	inode->i_mode = cpu_di.filemode;
+	inode->i_uid = make_kuid(&init_user_ns, cpu_di.uid);
+	inode->i_gid = make_kgid(&init_user_ns, cpu_di.gid);
+	inode->i_size = cpu_di.filesize;
+	inode->i_blocks = briefs_compute_i_blocks(sb, &cpu_di);
+
+	set_nlink(inode, cpu_di.nlinks);
+
+	/* Restore generation for NFS file-handle validation. */
+	inode->i_generation = (u32)cpu_di.generation;
+
+	inode->i_atime_sec = cpu_di.atime_sec;
+	inode->i_atime_nsec = cpu_di.atime_nsec;
+	inode->i_mtime_sec = cpu_di.mtime_sec;
+	inode->i_mtime_nsec = cpu_di.mtime_nsec;
+	inode->i_ctime_sec = cpu_di.ctime_sec;
+	inode->i_ctime_nsec = cpu_di.ctime_nsec;
+
+	/* Set VFS operations based on inode type */
+	if (S_ISDIR(inode->i_mode)) {
+		inode->i_op = &briefs_dir_inode_ops;
+		inode->i_fop = &briefs_dir_operations;
+	} else if (S_ISREG(inode->i_mode)) {
+		inode->i_op = &briefs_file_inode_ops;
+		inode->i_fop = &briefs_file_operations;
+		inode->i_mapping->a_ops = &briefs_aops;
+	} else if (S_ISLNK(inode->i_mode)) {
+		inode->i_op = &briefs_symlink_inode_ops;
+		/* no i_fop for symlinks */
+	} else if (S_ISBLK(inode->i_mode) || S_ISCHR(inode->i_mode) ||
+		   S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
+		init_special_inode(inode, inode->i_mode, cpu_di.rdev);
+	}
+
+	pr_info("briefs: inode %llu: mode=0o%06o, uid=%u, gid=%u, size=%llu, nlink=%u\n",
+		ino, inode->i_mode, from_kuid(&init_user_ns, inode->i_uid),
+		from_kgid(&init_user_ns, inode->i_gid), inode->i_size, inode->i_nlink);
+
+	brelse(bh);
+	return 0;
+}
+
+/*
+ * iget5 callbacks for generation-checked inode lookup. iget5_locked, unlike
+ * iget_locked, does NOT set inode->i_ino for us — the set callback must — so
+ * we carry both the inode number and the desired generation through @data in
+ * this small struct. Generation 0 means "wildcard" (do not validate), used by
+ * internal callers that have no handle generation to check against. The struct
+ * lives on the caller's stack; iget5_locked runs test/set synchronously, so it
+ * is valid for the lifetime of the call.
+ */
+struct briefs_iget5_data {
+	u64 ino;
+	u32 gen;
+};
+
+static int briefs_iget5_test(struct inode *inode, void *data)
+{
+	struct briefs_iget5_data *d = data;
+
+	if (d->gen == 0)
+		return 1;
+	return inode->i_generation == d->gen;
+}
+
+static int briefs_iget5_set(struct inode *inode, void *data)
+{
+	struct briefs_iget5_data *d = data;
+
+	inode->i_ino = d->ino;
+	return 0;
+}
+
+struct inode *briefs_iget(struct super_block *sb, u64 ino) {
+	struct inode *inode;
 	struct briefs_sb_info *bsi;
 
 	pr_debug("briefs: iget inode %llu\n", ino);
@@ -413,6 +531,8 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 		return ERR_PTR(-EIO);
 	}
 
+	/* iget_locked sets inode->i_ino from @ino for us, so the I_NEW read
+	 * path sees the correct number. No generation check on this path. */
 	inode = iget_locked(sb, ino);
 	if (!inode) {
 		pr_err("briefs: iget_locked failed\n");
@@ -420,68 +540,61 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 	}
 
 	if (inode->i_state & I_NEW) {
-		/* Read inode from disk */
-		bh = briefs_read_inode_block(sb, ino, &disk_inode);
-		if (IS_ERR(bh)) {
-			pr_err("briefs: unable to read inode block for ino %llu\n", ino);
+		int ret = briefs_read_and_fill_inode(inode);
+		if (ret) {
 			unlock_new_inode(inode);
 			iput(inode);
-			return ERR_PTR(-EIO);
+			return ERR_PTR(ret);
 		}
-
-		briefs_disk_inode_to_cpu(disk_inode, &cpu_di);
-
-		if (cpu_di.magic != _BRIEFS_INODE_MAGIC) {
-			pr_err("briefs: invalid inode magic for ino %llu: 0x%08llx\n", ino, cpu_di.magic);
-			brelse(bh);
-			unlock_new_inode(inode);
-			iput(inode);
-			return ERR_PTR(-EINVAL);
-		}
-
-		/* Copy disk inode to VFS inode */
-		binfo = briefs_i(inode);
-		memcpy(&binfo->disk_inode, &cpu_di, sizeof(struct briefs_inode));
-		binfo->inode_number = ino;
-
-		/* Set VFS inode fields from disk inode */
-		inode->i_mode = cpu_di.filemode;
-		inode->i_uid = make_kuid(&init_user_ns, cpu_di.uid);
-		inode->i_gid = make_kgid(&init_user_ns, cpu_di.gid);
-		inode->i_size = cpu_di.filesize;
-		inode->i_blocks = briefs_compute_i_blocks(sb, &cpu_di);
-
-		set_nlink(inode, cpu_di.nlinks);
-
-		inode->i_atime_sec = cpu_di.atime_sec;
-		inode->i_atime_nsec = cpu_di.atime_nsec;
-		inode->i_mtime_sec = cpu_di.mtime_sec;
-		inode->i_mtime_nsec = cpu_di.mtime_nsec;
-		inode->i_ctime_sec = cpu_di.ctime_sec;
-		inode->i_ctime_nsec = cpu_di.ctime_nsec;
-
-		/* Set VFS operations based on inode type */
-		if (S_ISDIR(inode->i_mode)) {
-			inode->i_op = &briefs_dir_inode_ops;
-			inode->i_fop = &briefs_dir_operations;
-		} else if (S_ISREG(inode->i_mode)) {
-			inode->i_op = &briefs_file_inode_ops;
-			inode->i_fop = &briefs_file_operations;
-			inode->i_mapping->a_ops = &briefs_aops;
-		} else if (S_ISLNK(inode->i_mode)) {
-			inode->i_op = &briefs_symlink_inode_ops;
-			/* no i_fop for symlinks */
-		} else if (S_ISBLK(inode->i_mode) || S_ISCHR(inode->i_mode) ||
-			   S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
-			init_special_inode(inode, inode->i_mode, cpu_di.rdev);
-		}
-
-		pr_info("briefs: inode %llu: mode=0o%06o, uid=%u, gid=%u, size=%llu, nlink=%u\n",
-			ino, inode->i_mode, from_kuid(&init_user_ns, inode->i_uid),
-			from_kgid(&init_user_ns, inode->i_gid), inode->i_size, inode->i_nlink);
-
-		brelse(bh);
 		unlock_new_inode(inode);
+	}
+
+	return inode;
+}
+
+/*
+ * briefs_iget_with_gen - look up an inode by number, validating its generation
+ * against @gen for NFS file-handle safety. If @gen is 0, behaves like
+ * briefs_iget (no validation). A cached inode whose generation matches is
+ * reused without a disk read; a mismatch (cached or freshly read from disk)
+ * yields -ESTALE so stale handles are rejected rather than resolving to a
+ * different file that reused the inode number.
+ */
+struct inode *briefs_iget_with_gen(struct super_block *sb, u64 ino, u32 gen)
+{
+	struct briefs_iget5_data data = { .ino = ino, .gen = gen };
+	struct inode *inode;
+	struct briefs_sb_info *bsi;
+	int ret;
+
+	bsi = sb->s_fs_info;
+	if (!bsi || !bsi->sb) {
+		pr_err("briefs: no sb_info for ino %llu\n", ino);
+		return ERR_PTR(-EIO);
+	}
+
+	inode = iget5_locked(sb, ino, briefs_iget5_test, briefs_iget5_set, &data);
+	if (!inode)
+		return ERR_PTR(-ENOMEM);
+
+	if (inode->i_state & I_NEW) {
+		ret = briefs_read_and_fill_inode(inode);
+		if (ret) {
+			unlock_new_inode(inode);
+			iput(inode);
+			return ERR_PTR(ret);
+		}
+		unlock_new_inode(inode);
+	}
+
+	/* Validate generation for both the cached-match and fresh-read paths.
+	 * A mismatch means the inode number was reused after the handle was
+	 * taken — reject it as stale. */
+	if (gen != 0 && inode->i_generation != gen) {
+		pr_warn("briefs: stale handle for ino %llu: gen %u != %u\n",
+			ino, inode->i_generation, gen);
+		iput(inode);
+		return ERR_PTR(-ESTALE);
 	}
 
 	return inode;

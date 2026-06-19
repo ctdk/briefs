@@ -149,6 +149,8 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 	}
 
 	sb->s_op = &briefs_super_ops;
+	/* Enable NFS export with generation-based file handles. */
+	sb->s_export_op = &briefs_export_ops;
 
 	/* BrieFS tracks file size, extent offsets/lengths, and extent counts in
 	 * 64-bit fields throughout, so the only file-size gate is the VFS s_maxbytes
