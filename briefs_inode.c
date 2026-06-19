@@ -13,6 +13,7 @@
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
+#include "briefs_debug.h"
 
 /*
  * Read the on-disk inode block for a given inode number.
@@ -509,6 +510,8 @@ void briefs_evict_inode(struct inode *inode) {
 /* briefs_alloc_inode - allocate a new inode number using the bitmap pyramid */
 u64 briefs_alloc_inode(struct super_block *sb) {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
+
+	briefs_stat_inc(bsi, inode_alloc_calls);
 	u64 inum = briefs_alloc_block(&bsi->inode_alloc);
 	if (inum == 0) {
 		pr_err("briefs: no free inodes\n");
@@ -525,6 +528,8 @@ void briefs_free_inode_num(struct super_block *sb, u64 ino) {
 
 	if (ino == 0)
 		return;
+
+	briefs_stat_inc(bsi, inode_free_calls);
 
 	/*
 	 * Zero out the inode on disk so fsck doesn't see a "free" inode with

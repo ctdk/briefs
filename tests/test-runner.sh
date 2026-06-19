@@ -591,6 +591,96 @@ umount "$OPT_MNT" 2>/dev/null || true
 rm -f "$OPT_IMG"
 rmdir "$OPT_MNT" 2>/dev/null || true
 
+# Phase 11e: debugfs/sysfs/proc observability surfaces (-o debug).
+#
+# Regression guard for the per-superblock observability surfaces: the always-on
+# sysfs attributes (/sys/fs/briefs/<s_id>/), the /proc/fs/briefs/mounts index,
+# and the per-sb debugfs tree (/sys/kernel/debug/briefs/<s_id>/, -o debug only)
+# with its gated stat counters. A regression in mount-option parsing, sysfs/
+# proc/debugfs registration or teardown, or the -o debug stat-counter
+# instrumentation surfaces here. Uses its own image + mount point so it cannot
+# perturb the main $TEST_IMG that Phase 12 checks read-only.
+echo ""
+echo "=== Phase 11e: observability surfaces (-o debug) ==="
+DBG_IMG="${TMPDIR:-/tmp}/briefs-obs-$$.img"
+DBG_MNT="/tmp/briefs-obs-mnt-$$"
+# debugfs must be mounted for /sys/kernel/debug/briefs to be reachable.
+mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+"$MKBRIEFS" -s 5000 "$DBG_IMG" 2>/dev/null && pass "obs: mkfs image" || fail "obs: mkfs"
+mkdir -p "$DBG_MNT"
+# -o debug enables the per-sb debugfs tree + stat counters; sysfs/proc are on
+# for every mount. -t briefs ensures "debug" is parsed by the filesystem, not
+# swallowed by mount(8).
+mount -o loop,debug -t briefs "$DBG_IMG" "$DBG_MNT" 2>/dev/null && pass "obs: mount -o debug" || fail "obs: mount -o debug"
+# The -o debug mount is the only briefs mount with a debugfs dir (the main
+# suite mount has no -o debug), so its s_id is the lone dir name there.
+DBG_SID=$(ls /sys/kernel/debug/briefs/ 2>/dev/null | head -1 || true)
+[ -n "$DBG_SID" ] && pass "obs: per-sb debugfs dir present" || fail "obs: per-sb debugfs dir missing"
+
+# sysfs: the per-sb attribute dir exists with the expected files.
+if [ -n "$DBG_SID" ] && [ -f "/sys/fs/briefs/$DBG_SID/version" ]; then
+  pass "obs: sysfs attr dir present"
+else
+  fail "obs: sysfs attr dir missing"
+fi
+# A representative attr reads a sane value (mkfs writes a 0.9.x on-disk version).
+DBG_VER=$(cat "/sys/fs/briefs/$DBG_SID/version" 2>/dev/null || true)
+case "$DBG_VER" in 0.9.*) pass "obs: sysfs version sane ($DBG_VER)";; *) fail "obs: sysfs version" "(got '$DBG_VER')";; esac
+
+# /proc/fs/briefs/mounts lists this mount (one line per mounted instance).
+if grep -q "^$DBG_SID" /proc/fs/briefs/mounts 2>/dev/null; then
+  pass "obs: /proc/fs/briefs/mounts lists mount"
+else
+  fail "obs: /proc/fs/briefs/mounts missing entry"
+fi
+
+# The seven debugfs files exist.
+DBG_FILES="mount_info superblock data_alloc inode_alloc journal trie_pool stats"
+DBG_ALL_OK=1
+for f in $DBG_FILES; do
+  if [ ! -f "/sys/kernel/debug/briefs/$DBG_SID/$f" ]; then
+    fail "obs: debugfs file '$f' missing"; DBG_ALL_OK=0
+  fi
+done
+[ "$DBG_ALL_OK" = 1 ] && pass "obs: all seven debugfs files present" || true
+
+# Stat counters: snapshot before, exercise the instrumented paths, assert they
+# advanced. Creates files (data alloc + inode alloc + dir add + journal records)
+# and punches a hole.
+DBG_DATA_BEFORE=$(awk -F= '/^data_alloc_calls=/{print $2}' "/sys/kernel/debug/briefs/$DBG_SID/stats" 2>/dev/null || echo 0)
+for i in 1 2 3 4 5; do dd if=/dev/zero of="$DBG_MNT/f$i" bs=4096 count=4 2>/dev/null || true; done
+fallocate -p -l 8192 "$DBG_MNT/f1" 2>/dev/null || true
+sync
+DBG_DATA_AFTER=$(awk -F= '/^data_alloc_calls=/{print $2}' "/sys/kernel/debug/briefs/$DBG_SID/stats" 2>/dev/null || echo 0)
+[ "$DBG_DATA_AFTER" -gt "$DBG_DATA_BEFORE" ] && pass "obs: stats data_alloc_calls advanced ($DBG_DATA_BEFORE -> $DBG_DATA_AFTER)" || fail "obs: stats data_alloc_calls did not advance" "(before $DBG_DATA_BEFORE after $DBG_DATA_AFTER)"
+DBG_PUNCH=$(awk -F= '/^punch_holes=/{print $2}' "/sys/kernel/debug/briefs/$DBG_SID/stats" 2>/dev/null || echo 0)
+[ "$DBG_PUNCH" -ge 1 ] && pass "obs: stats punch_holes counted ($DBG_PUNCH)" || fail "obs: stats punch_holes not counted" "(got $DBG_PUNCH)"
+
+# sysfs free_blocks is the authoritative live allocator count; after writes it
+# must be positive and below the total data-block count (5000-block image).
+DBG_FREE=$(cat "/sys/fs/briefs/$DBG_SID/free_blocks" 2>/dev/null || echo 0)
+[ "$DBG_FREE" -gt 0 ] && [ "$DBG_FREE" -lt 5000 ] && pass "obs: sysfs free_blocks sane ($DBG_FREE)" || fail "obs: sysfs free_blocks" "(got $DBG_FREE)"
+
+# Teardown: unmount and confirm every surface entry for this sb is gone.
+umount "$DBG_MNT" 2>/dev/null || true
+if [ -n "$DBG_SID" ] && [ -e "/sys/fs/briefs/$DBG_SID" ]; then
+  fail "obs: sysfs dir survived unmount"
+else
+  pass "obs: sysfs dir removed on unmount"
+fi
+if [ -n "$DBG_SID" ] && [ -e "/sys/kernel/debug/briefs/$DBG_SID" ]; then
+  fail "obs: debugfs dir survived unmount"
+else
+  pass "obs: debugfs dir removed on unmount"
+fi
+if grep -q "^$DBG_SID" /proc/fs/briefs/mounts 2>/dev/null; then
+  fail "obs: /proc entry survived unmount"
+else
+  pass "obs: /proc entry removed on unmount"
+fi
+rm -f "$DBG_IMG"
+rmdir "$DBG_MNT" 2>/dev/null || true
+
 # Phase 12: fsck CRC/structure check
 echo ""
 echo "=== Phase 12: fsck ==="

@@ -18,6 +18,7 @@
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
+#include "briefs_debug.h"
 
 /* address_space_operations wrappers (kernel 6.12 folio-based APIs). */
 
@@ -697,6 +698,9 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 	if (new_size == old_size)
 		goto out_copy;
+
+	if (new_size < old_size)
+		briefs_stat_inc(bsi, truncate_calls);
 
 	/*
 	 * From this point on we may manipulate the extent list or the chain
@@ -1431,9 +1435,12 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	inode_lock(inode);
 
 	if (mode & FALLOC_FL_PUNCH_HOLE) {
+		briefs_stat_inc(bsi, punch_holes);
 		ret = briefs_do_punch_hole(file, offset, len);
 		return ret;
 	}
+
+	briefs_stat_inc(bsi, fallocate_calls);
 
 	/*
 	 * Inline-data files don't consume real blocks.  If the requested range

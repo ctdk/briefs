@@ -12,6 +12,7 @@
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
+#include "briefs_debug.h"
 
 /*
  * Initialize journal from superblock
@@ -204,6 +205,8 @@ int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_ty
 		return -EINVAL;
 	}
 
+	briefs_stat_inc(briefs_sb(j->vfs_sb), journal_records);
+
 	total_size = hdr_size + data_len;
 
 	/* Check if record fits in remaining block space */
@@ -306,6 +309,8 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
 	struct briefs_sb_info *bsi;
 
 	if (!j) return -EINVAL;
+
+	briefs_stat_inc(briefs_sb(j->vfs_sb), journal_checkpoints);
 
 	/* Flush any pending records first */
 	if (j->dirty) {
@@ -865,6 +870,10 @@ int briefs_journal_replay(struct briefs_journal *j) {
 
 	pr_info("briefs: journal replay complete (blocks=%u, records=%u, errors=%u)\n",
 		blocks_read, records_replayed, errors);
+
+	/* Record how many records we replayed (set once, at mount). */
+	if (bsi && (bsi->mount_flags & BRIEFS_MF_DEBUG))
+		atomic64_set(&bsi->stats.journal_replay_records, records_replayed);
 
 	/*
 	 * Replay only updated the leaf bitmaps.  Recompute the allocator summary

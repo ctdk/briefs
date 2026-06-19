@@ -56,6 +56,14 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 		return -ENOMEM;
 	sb->s_fs_info = bsi;
 
+	/* Parse mount options (legacy mount API forwards the raw options string
+	 * in @data). Only "debug" is recognized today; unknown tokens are warned
+	 * about and ignored so future/VFS-injected options don't break mounting. */
+	bsi->mount_jiffies = get_jiffies_64();
+	ret = briefs_parse_options(data, bsi);
+	if (ret)
+		goto out;
+
 	if (!sb_set_blocksize(sb, 4096)) {
 		pr_err("briefs: blocksize too small\n");
 		goto out_bad_hblock;
@@ -178,6 +186,15 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 	bsi->num_inodes = bsi->inode_alloc.block_count;
 	bsi->free_inodes = bsi->inode_alloc.free_count;
 
+	/* Observability surfaces: register this sb on the global list (consumed
+	 * by /proc/fs/briefs/mounts), add its per-sb sysfs attributes (always on),
+	 * and — only under -o debug — its per-sb debugfs tree. All best-effort;
+	 * the put_super teardown counterparts are guarded so a failed add is a
+	 * no-op on remove. Done after d_make_root succeeds. */
+	briefs_sb_list_add(bsi);
+	briefs_sysfs_add_sb(sb);
+	briefs_debugfs_add_sb(sb);
+
 	pr_info("briefs: superblock loaded, mounting successful\n");
 
 	if (!sb_rdonly(sb))
@@ -237,6 +254,16 @@ void briefs_put_super(struct super_block *sb) {
 	pr_info("briefs: put_super enter\n");
 
 	if (bsi) {
+		/* Quiesce observability surfaces before tearing bsi down so no
+		 * debugfs/sysfs/proc reader races with the journal/alloc/sb_bh
+		 * cleanup below. sysfs kobject_del drains in-flight kernfs show
+		 * ops (and blocks new ones); the debugfs dir and the /proc list
+		 * entry are removed first. */
+		briefs_debugfs_remove_sb(sb);
+		if (!list_empty(&bsi->sb_list))
+			briefs_sb_list_del(bsi);
+		briefs_sysfs_remove_sb(sb);
+
 		/* Sync journal before unmount */
 		if (bsi->journal && bsi->journal->dirty) {
 			briefs_journal_checkpoint(bsi->journal);

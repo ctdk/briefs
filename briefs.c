@@ -54,6 +54,19 @@ static int __init briefs_init(void) {
 		return ret;
 	}
 
+	/* Observability surfaces. All best-effort and non-fatal: a failure here
+	 * must not prevent the module from loading — the filesystem still works
+	 * without them. Order: debugfs root, /sys/fs/briefs, /proc/fs/briefs. */
+	ret = briefs_debugfs_init();
+	if (ret)
+		pr_warn("briefs: debugfs_init failed: %d (continuing)\n", ret);
+	ret = briefs_sysfs_init();
+	if (ret)
+		pr_warn("briefs: sysfs_init failed: %d (continuing)\n", ret);
+	ret = briefs_proc_init();
+	if (ret)
+		pr_warn("briefs: proc_init failed: %d (continuing)\n", ret);
+
 	pr_info("briefs: filesystem registered successfully\n");
 	return 0;
 }
@@ -62,6 +75,13 @@ static int __init briefs_init(void) {
 static void __exit briefs_exit(void) {
 	pr_info("briefs: unregistering filesystem\n");
 	unregister_filesystem(&briefs_fs_type);
+
+	/* Tear down the module-level surfaces in reverse init order. Per-sb
+	 * entries were removed in briefs_put_super as each mount went away. */
+	briefs_proc_exit();
+	briefs_sysfs_exit();
+	briefs_debugfs_exit();
+
 	kmem_cache_destroy(briefs_inode_cachep);
 	pr_info("briefs: unloading filesystem module\n");
 }

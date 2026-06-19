@@ -65,6 +65,7 @@ const struct super_operations briefs_super_ops = {
 	.put_super = briefs_put_super,
 	.sync_fs = briefs_sync_fs,
 	.statfs = briefs_statfs,
+	.show_options = briefs_show_options,
 	.write_inode = briefs_write_inode,
 	.evict_inode = briefs_evict_inode,
 	.umount_begin = briefs_umount_begin,

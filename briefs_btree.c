@@ -40,6 +40,7 @@
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
+#include "briefs_debug.h"
 
 /* Result of a node split, propagated up so the parent can absorb the separator.
  * For a leaf split, separator is the min key of the right half. For an internal
@@ -271,6 +272,7 @@ static int btree_maybe_split_child(struct super_block *sb,
 
 	/* Full: split. Allocate the sibling first; on failure nothing is
 	 * modified (clean ENOSPC). */
+	briefs_stat_inc(bsi, btree_splits);
 	rel = briefs_alloc_block(&bsi->alloc);
 	if (rel == 0) {
 		brelse(child_bh);
@@ -741,6 +743,8 @@ int briefs_btree_insert_locked(struct super_block *sb, struct briefs_inode *di,
 		container_of(di, struct briefs_inode_info, disk_inode);
 	bool added, spill;
 	int ret;
+
+	briefs_stat_inc(briefs_sb(sb), btree_extents_added);
 
 	/* Maintain the extent-tail cache. For both merge and insert, the new
 	 * extent's end is the only value that can raise the running max. */
@@ -1226,6 +1230,8 @@ int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
 		return 0;
 	if (start >= end)
 		return 0;
+
+	briefs_stat_inc(briefs_sb(sb), btree_extents_freed);
 
 	cap = di->num_extents_total + 16;
 	if (cap > (1ull << 20))

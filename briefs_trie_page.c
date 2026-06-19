@@ -71,6 +71,26 @@ static struct briefs_trie_sb_state *briefs_trie_get_state(struct super_block *sb
 	return NULL;
 }
 
+/* Number of partial trie pages currently cached for @sb. Used by the debugfs
+ * "trie_pool" file as a quick gauge of trie-page allocator pressure. 0 if this
+ * sb has no trie state yet (e.g. no directory has been modified). */
+unsigned int briefs_trie_pool_depth(struct super_block *sb)
+{
+	struct briefs_trie_sb_state *st;
+	struct list_head *p;
+	unsigned int depth = 0;
+
+	st = briefs_trie_get_state(sb);
+	if (!st)
+		return 0;
+
+	mutex_lock(&st->pages.lock);
+	list_for_each(p, &st->pages.partial)
+		depth++;
+	mutex_unlock(&st->pages.lock);
+	return depth;
+}
+
 static struct briefs_trie_sb_state *briefs_trie_ensure_state(struct super_block *sb)
 {
 	struct briefs_trie_sb_state *st;

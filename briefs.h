@@ -9,6 +9,9 @@
 #include <linux/blk_types.h>
 #include <linux/buffer_head.h>
 #include <linux/unaligned.h>
+#include <linux/atomic.h>
+#include <linux/list.h>
+#include <linux/kobject.h>
 #include "briefs_alloc.h"
 
 /* BrieFS magic number */
@@ -768,6 +771,33 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter, u64 cu
 #define BRIEFS_S_ISFIFO(m) (((m) & BRIEFS_S_IFMT) == BRIEFS_S_IFIFO)
 
 /* VFS structures */
+
+/* Per-mount flags set from mount options (briefs_debug.c parse_options). */
+#define BRIEFS_MF_DEBUG 0x1   /* -o debug: create the debugfs tree + count stats */
+
+/*
+ * Best-effort per-superblock operation counters. Only incremented when
+ * BRIEFS_MF_DEBUG is set (via briefs_stat_inc, a no-op branch otherwise), so a
+ * non-debug mount pays nothing. Reads are racy/indicative — fine for debugfs.
+ */
+struct briefs_stats {
+	atomic64_t data_alloc_calls;
+	atomic64_t data_free_calls;
+	atomic64_t inode_alloc_calls;
+	atomic64_t inode_free_calls;
+	atomic64_t journal_records;
+	atomic64_t journal_checkpoints;
+	atomic64_t journal_replay_records;
+	atomic64_t btree_splits;
+	atomic64_t btree_extents_added;
+	atomic64_t btree_extents_freed;
+	atomic64_t dir_adds;
+	atomic64_t dir_dels;
+	atomic64_t truncate_calls;
+	atomic64_t fallocate_calls;
+	atomic64_t punch_holes;
+};
+
 struct briefs_sb_info {
 	__u64 data_blocks;
 	__u64 free_data_blocks;
@@ -779,6 +809,12 @@ struct briefs_sb_info {
 	struct briefs_alloc alloc;          /* data block allocator (3-level bitmap pyramid) */
 	struct briefs_alloc inode_alloc;    /* inode allocator (3-level bitmap pyramid) */
 	struct briefs_journal *journal;  /* transaction journal (dynamically allocated) */
+	struct list_head sb_list;        /* link on the global briefs_sb_list */
+	unsigned long mount_flags;      /* BRIEFS_MF_* */
+	struct briefs_stats stats;      /* -o debug counters */
+	struct dentry *debugfs_dir;     /* per-sb debugfs dir, NULL unless -o debug */
+	struct kobject s_kobj;          /* per-sb sysfs kobject, embedded in bsi */
+	u64 mount_jiffies;              /* time of mount, for debugfs/sysfs/proc */
 };
 
 /* briefs_inode_info - our inode info */
@@ -855,6 +891,38 @@ extern const struct super_operations briefs_super_ops;
 int briefs_fill_super(struct super_block *sb, void *data, int flags);
 struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
                           const char *dev_name, void *data);
+
+/*
+ * Observability surfaces (briefs_debug.c / briefs_sysfs.c / briefs_proc.c).
+ *
+ * debugfs: per-sb tree under /sys/kernel/debug/briefs/<s_id>/, gated to -o debug.
+ * sysfs:   per-sb attrs under /sys/fs/briefs/<s_id>/, always on.
+ * /proc:   /proc/fs/briefs/mounts index, always on.
+ * Mount-option parsing (briefs_parse_options) populates bsi->mount_flags;
+ * briefs_show_options emits them. The per-sb list (briefs_sb_list) lets /proc
+ * and the module enumerate live mounts.
+ */
+int briefs_parse_options(char *data, struct briefs_sb_info *bsi);
+int briefs_show_options(struct seq_file *seq, struct dentry *root);
+
+int briefs_debugfs_init(void);          /* module init: create /sys/kernel/debug/briefs */
+void briefs_debugfs_exit(void);         /* module exit */
+int briefs_debugfs_add_sb(struct super_block *sb);   /* fill_super: per-sb dir (if -o debug) */
+void briefs_debugfs_remove_sb(struct super_block *sb); /* put_super: remove per-sb dir */
+
+int briefs_sysfs_init(void);            /* module init: create /sys/fs/briefs kobj */
+void briefs_sysfs_exit(void);           /* module exit */
+int briefs_sysfs_add_sb(struct super_block *sb);    /* fill_super: per-sb kobj + attrs */
+void briefs_sysfs_remove_sb(struct super_block *sb); /* put_super: remove per-sb kobj */
+
+int briefs_proc_init(void);            /* module init: create /proc/fs/briefs/mounts */
+void briefs_proc_exit(void);           /* module exit */
+
+void briefs_sb_list_add(struct briefs_sb_info *bsi);   /* fill_super: link on global list */
+void briefs_sb_list_del(struct briefs_sb_info *bsi);   /* put_super: unlink */
+
+/* Partial directory-trie page count for the debugfs trie_pool file. */
+unsigned int briefs_trie_pool_depth(struct super_block *sb);
 
 /* Inode operation prototypes */
 struct inode *briefs_iget(struct super_block *sb, u64 ino);

@@ -13,6 +13,7 @@
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
+#include "briefs_debug.h"
 
 /* briefs_readdir - enumerate directory contents */
 int briefs_readdir(struct file *file, struct dir_context *ctx) {
@@ -178,8 +179,10 @@ int briefs_add_dir_entry(struct inode *dir, const char *name, size_t name_len, u
 		}
 	}
 
-	if (ret == 0)
+	if (ret == 0) {
 		binfo->trie_gen++;
+		briefs_stat_inc(briefs_sb(dir->i_sb), dir_adds);
+	}
 	mutex_unlock(&binfo->trie_lock);
 	return ret;
 }
@@ -204,7 +207,10 @@ int briefs_remove_dir_entry(struct inode *dir, const char *name, size_t name_len
 	}
 
 	ret = briefs_trie_remove(dir->i_sb, &binfo->disk_inode, name, name_len);
-		if (ret == 0) binfo->trie_gen++;
+		if (ret == 0) {
+			binfo->trie_gen++;
+			briefs_stat_inc(briefs_sb(dir->i_sb), dir_dels);
+		}
 	mutex_unlock(&binfo->trie_lock);
 	return ret;
 }

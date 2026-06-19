@@ -11,6 +11,7 @@
 
 #include "briefs.h"
 #include "briefs_alloc.h"
+#include "briefs_debug.h"
 
 /*
  * Initialize allocator from superblock.
@@ -179,6 +180,14 @@ int briefs_alloc_init_at(struct briefs_alloc *alloc, struct super_block *sb,
 u64 briefs_alloc_block(struct briefs_alloc *alloc)
 {
 	u64 w0, b0, w1_idx, l1_word, b1, w2_idx, l2_word, b2, block, i;
+	struct briefs_sb_info *bsi = briefs_sb(alloc->sb);
+
+	/* Count only data-block allocs here, not inode-number allocs (which also
+	 * flow through this function via bsi->inode_alloc and are counted in
+	 * briefs_alloc_inode). The pointer compare is short-circuited behind the
+	 * debug flag, so there is no cost when -o debug is off. */
+	if (bsi && (bsi->mount_flags & BRIEFS_MF_DEBUG) && alloc == &bsi->alloc)
+		atomic64_inc(&bsi->stats.data_alloc_calls);
 
 	mutex_lock(&alloc->lock);
 	if (!alloc || alloc->free_count == 0 || !alloc->l0) {
@@ -288,6 +297,12 @@ u64 briefs_alloc_blocks(struct briefs_alloc *alloc, u64 n)
 
 	if (!alloc || !alloc->l0 || n == 0)
 		return 0;
+
+	{
+		struct briefs_sb_info *bsi = briefs_sb(alloc->sb);
+		if (bsi && (bsi->mount_flags & BRIEFS_MF_DEBUG) && alloc == &bsi->alloc)
+			atomic64_inc(&bsi->stats.data_alloc_calls);
+	}
 
 	mutex_lock(&alloc->lock);
 	if (n > alloc->free_count || n > alloc->block_count) {
@@ -413,6 +428,12 @@ void briefs_reserve_block(struct briefs_alloc *alloc, u64 rel_block)
 void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block)
 {
 	u64 w2, b2, w1, b1, w0, b0;
+	struct briefs_sb_info *bsi = briefs_sb(alloc->sb);
+
+	/* See briefs_alloc_block: count data frees only (inode frees are counted
+	 * in briefs_free_inode_num). No cost when -o debug is off. */
+	if (bsi && (bsi->mount_flags & BRIEFS_MF_DEBUG) && alloc == &bsi->alloc)
+		atomic64_inc(&bsi->stats.data_free_calls);
 
 	mutex_lock(&alloc->lock);
 	if (!alloc || !alloc->l0 || rel_block >= alloc->block_count) {
@@ -462,6 +483,12 @@ void briefs_free_blocks(struct briefs_alloc *alloc, u64 rel_start, u64 n)
 
 	if (!alloc || !alloc->l0 || n == 0)
 		return;
+
+	{
+		struct briefs_sb_info *bsi = briefs_sb(alloc->sb);
+		if (bsi && (bsi->mount_flags & BRIEFS_MF_DEBUG) && alloc == &bsi->alloc)
+			atomic64_inc(&bsi->stats.data_free_calls);
+	}
 
 	mutex_lock(&alloc->lock);
 
