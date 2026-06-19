@@ -13,7 +13,7 @@
 - POSIX ACLs
 - direct I/O
 - online resize (or any resize)
-- extent inode map/add inodes to existing volume
+- extend inode map/add inodes to existing volume
 
 Much further down the list, if ever, items:
 - Optional data journaling
