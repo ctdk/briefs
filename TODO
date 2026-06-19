@@ -5,6 +5,10 @@
 - Move away from any deprecated kernel functions BrieFS may be using. Likely to
   come naturally as it's updated to work with newer kernels, but still needs
   calling out.
+- Start honoring mount options.
+- Make list of relevant mount options to honor, whether fs independent or
+  unique to briefs.
+- Make briefs(5) man page.
 - support xattrs
 - Quotas
 - POSIX ACLs
