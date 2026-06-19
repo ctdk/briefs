@@ -70,5 +70,5 @@ module_init(briefs_init);
 module_exit(briefs_exit);
 
 MODULE_AUTHOR("Jeremy Bingham");
-MODULE_DESCRIPTION("BrieFS - extend-only, trie-based filesystem.");
+MODULE_DESCRIPTION("BrieFS - extent-only, trie-based filesystem.");
 MODULE_LICENSE("Dual MIT/GPL");
