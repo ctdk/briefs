@@ -12,7 +12,6 @@
 - Quotas
 - POSIX ACLs
 - direct I/O
-- add export_operations so BrieFS can be exported via NFS
 - online resize (or any resize)
 - extent inode map/add inodes to existing volume
 
