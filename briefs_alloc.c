@@ -446,6 +446,76 @@ void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block)
 }
 
 /*
+ * briefs_free_blocks - free a contiguous run of @n blocks starting at
+ * @rel_start (data-relative) under one alloc->lock acquisition.  The mirror of
+ * briefs_alloc_blocks: sets the L2 bits, bumps free_count, and propagates L1/L0
+ * upward for every L2 word that transitioned from fully-allocated (0) to having
+ * at least one free bit.  Idempotent like briefs_free_block: a bit already free
+ * is left untouched and not counted.  The run is clamped to [0, block_count), so
+ * a corrupt extent pointing past the end frees only the in-range portion instead
+ * of looping forever (the per-block path's 1M-cap-to-1 guard existed only to
+ * bound that loop; this bulk path has no loop to bound).
+ */
+void briefs_free_blocks(struct briefs_alloc *alloc, u64 rel_start, u64 n)
+{
+	u64 end, w2, w2_first, w2_last, freed = 0;
+
+	if (!alloc || !alloc->l0 || n == 0)
+		return;
+
+	mutex_lock(&alloc->lock);
+
+	if (rel_start >= alloc->block_count) {
+		mutex_unlock(&alloc->lock);
+		return;
+	}
+	end = rel_start + n;
+	if (end > alloc->block_count || end < rel_start)	/* end < rel_start: overflow */
+		end = alloc->block_count;
+	if (end <= rel_start) {
+		mutex_unlock(&alloc->lock);
+		return;
+	}
+
+	w2_first = rel_start / 64;
+	w2_last = (end - 1) / 64;
+
+	for (w2 = w2_first; w2 <= w2_last; w2++) {
+		u64 lo = w2 * 64;		/* first block in this word */
+		u64 bit_lo = rel_start > lo ? rel_start - lo : 0;
+		u64 bit_hi = end - lo;		/* exclusive; <= 64 */
+		u64 mask, before;
+
+		/* mask of bits [bit_lo, bit_hi) within this word */
+		if (bit_hi >= 64)
+			mask = ~0ULL << bit_lo;
+		else
+			mask = ((1ULL << bit_hi) - 1) & (~0ULL << bit_lo);
+
+		before = alloc->l2[w2];
+
+		/* count only blocks that were actually allocated (bit was 0) */
+		freed += hweight64(~before & mask);
+
+		alloc->l2[w2] |= mask;
+
+		/* propagate upward iff this word was fully allocated and is now
+		 * not (mirrors briefs_free_block's == (1<<b2) check generalized
+		 * to a multi-bit set). */
+		if (before == 0 && alloc->l2[w2] != 0) {
+			u64 w1 = w2 / 64, b1 = w2 % 64;
+			u64 w0 = w1 / 64, b0 = w1 % 64;
+			alloc->l1[w1] |= (1ULL << b1);
+			if (alloc->l1[w1] == (1ULL << b1))
+				alloc->l0[w0] |= (1ULL << b0);
+		}
+	}
+
+	alloc->free_count += freed;
+	mutex_unlock(&alloc->lock);
+}
+
+/*
  * Compute the on-disk block offset for a given level's nth block.
  */
 static u64 alloc_level_block_offset(struct briefs_alloc *alloc, u64 words_per_block,

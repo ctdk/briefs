@@ -20,25 +20,18 @@
  * block numbers for sb_bread/sb_getblk using this helper.
  */
 /*
- * Free a contiguous run of data blocks.  Applies the same sanity cap on
- * length that the inline free paths use to avoid infinite loops on corrupt
- * extents.
+ * Free a contiguous run of data blocks.  Delegates to briefs_free_blocks, which
+ * sets the bits and propagates the summary levels under a single alloc->lock
+ * acquisition (the per-block loop took the lock once per block).  The run is
+ * clamped to the device end inside briefs_free_blocks, so a corrupt extent
+ * length can't free past block_count; there is no loop here to bound, hence no
+ * 1M-cap-to-1 guard (that guard only existed to stop the old per-block loop).
  */
 void briefs_free_blocks_range(struct briefs_sb_info *bsi, u64 phys_start, u64 len)
 {
-	u64 b;
-	u64 blocks_to_free = len;
+	u64 rel_start = abs_to_data(bsi->sb, phys_start);
 
-	if (blocks_to_free > 1024 * 1024) {
-		pr_warn("briefs: suspicious extent len=%llu, capping to 1\n", len);
-		blocks_to_free = 1;
-	}
-
-	for (b = 0; b < blocks_to_free; b++) {
-		u64 abs_block = phys_start + b;
-		u64 rel_block = abs_to_data(bsi->sb, abs_block);
-		briefs_free_block(&bsi->alloc, rel_block);
-	}
+	briefs_free_blocks(&bsi->alloc, rel_start, len);
 }
 
 /*

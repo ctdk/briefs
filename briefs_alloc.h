@@ -71,6 +71,14 @@ void briefs_reserve_block(struct briefs_alloc *alloc, u64 rel_block);
 /* Free a single block (data-relative block number) */
 void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block);
 
+/*
+ * Free a contiguous run of @n blocks starting at @rel_start (data-relative)
+ * under one alloc->lock acquisition — the mirror of briefs_alloc_blocks.
+ * Idempotent (already-free bits are not re-counted); the run is clamped to
+ * [0, block_count).  Used by briefs_free_blocks_range.
+ */
+void briefs_free_blocks(struct briefs_alloc *alloc, u64 rel_start, u64 n);
+
 /* Sync the in-memory bitmap back to disk */
 int briefs_alloc_sync(struct briefs_alloc *alloc);
 
