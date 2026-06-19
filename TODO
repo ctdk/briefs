@@ -1,4 +1,3 @@
-- Support for info in /proc and /sys (sysfs, debugfs) would be nice.
 - Read-write FUSE bridge (read-only already exists via briefs-utils).
 - Broader test coverage (e.g., xfstests integration, crash-consistency tests)
 - Annotate the source code thoroughly once things are more stable
