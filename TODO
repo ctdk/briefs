@@ -2,6 +2,9 @@
 - Read-write FUSE bridge (read-only already exists via briefs-utils).
 - Broader test coverage (e.g., xfstests integration, crash-consistency tests)
 - Annotate the source code thoroughly once things are more stable
+- Move away from any deprecated kernel functions BrieFS may be using. Likely to
+  come naturally as it's updated to work with newer kernels, but still needs
+  calling out.
 - support xattrs
 - Quotas
 - POSIX ACLs

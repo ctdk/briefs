@@ -77,7 +77,7 @@ WORKS
 DEFINITELY MISSING OR BROKEN
 ----------------------------
 
-* Some journal functionality is missing.
+* The journal is a **logical/metadata journal**, not a block-image one. It records and replays allocator changes, inode updates, directory changes, trie-page allocations, and symlink data, but it does **not** journal B+ tree extent-index *node structure*: a torn extent-index split is not reconstructed by replay. Instead it relies on ordered durable writes — every B+ tree index block the inode snapshot references is drained (synced) before the `JRN_INODE_FULL` record is written, so the journaled snapshot never points at a not-yet-on-disk tree block. If that ordering is violated by a crash the journal can't cover, `fsck.briefs --repair-only=btree-rebuild` can repair the damage offline.
 * Data journaling is not implemented. Metadata (allocations, inode updates, directory changes, etc.) is journaled and replayed on mount, but ordinary file writeback goes through the page cache and is only durable after `sync`/`fsync`/flush. A crash after a buffered write but before flush may lose data. This is the same trade-off most filesystems make by default; full data journaling is not currently planned.
 * FUSE implementation (requires less commitment than the kernel module). A read-only FUSE bridge exists via briefs-utils; read-write FUSE is not yet implemented.
 * Thorough annotations - Annotating the source code thoroughly will wait until tings settle down. Right now everything's still in constant flux, so there's no point thoroughly annotating something that may change unrecognizably or flat out disappear soon.
