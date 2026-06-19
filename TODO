@@ -1,5 +1,16 @@
-- Support for info in /proc would be nice.
+- Support for info in /proc and /sys (sysfs, debugfs) would be nice.
 - Read-write FUSE bridge (read-only already exists via briefs-utils).
-- Make list of desired functionality that still needs implementing.
 - Broader test coverage (e.g., xfstests integration, crash-consistency tests)
 - Annotate the source code thoroughly once things are more stable
+- support xattrs
+- Quotas
+- POSIX ACLs
+- direct I/O
+- add export_operations so BrieFS can be exported via NFS
+- online resize (or any resize)
+- extent inode map/add inodes to existing volume
+
+Much further down the list, if ever, items:
+- Optional data journaling
+- reflink/COW, fscrypt, fsverity, casefolding
+- build-in compression
