@@ -42,6 +42,7 @@ Vagrant.configure(2) do |config|
   # config.vm.synced_folder "../data", "/vagrant_data"
   config.vm.synced_folder "../linux", "/kernel-src/linux", :disabled => false, type: "nfs", nfs_version: 4, nfs_udp: false
   config.vm.synced_folder "../../go", "/go", :disabled => false, type: "nfs", nfs_version: 4, nfs_udp: false
+  config.vm.synced_folder "../xfstests-dev", "/xfstests", :disabled => false, type: "nfs", nfs_version: 4, nfs_udp: false
 
   # Provider-specific configuration so you can fine-tune various
   # backing providers for Vagrant. These expose provider-specific options.
@@ -74,5 +75,7 @@ Vagrant.configure(2) do |config|
   config.vm.provision "shell", inline: <<-SHELL
     sudo apt-get update
     sudo DEBIAN_FRONTEND=noninteractive apt-get install git fakeroot linux-headers-amd64 hexedit hexer linux-source debhelper-compat libdw-dev zstd -y
+    # xfstests build + runtime deps (for the BrieFS xfstests integration).
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install xfsprogs xfslibs-dev attr acl quota libgdbm-dev liburing-dev libcap-dev indent libaio-dev sqlite3 -y
   SHELL
 end

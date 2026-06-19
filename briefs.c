@@ -92,3 +92,10 @@ module_exit(briefs_exit);
 MODULE_AUTHOR("Jeremy Bingham");
 MODULE_DESCRIPTION("BrieFS - extent-only, trie-based filesystem.");
 MODULE_LICENSE("Dual MIT/GPL");
+
+/* Let `mount -t briefs` (and `modprobe fs-briefs`) auto-load this module via
+ * depmod. Without this alias, the module must be insmod'd manually before the
+ * first mount -- something xfstests and ordinary users won't do. depmod turns
+ * MODULE_ALIAS_FS("briefs") into the "fs-briefs" module alias that the kernel's
+ * request_module("fs-briefs") on mount looks up. */
+MODULE_ALIAS_FS("briefs");

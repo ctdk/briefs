@@ -393,6 +393,17 @@ int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
 /* Open file */
 int briefs_open(struct inode *inode, struct file *file) {
 	pr_debug("briefs: open inode %lu\n", inode->i_ino);
+
+	/* Direct I/O is not implemented: BrieFS serves all I/O through the page
+	 * cache (the address_space .direct_IO is noop_direct_IO, so an O_DIRECT
+	 * open would otherwise succeed while reads/writes silently stay
+	 * buffered). Reject O_DIRECT at open with a clear -EINVAL instead. This
+	 * makes xfstests' _require_odirect cleanly skip the whole DIO test class
+	 * (rather than running those tests against silently-buffered I/O and
+	 * producing spurious failures) until real DIO support exists. */
+	if (file->f_flags & O_DIRECT)
+		return -EINVAL;
+
 	return 0;
 }
 /* Release file */
