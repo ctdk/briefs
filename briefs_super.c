@@ -142,6 +142,12 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 
 	sb->s_op = &briefs_super_ops;
 
+	/* BrieFS tracks file size, extent offsets/lengths, and extent counts in
+	 * 64-bit fields throughout, so the only file-size gate is the VFS s_maxbytes
+	 * default (MAX_NON_LFS, ~2 GiB).  Raise it to the page-cache ceiling; the
+	 * allocator returns ENOSPC well before this binds. */
+	sb->s_maxbytes = MAX_LFS_FILESIZE;
+
 	root_inode = briefs_iget(sb, _BRIEFS_ROOT_INO);
 	if (IS_ERR(root_inode)) {
 		pr_err("BrieFS: error getting root inode.\n");
