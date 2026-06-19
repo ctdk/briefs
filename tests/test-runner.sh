@@ -507,6 +507,90 @@ EOF
   rm -f "$FIEMAP_C" "$FIEMAP_BIN"
 fi
 
+# Phase 11d: fsck --optimize on a populated filesystem.
+#
+# This is the regression guard for the class of bug where fsck's *writer* and
+# the kernel's *reader* disagree on an on-disk format (e.g. the trie name_len
+# field: fsck wrote len(name), the kernel read field-2 and truncated every
+# directory entry by 2 bytes). Such a bug is invisible to fsck's own re-verify
+# (its reader uses the stored length prefix, not the field) and to the rest of
+# this suite, which only ever runs fsck read-only on a populated filesystem. The
+# only thing that catches it is letting fsck --optimize rewrite the structures
+# and then having the *kernel* resolve them afterwards.
+#
+# The phase uses its own image + mount point so it cannot perturb the main
+# $TEST_IMG that Phase 12 checks read-only. It: populates a directory with
+# several varied-length names plus a multi-extent (>126-extent, multi-leaf
+# B-tree-backed) file; runs --optimize (which rewrites every directory trie and
+# walks every extent index); remounts; and verifies via the kernel that every
+# entry is present with the correct name and that the multi-extent file's
+# content is byte-identical (md5) before/after.
+echo ""
+echo "=== Phase 11d: fsck --optimize on populated fs ==="
+OPT_IMG="${TMPDIR:-/tmp}/briefs-opt-$$.img"
+OPT_MNT="/tmp/briefs-opt-mnt-$$"
+"$MKBRIEFS" -s 5000 "$OPT_IMG" 2>/dev/null && pass "optimize: mkfs image" || fail "optimize: mkfs"
+mkdir -p "$OPT_MNT"
+mount -o loop "$OPT_IMG" "$OPT_MNT" 2>/dev/null && pass "optimize: mount" || fail "optimize: mount"
+
+# A multi-extent file: 200 full 4 KiB writes at every-other 8 KiB offset forces
+# the kernel to build a multi-leaf B+ tree extent index (>126 extents), which
+# --optimize walks (and would rewrite if it found underfull leaves). Each block
+# gets random content so an md5 mismatch after --optimize would flag any extent
+# remap corruption, not just a size change.
+OPT_BIG="$OPT_MNT/bigfile"
+: > "$OPT_BIG"
+for i in $(seq 0 199); do
+  dd if=/dev/urandom of="$OPT_BIG" bs=4096 count=1 seek=$((i*2)) conv=notrunc 2>/dev/null || true
+done
+BIG_SIZE=$(stat -c%s "$OPT_BIG" 2>/dev/null || echo 0)
+[ "$BIG_SIZE" = "$((199*8192+4096))" ] && pass "optimize: multi-extent file size" || fail "optimize: multi-extent file size" "(got $BIG_SIZE)"
+BIG_MD5=$(md5sum "$OPT_BIG" 2>/dev/null | awk '{print $1}' || true)
+
+# Several small files with varied-length names to populate the directory trie
+# name heap. The name_len regression truncates each entry by 2 bytes, so mix
+# short and long names.
+OPT_NAMES="a ab abc abcd medium_name yet_another_file z9"
+for nm in $OPT_NAMES; do
+  echo -n "content-for-$nm" > "$OPT_MNT/$nm"
+done
+sync
+ENTRY_COUNT=$(ls "$OPT_MNT" 2>/dev/null | wc -l)
+umount "$OPT_MNT" 2>/dev/null || true
+
+# Run --optimize (rewrites dir tries + compacts extent indexes). Must exit 0.
+if "$FSCKBRIEFS" --optimize -y "$OPT_IMG" >/dev/null 2>&1; then
+  pass "optimize: fsck --optimize exits 0"
+else
+  fail "optimize: fsck --optimize failed" "(exit $?)"
+fi
+
+# Remount and verify via the KERNEL that every entry survived with the correct
+# name and content. The kernel resolves trie names itself, so a name_len field
+# bug surfaces here as missing/garbled entries — exactly where fsck's own
+# re-verify would have reported clean.
+mount -o loop "$OPT_IMG" "$OPT_MNT" 2>/dev/null && pass "optimize: remount" || fail "optimize: remount"
+OPT_ENTRY_COUNT=$(ls "$OPT_MNT" 2>/dev/null | wc -l)
+[ "$OPT_ENTRY_COUNT" = "$ENTRY_COUNT" ] && pass "optimize: entry count preserved" || fail "optimize: entry count" "(before $ENTRY_COUNT after $OPT_ENTRY_COUNT)"
+ALL_NAMES_OK=1
+for nm in $OPT_NAMES; do
+  if [ ! -e "$OPT_MNT/$nm" ]; then
+    fail "optimize: entry '$nm' missing after optimize"
+    ALL_NAMES_OK=0
+  else
+    check_file "optimize: '$nm' content" "$OPT_MNT/$nm" "content-for-$nm"
+  fi
+done
+[ "$ALL_NAMES_OK" = 1 ] && pass "optimize: all named entries present" || true
+BIG_MD5_AFTER=$(md5sum "$OPT_MNT/bigfile" 2>/dev/null | awk '{print $1}' || true)
+[ -n "$BIG_MD5_AFTER" ] && [ "$BIG_MD5_AFTER" = "$BIG_MD5" ] && pass "optimize: multi-extent file content intact" || fail "optimize: multi-extent file content" "(before ${BIG_MD5:-none} after ${BIG_MD5_AFTER:-missing})"
+
+# Leave the optimize image clean: read-only fsck must still pass after --optimize.
+umount "$OPT_MNT" 2>/dev/null || true
+"$FSCKBRIEFS" "$OPT_IMG" 2>/dev/null && pass "optimize: fsck clean after --optimize" || fail "optimize: fsck found errors after --optimize"
+rm -f "$OPT_IMG"
+rmdir "$OPT_MNT" 2>/dev/null || true
+
 # Phase 12: fsck CRC/structure check
 echo ""
 echo "=== Phase 12: fsck ==="
