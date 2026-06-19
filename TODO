@@ -1,5 +1,5 @@
 - Support for info in /proc would be nice.
-- FUSE for BrieFS once fsck.briefs is more than a stub. (In progress - read-only FUSE bridge exists.)
+- Read-write FUSE bridge (read-only already exists via briefs-utils).
 - Make list of desired functionality that still needs implementing.
-- Proper tests
+- Broader test coverage (e.g., xfstests integration, crash-consistency tests)
 - Annotate the source code thoroughly once things are more stable
