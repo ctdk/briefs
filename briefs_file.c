@@ -1160,6 +1160,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 	int old_count, new_count = 0;
 	bool changed = false;
 	bool need_partial_start, need_partial_end;
+	bool same_boundary_block;
 	u32 partial_start_off, partial_end_off;
 	int ret = 0;
 	int i;
@@ -1168,6 +1169,20 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 	need_partial_end = (end & (BRIEFS_BLOCK_SIZE - 1)) != 0;
 	partial_start_off = offset & (BRIEFS_BLOCK_SIZE - 1);
 	partial_end_off = end & (BRIEFS_BLOCK_SIZE - 1);
+	/*
+	 * Single-block punch: both the start and end of the punch land inside
+	 * the same block (start_blk == end_blk - 1, both ends partial).  In that
+	 * case the boundary block is one and the same, so the punched portion is
+	 * the sub-range [partial_start_off, partial_end_off) -- NOT the union of
+	 * [partial_start_off, BLOCK_SIZE) and [0, partial_end_off), which would
+	 * cover the whole block.  Zeroing the whole block here would destroy the
+	 * data outside the (small) punched range; the page cache masks this at
+	 * runtime, but after a crash/replay (page cache gone) the block reads back
+	 * as all-zero -- generic/059.  Handle this case with a single surgical
+	 * zero of [partial_start_off, partial_end_off).
+	 */
+	same_boundary_block = need_partial_start && need_partial_end &&
+			      (start_blk == end_blk - 1);
 
 	if (binfo->disk_inode.flags & InodeFlagInlineData) {
 		loff_t punch_start = max_t(loff_t, offset, 0);
@@ -1180,6 +1195,12 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 		}
 
 		if (changed) {
+			ktime_get_real_ts64(&now);
+			inode->i_mtime_sec = now.tv_sec;
+			inode->i_mtime_nsec = now.tv_nsec;
+			inode->i_ctime_sec = now.tv_sec;
+			inode->i_ctime_nsec = now.tv_nsec;
+			briefs_sync_inode_times(inode, &binfo->disk_inode);
 			briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
 						  &binfo->disk_inode, false);
 			briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
@@ -1249,6 +1270,27 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 			 * them up and zero the punched portion. -ENOENT means the
 			 * boundary was already a hole: nothing to zero.
 			 */
+			if (same_boundary_block) {
+				struct briefs_extent pext;
+
+				ret = briefs_inode_lookup_iblock(inode->i_sb, binfo,
+								 start_blk, &pext,
+								 true);
+				if (ret == 0) {
+					u64 ab = pext.phys + (start_blk - pext.offset);
+
+					ret = briefs_zero_block_range(inode->i_sb, ab,
+								      partial_start_off,
+								      partial_end_off);
+					if (ret)
+						goto out_unlock;
+					changed = true;
+				} else if (ret == -ENOENT) {
+					ret = 0;
+				} else {
+					goto out_unlock;
+				}
+			} else {
 			if (need_partial_start) {
 				struct briefs_extent pext;
 
@@ -1290,6 +1332,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 				} else {
 					goto out_unlock;
 				}
+			}
 			}
 
 			if (binfo->disk_inode.num_extents_total != total_before)
@@ -1335,6 +1378,22 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 		    free_start < free_end)
 			free_end--;
 
+		if (same_boundary_block) {
+			/*
+			 * Punch is wholly inside one block: zero only the
+			 * sub-range [partial_start_off, partial_end_off), not
+			 * the whole block.  See same_boundary_block comment above.
+			 */
+			if (start_blk >= ext.offset && start_blk < ext_end) {
+				u64 abs_block = ext.phys + (start_blk - ext.offset);
+
+				ret = briefs_zero_block_range(inode->i_sb, abs_block,
+							      partial_start_off,
+							      partial_end_off);
+				if (ret)
+					goto out_unlock;
+			}
+		} else {
 		if (need_partial_start && start_blk >= ext.offset &&
 		    start_blk < ext_end) {
 			u64 abs_block = ext.phys + (start_blk - ext.offset);
@@ -1355,6 +1414,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 						      partial_end_off);
 			if (ret)
 				goto out_unlock;
+		}
 		}
 
 		if (free_start > ext.offset) {
@@ -1427,6 +1487,23 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 	inode->i_blocks = briefs_compute_i_blocks(inode->i_sb,
 						 &binfo->disk_inode);
 
+	/*
+	 * Update mtime/ctime BEFORE persisting+journaling the inode snapshot,
+	 * so the journaled INODE_FULL (which is what replay restores) carries
+	 * the new times.  Previously the time update ran in out_update AFTER the
+	 * journal emit, so replay restored the pre-punch mtime/ctime -- and only
+	 * ctime was bumped, never mtime (generic/059 "mtime did not increase").
+	 * Hole punching changes both mtime and ctime.
+	 */
+	if (changed) {
+		ktime_get_real_ts64(&now);
+		inode->i_mtime_sec = now.tv_sec;
+		inode->i_mtime_nsec = now.tv_nsec;
+		inode->i_ctime_sec = now.tv_sec;
+		inode->i_ctime_nsec = now.tv_nsec;
+		briefs_sync_inode_times(inode, &binfo->disk_inode);
+	}
+
 	briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
 				  &binfo->disk_inode, false);
 	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
@@ -1437,10 +1514,6 @@ out_unlock:
 
 out_update:
 	if (changed) {
-		ktime_get_real_ts64(&now);
-		inode->i_ctime_sec = now.tv_sec;
-		inode->i_ctime_nsec = now.tv_nsec;
-		briefs_sync_inode_times(inode, &binfo->disk_inode);
 		mark_inode_dirty(inode);
 		truncate_pagecache_range(inode, offset, end - 1);
 	}
