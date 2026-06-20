@@ -146,10 +146,16 @@ static int briefs_write_folio_alloc_one(struct inode *inode,
 	iblock = folio_pos(folio) >> BRIEFS_BLOCK_SHIFT;
 	rel = briefs_alloc_block(&bsi->alloc);
 	if (rel == 0) {
-		folio_redirty_for_writepage(wbc, folio);
-		folio_unlock(folio);
-		mapping_set_error(inode->i_mapping, -ENOSPC);
-		return -ENOSPC;
+		/* No free block: fail the folio via __block_write_full_folio's
+		 * recover path instead of redirtying it.  Redirtying leaves the
+		 * dirty count unchanged and wedges balance_dirty_pages on a full
+		 * filesystem (generic/015).  briefs_get_block re-attempts the
+		 * alloc and, still finding none, returns -ENOSPC, which makes
+		 * __block_write_full_folio clear dirty on the unconverted delayed
+		 * buffer, set AS_ENOSPC on the mapping, and end writeback -- so
+		 * the dirty page drops and writeback makes progress.  The folio's
+		 * unwritten data is discarded; the error is surfaced via fsync. */
+		return briefs_block_write_full_folio(folio, wbc, briefs_get_block);
 	}
 	phys = data_to_abs(bsi->sb, rel);
 	ext.offset = iblock;
@@ -159,6 +165,13 @@ static int briefs_write_folio_alloc_one(struct inode *inode,
 	ret = briefs_append_extent_nojournal(inode->i_sb, &binfo->disk_inode, &ext);
 	if (ret) {
 		briefs_free_block(&bsi->alloc, rel);
+		if (ret == -ENOSPC) {
+			/* Extent append failed for lack of a btree chain block:
+			 * same full-fs condition as above -- fail the folio so
+			 * writeback makes progress instead of redirtying forever. */
+			return briefs_block_write_full_folio(folio, wbc,
+							     briefs_get_block);
+		}
 		folio_redirty_for_writepage(wbc, folio);
 		folio_unlock(folio);
 		mapping_set_error(inode->i_mapping, ret);
@@ -217,12 +230,15 @@ static int briefs_flush_run(struct inode *inode, struct address_space *mapping,
 	for (i = 0; i < n; i++) {
 		r = briefs_write_folio_alloc_one(inode, wbc, run[i], any_alloc);
 		if (r == -ENOSPC) {
-			/* Redirty the rest so writeback retries later. */
-			while (++i < n) {
-				folio_redirty_for_writepage(wbc, run[i]);
-				folio_unlock(run[i]);
-			}
+			/* Fs is full: briefs_write_folio_alloc_one already
+			 * failed run[i] through __block_write_full_folio's
+			 * recover.  Fail the remaining folios the same way
+			 * (discard + AS_ENOSPC + end writeback) rather than
+			 * redirtying, so balance_dirty_pages can make progress. */
 			mapping_set_error(mapping, -ENOSPC);
+			while (++i < n)
+				briefs_block_write_full_folio(run[i], wbc,
+							     briefs_get_block);
 			return -ENOSPC;
 		} else if (r) {
 			mapping_set_error(mapping, r);
@@ -321,12 +337,36 @@ static sector_t briefs_bmap(struct address_space *mapping, sector_t block)
  * by !uptodate: if the folio is already uptodate its contents are valid.
  */
 static int briefs_write_begin(struct file *file, struct address_space *mapping, loff_t pos, unsigned len, struct folio **foliop, void **fsdata) {
+	struct super_block *sb = mapping->host->i_sb;
+	struct briefs_sb_info *bsi = sb->s_fs_info;
 	struct folio *folio;
 	struct buffer_head *bh, *head;
 	size_t from, to, block_start, block_end, blocksize;
 	int ret;
+	get_block_t *gb;
 
-	ret = block_write_begin(mapping, pos, len, foliop, briefs_get_block_write);
+	/*
+	 * Delayed-allocation switch (mirrors ext4's nonda_switch).  With free
+	 * space plentiful we defer block allocation to writeback
+	 * (briefs_get_block_write -> BH_Delay) for write() throughput.  Once
+	 * free space drops below the watermark (a quarter of the data pool,
+	 * sized above the per-bdi dirty threshold) we allocate immediately at
+	 * write_begin (briefs_get_block) so that ENOSPC is returned
+	 * synchronously from write() instead of being discovered in writeback,
+	 * where a delayed folio that cannot be allocated would otherwise be
+	 * redirtied forever and wedge balance_dirty_pages (generic/015).
+	 * Immediate alloc is overwrite-aware: briefs_get_block maps an already
+	 * allocated block without touching the free pool, so overwriting an
+	 * existing file succeeds even on a full filesystem.  free_count is read
+	 * without alloc->lock as a heuristic; a stale read only shifts the
+	 * switch point slightly.  briefs_get_block does not journal the extent
+	 * (it calls briefs_btree_insert_locked, not _append_extent), so moving
+	 * allocation from writeback to write_begin preserves the invariant that
+	 * an extent is never journaled ahead of its data.
+	 */
+	gb = (bsi->alloc.free_count < (bsi->alloc.block_count >> 2))
+	     ? briefs_get_block : briefs_get_block_write;
+	ret = block_write_begin(mapping, pos, len, foliop, gb);
 
 	/*
 	 * Don't free data on error — the VFS / caller will handle cleanup
