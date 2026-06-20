@@ -785,10 +785,35 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		return 0;
 	}
 
-	/* Only shrinking remains; growth of extent-backed files is unchanged. */
+	/* Extending an extent-backed file: the new range [old_size, new_size) is
+	 * a hole that reads as zeros — no extents are allocated.  Grow i_size,
+	 * persist the new size, and journal an inode snapshot so a crash after a
+	 * following fsync (which advances journal_log_end past this record)
+	 * recovers the extended size.  This mirrors what the shrinking path below
+	 * does.  Without it, the old code fell through to out_copy, whose
+	 * setattr_copy() does NOT set i_size (by kernel contract size must be set
+	 * via truncate_setsize()), so i_size stayed at the pre-extend value and the
+	 * fsync journaled the stale size — generic/101 (truncate-down then -up then
+	 * fsync) recovered the pre-extend size.
+	 *
+	 * truncate_setsize() for a grow does not wait on pagecache writeback (no
+	 * pages beyond the new size to drop), so unlike the shrinking
+	 * truncate_setsize() above (which runs before extent_lock to avoid the
+	 * writeback AB-BA of generic/074) this is safe under the lock.
+	 */
 	if (new_size > old_size) {
+		truncate_setsize(inode, new_size);
+		binfo->disk_inode.filesize = new_size;
+		briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+					  &binfo->disk_inode, false);
+		{
+			struct briefs_disk_inode disk_di;
+			briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
+			briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+		}
 		mutex_unlock(&binfo->extent_lock);
-		goto out_copy;
+		mark_inode_dirty(inode);
+		return 0;
 	}
 
 	pr_debug("briefs: setattr truncate ino=%lu %llu -> %llu\n",

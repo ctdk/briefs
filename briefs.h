@@ -135,7 +135,8 @@ struct jrn_dir_update {
 	__le32 name_len;
 	__u8 name[255];
 	__u8 op;              /* 0 = add, 1 = delete */
-	__u8 reserved[2];
+	__u8 ftype;           /* d_type (DT_* >> 12 form: 4=dir, 8=reg, 10=lnk, ...) for op=0 */
+	__u8 reserved[1];
 };
 
 /* JRN_INODE_FULL - complete 512-byte on-disk inode snapshot */

@@ -424,18 +424,15 @@ static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
 	mutex_lock(&binfo->trie_lock);
 
 	if (rec->op == 0) {
-		/* Add directory entry */
-		u8 ftype = 0;
-
-		/* Read child inode to get file type */
-		struct inode *child = briefs_iget(sb, child_ino);
-		if (!IS_ERR(child)) {
-			ftype = (child->i_mode & S_IFMT) >> 12;
-			iput(child);
-		} else {
-			pr_warn("briefs: replay can't read child inode %llu, using ftype=0\n",
-				child_ino);
-		}
+		/* Add directory entry.  The d_type is carried in the record (set at
+		 * create/link/rename time from the child's i_mode) so we do NOT iget()
+		 * the child here: iget()ing the child during replay would load it into
+		 * the VFS inode cache with whatever on-disk state is current at this
+		 * point in the replay, and a later JRN_INODE_FULL for the same inode
+		 * updates the on-disk block but not the cached inode — leaving a stale
+		 * cached inode (e.g. size 0) that post-mount reads would use.  The
+		 * child's inode block itself is reconstructed by replay_inode_full(). */
+		u8 ftype = rec->ftype;
 
 		ret = briefs_trie_insert(sb, &binfo->disk_inode,
 						 rec->name, name_len,
@@ -641,12 +638,14 @@ static int replay_inode_full(struct super_block *sb, struct jrn_inode_full *rec)
 		return 0;
 	}
 
+	const struct briefs_disk_inode *rdi = (const struct briefs_disk_inode *)rec->inode_data;
 	memcpy(di, rec->inode_data, sizeof(struct briefs_disk_inode));
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
 	brelse(bh);
 
-	pr_debug("briefs: replay restored full inode %llu\n", ino);
+	pr_debug("briefs: replay restored full inode %llu (size=%llu, n_ext=%u)\n",
+		ino, le64_to_cpu(rdi->filesize), le32_to_cpu(rdi->num_extents_total));
 	return 0;
 }
 
@@ -964,7 +963,7 @@ int briefs_journal_inode_free(struct briefs_journal *j, u64 ino)
  * Log a directory entry change
  */
 int briefs_journal_dir_update(struct briefs_journal *j, u64 parent_ino, u64 child_ino,
-                              const char *name, size_t name_len, u8 op)
+                              const char *name, size_t name_len, u8 op, u8 ftype)
 {
 	struct jrn_dir_update rec;
 
@@ -980,6 +979,7 @@ int briefs_journal_dir_update(struct briefs_journal *j, u64 parent_ino, u64 chil
 	rec.name_len = cpu_to_le32((u32)name_len);
 	memcpy(rec.name, name, name_len);
 	rec.op = op;
+	rec.ftype = ftype;
 
 	return briefs_journal_write_record(j, JRN_DIR_UPDATE, &rec, sizeof(rec));
 }

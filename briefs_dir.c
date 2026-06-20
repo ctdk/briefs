@@ -354,7 +354,7 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 	}
 
 	/* Log new entry creation only after the entry is on disk. */
-	ret = briefs_journal_dir_add(bsi->journal, dir->i_ino, inode->i_ino, new_dentry);
+	ret = briefs_journal_dir_add(bsi->journal, dir->i_ino, inode->i_ino, new_dentry, ftype);
 	if (ret) {
 		pr_err("briefs: link failed to journal dir add: %d\n", ret);
 		briefs_remove_dir_entry(dir, new_dentry->d_name.name,
@@ -547,7 +547,7 @@ restore_entry:
 	/* Restore the directory entry and emit a compensating journal record. */
 	if (briefs_add_dir_entry(dir, dentry->d_name.name, dentry->d_name.len,
 				 inode->i_ino, ftype) == 0)
-		briefs_journal_dir_add(bsi->journal, dir->i_ino, inode->i_ino, dentry);
+		briefs_journal_dir_add(bsi->journal, dir->i_ino, inode->i_ino, dentry, ftype);
 
 	return ret;
 }
@@ -712,7 +712,7 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 		goto fail;
 	new_added = true;
 
-	ret = briefs_journal_dir_add(bsi->journal, new_dir->i_ino, inode->i_ino, new_dentry);
+	ret = briefs_journal_dir_add(bsi->journal, new_dir->i_ino, inode->i_ino, new_dentry, ftype);
 	if (ret)
 		goto fail;
 
@@ -773,7 +773,7 @@ fail:
 	if (old_removed) {
 		if (briefs_add_dir_entry(old_dir, old_dentry->d_name.name, old_dentry->d_name.len,
 					 inode->i_ino, ftype) == 0)
-			briefs_journal_dir_add(bsi->journal, old_dir->i_ino, inode->i_ino, old_dentry);
+			briefs_journal_dir_add(bsi->journal, old_dir->i_ino, inode->i_ino, old_dentry, ftype);
 	}
 
 	return ret;
@@ -785,7 +785,7 @@ fail_target:
 					 old_target_ftype) == 0)
 			briefs_journal_dir_add(bsi->journal, new_dir->i_ino,
 					       new_dentry->d_inode ? new_dentry->d_inode->i_ino : 0,
-					       new_dentry);
+					       new_dentry, old_target_ftype);
 	}
 	return ret;
 }

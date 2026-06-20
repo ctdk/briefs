@@ -279,7 +279,7 @@ void briefs_create_abort(struct super_block *sb, struct inode *dir,
 		briefs_remove_dir_entry(dir, name->name, name->len);
 		if (dir_add_logged)
 			briefs_journal_dir_update(bsi->journal, dir->i_ino, 0,
-						name->name, name->len, 1);
+						name->name, name->len, 1, 0);
 	}
 
 	briefs_journal_inode_free(bsi->journal, inode->i_ino);
@@ -339,7 +339,7 @@ int briefs_finish_create(struct inode *dir, struct dentry *dentry,
 		}
 	}
 
-	ret = briefs_journal_dir_add(bsi->journal, dir->i_ino, inode->i_ino, dentry);
+	ret = briefs_journal_dir_add(bsi->journal, dir->i_ino, inode->i_ino, dentry, ftype);
 	if (ret) {
 		pr_err("briefs: failed to journal dir add %pd: %d\n", dentry, ret);
 		briefs_create_abort(dir->i_sb, dir, inode, &dentry->d_name, false);
