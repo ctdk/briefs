@@ -789,6 +789,25 @@ static int walk_journal(struct briefs_journal *j, struct super_block *sb,
 	u32 records = 0, blocks = 0, errors = 0;
 
 	while (cur != end) {
+		/* The checkpoint block (journal_end - 1) is a reserved marker, not
+		 * part of the replay-able record stream: the write path
+		 * (briefs_journal_write_record / briefs_journal_sync) skips it when
+		 * advancing write_pos, so ordinary records never land there -- only
+		 * a single JRN_CHECKPOINT marker record does, and that is ignored
+		 * during replay (see the JRN_CHECKPOINT case below, which continues
+		 * without apply_record()).  When the live range wraps, next_block()
+		 * lands on it mid-walk; reading and validating it as an ordinary
+		 * record block fails whenever its on-disk content is stale from a
+		 * prior mount (correct header magic, but a stale/garbage record
+		 * type) -- the intermittent "invalid record type" replay failure.
+		 * Skip it here, mirroring the write path.  Neither log_start nor
+		 * log_end can equal it (write_pos never advances onto it), so this
+		 * only fires mid-traversal and never skips a real record block. */
+		if (cur == j->checkpoint_block) {
+			cur = briefs_journal_next_block(j, cur);
+			continue;
+		}
+
 		struct buffer_head *bh = briefs_journal_read_block(j, cur);
 		if (!bh) {
 			pr_err("briefs: journal replay failed at block=%llu\n", cur);
