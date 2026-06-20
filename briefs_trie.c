@@ -682,9 +682,19 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 
 			if ((node->node_type & NODE_TYPE_INTERM) &&
 			    !(node->node_type & NODE_STATUS_LEAF)) {
+				/* The name is a *prefix* of longer entries but is not itself
+				 * an entry (LEAF not set), so it does not exist in the trie.
+				 * This is -ENOENT, not -ENOTEMPTY: -ENOTEMPTY is reserved for
+				 * removing a directory that still has children, which is a
+				 * caller-level concern (briefs_dir.c:459 does the real rmdir
+				 * emptiness check before calling us).  Returning -ENOTEMPTY
+				 * here made cumulative journal replay (replay_dir_update's
+				 * delete path) fail: it tolerates -ENOENT but treats
+				 * -ENOTEMPTY as fatal, surfacing as replay -EIO /
+				 * "can't read superblock" on remount (generic/003). */
 				brelse(cbh);
 				brelse(bh);
-				ret = -ENOTEMPTY;
+				ret = -ENOENT;
 				goto out;
 			}
 

@@ -127,6 +127,24 @@ int briefs_update_parent_dir(struct inode *dir, struct briefs_sb_info *bsi,
 	pbinfo->disk_inode.filesize = new_size;
 	pbinfo->disk_inode.nlinks = new_nlink;
 
+	/* A create/unlink/link/rename changes the directory's contents, so the
+	 * directory's mtime/ctime must advance.  This helper persists directly
+	 * and intentionally does NOT mark_inode_dirty() (see comment below), so
+	 * briefs_write_inode() is never invoked for this path and the VFS
+	 * i_mtime/i_ctime would never be mirrored into the on-disk inode.  Set
+	 * the VFS times and sync them into disk_inode here before persisting
+	 * (generic/003 parent-dir mtime/ctime checks). */
+	{
+		struct timespec64 now;
+
+		ktime_get_real_ts64(&now);
+		dir->i_mtime_sec = now.tv_sec;
+		dir->i_mtime_nsec = now.tv_nsec;
+		dir->i_ctime_sec = now.tv_sec;
+		dir->i_ctime_nsec = now.tv_nsec;
+		briefs_sync_inode_times(dir, &pbinfo->disk_inode);
+	}
+
 	ret = briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
 	if (ret) {
 		pbinfo->disk_inode.filesize = old_size;

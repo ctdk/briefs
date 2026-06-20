@@ -747,6 +747,29 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 			goto fail;
 	}
 
+	/* Renaming changes which directory entry points at @inode, so the moved
+	 * inode's ctime must advance (POSIX; generic/003 ctime check).  Set the
+	 * VFS time, mirror it into the on-disk inode, persist, and journal a full
+	 * snapshot so a crash recovers the new ctime.  briefs_update_parent_dir
+	 * above handled the directory mtimes; the inode itself still needs this. */
+	{
+		struct briefs_inode_info *minfo = briefs_i(inode);
+		struct briefs_disk_inode disk_di;
+		struct timespec64 now;
+
+		ktime_get_real_ts64(&now);
+		inode->i_ctime_sec = now.tv_sec;
+		inode->i_ctime_nsec = now.tv_nsec;
+		briefs_sync_inode_times(inode, &minfo->disk_inode);
+		ret = briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+						&minfo->disk_inode, false);
+		if (ret)
+			goto fail;
+		briefs_cpu_inode_to_disk(&minfo->disk_inode, &disk_di);
+		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+		mark_inode_dirty(inode);
+	}
+
 	pr_debug("briefs: renamed %pd -> %pd\n", old_dentry, new_dentry);
 	return 0;
 

@@ -520,6 +520,10 @@ ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		}
 		iocb->ki_pos += copied;
 		inode_unlock(inode);
+		/* Inline reads bypass generic_file_read_iter, which would otherwise
+		 * call file_accessed() for us.  Without this the VFS i_atime is never
+		 * updated for inline-data reads (generic/003 atime check failures). */
+		file_accessed(iocb->ki_filp);
 		return copied;
 	}
 
@@ -572,6 +576,19 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			write_seqcount_end(&binfo->extent_seq);
 
 			inode->i_blocks = 0;
+			/* Inline writes bypass generic_file_write_iter, whose
+			 * file_update_time() would otherwise set i_mtime/i_ctime.  Set
+			 * them here so a following write_inode persists the change via
+			 * briefs_sync_inode_times() (generic/003 mtime/ctime checks). */
+			{
+				struct timespec64 now;
+
+				ktime_get_real_ts64(&now);
+				inode->i_mtime_sec = now.tv_sec;
+				inode->i_mtime_nsec = now.tv_nsec;
+				inode->i_ctime_sec = now.tv_sec;
+				inode->i_ctime_nsec = now.tv_nsec;
+			}
 			mark_inode_dirty(inode);
 
 			iocb->ki_pos += count;
