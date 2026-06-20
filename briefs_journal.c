@@ -1144,6 +1144,29 @@ int briefs_journal_sync(struct briefs_journal *j) {
 	pr_debug("briefs: journal synced, write_pos=%llu\n", j->write_pos);
 
 	/*
+	 * Persist the journal tail so crash recovery can find the records we
+	 * just durably flushed.  briefs_journal_write_block()/sync_dirty_buffer()
+	 * above wrote the record blocks to disk, but the on-disk superblock's
+	 * journal_log_end still points at the last checkpoint (or, on a fresh
+	 * mount, the empty start) -- only briefs_journal_checkpoint() advanced it
+	 * before.  So without this, an fsync that doesn't cross a checkpoint
+	 * boundary (the common case) leaves the synced record blocks orphaned on
+	 * disk: on the next mount briefs_journal_replay() sees log_start == log_end
+	 * and replays nothing, and the fsync'd metadata is lost.  journal_log_start
+	 * (head) is advanced only by checkpoint and already delimits the oldest
+	 * uncheckpointed record, so only the tail needs advancing here.  Replay is
+	 * idempotent (briefs_trie_insert tolerates -EEXIST, replay_inode_full
+	 * overwrites a fixed snapshot, *_alloc set bitmap bits), so re-applying
+	 * records that also reached regular metadata via writeback is harmless.
+	 */
+	j->sb->journal_log_end = cpu_to_le64(j->write_pos);
+	ret = briefs_journal_sync_superblock(j);
+	if (ret) {
+		pr_err("briefs: failed to persist journal tail after sync: %d\n", ret);
+		return ret;
+	}
+
+	/*
 	 * Periodic checkpoint: if we've accumulated enough records since
 	 * the last checkpoint, flush one now.  This prevents the journal
 	 * from growing unbounded between unmounts and limits replay time.

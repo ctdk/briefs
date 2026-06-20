@@ -141,16 +141,36 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 		goto out_no_journal;
 	}
 
+	/*
+	 * Install the super_operations and mark the superblock active BEFORE
+	 * running journal replay.  Replay applies JRN_DIR_UPDATE / JRN_SYMLINK_DATA
+	 * records by iget()/iput() of the affected inodes to read/modify their
+	 * on-disk metadata.  iput_final() only takes its benign __inode_add_lru()
+	 * early-return path (which simply caches the inode on the sb LRU, touching
+	 * no other list) when (sb->s_flags & SB_ACTIVE); without SB_ACTIVE it instead
+	 * falls into the evict branch, which runs inode_lru_list_del()/inode_sb_list_del()
+	 * and destroy_inode() on every replayed inode.  Doing that alloc/evict/destroy
+	 * cycling repeatedly (pre-SB_ACTIVE, before the inode cache is warm) corrupts
+	 * the VFS inode lists: freshly-iget'd I_NEW inodes have i_lru/i_sb_list left at
+	 * stale slab-reuse values (inode_init_always() does not initialize them; only the
+	 * one-time slab ctor does), and evicting them trips list-debug BUGs ("next is
+	 * NULL" / "next->prev should be X but was NULL").  Setting SB_ACTIVE here makes
+	 * replay's iput()s cache inodes instead of evicting them, sidestepping the whole
+	 * fragile pre-mount eviction path.  The VFS ORs SB_ACTIVE in again later; this
+	 * is not undone on a clean mount.  s_op must be installed first so that any
+	 * writeback during replay has a valid super_operations.
+	 */
+	sb->s_op = &briefs_super_ops;
+	/* Enable NFS export with generation-based file handles. */
+	sb->s_export_op = &briefs_export_ops;
+	sb->s_flags |= SB_ACTIVE;
+
 	/* Replay journal on mount (if not clean) */
 	ret = briefs_journal_replay(bsi->journal);
 	if (ret) {
 		pr_err("briefs: journal replay failed: %d\n", ret);
 		goto out_no_journal;
 	}
-
-	sb->s_op = &briefs_super_ops;
-	/* Enable NFS export with generation-based file handles. */
-	sb->s_export_op = &briefs_export_ops;
 
 	/* BrieFS tracks file size, extent offsets/lengths, and extent counts in
 	 * 64-bit fields throughout, so the only file-size gate is the VFS s_maxbytes

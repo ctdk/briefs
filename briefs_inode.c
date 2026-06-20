@@ -308,6 +308,37 @@ int briefs_finish_create(struct inode *dir, struct dentry *dentry,
 		return ret;
 	}
 
+	/*
+	 * Journal the new inode's full on-disk snapshot BEFORE the JRN_DIR_UPDATE
+	 * that references it.  briefs_journal_sync() flushes only the journal
+	 * region, not the bdev's inode/trie buffers, and briefs_persist_disk_inode()
+	 * is sync=false, so the inode block written during create is not durable
+	 * across a crash that hits before writeback.  The create path otherwise
+	 * emits only JRN_INODE_ALLOC (whose replay merely reserves the inode
+	 * number, ignoring the recorded mode) and a JRN_INODE_FULL for the parent
+	 * directory; without this record, the next mount's replay leaves the new
+	 * inode's block stale, so replay_dir_update()'s iget() of the inode (to
+	 * read its file type) reads a stale/garbage mode and the directory entry is
+	 * recorded with the wrong d_type.  Emitting it here (after the directory
+	 * trie root is set for directories, and after inline/extent data is set
+	 * for symlinks) captures the finalized inode; ordering it before
+	 * JRN_DIR_UPDATE makes replay reconstruct the inode before it is iget()d.
+	 * Replay is idempotent (replay_inode_full overwrites a fixed snapshot),
+	 * so re-applying this when writeback also reached the block is harmless.
+	 */
+	{
+		struct briefs_inode_info *cbinfo = briefs_i(inode);
+		struct briefs_disk_inode disk_di;
+		briefs_cpu_inode_to_disk(&cbinfo->disk_inode, &disk_di);
+		ret = briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+		if (ret) {
+			pr_err("briefs: failed to journal new inode %lu: %d\n",
+			       inode->i_ino, ret);
+			briefs_create_abort(dir->i_sb, dir, inode, &dentry->d_name, false);
+			return ret;
+		}
+	}
+
 	ret = briefs_journal_dir_add(bsi->journal, dir->i_ino, inode->i_ino, dentry);
 	if (ret) {
 		pr_err("briefs: failed to journal dir add %pd: %d\n", dentry, ret);
@@ -387,6 +418,36 @@ struct inode *briefs_alloc_vfs_inode(struct super_block *sb) {
 	binfo = alloc_inode_sb(sb, briefs_inode_cachep, GFP_KERNEL);
 	if (!binfo)
 		return NULL;
+
+	/*
+	 * Re-initialize the VFS inode's list_heads on every allocation.
+	 * The slab ctor (briefs_init_once -> inode_init_once) zeroes these and
+	 * runs INIT_LIST_HEAD on them, but slab constructors execute only when an
+	 * object is first created in a fresh slab page, NOT when a freed slot is
+	 * reused from the freelist.  A reused briefs_inode_info therefore carries
+	 * stale i_lru/i_io_list/i_wb_list/i_sb_list from the previous occupant.
+	 *
+	 * During normal operation this is harmless: every inode is added to the
+	 * superblock's inode LRU (which links i_lru) before it can be evicted, so
+	 * iput_final never observes a stale i_lru.  But journal replay runs inside
+	 * fill_super, BEFORE SB_ACTIVE is set.  iput_final() then cannot take its
+	 * __inode_add_lru early-return path (which requires SB_ACTIVE) and instead
+	 * falls into the evict branch:
+	 *
+	 *     if (!list_empty(&inode->i_lru)) inode_lru_list_del(inode);
+	 *
+	 * A stale i_lru (next != &i_lru) makes list_empty() return false, and
+	 * list_lru_del() trips list-debug ("next is NULL" BUG) on the stale node.
+	 * Re-initializing the list_heads here makes eviction of a freshly-iget'd
+	 * inode during replay safe regardless of slab reuse state.  iget_locked()
+	 * subsequently list_add()s i_sb_list onto sb->s_inodes, which overwrites
+	 * the self-init cleanly (and the self-init avoids orphaning a stale node
+	 * from some freed list).
+	 */
+	INIT_LIST_HEAD(&binfo->vfs_inode.i_lru);
+	INIT_LIST_HEAD(&binfo->vfs_inode.i_io_list);
+	INIT_LIST_HEAD(&binfo->vfs_inode.i_wb_list);
+	INIT_LIST_HEAD(&binfo->vfs_inode.i_sb_list);
 
 	seqcount_init(&binfo->extent_seq);
 	mutex_init(&binfo->trie_lock);

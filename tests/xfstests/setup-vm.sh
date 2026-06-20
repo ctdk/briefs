@@ -84,6 +84,15 @@ export SCRATCH_MNT=$SCRATCH_MNT
 export TEST_DEV=$TEST_LOOP
 export SCRATCH_DEV=$SCRATCH_LOOP
 export MKFS_PROG=/go/bin/mkfs.briefs
+# Dedicated prog var (mirrors MKFS_BTRFS_PROG / MKFS_BCACHEFS_PROG, etc.).
+# common/config unconditionally resets MKFS_PROG="$(type -P mkfs)" (the generic
+# util-linux mkfs -> mke2fs) when sourced, and each test runs in a child bash
+# that re-sources common/rc -> common/config via _begin_fstest.  That clobbers
+# the [briefs] MKFS_PROG override in the child, so any test calling _scratch_mkfs
+# in its own body would mkfs the scratch dev as ext4 and then fail to mount -t
+# briefs ("wrong fs type, bad superblock").  MKFS_BRIEFS_PROG is exported here
+# and common/config never touches it, so the child inherits the real mkfs.briefs.
+export MKFS_BRIEFS_PROG=/go/bin/mkfs.briefs
 export FSCK_PROG=/go/bin/fsck.briefs
 export MKFS_OPTIONS=""
 export MOUNT_OPTIONS=""
