@@ -714,6 +714,28 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		briefs_stat_inc(bsi, truncate_calls);
 
 	/*
+	 * Truncate the pagecache beyond the new size BEFORE taking extent_lock.
+	 * truncate_setsize() -> truncate_pagecache() waits for any in-flight
+	 * writeback on the pages it drops; meanwhile ->writepages
+	 * (briefs_writepages -> briefs_flush_run -> briefs_append_extent_nojournal)
+	 * acquires extent_lock to map blocks.  Holding extent_lock across that
+	 * wait deadlocks writeback against truncate (AB-BA): the writeback of the
+	 * very pages truncate is waiting on blocks on the lock truncate holds.
+	 * This is the generic/074 mmap hang (kworker flush wedged in
+	 * briefs_append_extent_nojournal, fstest wedged in truncate_pagecache).
+	 *
+	 * Doing this first is also the correct block-freeing order: by the time
+	 * we drop extent_lock below and free the backing extents' data blocks,
+	 * their in-flight writeback has already completed, so no bio targets a
+	 * block we are about to free.  Inline-data truncates manage their bytes
+	 * directly (no pagecache wait under the lock), so they stay under
+	 * extent_lock below as before and skip this pre-lock step.
+	 */
+	if (new_size < old_size &&
+	    !(binfo->disk_inode.flags & InodeFlagInlineData))
+		truncate_setsize(inode, new_size);
+
+	/*
 	 * From this point on we may manipulate the extent list or the chain
 	 * blocks that back it.  Hold the per-inode extent lock to serialize
 	 * with concurrent appends (briefs_append_extent / briefs_get_block)
@@ -895,9 +917,6 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	binfo->disk_inode.filesize = new_size;
 	inode->i_blocks = briefs_compute_i_blocks(inode->i_sb,
 						  &binfo->disk_inode);
-
-	/* Let VFS handle page cache truncation */
-	truncate_setsize(inode, new_size);
 
 	/* Persist the inode to disk */
 	briefs_persist_disk_inode(inode->i_sb, inode->i_ino, &binfo->disk_inode, false);
