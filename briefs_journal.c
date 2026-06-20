@@ -638,14 +638,12 @@ static int replay_inode_full(struct super_block *sb, struct jrn_inode_full *rec)
 		return 0;
 	}
 
-	const struct briefs_disk_inode *rdi = (const struct briefs_disk_inode *)rec->inode_data;
 	memcpy(di, rec->inode_data, sizeof(struct briefs_disk_inode));
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
 	brelse(bh);
 
-	pr_debug("briefs: replay restored full inode %llu (size=%llu, n_ext=%u)\n",
-		ino, le64_to_cpu(rdi->filesize), le32_to_cpu(rdi->num_extents_total));
+	pr_debug("briefs: replay restored full inode %llu\n", ino);
 	return 0;
 }
 
@@ -710,29 +708,85 @@ static int replay_symlink_data(struct super_block *sb, struct jrn_symlink_data *
 /*
  * Mount/recovery: replay journal from last checkpoint.
  *
- * Walks the journal from journal_log_start to journal_log_end and re-applies
- * each record.  After successful replay, the journal is marked clean.
+ * Apply one journal record.
+ *
+ * In the reservation pre-scan (reserve_only=true) only the block/inode
+ * allocator ALLOC/FREE records are applied (they reserve or free blocks and
+ * are idempotent).  The write/re-derive handlers (DIR_UPDATE, INODE_FULL,
+ * INODE_UPDATE, SYMLINK_DATA) are skipped, so the pre-scan touches no on-disk
+ * metadata and allocates nothing.  In the apply pass (reserve_only=false) every
+ * record is applied as before.
  */
-int briefs_journal_replay(struct briefs_journal *j) {
-	if (!j) return -EINVAL;
+static int apply_record(struct super_block *sb, u32 rec_type, void *rec_data,
+			bool reserve_only)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	int ret = 0;
 
-	if (le64_to_cpu(j->sb->journal_log_start) == le64_to_cpu(j->sb->journal_log_end)) {
-		pr_info("briefs: journal is clean (no replay needed)\n");
-		return 0;
+	switch (rec_type) {
+	case JRN_DIR_UPDATE:
+		if (!reserve_only)
+			ret = replay_dir_update(sb, rec_data);
+		break;
+	case JRN_INODE_ALLOC: {
+		struct jrn_inode_alloc *ia = rec_data;
+		u64 inum = le64_to_cpu(ia->ino);
+		if (inum > 0)
+			briefs_reserve_block(&bsi->inode_alloc, inum - 1);
+		break;
 	}
+	case JRN_INODE_FREE: {
+		struct jrn_inode_free *ifree = rec_data;
+		u64 inum = le64_to_cpu(ifree->ino);
+		if (inum > 0)
+			briefs_free_block(&bsi->inode_alloc, inum - 1);
+		break;
+	}
+	case JRN_INODE_UPDATE:
+		if (!reserve_only)
+			ret = replay_inode_update(sb, rec_data);
+		break;
+	case JRN_EXTENT_ALLOC:
+		/* reserves data blocks only; safe and idempotent in both passes */
+		ret = replay_extent_alloc(sb, rec_data);
+		break;
+	case JRN_EXTENT_FREE:
+		/* frees data blocks only; safe and idempotent in both passes */
+		ret = replay_extent_free(sb, rec_data);
+		break;
+	case JRN_TRIE_ALLOC:
+		/* reserves/frees the trie page block only; safe in both passes */
+		ret = replay_trie_alloc(sb, rec_data);
+		break;
+	case JRN_INODE_FULL:
+		if (!reserve_only)
+			ret = replay_inode_full(sb, rec_data);
+		break;
+	case JRN_SYMLINK_DATA:
+		if (!reserve_only)
+			ret = replay_symlink_data(sb, rec_data);
+		break;
+	default:
+		pr_debug("briefs: replay skipping unhandled record type=%u\n", rec_type);
+		break;
+	}
+	return ret;
+}
 
-	pr_info("briefs: replaying journal (start=%llu, end=%llu)\n",
-		le64_to_cpu(j->sb->journal_log_start),
-		le64_to_cpu(j->sb->journal_log_end));
-
+/*
+ * Walk the journal from journal_log_start to journal_log_end once, applying
+ * each record via apply_record().  When reserve_only is true this is the
+ * reservation pre-scan; otherwise it is the full apply pass.  Returns 0 on
+ * success or -EIO on an unreadable/corrupt journal block; *out_* accumulate
+ * per-record counters.
+ */
+static int walk_journal(struct briefs_journal *j, struct super_block *sb,
+			bool reserve_only, u32 *out_records, u32 *out_blocks,
+			u32 *out_errors)
+{
 	u64 cur = le64_to_cpu(j->sb->journal_log_start);
 	u64 end = le64_to_cpu(j->sb->journal_log_end);
-	struct super_block *sb = j->vfs_sb;
-	struct briefs_sb_info *bsi = sb->s_fs_info;
-
-	u32 records_replayed = 0;
-	u32 blocks_read = 0;
-	u32 errors = 0;
+	u32 records = 0, blocks = 0, errors = 0;
 
 	while (cur != end) {
 		struct buffer_head *bh = briefs_journal_read_block(j, cur);
@@ -741,11 +795,10 @@ int briefs_journal_replay(struct briefs_journal *j) {
 			return -EIO;
 		}
 
-		blocks_read++;
+		blocks++;
 
 		struct journal_block_header *hdr = (struct journal_block_header *)bh->b_data;
-		__le32 hdr_magic = hdr->magic;
-		u32 block_magic = le32_to_cpu(hdr_magic);
+		u32 block_magic = le32_to_cpu(hdr->magic);
 		if (block_magic != JOURNAL_MAGIC && block_magic != CHECKPOINT_MAGIC) {
 			pr_warn("briefs: invalid journal magic at block=%llu (got=0x%08x, expected=0x%08x)\n",
 				cur, block_magic, JOURNAL_MAGIC);
@@ -753,7 +806,6 @@ int briefs_journal_replay(struct briefs_journal *j) {
 			break;
 		}
 
-		/* Walk records by their actual sizes */
 		u64 rec_off = sizeof(struct journal_block_header);
 		bool legacy_checksum_warned = false;
 		u32 rec_count = le32_to_cpu(hdr->record_count);
@@ -768,7 +820,6 @@ int briefs_journal_replay(struct briefs_journal *j) {
 				return -EIO;
 			}
 
-			/* Bounds check the record data */
 			if (rec_off + sizeof(*rh) + rec_data_len > JOURNAL_BLOCK_SIZE) {
 				pr_err("briefs: journal record overflows block at block=%llu (rec_off=%llu data_len=%u)\n",
 				       cur, rec_off, rec_data_len);
@@ -778,7 +829,6 @@ int briefs_journal_replay(struct briefs_journal *j) {
 
 			void *rec_data = bh->b_data + rec_off + sizeof(*rh);
 
-			/* Verify record checksum before replaying */
 			if (le32_to_cpu(rh->checksum) == 0) {
 				if (!legacy_checksum_warned) {
 					pr_warn("briefs: legacy journal record with no checksum at block=%llu; skipping CRC verification for this replay\n",
@@ -797,75 +847,72 @@ int briefs_journal_replay(struct briefs_journal *j) {
 				continue;
 			}
 
-			int apply_ret = 0;
-
-			switch (rec_type) {
-			case JRN_DIR_UPDATE: {
-				struct jrn_dir_update *du = rec_data;
-				apply_ret = replay_dir_update(sb, du);
-				break;
-			}
-			case JRN_INODE_ALLOC: {
-				struct jrn_inode_alloc *ia = rec_data;
-				u64 inum = le64_to_cpu(ia->ino);
-				if (inum > 0)
-					briefs_reserve_block(&bsi->inode_alloc, inum - 1);
-				break;
-			}
-			case JRN_INODE_FREE: {
-				struct jrn_inode_free *ifree = rec_data;
-				u64 inum = le64_to_cpu(ifree->ino);
-				if (inum > 0)
-					briefs_free_block(&bsi->inode_alloc, inum - 1);
-				break;
-			}
-			case JRN_INODE_UPDATE: {
-				struct jrn_inode_update *iu = rec_data;
-				apply_ret = replay_inode_update(sb, iu);
-				break;
-			}
-			case JRN_EXTENT_ALLOC: {
-				struct jrn_extent_alloc *ea = rec_data;
-				apply_ret = replay_extent_alloc(sb, ea);
-				break;
-			}
-			case JRN_EXTENT_FREE: {
-				struct jrn_extent_free *ef = rec_data;
-				apply_ret = replay_extent_free(sb, ef);
-				break;
-			}
-			case JRN_TRIE_ALLOC: {
-				struct jrn_trie_alloc *ta = rec_data;
-				apply_ret = replay_trie_alloc(sb, ta);
-				break;
-			}
-			case JRN_INODE_FULL: {
-				struct jrn_inode_full *inf = rec_data;
-				apply_ret = replay_inode_full(sb, inf);
-				break;
-			}
-			case JRN_SYMLINK_DATA: {
-				struct jrn_symlink_data *sd = rec_data;
-				apply_ret = replay_symlink_data(sb, sd);
-				break;
-			}
-			default:
-				pr_debug("briefs: replay skipping unhandled record type=%u\n", rec_type);
-				break;
-			}
-
+			int apply_ret = apply_record(sb, rec_type, rec_data, reserve_only);
 			if (apply_ret) {
 				pr_err("briefs: replay error for record type=%u: %d\n",
 				       rec_type, apply_ret);
 				errors++;
 			}
-			records_replayed++;
+			records++;
 			rec_off += sizeof(*rh) + rec_data_len;
 		}
 
 		brelse(bh);
 		cur = briefs_journal_next_block(j, cur);
 	}
+
+	*out_records = records;
+	*out_blocks = blocks;
+	*out_errors = errors;
+	return 0;
+}
+
+/*
+ * Walks the journal from journal_log_start to journal_log_end and re-applies
+ * each record.  After successful replay, the journal is marked clean.
+ *
+ * Two passes: (1) a reservation pre-scan that marks every block/inode claimed
+ * by an ALLOC record (and frees every FREE record) so the in-memory allocators
+ * reflect the full post-crash allocation state BEFORE any directory-trie
+ * re-derivation runs; (2) the apply pass that writes inode/symlink blocks and
+ * re-derives directory tries.  Without the pre-scan, re-derivation
+ * (replay_dir_update -> briefs_trie_insert) could allocate a fresh trie page
+ * out of a block that a later JRN_EXTENT_ALLOC record reserves for file data,
+ * aliasing a trie page onto file data (generic/073 after the page_init sync).
+ * briefs_reserve_block is idempotent, so re-reserving in the apply pass is
+ * harmless.
+ */
+int briefs_journal_replay(struct briefs_journal *j) {
+	if (!j) return -EINVAL;
+
+	if (le64_to_cpu(j->sb->journal_log_start) == le64_to_cpu(j->sb->journal_log_end)) {
+		pr_info("briefs: journal is clean (no replay needed)\n");
+		return 0;
+	}
+
+	pr_info("briefs: replaying journal (start=%llu, end=%llu)\n",
+		le64_to_cpu(j->sb->journal_log_start),
+		le64_to_cpu(j->sb->journal_log_end));
+
+	struct super_block *sb = j->vfs_sb;
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	u32 pre_records = 0, pre_blocks = 0, pre_errors = 0;
+	u32 records_replayed = 0, blocks_read = 0, errors = 0;
+	int ret;
+
+	/* Pass 1: reserve/free all allocator blocks before re-derivation. */
+	ret = walk_journal(j, sb, true, &pre_records, &pre_blocks, &pre_errors);
+	if (ret)
+		return ret;
+	if (pre_errors) {
+		pr_err("briefs: journal reservation pre-scan reported %u errors\n", pre_errors);
+		return -EIO;
+	}
+
+	/* Pass 2: apply all records (writes + trie re-derivation). */
+	ret = walk_journal(j, sb, false, &records_replayed, &blocks_read, &errors);
+	if (ret)
+		return ret;
 
 	pr_info("briefs: journal replay complete (blocks=%u, records=%u, errors=%u)\n",
 		blocks_read, records_replayed, errors);

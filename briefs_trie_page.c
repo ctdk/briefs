@@ -260,6 +260,27 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 	node->byte_val = byte_val;
 	node->node_type = node_type;
 
+	/*
+	 * Make the freshly-initialized trie page durable on disk immediately.
+	 * briefs_get_zero_block() left the buffer dirty in the page cache; without
+	 * this sync the page's content (magic, slot 0, ...) is only written back
+	 * lazily by pdflush.  If a crash hits before that writeback, the block is
+	 * reserved on replay (JRN_TRIE_ALLOC below records only the block NUMBER)
+	 * but its on-disk content is stale/garbage, so replay_dir_update()'s
+	 * briefs_trie_insert() reads a page with bad magic and fails -ENOSPC
+	 * (generic/065: "trie page N has bad magic 0xaaaaaaaa").  Syncing here
+	 * guarantees every allocated trie page has a valid initialized form on
+	 * disk before any later journal record (DIR_UPDATE) that traverses into it
+	 * can become durable; replay then re-derives the entries on top of a valid
+	 * page.  This is the single chokepoint for new trie-page block allocation.
+	 * Safe in syscall context (mkdir/create/split) and during replay: a metadata
+	 * buffer sync, not pagecache writeback, so it cannot trip the mmap/writeback
+	 * AB-BA of generic/074.  See briefs_journal_replay()'s pre-scan pass, which
+	 * reserves all file-data extent blocks before re-derivation runs, so this
+	 * sync'd trie page cannot alias a later-reserved data block.
+	 */
+	sync_dirty_buffer(bh);
+
 	/* Journal the trie page allocation so recovery knows this block is in use. */
 	briefs_journal_trie_alloc(bsi->journal, block);
 
