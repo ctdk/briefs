@@ -15,12 +15,26 @@
 #include "briefs_debug.h"
 
 /*
+ * Locking: the three public journal mutators (briefs_journal_write_record,
+ * _sync, _checkpoint) each acquire j->write_lock and delegate to the
+ * corresponding __*_locked() helper, which assumes the lock is already held.
+ * This lets the internal call chain (write_record -> back-pressure checkpoint
+ * -> sync -> periodic checkpoint) run under a single lock acquisition instead
+ * of re-taking a non-recursive mutex and deadlocking.  All three helpers are
+ * file-local.
+ */
+static int __briefs_journal_write_record_locked(struct briefs_journal *j,
+	enum journal_record_type type, void *data, u32 data_len);
+static int __briefs_journal_checkpoint_locked(struct briefs_journal *j);
+static int __briefs_journal_sync_locked(struct briefs_journal *j);
+/*
  * Initialize journal from superblock
  */
 int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb) {
 	if (!j || !sb) return -EINVAL;
 
 	memset(j, 0, sizeof(*j));
+	mutex_init(&j->write_lock);
 	j->sb = sb;
 	j->journal_start = le64_to_cpu(sb->journal_offset);
 	j->journal_end = le64_to_cpu(sb->journal_offset) + le64_to_cpu(sb->journal_blocks);
@@ -193,7 +207,8 @@ static int verify_record_checksum(struct journal_record_hdr *rh, const void *dat
  * If a record doesn't fit, the current block is flushed to disk,
  * write_pos advances, and a new block is started.
  */
-int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_type type,
+static int __briefs_journal_write_record_locked(struct briefs_journal *j,
+                                 enum journal_record_type type,
                                  void *data, u32 data_len) {
 	u32 total_size;
 	u32 hdr_size = sizeof(struct journal_record_hdr);
@@ -260,9 +275,9 @@ int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_ty
 		 * write_record caller (including under alloc->lock).
 		 */
 		if (j->write_pos == le64_to_cpu(j->sb->journal_log_start)) {
-			pr_info("briefs: journal ring full (back-pressure), checkpointing at write_pos=%llu\n",
+			pr_debug("briefs: journal ring full (back-pressure), checkpointing at write_pos=%llu\n",
 				j->write_pos);
-			ret = briefs_journal_checkpoint(j);
+			ret = __briefs_journal_checkpoint_locked(j);
 			if (ret) {
 				pr_err("briefs: journal back-pressure checkpoint failed: %d\n",
 				       ret);
@@ -303,9 +318,24 @@ int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_ty
 }
 
 /*
+ * Public entry: serialize concurrent journal writers on j->write_lock, then
+ * run the record append.  See struct briefs_journal.write_lock for why this
+ * serialization is required (the 011 livelock).
+ */
+int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_type type,
+                                 void *data, u32 data_len) {
+	int ret;
+	if (!j) return -EINVAL;
+	mutex_lock(&j->write_lock);
+	ret = __briefs_journal_write_record_locked(j, type, data, data_len);
+	mutex_unlock(&j->write_lock);
+	return ret;
+}
+
+/*
  * Write a checkpoint
  */
-int briefs_journal_checkpoint(struct briefs_journal *j) {
+static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	struct briefs_sb_info *bsi;
 
 	if (!j) return -EINVAL;
@@ -314,7 +344,7 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
 
 	/* Flush any pending records first */
 	if (j->dirty) {
-		int ret = briefs_journal_sync(j);
+		int ret = __briefs_journal_sync_locked(j);
 		if (ret) return ret;
 	}
 
@@ -390,6 +420,20 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
 
 	/* Persist the updated superblock so free counts are not stale. */
 	return briefs_journal_sync_superblock(j);
+}
+
+/*
+ * Public entry: take j->write_lock around the checkpoint.  Callers that
+ * already hold the lock (the back-pressure path in write_record, the periodic
+ * checkpoint in sync) call __briefs_journal_checkpoint_locked() directly.
+ */
+int briefs_journal_checkpoint(struct briefs_journal *j) {
+	int ret;
+	if (!j) return -EINVAL;
+	mutex_lock(&j->write_lock);
+	ret = __briefs_journal_checkpoint_locked(j);
+	mutex_unlock(&j->write_lock);
+	return ret;
 }
 
 /**********************************************************************
@@ -1138,6 +1182,7 @@ void briefs_journal_cleanup(struct briefs_journal *j) {
 	j->cur_block = NULL;
 	j->cur_hdr = NULL;
 
+	mutex_destroy(&j->write_lock);
 	memset(j, 0, sizeof(*j));
 }
 
@@ -1145,7 +1190,7 @@ void briefs_journal_cleanup(struct briefs_journal *j) {
  * Sync dirty journal block to disk
  * Flushes the current block, advances write_pos.
  */
-int briefs_journal_sync(struct briefs_journal *j) {
+static int __briefs_journal_sync_locked(struct briefs_journal *j) {
 	u64 sync_start, sync_end, pos;
 	int ret;
 
@@ -1238,12 +1283,28 @@ int briefs_journal_sync(struct briefs_journal *j) {
 	 * from growing unbounded between unmounts and limits replay time.
 	 */
 	if (j->records_since_checkpoint >= JRN_CHECKPOINT_INTERVAL) {
-		ret = briefs_journal_checkpoint(j);
+		ret = __briefs_journal_checkpoint_locked(j);
 		if (ret)
 			pr_warn("briefs: periodic checkpoint failed: %d\n", ret);
 	}
 
 	return 0;
+}
+
+/*
+ * Public entry: take j->write_lock around the sync.  Callers that already
+ * hold the lock (the flush inside checkpoint, the fsync/sync_fs paths are the
+ * public ones that go through here) call __briefs_journal_sync_locked()
+ * directly.  The fsync(2) path (briefs_file.c) and sync_fs(2)/umount path
+ * (briefs_super.c) arrive here without any other BrieFS lock held.
+ */
+int briefs_journal_sync(struct briefs_journal *j) {
+	int ret;
+	if (!j) return 0;
+	mutex_lock(&j->write_lock);
+	ret = __briefs_journal_sync_locked(j);
+	mutex_unlock(&j->write_lock);
+	return ret;
 }
 
 /*

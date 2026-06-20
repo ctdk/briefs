@@ -5,6 +5,7 @@
 
 #include "briefs.h"
 #include <linux/blkdev.h>
+#include <linux/mutex.h>
 
 /* Journal constants */
 #define JOURNAL_BLOCK_SIZE 4096
@@ -24,6 +25,25 @@ struct briefs_journal {
 	u64 checkpoint_seq;               /* current checkpoint sequence */
 	u32 records_since_checkpoint;      /* records written since last checkpoint */
 	bool dirty;                       /* has uncommitted changes */
+	/*
+	 * Serializes all journal writers.  briefs_journal_write_record(),
+	 * _sync() and _checkpoint() mutate shared ring state (write_pos,
+	 * write_offset, cur_block, journal_log_start, records_since_checkpoint)
+	 * that has no other protection: concurrent syscalls from separate
+	 * directories (no shared VFS dir i_rwsem) used to race on write_pos and
+	 * all hit the back-pressure checkpoint at once, each resetting
+	 * log_start=log_end=write_pos while others advanced write_pos past it ->
+	 * livelock (CPU-burning, no progress).  The lock is taken once at the
+	 * outermost public entry; internal call chains (write_record ->
+	 * checkpoint -> sync -> periodic checkpoint) use the __*_locked()
+	 * helpers so the mutex is never re-acquired.  All callers are in
+	 * sleepable context (the journal paths only ever read
+	 * bsi->alloc.free_count, never acquire alloc->lock), so the lock order
+	 * alloc->lock -> write_lock is never inverted.  Critical sections sleep
+	 * (sync_dirty_buffer, sb_bread, GFP_KERNEL), so this is a mutex, not a
+	 * spinlock.
+	 */
+	struct mutex write_lock;
 };
 
 /*
