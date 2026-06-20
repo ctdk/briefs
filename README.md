@@ -7,14 +7,47 @@ _"If you want a picture of the future, imagine a pelican standing on a human hea
 
 BrieFS: A Linux filesystem that solely uses [extents](https://en.wikipedia.org/wiki/Extent_(file_systems)) for file data, [tries](https://en.wikipedia.org/wiki/Trie) for storing directory contents, and bitmap pyramids for inode and block allocation.
 
-
 **NB:** This filesystem is experimental and may totally flip out, make your machine hang and stop responding, corrupt your data, corrupt your children, annoy you greatly, or just up and crash. Caution is advised. I must state that I've warned you about potential issues and that I'm not responsible if anything bad happens because you were messing around with this. Also, no warranty as per the LICENSE files.
+
+INSTALLATION
+------------
+
+First and foremost, clone, untar, or what have you this repository on your machine somewhere convenient. Then, make sure all of the kernel development packages you'll need are installed. You'll also need to set up the kernel build directory one way or another. If you're using the distro kernel, simply installing the `linux-headers` (or equivalent) package should be enough. If you're building your own, you'll need to set the KDIR environment variable for `make`.
+
+Once you've either installed the kernel header package or built your custom kernel, building the BrieFS module should be straightforward. Go into the BrieFS source directory and run
+
+```
+$ make # or possibly KDIR=/path/to/the/kernel/build make
+```
+
+and you should have the `briefs_fs.ko` module ready and waiting.
+
+USAGE
+-----
+
+Load the kernel module, most likely with `sudo insmod /path/to/briefs_fs.ko` unless you put it in your kernel's module tree, in which case you can run `sudo insmod briefs_fs`.
+
+The BrieFS kernel module isn't very useful without a filesystem. If you haven't already, install the [briefs-utils](https://github.com/ctdk/briefs-utils) and create a filesystem:
+
+```
+$ sudo mkfs.briefs /dev/xvdb1 # or whatever
+```
+
+Obviously you can skip that step on the off chance you already have a BrieFS image laying around.
+
+Once you have a BrieFS formatted volume, just mount it the usual way with
+
+```
+$ sudo mount -t briefs /dev/xvdb1 /mnt # or whatever
+```
+
+and you're on your way. If your BrieFS volume gets messed up, `fsck.briefs` is there to help you. It works the way you would expect an fsck program to work, but refer to the `briefs-utils` documentation for specific options.
 
 RELATED
 -------
 
-* [github.com/ctdk/briefs-utils](github.com/ctdk/briefs-utils): The briefs utilities, written in Golang, composed of `mkfs.briefs`, `fsck.briefs`, and `fuse.briefs`. `mkfs.briefs` creates BrieFS volumes, `fsck.briefs` checks and repairs BrieFS volumes, and `fuse.briefs` provides a read-only FUSE bridge for those same BrieFS volumes.
-* [github.com/ctdk/modern-xiafs](github.com/ctdk/modern-xiafs): Computer filesystem archaeology. A port of an ancient Linux filesystem to modern kernels, updated as I get around to it.
+* [github.com/ctdk/briefs-utils](https://github.com/ctdk/briefs-utils): The briefs utilities, written in Golang, composed of `mkfs.briefs`, `fsck.briefs`, and `fuse.briefs`. `mkfs.briefs` creates BrieFS volumes, `fsck.briefs` checks and repairs BrieFS volumes, and `fuse.briefs` provides a read-only FUSE bridge for those same BrieFS volumes.
+* [github.com/ctdk/modern-xiafs](https://github.com/ctdk/modern-xiafs): Computer filesystem archaeology. A port of an ancient Linux filesystem to modern kernels, updated as I get around to it.
 
 RATIONALE
 ---------
@@ -33,7 +66,7 @@ Since trying out AI assisted coding was part of the reason for this in the first
 SUPPORTED KERNEL VERSIONS
 -------------------------
 
-For certain values of "support", anyway. As of this writing, all BrieFS development is being done using the Debian Linux kernel version 6.12.48. Once it gets far enough along, it will jump up to track the current `linux` git repo. Other kernel versions and specific distro kernels may come as time and interest permit and dictate.
+For certain values of "support", anyway. As of this writing, all BrieFS development is being done using the Debian Linux kernel version 6.12.48 or 6.12.90 (in other words, the default on trixie when I set things up). Once it gets far enough along, it will jump up to track the current `linux` git repo. Other kernel versions and specific distro kernels may come as time and interest permit and dictate.
 
 BUGS
 ----
