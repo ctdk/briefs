@@ -58,6 +58,20 @@ const struct file_operations briefs_file_operations = {
 	.mmap = generic_file_mmap,
 	.fsync = briefs_fsync,
 	.fallocate = briefs_fallocate,
+	/*
+	 * Splice ops are required for copy_file_range() to work: the VFS
+	 * vfs_copy_file_range() same-sb fallback path (used when a filesystem
+	 * defines neither ->copy_file_range nor ->remap_file_range) routes the
+	 * copy through do_splice_direct(), which returns -EINVAL unless both
+	 * ->splice_read and ->splice_write are present.  BrieFS is fully
+	 * pagecache-backed (briefs_read_iter/briefs_write_iter delegate to the
+	 * generic iter helpers; briefs_aops provides read_folio/write_begin/
+	 * write_end), so the generic splice implementations are correct here and
+	 * route through the same pagecache paths as read/write/mmap.
+	 * (generic/075: fsx copy_file_range "do_copy_range: Invalid argument".)
+	 */
+	.splice_read = filemap_splice_read,
+	.splice_write = iter_file_splice_write,
 };
 
 /* Superblock operations */
