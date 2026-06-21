@@ -281,6 +281,29 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 	 */
 	sync_dirty_buffer(bh);
 
+	/*
+	 * The underlying device can fail this synchronous write (dm-thin pool
+	 * exhaustion after its no_space_timeout, a failing loop backing store,
+	 * etc.).  Without checking, BrieFS would journal + reference a block
+	 * whose on-disk content is still zero, so every later traversal that
+	 * reads it logs "trie page N has bad magic 0x0" and the dir op fails;
+	 * the caller (briefs_trie_alloc_node) would also re-mark this buffer
+	 * dirty, tripping the kernel's mark_buffer_dirty() write-error WARN.
+	 * Detect the error, abandon the block (clear dirty so pdflush does not
+	 * later write stale trie content to a block we just freed, and clear
+	 * the EIO flag so a future re-allocation of this block via
+	 * briefs_get_zero_block() -- which memsets+set_buffer_uptodate+re-dirties
+	 * -- does not WARN), free it, and propagate -EIO so the caller unwinds
+	 * (does not insert a dir entry pointing at the zeroed page).
+	 */
+	if (buffer_write_io_error(bh)) {
+		clear_buffer_dirty(bh);
+		clear_buffer_write_io_error(bh);
+		briefs_free_block(&bsi->alloc, rel);
+		brelse(bh);
+		return -EIO;
+	}
+
 	/* Journal the trie page allocation so recovery knows this block is in use. */
 	briefs_journal_trie_alloc(bsi->journal, block);
 
