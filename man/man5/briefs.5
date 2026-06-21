@@ -1,0 +1,339 @@
+.\" BrieFS on-disk format man page
+.\" To install: cp briefs.5 /usr/share/man/man5/ ; mandb
+.TH BRIEFS 5 "2026-06-21" "BrieFS v0.9.2" "File formats"
+.SH NAME
+briefs \- the BrieFS extents-and-tries filesystem on-disk format
+.SH DESCRIPTION
+BrieFS is an experimental Linux filesystem designed as a teaching and
+research vehicle.  It stores file data with extents, directory contents in
+trie structures, and uses bitmap pyramids for inode and data-block allocation.
+.PP
+This manual describes the on-disk format used by BrieFS volumes created with
+.BR mkfs.briefs (8)
+and checked with
+.BR fsck.briefs (8).
+The authoritative version is v0.9.2.
+.SH OVERVIEW
+A BrieFS volume is laid out as a sequence of fixed-size blocks, defaulting to
+4096 bytes.  Block addresses are absolute 64-bit block numbers starting at 0.
+The basic layout is:
+.PP
+.nf
+    Block 0              Superblock (1024 bytes; rest of block reserved)
+    Block 1..N           Inode table
+    Next region(s)        Inode bitmap, data allocator structures (EAT)
+    Data region          File data blocks, directory-trie pages, B-tree nodes
+    End of volume        Journal ring
+.fi
+.PP
+Exact offsets are stored in the superblock and vary with volume geometry and
+formatting options.
+.SH SUPERBLOCK
+The superblock occupies the first 1024 bytes of block 0.  The remainder of
+block 0 is unused.  It is encoded in little endian and starts with:
+.PP
+.nf
+    Offset  Size  Field
+      0       8   magic          0x504C434E ("PLCN")
+      8       8   major_version
+     16       8   minor_version
+     24       8   patch_version
+     32       8   total_blocks
+     40       8   data_blocks
+     48       8   block_size
+     56       8   inode_size
+     64       8   blocks_per_group
+     72       8   inodes_per_group
+     80       8   fs_created     seconds since epoch
+     88       8   fs_last_mounted
+     96       8   fs_last_checkpoint
+    104       8   free_data_blocks
+    112       8   free_inodes
+    120       8   root_inode_number
+    128       8   feature_compat
+    136       8   feature_ro_compat
+    144       8   feature_incompat
+    152      16   uuid
+.fi
+.PP
+The metadata-pointer region follows at byte 168:
+.PP
+.nf
+    Offset  Size  Field
+    168       8   eat_offset
+    176       8   eat_blocks
+    184       8   trie_root_block
+    192       8   trie_blocks_used
+    200       8   trie_node_pool_start
+    208       8   trie_node_pool_size
+    216       8   inode_bitmap_offset
+    224       8   inode_bitmap_blocks
+    232       8   inode_table_offset
+    240       8   journal_offset
+    248       8   journal_blocks
+    256       8   checkpoint_seq
+    264       8   journal_log_start
+    272       8   journal_log_end
+    280      32   reserved_journal[4]
+    312      64   label (UTF-8, NUL padded)
+    376     648   reserved
+.fi
+.PP
+The superblock is 1024 bytes in total.  Volumes are expected to have a block
+size of at least 1024 bytes; the default is 4096.
+.SS Feature bits
+The
+.B feature_incompat
+field at offset 144 gates the on-disk format.  Currently only one bit is
+defined:
+.TP
+.B 0x0000000000000001
+B+ tree extent index (introduced in BrieFS v0.9.0).
+.PP
+A BrieFS implementation must reject any volume whose
+.B feature_incompat
+contains bits it does not understand.
+.SH INODES
+Each inode is 512 bytes.  Inode 1 is the root directory; inode 2 is reserved as
+the bad-inode marker.  The inode table is stored starting at the block given
+by
+.BR inode_table_offset .
+An inode record contains:
+.PP
+.nf
+    Offset  Size  Field
+      0       8   inode_number
+      8       8   magic          0x494E4F44 ("INOD")
+     16       4   filemode
+     20       4   uid
+     24       4   gid
+     28       4   _pad0
+     32       8   filesize
+     40       8   ctime_sec
+     48       8   ctime_nsec
+     56       8   atime_sec
+     64       8   atime_nsec
+     72       8   mtime_sec
+     80       8   mtime_nsec
+     88       8   creation_time_sec
+     96       8   creation_time_nsec
+    104       4   nlinks
+    108       4   num_extents_inline
+    112       8   extent_inline_base
+    120       8   num_extents_total
+    128     256   inline region (extents or inline data)
+    384       8   xattr_offset
+    392       8   xattr_size
+    400       8   parent_inode
+    408       4   unused
+    412       4   flags
+    416       8   dir_trie_root
+    424       8   rdev
+    432       8   generation
+    440      72   reserved
+.fi
+.PP
+The inline region may hold either up to 8 inline extent records (32 bytes each)
+or 256 bytes of inline file data / symlink target.  Which interpretation is
+valid depends on the file type and inode flags.
+.SS Inode flags
+.TP
+.B 0x00000004
+InodeFlagIndexed \- the inode uses a B+ tree extent index for its extents.
+.TP
+.B 0x00000008
+InodeFlagInlineData \- the inline region stores file data rather than extents.
+.PP
+The remaining bits are reserved.
+.SH EXTENTS
+Each extent record is 32 bytes:
+.PP
+.nf
+    Offset  Size  Field
+      0       8   offset         logical block offset in file
+      8       8   phys           absolute physical block number
+     16       8   len            length in blocks
+     24       4   flags
+     28       4   pad
+.fi
+.PP
+An inode may store up to 8 extents inline.  When a file grows beyond 8
+extents, the inline extents are migrated into a B+ tree extent index, the
+InodeFlagIndexed bit is set, and
+.B extent_inline_base
+records the absolute block number of the root B-tree node.
+.SH B+ TREE EXTENT INDEX
+B+ tree nodes are exactly one block in size.  The node header is 24 bytes:
+.PP
+.nf
+    Offset  Size  Field
+      0       4   magic          0x42545245 ("BTRE")
+      4       4   flags          bit 0 = leaf
+      8       2   level          0 = leaf
+     10       2   num_keys
+     12       8   next_leaf      leaf nodes only; 0 if none
+.fi
+.PP
+Leaf nodes contain up to 126 extent records, followed by 24 padding bytes,
+a checksum at byte 4080, and 8 unused slack bytes at 4088.  Internal nodes
+contain up to 253 index entries (child block and high key) plus a trailing
+child pointer.  The checksum is a CRC32C over bytes 0 through 4079.
+.SH DIRECTORIES
+Directories store their entries in trie structures.  In the current on-disk
+format (v0.7.0 and later), trie nodes are packed into 4 KiB pages allocated
+from the data-block region.
+.SS Packed trie page
+Each page starts with a 20-byte header and then provides 64 node slots.
+Names are stored in a heap that grows upward from the end of the block toward
+the slot array.  Node references are encoded as:
+.PP
+.nf
+    ref = (absolute_block_number << 6) | slot_index
+.fi
+.PP
+A reference value of 0 means "null".  Slot 0 of each page is the root node
+for that page.  The page magic is 0x54524E50 ("TRNP").
+.SS Trie node
+Each packed trie node is 48 bytes:
+.PP
+.nf
+    Offset  Size  Field
+      0       8   flags
+      8       8   node_type
+     16       8   f_type
+     24       8   first_child
+     32       8   next_sibling
+     40       4   name_offset      offset into page name heap
+     44       2   name_len
+     46       2   _pad
+.fi
+.SS Node types
+.TP
+.B 0x01
+file entry
+.TP
+.B 0x02
+directory entry
+.TP
+.B 0x04
+intermediate (branching) node
+.TP
+.B 0x08
+NODE_STATUS_LEAF \- set on intermediate nodes that also hold a leaf entry
+.PP
+The
+.B dir_trie_root
+field in a directory inode holds the packed node reference of the directory's
+trie root.
+.SH ALLOCATION
+Inodes are allocated from a bitmap pyramid rooted at
+.BR inode_bitmap_offset .
+Data blocks are tracked by an extent allocator tree (EAT) stored at
+.BR eat_offset .
+Directory-trie pages, B-tree nodes, and file-data blocks all come from the
+single data-block region.
+.SH JOURNAL
+The journal is a ring of blocks at the end of the volume, starting at
+.BR journal_offset
+and containing
+.BR journal_blocks
+blocks.  It records metadata-only transactions; ordinary file writeback is
+not journaled.
+.PP
+Each journal block begins with a 16-byte header:
+.PP
+.nf
+    Offset  Size  Field
+      0       4   magic          0x4A4E4C5A ("JNLZ")
+      4       4   block_seq      monotonically increasing
+      8       4   record_count
+     12       4   reserved
+.fi
+.PP
+Records follow the header.  Each record has a 16-byte header
+(type, flags, data length, CRC32C checksum) followed by type-specific data.
+.SS Journal record types
+.TP
+.B 0
+JRN_NONE
+.TP
+.B 1
+JRN_EXTENT_ALLOC
+.TP
+.B 2
+JRN_EXTENT_FREE
+.TP
+.B 3
+JRN_INODE_UPDATE
+.TP
+.B 4
+JRN_INODE_ALLOC
+.TP
+.B 5
+JRN_INODE_FREE
+.TP
+.B 6
+JRN_TRIE_ALLOC
+.TP
+.B 7
+JRN_DIR_UPDATE
+.TP
+.B 8
+JRN_CHECKPOINT
+.TP
+.B 9
+JRN_INODE_FULL \- complete 512-byte disk-inode snapshot
+.TP
+.B 10
+JRN_SYMLINK_DATA
+.TP
+.B 11
+JRN_END
+.PP
+A checkpoint record stores the current log sequence, trie root,
+free-data-block count, and free-inode count, allowing replay to establish a
+consistent mount state.  The journal ring skips the last block to avoid
+wrapping ambiguity.
+.SH CHECKSUMS
+BrieFS uses CRC32C for metadata integrity:
+.IP \(bu 2
+Journal record headers include a CRC32C of the record payload.
+.IP \(bu 2
+Journal block payloads are checksummed as part of their records.
+.IP \(bu 2
+B+ tree extent-index nodes carry a CRC32C at byte 4080 covering bytes 0\-4079.
+.IP \(bu 2
+Directory-trie pages have their own checksum field in the page header.
+.SH LIMITATIONS
+The following are intentionally not implemented in v0.9.2:
+.PP
+.IP \(bu 2
+No data journaling: buffered writes require an explicit flush or fsync to be
+durable.
+.IP \(bu 2
+No extended attributes, POSIX ACLs, quotas, direct I/O, or online resize.
+.IP \(bu 2
+B+ tree node splits are not themselves journaled; crash recovery relies on
+ordered writeback and, if necessary, offline repair with
+.BR fsck.briefs (8).
+.SH FILES
+.TP
+.I /usr/share/man/man8/mkfs.briefs.8
+mkfs.briefs manual page
+.TP
+.I /usr/share/man/man8/fsck.briefs.8
+fsck.briefs manual page
+.TP
+.I /usr/share/man/man8/fuse.briefs.8
+fuse.briefs manual page
+.SH SEE ALSO
+.BR mkfs.briefs (8),
+.BR fsck.briefs (8),
+.BR fuse.briefs (8),
+.BR mount (8)
+.SH AUTHORS
+BrieFS was written by Jeremy Bingham.
+.PP
+The latest source is available at
+.UR https://github.com/ctdk/briefs
+.UE .
