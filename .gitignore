@@ -10,6 +10,7 @@
 
 # ignore agent stuff, in the event I run claude in here or something
 .claude/
+CLAUDE.md
 
 # ignore object files and other build artifacts
 *.o
