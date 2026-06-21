@@ -137,7 +137,7 @@ int briefs_update_parent_dir(struct inode *dir, struct briefs_sb_info *bsi,
 	{
 		struct timespec64 now;
 
-		ktime_get_real_ts64(&now);
+		now = current_time(dir);
 		dir->i_mtime_sec = now.tv_sec;
 		dir->i_mtime_nsec = now.tv_nsec;
 		dir->i_ctime_sec = now.tv_sec;
@@ -220,7 +220,7 @@ struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
 	inode->i_blocks = briefs_compute_i_blocks(dir->i_sb, &binfo->disk_inode);
 	set_nlink(inode, is_dir ? 2 : 1);
 
-	ktime_get_real_ts64(&now);
+	now = current_time(inode);
 	inode->i_atime_sec = inode->i_mtime_sec = inode->i_ctime_sec = now.tv_sec;
 	inode->i_atime_nsec = inode->i_mtime_nsec = inode->i_ctime_nsec = now.tv_nsec;
 
@@ -259,6 +259,11 @@ struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
 		   S_ISFIFO(mode) || S_ISSOCK(mode)) {
 		init_special_inode(inode, mode, rdev);
 		binfo->disk_inode.rdev = rdev;
+		/* Special inodes still need setattr/getattr (chmod, statx): without
+		 * an i_op the VFS falls back to simple_setattr for chmod and a
+		 * stale/generic getattr, which mishandles BrieFS timestamps (e.g.
+		 * fchmod after mknod left ctime behind mtime -> generic/423). */
+		inode->i_op = &briefs_file_inode_ops;
 	}
 
 	unlock_new_inode(inode);
@@ -417,6 +422,20 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 		disk_inode->nlinks = cpu_to_le32(inode->i_nlink);
 	} while (read_seqcount_retry(&binfo->extent_seq, seq));
 
+	/* Mirror the VFS-derived fields back into the in-memory disk inode so
+	 * binfo->disk_inode stays the source of truth.  Without this, a later
+	 * operation that journals from binfo->disk_inode (dir create/unlink, punch,
+	 * etc.) would emit stale uid/gid/mode/nlink captured before this chown/
+	 * chmod, and the last journal record before a crash wins on replay
+	 * (generic/547).  These fields are not extent-seq-protected, so a plain
+	 * write outside the retry loop is safe; cpu_inode_to_disk above already
+	 * snapshotted the extent fields under the seqcount.
+	 */
+	binfo->disk_inode.filemode = inode->i_mode;
+	binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
+	binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);
+	binfo->disk_inode.nlinks = inode->i_nlink;
+
 	/*
 	 * Log the complete on-disk inode snapshot for crash recovery.
 	 * This captures extent metadata, timestamps, mode, nlink, and the
@@ -557,6 +576,7 @@ static int briefs_read_and_fill_inode(struct inode *inode)
 	} else if (S_ISBLK(inode->i_mode) || S_ISCHR(inode->i_mode) ||
 		   S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
 		init_special_inode(inode, inode->i_mode, cpu_di.rdev);
+		inode->i_op = &briefs_file_inode_ops;
 	}
 
 	pr_info("briefs: inode %llu: mode=0o%06o, uid=%u, gid=%u, size=%llu, nlink=%u\n",

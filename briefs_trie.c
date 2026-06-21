@@ -902,6 +902,7 @@ struct trie_iter *briefs_trie_iter_alloc(void)
 	iter->sp = 0;
 	iter->pending = false;
 	iter->gen = 0;
+	iter->emit_idx = 0;
 	return iter;
 }
 
@@ -981,6 +982,7 @@ void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di, u64 
 	iter->sp = 0;
 	iter->pending = false;
 	iter->gen = gen;
+	iter->emit_idx = 0;
 	if (!TRIE_REF_IS_NULL(di->dir_trie_root)) {
 		if (iter->cap > 0) {
 			iter->stack[0] = di->dir_trie_root;

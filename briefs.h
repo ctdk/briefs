@@ -743,6 +743,10 @@ struct trie_iter {
 	u8 pending_name_buf[BRIEFS_NAME_LEN + 1];
 	int pending_name_len;
 	u64 gen;               /* generation of the trie when iterator was created */
+	u64 emit_idx;          /* # real (non-dot) entries already emitted == index
+				* of the next real entry the iterator will yield.
+				* Used to detect a telldir/seekdir to a non-linear
+				* ctx->pos and re-position the iterator. */
 };
 
 struct trie_iter *briefs_trie_iter_alloc(void);

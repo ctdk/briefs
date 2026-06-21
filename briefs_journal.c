@@ -349,6 +349,68 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	}
 
 	/*
+	 * Flush all dirty metadata buffers (inode blocks, trie blocks) to disk
+	 * BEFORE discarding the journal records that reference them.  The records
+	 * in [journal_log_start, write_pos) are about to be discarded by setting
+	 * log_start = log_end = write_pos below.  briefs_write_inode() only
+	 * mark_buffer_dirty()s the inode block -- it does NOT sync it, because
+	 * fsync(2) relies on the JRN_INODE_FULL journal record for durability, not
+	 * the inode block itself.  If we advance log_start without first writing
+	 * those inode/trie blocks back, a crash leaves the on-disk metadata stale
+	 * AND its journal record past log_start (unreplayed): recovery sees
+	 * log_start == log_end and replays nothing, so the stale on-disk inode
+	 * (e.g. a file's extent btree pointing at a pre-writeback physical block)
+	 * wins -> data/metadata loss.  generic/547 hits exactly this: an fsync-all
+	 * storm drives periodic checkpoints; an inode block whose JRN_INODE_FULL
+	 * was checkpointed away and that background writeback hadn't yet reached
+	 * disk before the drop_writes+unmount reverts to stale data on remount.
+	 *
+	 * sync_blockdev() flushes sb->s_bdev's mapping, which holds the
+	 * sb_bread()-read inode and trie buffers.  File DATA lives in the
+	 * per-inode address_space and is flushed separately by
+	 * file_write_and_wait_range() at fsync time, so it is not touched here.
+	 * We hold j->write_lock; no BrieFS metadata-writeback path takes it
+	 * (buffer I/O submission/completion is lock-free, and briefs_write_inode
+	 * acquires write_lock only when *creating* a record, not when its dirty
+	 * buffer is written back), so this wait cannot self-deadlock.
+	 */
+	{
+		int ret = sync_blockdev(j->vfs_sb->s_bdev);
+		if (ret)
+			return ret;
+	}
+
+	/*
+	 * Persist the allocator bitmaps alongside the inode/trie buffers flushed
+	 * above.  briefs_alloc_sync() is the ONLY path that marks the bitmap
+	 * buffer_heads dirty -- the alloc/free hot paths mutate only the in-memory
+	 * l0/l1/l2 arrays and never dirty the backing buffers -- so sync_blockdev()
+	 * does NOT reach them (it writes only already-dirty buffers).  Without this,
+	 * a back-pressure checkpoint mid-burst advances log_start past the
+	 * JRN_TRIE_ALLOC/JRN_INODE_ALLOC records that recorded the just-allocated
+	 * blocks while the on-disk bitmap still fails to mark those blocks
+	 * allocated.  A crash then leaves a correct on-disk trie/inode state beside
+	 * a stale bitmap; journal replay rebuilds the allocator from that stale
+	 * bitmap plus the now-short live record range, treats the
+	 * checkpointed-away-but-still-in-use blocks as FREE, hands one out to a
+	 * replayed allocation, and briefs_trie_page_init() ZEROES an in-use trie
+	 * page -> mass directory-entry loss (generic/040/041 hardlink storm; same
+	 * family as the 547 #2 freed-trie-page-reuse path).  The same safety
+	 * argument as sync_blockdev() above holds: briefs_alloc_sync() does
+	 * sb_bread()+sync_dirty_buffer() (lock-free buffer I/O) under write_lock,
+	 * and no BrieFS metadata path takes write_lock during buffer writeback.
+	 */
+	bsi = j->vfs_sb->s_fs_info;
+	if (bsi) {
+		int r2 = briefs_alloc_sync(&bsi->alloc);
+		if (r2)
+			return r2;
+		r2 = briefs_alloc_sync(&bsi->inode_alloc);
+		if (r2)
+			return r2;
+	}
+
+	/*
 	 * Refresh superblock free counts from the authoritative allocator state
 	 * before writing the checkpoint.
 	 */
@@ -1010,6 +1072,21 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	/* Update superblock to mark journal clean */
 	j->sb->journal_log_start = j->sb->journal_log_end;
 	j->sb->checkpoint_seq = cpu_to_le64(le64_to_cpu(j->sb->checkpoint_seq) + 1);
+
+	/* Replay cleared the live range (log_start = log_end), but j->write_pos
+	 * / synced_pos were initialized in briefs_journal_init() from the OLD
+	 * journal_log_start (now stale, pointing at a block behind the new
+	 * log_start).  Without re-pointing them at the cleared log_end, the next
+	 * briefs_journal_sync() writes its block at the stale write_pos -- a
+	 * block now OUTSIDE [log_start, log_end) -- so the records it holds
+	 * (e.g. the create/add entries written between mount and the first
+	 * post-replay fsync) are orphaned from the replay range and silently
+	 * lost on the next crash, even though they were fsync'd.  generic/321
+	 * and generic/322 (rename + fsync, then dm-flakey crash) lost the
+	 * renamed-into directory this way.  The cur_block was left empty by
+	 * briefs_journal_init(), so only the position cursors need resetting. */
+	j->write_pos = le64_to_cpu(j->sb->journal_log_end);
+	j->synced_pos = j->write_pos;
 
 	/*
 	 * Replay may have changed the allocator free counts.  Copy the current

@@ -328,6 +328,26 @@ do_alloc:
 
 		ret = briefs_btree_insert_locked(inode->i_sb, &binfo->disk_inode,
 						  &new_ext);
+		if (ret == -EEXIST) {
+			/*
+			 * Lost a race: another inserter mapped this block after
+			 * our locked re-check.  Free our block and adopt the
+			 * existing mapping instead of returning an error (which
+			 * would fail writeback).  The locked re-check above makes
+			 * this branch unreachable in practice; handle it anyway.
+			 */
+			briefs_free_block(&bsi->alloc, rel);
+			ret = briefs_inode_lookup_iblock(inode->i_sb, binfo,
+							 (u64)iblock, &ext, true);
+			if (ret == 0) {
+				phys = ext.phys + ((u64)iblock - ext.offset);
+				map_bh(bh_result, inode->i_sb, phys);
+				mutex_unlock(&binfo->extent_lock);
+				return 0;
+			}
+			mutex_unlock(&binfo->extent_lock);
+			return ret;
+		}
 		if (ret != 0) {
 			briefs_free_block(&bsi->alloc, rel);
 			mutex_unlock(&binfo->extent_lock);

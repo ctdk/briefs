@@ -15,53 +15,69 @@
 #include "briefs_journal.h"
 #include "briefs_debug.h"
 
-/* briefs_readdir - enumerate directory contents */
+/* briefs_readdir - enumerate directory contents
+ *
+ * Offset scheme (mirrors libfs simple_offset so telldir/seekdir round-trip):
+ *   offset 0 -> ".", offset 1 -> "..", offset 2+k -> real (k-th) entry.
+ * ctx->pos is the offset of the next entry to read; dir_emit records
+ * d_off = ctx->pos (this entry's offset) and we advance ctx->pos after a
+ * successful emit.  The persistent trie iterator caches its position as
+ * emit_idx (the index of the next real entry it will yield); if a
+ * telldir/seekdir lands ctx->pos away from the iterator, we re-initialize
+ * and fast-forward to the requested entry so random seeks resume correctly
+ * (generic/257, generic/637). */
 int briefs_readdir(struct file *file, struct dir_context *ctx) {
 	struct inode *dir = file_inode(file);
+	struct briefs_inode_info *binfo = briefs_i(dir);
 	struct trie_iter *iter;
+	u64 target;
 
 	pr_debug("briefs: readdir offset=%llu (trie)\n", ctx->pos);
 
 	if (!S_ISDIR(dir->i_mode))
 		return -ENOTDIR;
 
-	/* Emit . and .. via dir_emit_dots */
+	/* Emit . and .. at offsets 0 and 1. */
 	if (ctx->pos < 2) {
 		if (!dir_emit_dots(file, ctx))
-			return -EIO;
+			return 0;	/* buffer full mid-dots; VFS retries */
 		ctx->pos = 2;
 	}
 
-	/*
-	 * Get or create the persistent trie iterator.
-	 * If ctx->pos is 2 (just past dots), this is the first call or
-	 * a seek to 0 — (re)initialize the iterator.
-	 * If the iterator doesn't exist (e.g. opened without briefs_dir_open),
-	 * allocate one now.
-	 */
+	/* Get or create the persistent trie iterator. */
 	iter = file->private_data;
 	if (!iter) {
-		struct briefs_inode_info *binfo = briefs_i(dir);
 		iter = briefs_trie_iter_alloc();
 		if (!iter)
 			return -ENOMEM;
-
 		mutex_lock(&binfo->trie_lock);
 		briefs_trie_iter_init(iter, &binfo->disk_inode, binfo->trie_gen);
 		mutex_unlock(&binfo->trie_lock);
-
 		file->private_data = iter;
-	} else if (ctx->pos == 2) {
-		/* Seek to 0: reinitialize the iterator.
-		 * Always reinitialize when ctx->pos is 2 (just past . and ..)
-		 * regardless of whether the iterator is exhausted.  The old
-		 * check (iter->sp > 0) skipped re-initialization when the
-		 * iterator was fully consumed, causing the directory to
-		 * appear empty after a seekdir(0) + readdir cycle. */
-		struct briefs_inode_info *binfo = briefs_i(dir);
+	}
+
+	/* Real entry index named by the current ctx->pos. */
+	target = ctx->pos - 2;
+
+	/* If the iterator is not positioned at `target` (telldir/seekdir to a
+	 * non-linear offset, or a rewind), re-initialize and skip forward. */
+	if (target != iter->emit_idx) {
+		char skip_name[BRIEFS_NAME_LEN + 1];
+		u64 k, skip = target;
+		int skip_len;
+		u8 skip_type;
+		u64 skip_ino;
 
 		mutex_lock(&binfo->trie_lock);
 		briefs_trie_iter_init(iter, &binfo->disk_inode, binfo->trie_gen);
+		iter->emit_idx = 0;
+		for (k = 0; k < skip; k++) {
+			if (briefs_trie_iter_next(dir->i_sb, iter, binfo->trie_gen,
+			                          &skip_ino, &skip_type, skip_name,
+			                          &skip_len) != 0)
+				break;	/* seek past EOF */
+			iter->emit_idx++;
+		}
 		mutex_unlock(&binfo->trie_lock);
 	}
 
@@ -71,7 +87,6 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 		int entry_name_len;
 		u64 entry_ino;
 		u8 entry_type;
-		struct briefs_inode_info *binfo = briefs_i(dir);
 
 		mutex_lock(&binfo->trie_lock);
 		if (briefs_trie_iter_next(dir->i_sb, iter, binfo->trie_gen, &entry_ino, &entry_type,
@@ -87,7 +102,8 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 		              entry_ino, fs_umode_to_dtype(file_type))) {
 			/* Buffer full - save this entry so briefs_trie_iter_next
 			 * returns it on the next call (VFS retries with same ctx->pos
-			 * and the trie iterator has already advanced past the entry). */
+			 * and the trie iterator has already advanced past the entry).
+			 * Do NOT advance ctx->pos/emit_idx: the entry was not emitted. */
 			iter->pending = true;
 			iter->pending_ino = entry_ino;
 			iter->pending_type = entry_type;
@@ -97,6 +113,7 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 		}
 
 		ctx->pos++;
+		iter->emit_idx++;
 	}
 
 	return 0;
@@ -365,6 +382,20 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 	/* Increment nlink on the inode */
 	inc_nlink(inode);
 
+	/*
+	 * vfs_link() does NOT bump ctime on the target inode -- the filesystem
+	 * must, like ext2/ext4 (inode_set_ctime_current).  generic/236 checks
+	 * that a newly-created hard link updates the target's ctime.  Set it
+	 * before journaling/persisting so the disk_inode snapshot and the
+	 * JRN_INODE_UPDATE record both carry the new ctime.
+	 */
+	{
+		struct briefs_inode_info *binfo = briefs_i(inode);
+		inode_set_ctime_to_ts(inode, current_time(inode));
+		briefs_sync_inode_times(inode, &binfo->disk_inode);
+		mark_inode_dirty(inode);
+	}
+
 	/* Journal the nlink change */
 	briefs_journal_inode_update(bsi->journal, inode);
 
@@ -512,8 +543,15 @@ static int briefs_unlink_common(struct inode *dir, struct dentry *dentry) {
 		clear_nlink(inode);
 	} else {
 		drop_nlink(inode);
-		mark_inode_dirty(inode);
 	}
+
+	/* Bump the target inode's ctime: an nlink drop / removal is a metadata
+	 * change, so ctime must advance (generic/755; cf. btrfs 9b378f6a
+	 * "update target inode's ctime on unlink").  briefs_journal_inode_update()
+	 * below reads the timestamps straight from the VFS inode, so setting it
+	 * here propagates to both the journal record and the later writeback. */
+	inode_set_ctime_to_ts(inode, current_time(inode));
+	mark_inode_dirty(inode);
 
 	/* Journal the target inode nlink change */
 	briefs_journal_inode_update(bsi->journal, inode);
@@ -598,6 +636,206 @@ int briefs_rmdir(struct inode *dir, struct dentry *dentry) {
 	return ret;
 }
 
+/*
+ * briefs_rename_exchange - implement RENAME_EXCHANGE: atomically swap two
+ * directory entries so that old_name names new_dentry's inode and new_name
+ * names old_dentry's inode.  Both entries must exist (the VFS checks this for
+ * EXCHANGE).  No link counts change for non-directories; for a crossed
+ * directory each side's parent_inode pointer and the parent ".." link counts
+ * are updated.  Both moved inodes and both parent dirs get ctime (and mtime
+ * for the dirs) advanced.
+ *
+ * The swap is journaled as four records (del old, add old->new, del new, add
+ * new->old) rather than a single "repoint" op: replay_dir_update() maps
+ * briefs_trie_insert's -EEXIST to 0 (leaving the old pointer in place), so an
+ * insert-on-existing-name record would not re-point on replay.  Remove+add
+ * re-derives the swap correctly.
+ */
+static int briefs_rename_exchange(struct inode *old_dir, struct dentry *old_dentry,
+                                  struct inode *new_dir, struct dentry *new_dentry)
+{
+	struct briefs_sb_info *bsi = old_dir->i_sb->s_fs_info;
+	struct inode *old_inode = d_inode(old_dentry);
+	struct inode *new_inode = d_inode(new_dentry);
+	struct briefs_inode_info *old_binfo = briefs_i(old_inode);
+	struct briefs_inode_info *new_binfo = briefs_i(new_inode);
+	const char *old_name = old_dentry->d_name.name;
+	size_t old_len = old_dentry->d_name.len;
+	const char *new_name = new_dentry->d_name.name;
+	size_t new_len = new_dentry->d_name.len;
+	u64 old_parent_saved = 0, new_parent_saved = 0;
+	unsigned old_olddir_nlink = 0, old_newdir_nlink = 0;
+	bool old_is_dir = S_ISDIR(old_inode->i_mode);
+	bool new_is_dir = S_ISDIR(new_inode->i_mode);
+	bool cross = (old_dir != new_dir);
+	bool xch_changed = false;
+	u8 old_ftype = (old_inode->i_mode & S_IFMT) >> 12;
+	u8 new_ftype = (new_inode->i_mode & S_IFMT) >> 12;
+	struct timespec64 now;
+	int ret;
+
+	/* Swap the trie entries: old_name -> new_inode, new_name -> old_inode. */
+	ret = briefs_remove_dir_entry(old_dir, old_name, old_len);
+	if (ret) goto fail;
+	ret = briefs_journal_dir_update(bsi->journal, old_dir->i_ino, 0,
+					old_name, old_len, 1, 0);
+	if (ret) goto fail;
+	ret = briefs_add_dir_entry(old_dir, old_name, old_len, new_inode->i_ino, new_ftype);
+	if (ret) goto fail;
+	ret = briefs_journal_dir_update(bsi->journal, old_dir->i_ino, new_inode->i_ino,
+					old_name, old_len, 0, new_ftype);
+	if (ret) goto fail;
+
+	ret = briefs_remove_dir_entry(new_dir, new_name, new_len);
+	if (ret) goto fail;
+	ret = briefs_journal_dir_update(bsi->journal, new_dir->i_ino, 0,
+					new_name, new_len, 1, 0);
+	if (ret) goto fail;
+	ret = briefs_add_dir_entry(new_dir, new_name, new_len, old_inode->i_ino, old_ftype);
+	if (ret) goto fail;
+	ret = briefs_journal_dir_update(bsi->journal, new_dir->i_ino, old_inode->i_ino,
+					new_name, new_len, 0, old_ftype);
+	if (ret) goto fail;
+
+	/* Cross-directory directory moves: swap parent_inode + ".." link counts.
+	 * If both are dirs, each parent loses one subdir link and gains one, so
+	 * the net nlink change is zero (we still record the saved values to undo
+	 * on failure).  Non-dir inodes carry no parent/link state. */
+	if (cross) {
+		old_olddir_nlink = old_dir->i_nlink;
+		old_newdir_nlink = new_dir->i_nlink;
+		old_parent_saved = old_binfo->disk_inode.parent_inode;
+		new_parent_saved = new_binfo->disk_inode.parent_inode;
+		if (old_is_dir) {
+			old_binfo->disk_inode.parent_inode = new_dir->i_ino;
+			drop_nlink(old_dir);
+			inc_nlink(new_dir);
+			xch_changed = true;
+		}
+		if (new_is_dir) {
+			new_binfo->disk_inode.parent_inode = old_dir->i_ino;
+			drop_nlink(new_dir);
+			inc_nlink(old_dir);
+			xch_changed = true;
+		}
+	}
+
+	/* ctime on both moved inodes; mtime/ctime on both parent dirs. */
+	now = current_time(old_inode);
+	old_inode->i_ctime_sec = now.tv_sec;
+	old_inode->i_ctime_nsec = now.tv_nsec;
+	briefs_sync_inode_times(old_inode, &old_binfo->disk_inode);
+	ret = briefs_persist_disk_inode(old_inode->i_sb, old_inode->i_ino,
+					&old_binfo->disk_inode, false);
+	if (ret) goto fail;
+	briefs_journal_inode_update(bsi->journal, old_inode);
+	mark_inode_dirty(old_inode);
+
+	now = current_time(new_inode);
+	new_inode->i_ctime_sec = now.tv_sec;
+	new_inode->i_ctime_nsec = now.tv_nsec;
+	briefs_sync_inode_times(new_inode, &new_binfo->disk_inode);
+	ret = briefs_persist_disk_inode(new_inode->i_sb, new_inode->i_ino,
+					&new_binfo->disk_inode, false);
+	if (ret) goto fail;
+	briefs_journal_inode_update(bsi->journal, new_inode);
+	mark_inode_dirty(new_inode);
+
+	ret = briefs_update_parent_dir(old_dir, bsi, 0, 0);
+	if (ret) goto fail;
+	if (cross) {
+		ret = briefs_update_parent_dir(new_dir, bsi, 0, 0);
+		if (ret) goto fail;
+	}
+
+	return 0;
+
+fail:
+	/* Restore the pre-swap entries (idempotent: remove whatever sits at each
+	 * name, then re-add the original pointer; -ENOENT/-EEXIST are absorbed by
+	 * the helpers' update-in-place fallback) and the saved nlink/parent state. */
+	briefs_remove_dir_entry(old_dir, old_name, old_len);
+	briefs_journal_dir_update(bsi->journal, old_dir->i_ino, 0, old_name, old_len, 1, 0);
+	briefs_add_dir_entry(old_dir, old_name, old_len, old_inode->i_ino, old_ftype);
+	briefs_journal_dir_update(bsi->journal, old_dir->i_ino, old_inode->i_ino,
+				  old_name, old_len, 0, old_ftype);
+	briefs_remove_dir_entry(new_dir, new_name, new_len);
+	briefs_journal_dir_update(bsi->journal, new_dir->i_ino, 0, new_name, new_len, 1, 0);
+	briefs_add_dir_entry(new_dir, new_name, new_len, new_inode->i_ino, new_ftype);
+	briefs_journal_dir_update(bsi->journal, new_dir->i_ino, new_inode->i_ino,
+				  new_name, new_len, 0, new_ftype);
+
+	if (xch_changed) {
+		set_nlink(old_dir, old_olddir_nlink);
+		set_nlink(new_dir, old_newdir_nlink);
+		if (old_is_dir)
+			old_binfo->disk_inode.parent_inode = old_parent_saved;
+		if (new_is_dir)
+			new_binfo->disk_inode.parent_inode = new_parent_saved;
+	}
+	return ret;
+}
+
+/*
+ * briefs_make_whiteout - create a whiteout (char device 0/0) directory entry
+ * for RENAME_WHITEOUT.  @dentry->d_name is the old name (the VFS has not yet
+ * d_move()d old_dentry, so it still carries the old name); the old entry has
+ * already been removed by the rename, so the name is free.  The whiteout inode
+ * is journaled as a full snapshot BEFORE the dir-add record so replay
+ * reconstructs the char-dev inode before any lookup references it.  No
+ * d_instantiate: the whiteout has no dentry until the next lookup; the VFS
+ * d_move()s old_dentry to the new name after ->rename returns.
+ */
+static int briefs_make_whiteout(struct inode *dir, struct dentry *dentry)
+{
+	struct briefs_sb_info *bsi = dir->i_sb->s_fs_info;
+	struct inode *wi;
+	struct briefs_inode_info *wbinfo;
+	struct briefs_disk_inode disk_di;
+	u8 ftype = S_IFCHR >> 12;
+	int ret;
+
+	wi = briefs_new_inode(dir, dentry, S_IFCHR | WHITEOUT_MODE, WHITEOUT_DEV);
+	if (IS_ERR(wi))
+		return PTR_ERR(wi);
+
+	ret = briefs_add_dir_entry(dir, dentry->d_name.name, dentry->d_name.len,
+				   wi->i_ino, ftype);
+	if (ret) {
+		briefs_create_abort(dir->i_sb, dir, wi, &dentry->d_name, false);
+		return ret;
+	}
+
+	wbinfo = briefs_i(wi);
+	briefs_cpu_inode_to_disk(&wbinfo->disk_inode, &disk_di);
+	ret = briefs_journal_inode_full(bsi->journal, wi->i_ino, &disk_di);
+	if (ret) {
+		briefs_create_abort(dir->i_sb, dir, wi, &dentry->d_name, true);
+		return ret;
+	}
+
+	ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, wi->i_ino,
+					dentry->d_name.name, dentry->d_name.len,
+					0, ftype);
+	if (ret) {
+		briefs_create_abort(dir->i_sb, dir, wi, &dentry->d_name, true);
+		return ret;
+	}
+
+	ret = briefs_update_parent_dir(dir, bsi,
+				       BRIEFS_DIR_ENTRY_PREFIX_LEN + dentry->d_name.len,
+				       0);
+	if (ret) {
+		briefs_create_abort(dir->i_sb, dir, wi, &dentry->d_name, true);
+		return ret;
+	}
+
+	mark_inode_dirty(wi);
+	/* nlink=1 keeps the inode resident on disk; drop our reference. */
+	iput(wi);
+	return 0;
+}
+
 /* briefs_rename - rename a directory entry */
 int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
                   struct inode *new_dir, struct dentry *new_dentry, unsigned int flags) {
@@ -625,6 +863,11 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 	old_olddir_nlink = old_dir->i_nlink;
 	old_newdir_nlink = new_dir->i_nlink;
 
+	/* RENAME_EXCHANGE swaps the two entries rather than overwriting; the VFS
+	 * rejects EXCHANGE combined with NOREPLACE/WHITEOUT, so handle it alone. */
+	if (flags & RENAME_EXCHANGE)
+		return briefs_rename_exchange(old_dir, old_dentry, new_dir, new_dentry);
+
 	if (flags & RENAME_NOREPLACE) {
 		if (d_really_is_positive(new_dentry))
 			return -EEXIST;
@@ -642,6 +885,20 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 		if (old_target) {
 			old_target_binfo = briefs_i(old_target);
 			old_target_ftype = (old_target->i_mode & S_IFMT) >> 12;
+		}
+
+		/* Renaming over an existing directory requires the target to be
+		 * empty.  The VFS does NOT check this for ->rename (unlike rmdir),
+		 * so the filesystem must; otherwise a non-empty target would be
+		 * silently replaced and its children orphaned (generic/023:
+		 * dire/tree and tree/tree must return -ENOTEMPTY).  Non-dir targets
+		 * are always replaceable; dir-over-non-dir / non-dir-over-dir are
+		 * already rejected as -ENOTDIR/-EISDIR by the VFS via may_delete. */
+		if (old_target && S_ISDIR(old_target->i_mode)) {
+			int eret = 0;
+
+			if (!briefs_empty_dir(old_target, &eret))
+				return eret;	/* -ENOTEMPTY (or -ENOMEM) */
 		}
 
 		ret = briefs_remove_dir_entry(new_dir, new_dentry->d_name.name,
@@ -757,7 +1014,7 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 		struct briefs_disk_inode disk_di;
 		struct timespec64 now;
 
-		ktime_get_real_ts64(&now);
+		now = current_time(inode);
 		inode->i_ctime_sec = now.tv_sec;
 		inode->i_ctime_nsec = now.tv_nsec;
 		briefs_sync_inode_times(inode, &minfo->disk_inode);
@@ -768,6 +1025,16 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 		briefs_cpu_inode_to_disk(&minfo->disk_inode, &disk_di);
 		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
 		mark_inode_dirty(inode);
+	}
+
+	/* RENAME_WHITEOUT: the move above is plain rename semantics; now create a
+	 * whiteout char device at the (now-vacated) old name in the old dir.  The
+	 * old_dentry still carries the old name here (the VFS d_move()s it to the
+	 * new name only after ->rename returns). */
+	if (flags & RENAME_WHITEOUT) {
+		ret = briefs_make_whiteout(old_dir, old_dentry);
+		if (ret)
+			goto fail;
 	}
 
 	pr_debug("briefs: renamed %pd -> %pd\n", old_dentry, new_dentry);

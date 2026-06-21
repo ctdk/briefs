@@ -367,6 +367,37 @@ static int btree_leaf_insert(struct super_block *sb, struct briefs_inode *di,
 	int pos = btree_leaf_find_pos(node, ext->offset);
 	struct briefs_disk_extent *ents = node->u.leaf.extents;
 
+	/*
+	 * Reject overlapping extents.  btree_leaf_find_pos() returns the first
+	 * index whose offset is strictly greater than ext->offset, so any entry
+	 * at exactly ext->offset sits at pos-1 -- and the merge checks below do
+	 * NOT catch it (they require the neighbor to *end at* ext->offset, not
+	 * equal it).  Without this guard, a check-then-insert race (notably
+	 * fallocate's unlocked briefs_block_mapped() test vs. background writeback
+	 * converting a BH_Delay page) lets two extents for the same logical range
+	 * coexist: lookup returns one phys while a pagecache buffer_head is pinned
+	 * to the other, so writeback writes data to a block the btree no longer
+	 * points at and the file silently diverges after drop_caches/crash
+	 * (generic/547).  The scan also covers a run overlapping an existing
+	 * middle block.  Return -EEXIST so the caller frees its just-allocated
+	 * block and adopts the existing mapping / skips.  This runs under
+	 * extent_lock, so it is atomic with respect to other inserters.
+	 */
+	{
+		int start_i = (pos > 0) ? pos - 1 : pos;
+		int i;
+
+		for (i = start_i; i < n; i++) {
+			struct briefs_extent e;
+
+			briefs_disk_extent_to_cpu(&ents[i], &e);
+			if (e.offset >= ext->offset + ext->len)
+				break;		/* strictly to the right; no overlap */
+			if (e.offset + e.len > ext->offset)
+				return -EEXIST;	/* overlaps [ext->offset, ext->end) */
+		}
+	}
+
 	/* Merge with the left neighbor (extent just before the insertion slot). */
 	if (pos > 0) {
 		struct briefs_extent left;
@@ -688,6 +719,21 @@ static int btree_inline_insert(struct super_block *sb, struct briefs_inode *di,
 	for (pos = 0; pos < n; pos++)
 		if (di->inline_extents[pos].offset > ext->offset)
 			break;
+
+	/* Reject overlapping extents -- see btree_leaf_insert(). */
+	{
+		int start_i = (pos > 0) ? pos - 1 : pos;
+		int j;
+
+		for (j = start_i; j < n; j++) {
+			struct briefs_extent *e = &di->inline_extents[j];
+
+			if (e->offset >= ext->offset + ext->len)
+				break;
+			if (e->offset + e->len > ext->offset)
+				return -EEXIST;
+		}
+	}
 
 	/* Merge with the left neighbor. */
 	if (pos > 0) {

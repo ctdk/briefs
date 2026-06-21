@@ -49,7 +49,10 @@ static int briefs_read_folio(struct file *file, struct folio *folio)
 		return 0;
 	}
 
-	return mpage_read_folio(folio, briefs_get_block);
+	{
+		int rf_ret = mpage_read_folio(folio, briefs_get_block);
+		return rf_ret;
+	}
 }
 /*
  * #6 Step 3: run-allocating writepages.
@@ -163,6 +166,16 @@ static int briefs_write_folio_alloc_one(struct inode *inode,
 	ext.len = 1;
 	ext.flags = 0;
 	ret = briefs_append_extent_nojournal(inode->i_sb, &binfo->disk_inode, &ext);
+	if (ret == -EEXIST) {
+		/*
+		 * Lost a race: the block is already mapped.  Free our block and
+		 * write the folio through the existing mapping via briefs_get_block
+		 * (which re-looks it up).  Falling through to the redirty path would
+		 * loop forever, since the next attempt would hit -EEXIST again.
+		 */
+		briefs_free_block(&bsi->alloc, rel);
+		return briefs_block_write_full_folio(folio, wbc, briefs_get_block);
+	}
 	if (ret) {
 		briefs_free_block(&bsi->alloc, rel);
 		if (ret == -ENOSPC) {
@@ -321,6 +334,52 @@ static sector_t briefs_bmap(struct address_space *mapping, sector_t block)
 {
 	return generic_block_bmap(mapping, block, briefs_get_block);
 }
+/*
+ * briefs_zero_eof_tail - zero [eof, block_end) of the block containing @eof.
+ *
+ * Called when i_size is about to grow past a mid-block EOF (truncate-up, or a
+ * write that jumps past EOF).  The tail [eof, block_end) is beyond the file's
+ * valid data but inside the EOF block, which may carry mmap pollution (fsx -e
+ * pollute_eofpage writes the fsx pattern into the page tail beyond EOF) or
+ * stale data left over from a prior, smaller i_size.  Left unzeroed, that tail
+ * leaks as valid data once i_size later grows past the block (generic/363: fsx
+ * READ BAD DATA at the old EOF).
+ *
+ * ext4 handles this in cont_write_begin/cont_expand_zero, which BrieFS does not
+ * use (plain block_write_begin).  We cannot use block_truncate_page here: with
+ * delayed allocation the EOF block is typically BH_Delay (not yet allocated), so
+ * __block_truncate_page's create=0 get_block returns unmapped and SKIPS the
+ * zeroing -- and fsx pollutes via mmap then immediately extends, so the polluted
+ * folio is a cached delayed folio at this point (the exact case
+ * block_truncate_page cannot touch).  Zero the pagecache folio's tail directly
+ * and leave it dirty: writeback (briefs_block_write_full_folio ->
+ * briefs_get_block create=1) allocates the block and persists the zeroed folio.
+ * Assumes bs == PAGE_SIZE (BrieFS 4K blocks on 4K pages), matching
+ * briefs_block_write_full_folio; a cached delayed folio is always uptodate.
+ */
+static void briefs_zero_eof_tail(struct address_space *mapping, loff_t eof)
+{
+	unsigned int bs = i_blocksize(mapping->host);
+	struct folio *folio;
+	unsigned int off;
+
+	if ((eof & (bs - 1)) == 0)
+		return;		/* block-aligned EOF: no tail to zero */
+
+	folio = __filemap_get_folio(mapping, eof >> PAGE_SHIFT, FGP_LOCK, GFP_NOFS);
+	if (IS_ERR_OR_NULL(folio))
+		return;		/* not cached: nothing dirty to persist.
+				 * __filemap_get_folio returns ERR_PTR(-ENOENT), not
+				 * NULL, when FGP_LOCK is set and the folio is absent. */
+	if (folio_test_uptodate(folio)) {
+		off = eof & (bs - 1);
+		folio_zero_segment(folio, off, folio_size(folio));
+		folio_mark_dirty(folio);
+	}
+	folio_unlock(folio);
+	folio_put(folio);
+}
+
 /* cribbed from xiafs, at least for now.
  *
  * Uses briefs_get_block_write, which DEFERS block allocation: an unmapped
@@ -366,6 +425,23 @@ static int briefs_write_begin(struct file *file, struct address_space *mapping, 
 	 */
 	gb = (bsi->alloc.free_count < (bsi->alloc.block_count >> 2))
 	     ? briefs_get_block : briefs_get_block_write;
+
+	/* Zero-fill the tail of the block containing the current EOF when this
+	 * write jumps past EOF (pos > i_size) and EOF is mid-block.  The tail
+	 * [i_size, block_end) is beyond the file's valid data but inside the
+	 * EOF block; without zeroing it here, bytes there -- written by an mmap
+	 * store beyond EOF (fsx -e EOF pollution) or left over from a prior,
+	 * smaller i_size -- persist and leak as valid data once i_size later
+	 * grows past the block (generic/363: fsx READ BAD DATA at the old EOF).
+	 * Plain block_write_begin does NOT do this zeroing (only cont_write_begin
+	 * / cont_expand_zero does, which ext4 uses).  Use briefs_zero_eof_tail,
+	 * NOT block_truncate_page: under delalloc the EOF block is typically
+	 * BH_Delay (unmapped), so block_truncate_page's create=0 get_block
+	 * returns unmapped and skips the zeroing -- exactly the fsx case.
+	 */
+	if (pos > i_size_read(mapping->host))
+		briefs_zero_eof_tail(mapping, i_size_read(mapping->host));
+
 	ret = block_write_begin(mapping, pos, len, foliop, gb);
 
 	/*
@@ -623,7 +699,7 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			{
 				struct timespec64 now;
 
-				ktime_get_real_ts64(&now);
+				now = current_time(inode);
 				inode->i_mtime_sec = now.tv_sec;
 				inode->i_mtime_nsec = now.tv_nsec;
 				inode->i_ctime_sec = now.tv_sec;
@@ -767,6 +843,23 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (new_size == old_size)
 		goto out_copy;
 
+	/* A size change updates mtime and ctime.  notify_change() populates
+	 * attr->ia_mtime/ia_ctime but, for a plain truncate, does NOT set the
+	 * ATTR_MTIME/ATTR_CTIME bits in ia_valid, so setattr_copy() (in the
+	 * out_copy epilogue, which these truncate paths bypass) would skip
+	 * them.  Set both to the same current_time() so ctime==mtime (the
+	 * ctime>=mtime invariant generic/423 checks) and mirror them into the
+	 * disk inode once here — every truncate path below persists/journals
+	 * &binfo->disk_inode, so they all pick up the new times.  This is the
+	 * generic/313 "update timestamps on truncate" expectation (cf. btrfs
+	 * 3972f26). */
+	{
+		struct timespec64 now = current_time(inode);
+		inode_set_mtime_to_ts(inode, now);
+		inode_set_ctime_to_ts(inode, now);
+		briefs_sync_inode_times(inode, &binfo->disk_inode);
+	}
+
 	if (new_size < old_size)
 		briefs_stat_inc(bsi, truncate_calls);
 
@@ -789,8 +882,56 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	 * extent_lock below as before and skip this pre-lock step.
 	 */
 	if (new_size < old_size &&
-	    !(binfo->disk_inode.flags & InodeFlagInlineData))
+	    !(binfo->disk_inode.flags & InodeFlagInlineData)) {
+		/* Zero and dirty the tail of the block containing new_size so the
+		 * stale bytes [new_size, end-of-block) persist as zeros on disk.
+		 * truncate_setsize() below zeroes that tail in the pagecache but
+		 * does NOT mark it dirty, so without this the retained tail block
+		 * keeps its pre-truncate data on disk; a later file extension that
+		 * spans the old EOF then reads back that stale content
+		 * (generic/363 EOF-pollution: TRUNCATE DOWN then WRITE-HOLE leaves
+		 * the gap non-zero).  Every block-based FS (ext2/ext3/minix/fat)
+		 * does exactly this block_truncate_page() before truncate_setsize().
+		 *
+		 * Under delalloc the block at new_size is typically BH_Delay (not
+		 * yet allocated), so block_truncate_page's create=0 get_block returns
+		 * unmapped and SKIPS the zeroing -- the exact case here (op 471
+		 * delalloc WRITE then op 472 TRUNCATE DOWN left the tail pattern,
+		 * read back stale after op 473 FALLOC EXTENDING).  briefs_zero_eof_tail
+		 * zeroes the cached delayed folio's tail directly first; the
+		 * block_truncate_page below then handles the allocated-block case
+		 * (read+zero+dirty) and is a no-op for the already-zeroed delayed
+		 * folio.  Called before extent_lock: briefs_get_block takes
+		 * extent_lock internally and is released before this returns, and
+		 * this does not wait on writeback (unlike truncate_setsize's
+		 * truncate_pagecache), so there is no AB-BA with the writeback path
+		 * described below. */
+		briefs_zero_eof_tail(inode->i_mapping, new_size);
+		ret = block_truncate_page(inode->i_mapping, new_size,
+					  briefs_get_block);
+		if (ret)
+			return ret;
 		truncate_setsize(inode, new_size);
+	}
+
+	/* Symmetric zeroing for a GROW (truncate-up): zero+dirty the tail of the
+	 * block containing old_size, [old_size, block_end).  That tail is beyond
+	 * the old EOF but inside the EOF block, so it may hold bytes written by an
+	 * mmap store past EOF (fsx -e EOF pollution) or stale content from a prior
+	 * smaller i_size; once truncate_setsize grows i_size past the block,
+	 * writeback's [i_size,block_end) zeroing no longer covers it and the stale
+	 * tail leaks as valid data (generic/363).  Use briefs_zero_eof_tail, NOT
+	 * block_truncate_page: under delalloc the old-EOF block may be BH_Delay
+	 * (unmapped), so block_truncate_page's create=0 get_block would skip it.
+	 * Inline-data grows manage their bytes directly under extent_lock below,
+	 * so they are excluded.  Pre-extent_lock for the same AB-BA reason as the
+	 * shrink path (briefs_get_block takes extent_lock internally); this helper
+	 * takes no locks and waits on no writeback.  Only the partial old-EOF block
+	 * needs this; whole-block gaps in [old_size,new_size) read as zeros. */
+	if (new_size > old_size &&
+	    !(binfo->disk_inode.flags & InodeFlagInlineData) &&
+	    (old_size & (BRIEFS_BLOCK_SIZE - 1)))
+		briefs_zero_eof_tail(inode->i_mapping, old_size);
 
 	/*
 	 * From this point on we may manipulate the extent list or the chain
@@ -1019,8 +1160,23 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 out_unlock:
 	mutex_unlock(&binfo->extent_lock);
 out_copy:
-	/* For non-size changes, just copy attributes */
+	/* For non-size changes (chown/chmod/etc), copy attributes into the VFS
+	 * inode AND mirror the VFS-derived fields into the in-memory disk inode.
+	 * briefs_write_inode syncs uid/gid/mode/nlink into the on-disk buffer, but
+	 * it does NOT write them back to binfo->disk_inode, so without this mirror
+	 * any later operation that journals from binfo->disk_inode (a directory
+	 * create/unlink/rename inside this inode, a punch, etc.) would emit a STALE
+	 * uid/gid/mode/nlink -- and the last such journal record before a crash
+	 * wins on replay, losing the chown (generic/547: a chown'd directory's
+	 * uid/gid reverted to 0 after crash+replay because a later child create
+	 * re-journaled the parent from the stale in-memory disk inode).
+	 */
 	setattr_copy(idmap, inode, attr);
+	binfo->disk_inode.filemode = inode->i_mode;
+	binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
+	binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);
+	binfo->disk_inode.nlinks = inode->i_nlink;
+	briefs_sync_inode_times(inode, &binfo->disk_inode);
 	mark_inode_dirty(inode);
 	return 0;
 }
@@ -1252,7 +1408,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 		}
 
 		if (changed) {
-			ktime_get_real_ts64(&now);
+			now = current_time(inode);
 			inode->i_mtime_sec = now.tv_sec;
 			inode->i_mtime_nsec = now.tv_nsec;
 			inode->i_ctime_sec = now.tv_sec;
@@ -1553,7 +1709,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 	 * Hole punching changes both mtime and ctime.
 	 */
 	if (changed) {
-		ktime_get_real_ts64(&now);
+		now = current_time(inode);
 		inode->i_mtime_sec = now.tv_sec;
 		inode->i_mtime_nsec = now.tv_nsec;
 		inode->i_ctime_sec = now.tv_sec;
@@ -1709,15 +1865,30 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 				ret = briefs_append_extent_nojournal(inode->i_sb,
 								     &binfo->disk_inode,
 								     &ext);
-				if (ret) {
+				if (ret == -EEXIST) {
+					/*
+					 * A concurrent writer mapped part of this
+					 * run after our unlocked briefs_block_mapped
+					 * check.  Free the run and retry block-by-
+					 * block via the per-block fallback below,
+					 * which skips the now-mapped block(s) on
+					 * their own -EEXIST.
+					 */
 					for (j = 0; j < run_len; j++)
 						briefs_free_block(&bsi->alloc,
 								  rel_run + j);
-					goto falloc_loop_done;
+					/* fall through to per-block fallback */
+				} else {
+					if (ret) {
+						for (j = 0; j < run_len; j++)
+							briefs_free_block(&bsi->alloc,
+									  rel_run + j);
+						goto falloc_loop_done;
+					}
+					changed = true;
+					blk += run_len;
+					continue;
 				}
-				changed = true;
-				blk += run_len;
-				continue;
 			}
 		}
 
@@ -1744,6 +1915,13 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 			ret = briefs_append_extent_nojournal(inode->i_sb,
 							     &binfo->disk_inode,
 							     &ext);
+			if (ret == -EEXIST) {
+				/* Block mapped by a concurrent writer after our
+				 * unlocked check; skip it (already allocated by
+				 * the racer). */
+				briefs_free_block(&bsi->alloc, rel);
+				continue;
+			}
 			if (ret) {
 				briefs_free_block(&bsi->alloc, rel);
 				goto falloc_loop_done;
@@ -1755,6 +1933,17 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 falloc_loop_done:
 
 	if (!(mode & FALLOC_FL_KEEP_SIZE) && end > inode->i_size) {
+		/* Zero the tail of the old-EOF block before growing i_size past
+		 * it.  A mid-block EOF block is delalloc (BH_Delay, possibly
+		 * mmap-polluted by fsx -e pollute_eofpage); left unzeroed, its
+		 * stale tail persists and leaks as valid data once i_size
+		 * advances past the block (generic/363: FALLOC PAST_EOF after a
+		 * mid-block MAPWRITE).  filemap_write_and_wait_range above only
+		 * flushed [offset,end); the old-EOF block lies before offset, so
+		 * it is still a cached delayed folio here -- briefs_zero_eof_tail
+		 * zeroes its tail directly. */
+		if (inode->i_size & (BRIEFS_BLOCK_SIZE - 1))
+			briefs_zero_eof_tail(inode->i_mapping, inode->i_size);
 		inode->i_size = end;
 		binfo->disk_inode.filesize = end;
 		changed = true;
@@ -1770,7 +1959,7 @@ falloc_loop_done:
 
 out_update:
 	if (changed) {
-		ktime_get_real_ts64(&now);
+		now = current_time(inode);
 		inode->i_ctime_sec = now.tv_sec;
 		inode->i_ctime_nsec = now.tv_nsec;
 		if (grew_size) {

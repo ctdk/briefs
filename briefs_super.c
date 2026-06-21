@@ -182,10 +182,41 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 	 * every conversion preserves nanoseconds, so match that granularity here.
 	 * The inherited default (NSEC_PER_SEC = 1 s) truncates the generic VFS
 	 * timestamp updates (atime/mtime/ctime via current_time()) to whole
-	 * seconds, while BrieFS's own write sites (new inode, punch, fallocate)
-	 * already store full ns via ktime_get_real_ts64 — s_time_gran = 1 makes
-	 * the two consistent. ext4/xfs/btrfs/f2fs use the same value. */
+	 * seconds; s_time_gran = 1 keeps sub-second resolution. All BrieFS time
+	 * writes use current_time() (the same coarse clock the VFS uses in
+	 * notify_change/file_update_time) so a BrieFS-set time can never run
+	 * ahead of a later VFS-set time -- mixing current_time() (coarse) with
+	 * ktime_get_real_ts64() (fine) let a post-create chmod record a ctime
+	 * nominally before the fine-grained creation mtime (generic/423).
+	 * ext4/xfs/btrfs/f2fs use the same value. */
 	sb->s_time_gran = 1;
+
+	/* Drop every inode the replay pass cached.
+	 *
+	 * Journal replay applies records in commit order, but a directory-add
+	 * record (replay_dir_update) must iget() the *parent* to operate on its
+	 * trie, and that iget happens BEFORE the parent's own inode_full/inode_update
+	 * record is replayed.  The iget therefore reads the parent's pre-update
+	 * on-disk state and caches it; the subsequent inode_full write updates the
+	 * on-disk inode block (sync_dirty_buffer) but leaves the cached VFS inode
+	 * stale -- most importantly nlinks, which the cached copy never sees
+	 * bumped.  fill_super's briefs_iget(root) below would then return that stale
+	 * cached root, and across crash-remount mkdir/rmdir cycles root's nlink
+	 * never advanced (2->2->2->1->1->1->0), eventually hitting 0 on umount and
+	 * freeing root's inode slot -> the shared inode-table block (ino 1/2/3)
+	 * gets zeroed, and the next mount cannot iget root (generic/321 subtest 3).
+	 *
+	 * evict_inodes() is the standard umount-style sweep: it disposes every
+	 * i_count==0, non-I_NEW inode on sb->s_inodes.  All replay-cached parents
+	 * are unreferenced (replay_dir_update iput()s them) and not I_DIRTY (the
+	 * replay path persists inode blocks via sync_dirty_buffer, not
+	 * mark_inode_dirty), so eviction is lossless -- the synced inode blocks
+	 * live in the block device's buffer cache, not the inode mappings, and the
+	 * root iget below re-reads the now-correct nlinks.  SB_ACTIVE remains set;
+	 * it only governed the during-replay iput() path (see the comment above),
+	 * not this post-replay sweep.
+	 */
+	evict_inodes(sb);
 
 	root_inode = briefs_iget(sb, _BRIEFS_ROOT_INO);
 	if (IS_ERR(root_inode)) {
