@@ -60,8 +60,16 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 	target = ctx->pos - 2;
 
 	/* If the iterator is not positioned at `target` (telldir/seekdir to a
-	 * non-linear offset, or a rewind), re-initialize and skip forward. */
-	if (target != iter->emit_idx) {
+	 * non-linear offset, or a rewind), re-initialize and skip forward.
+	 * Also re-initialize when the cached iterator's generation is stale:
+	 * rewinddir(3) lseeks to offset 0, so target == emit_idx == 0 and the
+	 * index check alone would skip the re-init, but the directory may have
+	 * grown between the opendir(3) and the rewinddir(3) (each add/remove
+	 * bumps binfo->trie_gen).  Reusing the stale iterator would then hit
+	 * the gen mismatch in briefs_trie_iter_next (-ESTALE) and return a
+	 * short read with no real entries (generic/471: POSIX requires that
+	 * names added before rewinddir be returned by subsequent readdir). */
+	if (target != iter->emit_idx || iter->gen != binfo->trie_gen) {
 		char skip_name[BRIEFS_NAME_LEN + 1];
 		u64 k, skip = target;
 		int skip_len;
