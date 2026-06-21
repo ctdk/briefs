@@ -177,6 +177,28 @@ int briefs_add_dir_entry(struct inode *dir, const char *name, size_t name_len, u
 			mutex_unlock(&binfo->trie_lock);
 			return ret;
 		}
+		/*
+		 * Pin the freshly allocated trie root in the journal BEFORE any
+		 * JRN_DIR_UPDATE record that will insert into it.  Replay applies
+		 * INODE_FULL records in journal order, and the DIR_UPDATE record
+		 * does not carry the trie root -- replay derives it from the
+		 * parent's most-recent INODE_FULL.  If the root is journaled only
+		 * after the DIR_ADD (as update_parent_dir does later), then on
+		 * replay the entry is inserted into the parent's previously
+		 * journaled (stale) root and the later INODE_FULL then repoints
+		 * the dir at the new root, orphaning the entry (generic/640: mkdir
+		 * created+journaled a root it never persisted to the inode block,
+		 * drop_caches lost it, and a later rename allocated a different
+		 * root).  Replaying INODE_FULL is idempotent, so the redundant
+		 * record later written by update_parent_dir() is harmless.
+		 */
+		{
+			struct briefs_disk_inode disk_di;
+
+			briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
+			briefs_journal_inode_full(briefs_sb(dir->i_sb)->journal,
+						 dir->i_ino, &disk_di);
+		}
 	}
 
 	ret = briefs_trie_insert(dir->i_sb, &binfo->disk_inode,
