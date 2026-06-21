@@ -1279,6 +1279,9 @@ int briefs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 		if (i + 1 == snap_total)
 			flags |= FIEMAP_EXTENT_LAST;
 
+		if (arr[i].flags & BRIEFS_EXT_UNWRITTEN)
+			flags |= FIEMAP_EXTENT_UNWRITTEN;
+
 		ret = fiemap_fill_next_extent(fieinfo, logical,
 			arr[i].phys << BRIEFS_BLOCK_SHIFT, ext_bytes, flags);
 		if (ret < 0)
@@ -1861,7 +1864,7 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 				ext.offset = blk;
 				ext.phys = phys_run;
 				ext.len = run_len;
-				ext.flags = 0;
+				ext.flags = BRIEFS_EXT_UNWRITTEN;
 				ret = briefs_append_extent_nojournal(inode->i_sb,
 								     &binfo->disk_inode,
 								     &ext);
@@ -1910,7 +1913,7 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 			ext.offset = blk + i;
 			ext.phys = phys;
 			ext.len = 1;
-			ext.flags = 0;
+			ext.flags = BRIEFS_EXT_UNWRITTEN;
 
 			ret = briefs_append_extent_nojournal(inode->i_sb,
 							     &binfo->disk_inode,

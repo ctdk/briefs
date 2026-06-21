@@ -168,6 +168,24 @@ Each extent record is 32 bytes, stored little endian on disk
      28       4   pad
 .fi
 .PP
+.SS Extent flags
+The
+.B flags
+field at offset 24 currently defines one bit:
+.TP
+.B 0x00000001
+Unwritten \- the extent was allocated by
+.BR fallocate (2)
+but has not yet been written to.  Its blocks are zeroed at allocation time, so
+reads return zeros, but the extent is reported as
+.B FIEMAP_EXTENT_UNWRITTEN
+by
+.BR fiemap (2)
+until a write converts it (clearing the bit).  A write into any block of an
+unwritten extent converts the whole extent to written in place (no split); the
+blocks are already zeroed, so this only changes the reported state, not the
+data.  The remaining bits are reserved.
+.PP
 An inode may store up to 8 extents inline.  When a file grows beyond 8
 extents, the inline extents are migrated into a B+ tree extent index, the
 InodeFlagIndexed bit is set, and

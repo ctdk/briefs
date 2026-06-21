@@ -121,6 +121,50 @@ int briefs_inode_lookup_iblock(struct super_block *sb,
 }
 
 /*
+ * briefs_clear_extent_unwritten - convert the unwritten extent covering
+ * @iblock to written (clear BRIEFS_EXT_UNWRITTEN, in place -- no split, no
+ * block free).  Called by the write paths (briefs_get_block /
+ * briefs_get_block_write) when a write targets a previously-fallocated
+ * (unwritten) extent, so a subsequent fiemap reports it as written data
+ * instead of unwritten.  Caller MUST hold binfo->extent_lock.  Returns 0 if an
+ * extent covered @iblock (converted or already written), -ENOENT if none.
+ *
+ * For inline-only inodes the flag lives in binfo->disk_inode.inline_extents[],
+ * mutated under extent_seq (mirroring briefs_btree_insert_locked) and
+ * persisted by briefs_write_inode's INODE_FULL snapshot.  For tree-backed
+ * inodes the leaf record is updated on disk (briefs_btree_clear_unwritten).
+ */
+int briefs_clear_extent_unwritten(struct inode *inode, u64 iblock)
+{
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct briefs_inode *di = &binfo->disk_inode;
+
+	if (di->flags & InodeFlagIndexed)
+		return briefs_btree_clear_unwritten(inode->i_sb, di, iblock);
+
+	{
+		int k, n = di->num_extents_inline;
+
+		if (n > 8)
+			n = 8;
+		for (k = 0; k < n; k++) {
+			struct briefs_extent *e = &di->inline_extents[k];
+
+			if (iblock >= e->offset && iblock < e->offset + e->len) {
+				if (e->flags & BRIEFS_EXT_UNWRITTEN) {
+					write_seqcount_begin(&binfo->extent_seq);
+					e->flags &= ~BRIEFS_EXT_UNWRITTEN;
+					write_seqcount_end(&binfo->extent_seq);
+					mark_inode_dirty(inode);
+				}
+				return 0;
+			}
+		}
+		return -ENOENT;
+	}
+}
+
+/*
  * briefs_append_extent - insert an extent into the index.  Takes the per-inode
  * extent lock and calls the locked tree/inline mutator.  This is the entry
  * point for callers that are not already holding the lock.  Returns 0 or
@@ -263,6 +307,16 @@ int briefs_get_block(struct inode *inode, sector_t iblock,
 	/* Look up iblock in the snapped extent view (unlocked: verify CRCs). */
 	ret = briefs_inode_lookup_iblock(inode->i_sb, binfo, (u64)iblock, &ext, false);
 	if (ret == 0) {
+		/*
+		 * A write into a previously-fallocated (unwritten) extent must
+		 * convert it to written so a later fiemap reports data, not
+		 * unwritten.  Defer to the locked path, which re-looks-up under
+		 * extent_lock and clears BRIEFS_EXT_UNWRITTEN before mapping.
+		 * Reads (create == 0) and overwrites of already-written extents
+		 * map the block directly.
+		 */
+		if (create && (ext.flags & BRIEFS_EXT_UNWRITTEN))
+			goto locked_create;
 		phys = ext.phys + ((u64)iblock - ext.offset);
 		map_bh(bh_result, inode->i_sb, phys);
 		return 0;
@@ -300,6 +354,8 @@ locked_create:
 	 * torn a buffer we cached under this same lock). */
 	ret = briefs_inode_lookup_iblock(inode->i_sb, binfo, (u64)iblock, &ext, true);
 	if (ret == 0) {
+		if (ext.flags & BRIEFS_EXT_UNWRITTEN)
+			briefs_clear_extent_unwritten(inode, (u64)iblock);
 		phys = ext.phys + ((u64)iblock - ext.offset);
 		map_bh(bh_result, inode->i_sb, phys);
 		mutex_unlock(&binfo->extent_lock);
@@ -421,9 +477,35 @@ int briefs_get_block_write(struct inode *inode, sector_t iblock,
 	/* Unlocked lookup (verify CRCs): a hit means the block is already mapped. */
 	ret = briefs_inode_lookup_iblock(inode->i_sb, binfo, (u64)iblock, &ext, false);
 	if (ret == 0) {
-		phys = ext.phys + ((u64)iblock - ext.offset);
-		map_bh(bh_result, inode->i_sb, phys);
-		return 0;
+		/*
+		 * A write into a previously-fallocated (unwritten) extent must
+		 * convert it to written here: writeback does NOT re-call get_block
+		 * for a buffer this path already mapped, so deferring conversion to
+		 * briefs_get_block would never fire and fiemap would keep reporting
+		 * unwritten after the data was written.  Take extent_lock, re-look-up
+		 * under it, clear BRIEFS_EXT_UNWRITTEN, and map.  Reads and overwrites
+		 * of already-written extents map directly with no lock.
+		 */
+		if (create && (ext.flags & BRIEFS_EXT_UNWRITTEN)) {
+			mutex_lock(&binfo->extent_lock);
+			ret = briefs_inode_lookup_iblock(inode->i_sb, binfo,
+							 (u64)iblock, &ext, true);
+			if (ret == 0) {
+				if (ext.flags & BRIEFS_EXT_UNWRITTEN)
+					briefs_clear_extent_unwritten(inode,
+								      (u64)iblock);
+				phys = ext.phys + ((u64)iblock - ext.offset);
+				map_bh(bh_result, inode->i_sb, phys);
+				mutex_unlock(&binfo->extent_lock);
+				return 0;
+			}
+			mutex_unlock(&binfo->extent_lock);
+			/* Mappings don't vanish under us; fall through to defer. */
+		} else {
+			phys = ext.phys + ((u64)iblock - ext.offset);
+			map_bh(bh_result, inode->i_sb, phys);
+			return 0;
+		}
 	}
 	/* -ENOENT or -EIO (torn read): treat as not-yet-mapped and defer.  A
 	 * spurious -EIO here is harmless: the writeback-time get_block re-lookup

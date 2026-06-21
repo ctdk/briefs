@@ -271,6 +271,14 @@ struct briefs_disk_extent {
 #define InodeFlagIndexed     0x00000004
 #define InodeFlagInlineData  0x00000008
 
+/* briefs_extent / briefs_disk_extent .flags bits.  Currently only one is
+ * defined: an extent allocated by fallocate() that has not yet been written
+ * to.  Its blocks are zeroed on allocation, so reads return zeros and no
+ * read-path change is needed, but the flag lets fiemap report the extent as
+ * FIEMAP_EXTENT_UNWRITTEN.  A write into the extent converts it (clears the
+ * bit) so a subsequent fiemap reports it as written data. */
+#define BRIEFS_EXT_UNWRITTEN 0x00000001u
+
 /* Inode - 512 bytes (in-memory, CPU endian) */
 struct briefs_inode {
 	__u64 inode_number;
@@ -953,6 +961,12 @@ int briefs_read_extent(struct super_block *sb, struct briefs_inode *di, int inde
  * read/checksum failure. */
 int briefs_inode_lookup_iblock(struct super_block *sb, struct briefs_inode_info *binfo,
 			       u64 iblock, struct briefs_extent *ext, bool trust_verified);
+
+/* Convert the unwritten extent covering @iblock to written (clear
+ * BRIEFS_EXT_UNWRITTEN in place).  Caller holds binfo->extent_lock.  Returns 0
+ * if an extent covered @iblock, -ENOENT otherwise. */
+int briefs_clear_extent_unwritten(struct inode *inode, u64 iblock);
+
 int briefs_append_extent(struct super_block *sb, struct briefs_inode *di, struct briefs_extent *ext);
 int briefs_append_extent_nojournal(struct super_block *sb, struct briefs_inode *di,
                                     struct briefs_extent *ext);
@@ -1017,6 +1031,15 @@ void briefs_btree_free_nodes_only(struct super_block *sb, struct briefs_inode *d
  * the journal snapshot ordering (must run before JRN_INODE_FULL). Bounded by
  * @max_nodes as a guard against corrupt/cyclic trees. */
 void briefs_btree_drain(struct super_block *sb, u64 root_block, u64 max_nodes);
+
+/* Clear BRIEFS_EXT_UNWRITTEN on the tree-backed extent covering @iblock (an
+ * in-place flag update on the leaf record -- no split, no block free).  The
+ * extent's blocks are kept and its length unchanged; only the unwritten bit is
+ * cleared.  Caller holds extent_lock.  Returns 0 if the extent was found and
+ * converted, -ENOENT if no extent covers @iblock, -EIO on a read failure.
+ * No-op (returns -ENOENT) for inline-only inodes (handled by the caller). */
+int briefs_btree_clear_unwritten(struct super_block *sb, struct briefs_inode *di,
+				 u64 iblock);
 
 /* Disk inode I/O helpers (briefs_inode.c) */
 struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,

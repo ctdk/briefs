@@ -198,6 +198,67 @@ int briefs_btree_lookup(struct super_block *sb, u64 root_block, u64 iblock,
 	return btree_lookup_block(sb, root_block, iblock, ext, trust_verified);
 }
 
+/* Descend to the leaf covering @iblock and clear BRIEFS_EXT_UNWRITTEN on the
+ * matching extent record in place (no split, no block free).  Caller holds
+ * extent_lock, so we may read nodes with trust_verified=true.  Returns 0 if
+ * converted, -ENOENT if no extent covers @iblock, -EIO on a read failure. */
+static int btree_clear_unwritten_block(struct super_block *sb, u64 block,
+					u64 iblock)
+{
+	struct buffer_head *bh;
+	struct briefs_extent_btree_node *node;
+	int ret;
+
+	node = btree_read_node(sb, block, true, &bh);
+	if (!node)
+		return -EIO;
+
+	if (btree_node_is_leaf(node)) {
+		int i, num_keys = le16_to_cpu(node->hdr.num_keys);
+
+		for (i = 0; i < num_keys; i++) {
+			struct briefs_disk_extent *de = &node->u.leaf.extents[i];
+			u64 off = le64_to_cpu(de->offset);
+			u64 len = le64_to_cpu(de->len);
+
+			if (iblock >= off && iblock < off + len) {
+				if (le32_to_cpu(de->flags) & BRIEFS_EXT_UNWRITTEN) {
+					de->flags = cpu_to_le32(
+						le32_to_cpu(de->flags) &
+						~BRIEFS_EXT_UNWRITTEN);
+					btree_commit_node(bh);
+				}
+				brelse(bh);
+				return 0;
+			}
+			if (off > iblock)
+				break;	/* sorted: no later extent can cover it */
+		}
+		brelse(bh);
+		return -ENOENT;
+	}
+
+	{
+		int p = btree_internal_find_child(node, iblock);
+		u64 child = (p < le16_to_cpu(node->hdr.num_keys))
+			    ? le64_to_cpu(node->u.internal.idx[p].child)
+			    : le64_to_cpu(node->u.internal.trailing_child);
+		brelse(bh);
+		if (child == 0)
+			return -EIO;
+		ret = btree_clear_unwritten_block(sb, child, iblock);
+		return ret;
+	}
+}
+
+int briefs_btree_clear_unwritten(struct super_block *sb, struct briefs_inode *di,
+				 u64 iblock)
+{
+	if (!(di->flags & InodeFlagIndexed) || di->extent_inline_base == 0)
+		return -ENOENT;
+	return btree_clear_unwritten_block(sb, di->extent_inline_base, iblock);
+}
+
 /* ---------- insertion ---------- */
 
 /* Absorb a child split into parent @node_bh at child position @p. The separator
