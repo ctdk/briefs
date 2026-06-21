@@ -21,7 +21,7 @@ The basic layout is:
 .nf
     Block 0              Superblock (1024 bytes; rest of block reserved)
     Block 1..N           Inode table
-    Next region(s)        Inode bitmap, data allocator structures (EAT)
+    Next region(s)        Inode bitmap pyramid, data-block bitmap pyramid
     Data region          File data blocks, directory-trie pages, B-tree nodes
     End of volume        Journal ring
 .fi
@@ -98,6 +98,9 @@ Each inode is 512 bytes.  Inode 1 is the root directory; inode 2 is reserved as
 the bad-inode marker.  The inode table is stored starting at the block given
 by
 .BR inode_table_offset .
+Inode records are stored little endian on disk
+(as
+.BR "struct briefs_disk_inode" ).
 An inode record contains:
 .PP
 .nf
@@ -138,6 +141,12 @@ or 256 bytes of inline file data / symlink target.  Which interpretation is
 valid depends on the file type and inode flags.
 .SS Inode flags
 .TP
+.B 0x00000001
+InodeFlagReserved \- reserved.
+.TP
+.B 0x00000002
+InodeFlagCompressed \- defined but unused in v0.9.2.
+.TP
 .B 0x00000004
 InodeFlagIndexed \- the inode uses a B+ tree extent index for its extents.
 .TP
@@ -146,7 +155,9 @@ InodeFlagInlineData \- the inline region stores file data rather than extents.
 .PP
 The remaining bits are reserved.
 .SH EXTENTS
-Each extent record is 32 bytes:
+Each extent record is 32 bytes, stored little endian on disk
+(as
+.BR "struct briefs_disk_extent" ):
 .PP
 .nf
     Offset  Size  Field
@@ -171,7 +182,8 @@ B+ tree nodes are exactly one block in size.  The node header is 24 bytes:
       4       4   flags          bit 0 = leaf
       8       2   level          0 = leaf
      10       2   num_keys
-     12       8   next_leaf      leaf nodes only; 0 if none
+     12       4   reserved       padding before the aligned next_leaf
+     16       8   next_leaf      leaf nodes only; 0 if none
 .fi
 .PP
 Leaf nodes contain up to 126 extent records, followed by 24 padding bytes,
@@ -183,7 +195,17 @@ Directories store their entries in trie structures.  In the current on-disk
 format (v0.7.0 and later), trie nodes are packed into 4 KiB pages allocated
 from the data-block region.
 .SS Packed trie page
-Each page starts with a 20-byte header and then provides 64 node slots.
+Each page starts with a 20-byte header and then provides 64 node slots:
+.PP
+.nf
+    Offset  Size  Field
+      0       4   magic           0x54524E50 ("TRNP")
+      4       4   version         1
+      8       2   live_count      number of allocated slots
+     10       2   free_name_off   bytes of name heap used, from end of block
+     12       8   free_slots      bitmap of free slots (bit i set == free)
+.fi
+.PP
 Names are stored in a heap that grows upward from the end of the block toward
 the slot array.  Node references are encoded as:
 .PP
@@ -194,18 +216,21 @@ the slot array.  Node references are encoded as:
 A reference value of 0 means "null".  Slot 0 of each page is the root node
 for that page.  The page magic is 0x54524E50 ("TRNP").
 .SS Trie node
-Each packed trie node is 48 bytes:
+Each packed trie node is 36 bytes:
 .PP
 .nf
     Offset  Size  Field
-      0       8   flags
-      8       8   node_type
-     16       8   f_type
-     24       8   first_child
-     32       8   next_sibling
-     40       4   name_offset      offset into page name heap
-     44       2   name_len
-     46       2   _pad
+      0       8   first_child      node reference, or 0 if none
+      8       8   next_sibling     node reference, or 0 if none
+     16       8   inode            inode number (leaf entries; 0 otherwise)
+     24       2   name_len         full name length + 2-byte prefix, or 0 if free
+     26       2   name_offset      offset from block end to name bytes, or 0 if free
+     28       1   depth            depth in trie (0 = root)
+     29       1   node_type        NODE_TYPE_* value
+     30       1   byte_val         the byte value this node represents
+     31       1   f_type           file type for leaf entries (S_IFMT >> 12)
+     32       2   flags            NODE_FLAG_* value
+     34       2   child_count      number of children
 .fi
 .SS Node types
 .TP
@@ -226,10 +251,37 @@ The
 field in a directory inode holds the packed node reference of the directory's
 trie root.
 .SH ALLOCATION
-Inodes are allocated from a bitmap pyramid rooted at
+Inodes and data blocks are each tracked by a three-level bitmap pyramid
+(see
+.BR "struct briefs_alloc"
+in
+.BR briefs_alloc.h ).
+A pyramid is rooted at a pool block and begins with a 48-byte
+.BR alloc_pool_header :
+.PP
+.nf
+    Offset  Size  Field
+      0       4   magic            ALLOC_MAGIC
+      4       4   version          1
+      8       8   l0_words         number of u64 words in level 0
+     16       8   l1_words         number of u64 words in level 1
+     24       8   l2_words         number of u64 words in level 2
+     32       8   block_count      total blocks tracked
+     40       8   free_count       total free blocks
+.fi
+.PP
+The inode-allocator pyramid is rooted at the block given by
 .BR inode_bitmap_offset .
-Data blocks are tracked by an extent allocator tree (EAT) stored at
-.BR eat_offset .
+The data-block allocator pyramid is rooted at the block given by
+.BR trie_node_pool_start
+(and sized by
+.BR trie_node_pool_size );
+the kernel mount path reads its pool header from there.  The superblock fields
+.BR eat_offset
+and
+.BR eat_blocks
+are legacy and are not read by the kernel.
+.PP
 Directory-trie pages, B-tree nodes, and file-data blocks all come from the
 single data-block region.
 .SH JOURNAL
@@ -290,10 +342,17 @@ JRN_SYMLINK_DATA
 .B 11
 JRN_END
 .PP
-A checkpoint record stores the current log sequence, trie root,
-free-data-block count, and free-inode count, allowing replay to establish a
-consistent mount state.  The journal ring skips the last block to avoid
-wrapping ambiguity.
+A checkpoint record (JRN_CHECKPOINT) stores the checkpoint sequence, the
+record count, the end of the live log sequence, the trie root, the free
+data-block count, and the free-inode count, allowing replay to establish a
+consistent mount state.  The checkpoint record is written to a dedicated
+checkpoint block that is distinct from the ordinary journal-block stream: that
+block carries magic
+.B 0x43485053
+("CHPS")
+.RB ( CHECKPOINT_MAGIC ),
+rather than the JNLZ journal-block magic.  The journal ring skips this last
+block (the checkpoint block) to avoid wrapping ambiguity.
 .SH CHECKSUMS
 BrieFS uses CRC32C for metadata integrity:
 .IP \(bu 2
@@ -304,6 +363,74 @@ Journal block payloads are checksummed as part of their records.
 B+ tree extent-index nodes carry a CRC32C at byte 4080 covering bytes 0\-4079.
 .IP \(bu 2
 Directory-trie pages have their own checksum field in the page header.
+.SH LIMITS
+The on-disk fields are wide, so the binding limits are mostly VFS ceilings or
+allocator/encoding widths rather than the disk types themselves.
+.PP
+.IP \(bu 2
+Block size: effectively fixed at 4096 bytes.
+.B mkfs.briefs
+accepts
+.B \-b
+with any power of two, but the kernel module hardcodes
+.BR sb_set_blocksize ( sb , 4096 )
+and the on-disk layout assumes 4096 throughout; only 4096 actually mounts.
+.IP \(bu 2
+File size: the VFS ceiling
+.BR MAX_LFS_FILESIZE
+(2^63\-1 bytes on 64-bit, \[ti]8 EiB), set as
+.IR s_maxbytes .
+The allocator returns ENOSPC long before this binds for any real volume.
+Inline data is at most 256 bytes; a file uses up to 8 inline extents before
+spilling into the B+ tree extent index.
+.IP \(bu 2
+Volume size: directory-trie node references encode the block number in the top
+58 bits of a 64-bit word
+.RB ( block " << " 6 " | " slot ),
+so the practical ceiling is 2^58 blocks, i.e. 2^58 \[mu] 4096 = 2^70 bytes
+(\[ti]1 ZiB). The on-disk
+.I total_blocks
+is a full 64-bit field (2^64 blocks theoretical), and
+.B mkfs.briefs
+imposes no upper cap, only a minimum.
+.IP \(bu 2
+Directories: there is no per-directory entry cap (no ext2-style 32000 limit).
+A trie page holds 64 nodes per 4 KiB and chains on demand, bounded only by free
+space. Entry names are limited to
+.B NAME_MAX
+(255 bytes).
+.IP \(bu 2
+Hard links: the on-disk link count is a 32-bit field (\[ti]4.29\[mu]10^9),
+well beyond the VFS
+.B LINK_MAX
+(65000).
+A directory's link count is 2 plus its subdirectory count.
+.IP \(bu 2
+Symbolic links: targets up to 256 bytes are stored inline in the inode; longer
+targets use ordinary data extents, up to the file-size limit above.
+.IP \(bu 2
+Inodes: the inode number is a 64-bit field.
+.B mkfs.briefs
+provisions one inode per
+.IR inode-ratio
+blocks (default 8, minimum 100), so a freshly made filesystem has
+totalBlocks / inode-ratio inodes available.
+.IP \(bu 2
+Timestamps: on disk, 64-bit seconds plus 64-bit nanoseconds, at 1 ns granularity
+.RB ( s_time_gran = 1 ).
+BrieFS does not set
+.I s_time_min
+or
+.IR s_time_max ,
+so the VFS defaults apply
+.RB ( TIME64_MIN " to " TIME64_MAX ,
+\[+-](2^63\[mi]1) seconds from the epoch, \[ti]\[+-]292 billion years).
+BrieFS never clamps timestamps, so values outside the representable range are
+rejected by the VFS rather than silently wrapped.
+.IP \(bu 2
+Journal: a fixed-size metadata-only ring, 64 blocks by default
+.RB ( \-j ),
+with a separate checkpoint block. There is no data journaling.
 .SH LIMITATIONS
 The following are intentionally not implemented in v0.9.2:
 .PP

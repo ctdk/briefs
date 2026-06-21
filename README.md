@@ -116,6 +116,21 @@ DEFINITELY MISSING OR BROKEN
 * Thorough annotations - Annotating the source code thoroughly will wait until things settle down. Right now everything's still in constant flux, so there's no point thoroughly annotating something that may change unrecognizably or flat out disappear soon.
 * Refactoring. Since BrieFS is partly a project to learn about using AI assistance while coding, even though I've been reviewing what it's doing there's definitely some weirdness and clunkiness that needs to be gussied up and organized so it's easier to understand. This will go nicely hand in hand with the annotation project above.
 
+LIMITS
+------
+
+Where the on-disk fields are wide enough that they aren't the binding constraint, the practical limits come from the VFS ceilings or from allocator/encoding widths:
+
+* **Block size** is effectively fixed at 4096 bytes. `mkfs.briefs -b` accepts any power of two, but the kernel module hardcodes `sb_set_blocksize(sb, 4096)` and the on-disk layout assumes 4096 throughout, so only 4096 actually mounts.
+* **File size** is bounded by the VFS ceiling `MAX_LFS_FILESIZE` (2^63−1 bytes on 64-bit, ~8 EiB), set as `s_maxbytes`. The allocator returns ENOSPC long before this binds on any real volume. Inline data is at most 256 bytes, and a file uses up to 8 inline extents before spilling into the B+ tree extent index.
+* **Volume size** is limited by directory-trie node references, which encode the block number in the top 58 bits of a 64-bit word (`block << 6 | slot`). That gives a practical ceiling of 2^58 blocks, i.e. 2^58 × 4096 = 2^70 bytes (~1 ZiB). The on-disk `total_blocks` is a full 64-bit field (2^64 blocks theoretical), and `mkfs.briefs` imposes no upper cap, only a minimum.
+* **Directories** have no per-directory entry cap (no ext2-style 32000 limit). A trie page holds 64 nodes per 4 KiB and chains on demand, bounded only by free space. Entry names are limited to `NAME_MAX` (255 bytes).
+* **Hard links**: the on-disk link count is a 32-bit field (~4.29×10^9), well beyond the VFS `LINK_MAX` (65000). A directory's link count is 2 plus its subdirectory count.
+* **Symbolic links**: targets up to 256 bytes are stored inline in the inode; longer targets use ordinary data extents, up to the file-size limit.
+* **Inodes**: the inode number is a 64-bit field. `mkfs.briefs` provisions one inode per `inode-ratio` blocks (default 8, minimum 100), so a freshly made filesystem has `totalBlocks / inode-ratio` inodes available.
+* **Timestamps**: on disk, 64-bit seconds plus 64-bit nanoseconds, at 1 ns granularity (`s_time_gran = 1`). BrieFS does not set `s_time_min`/`s_time_max`, so the VFS defaults apply (`TIME64_MIN` … `TIME64_MAX`, ±(2^63−1) seconds from the epoch, ~±292 billion years). BrieFS never clamps timestamps, so values outside the representable range are rejected by the VFS rather than silently wrapped.
+* **Journal**: a fixed-size metadata-only ring, 64 blocks by default (`mkfs.briefs -j`), with a separate checkpoint block. There is no data journaling.
+
 LICENSE
 -------
 
