@@ -1075,8 +1075,8 @@ int briefs_update_parent_dir(struct inode *dir, struct briefs_sb_info *bsi,
                               ssize_t size_delta, int link_delta);
 
 /* New inode creation helpers (briefs_inode.c) */
-struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
-                                umode_t mode, dev_t rdev);
+struct inode *briefs_new_inode(struct mnt_idmap *idmap, struct inode *dir,
+                                struct dentry *dentry, umode_t mode, dev_t rdev);
 int briefs_finish_create(struct inode *dir, struct dentry *dentry,
                           struct inode *inode, int link_delta);
 void briefs_create_abort(struct super_block *sb, struct inode *dir,

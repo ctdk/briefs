@@ -175,8 +175,8 @@ int briefs_update_parent_dir(struct inode *dir, struct briefs_sb_info *bsi,
  * the parent — the caller must finish with briefs_finish_create().  Returns
  * the new inode, or an ERR_PTR on failure.
  */
-struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
-                                umode_t mode, dev_t rdev)
+struct inode *briefs_new_inode(struct mnt_idmap *idmap, struct inode *dir,
+                                struct dentry *dentry, umode_t mode, dev_t rdev)
 {
 	struct briefs_sb_info *bsi = dir->i_sb->s_fs_info;
 	struct inode *inode;
@@ -213,9 +213,16 @@ struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
 	memset(&binfo->disk_inode, 0, sizeof(struct briefs_inode));
 	binfo->inode_number = ino;
 
-	inode->i_mode = mode;
-	inode->i_uid = current_fsuid();
-	inode->i_gid = current_fsgid();
+	/*
+	 * Initialize ownership and mode the standard way.  inode_init_owner()
+	 * applies the mount idmapping to the caller's fsuid/fsgid and, crucially,
+	 * inherits the parent directory's group when the parent has S_ISGID set:
+	 * a create in a setgid directory must take the directory's gid (not the
+	 * caller's fsgid), and a new subdirectory inherits S_ISGID itself
+	 * (generic/633, generic/696).  Using raw current_fsuid()/current_fsgid()
+	 * here skipped both the idmapping and the setgid inheritance.
+	 */
+	inode_init_owner(idmap, inode, dir, mode);
 	inode->i_size = 0;
 	inode->i_blocks = briefs_compute_i_blocks(dir->i_sb, &binfo->disk_inode);
 	set_nlink(inode, is_dir ? 2 : 1);
@@ -227,7 +234,9 @@ struct inode *briefs_new_inode(struct inode *dir, struct dentry *dentry,
 	/* Set up briefs_inode fields */
 	binfo->disk_inode.inode_number = ino;
 	binfo->disk_inode.magic = _BRIEFS_INODE_MAGIC;
-	binfo->disk_inode.filemode = mode;
+	/* Mirror the authoritative VFS mode: inode_init_owner() may have added
+	 * S_ISGID for a directory created in a setgid parent. */
+	binfo->disk_inode.filemode = inode->i_mode;
 	binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
 	binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);
 	binfo->disk_inode.filesize = 0;

@@ -2040,7 +2040,7 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (len == 0 || len > BRIEFS_NAME_LEN * 10)
 		return -ENAMETOOLONG;
 
-	inode = briefs_new_inode(dir, dentry, S_IFLNK | 0777, 0);
+	inode = briefs_new_inode(idmap, dir, dentry, S_IFLNK | 0777, 0);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
 
@@ -2140,7 +2140,7 @@ int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	pr_debug("briefs: mknod %pd (mode=%o, rdev=%u:%u) in dir %lu\n",
 		 dentry, mode, MAJOR(rdev), MINOR(rdev), dir->i_ino);
 
-	inode = briefs_new_inode(dir, dentry, mode, rdev);
+	inode = briefs_new_inode(idmap, dir, dentry, mode, rdev);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
 

@@ -326,7 +326,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 
 	pr_debug("briefs: create %pd (mode=%o) in dir %lu\n", dentry, mode, dir->i_ino);
 
-	inode = briefs_new_inode(dir, dentry, mode, 0);
+	inode = briefs_new_inode(idmap, dir, dentry, mode, 0);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
 
@@ -816,7 +816,8 @@ fail:
  * d_instantiate: the whiteout has no dentry until the next lookup; the VFS
  * d_move()s old_dentry to the new name after ->rename returns.
  */
-static int briefs_make_whiteout(struct inode *dir, struct dentry *dentry)
+static int briefs_make_whiteout(struct mnt_idmap *idmap, struct inode *dir,
+                                struct dentry *dentry)
 {
 	struct briefs_sb_info *bsi = dir->i_sb->s_fs_info;
 	struct inode *wi;
@@ -825,7 +826,7 @@ static int briefs_make_whiteout(struct inode *dir, struct dentry *dentry)
 	u8 ftype = S_IFCHR >> 12;
 	int ret;
 
-	wi = briefs_new_inode(dir, dentry, S_IFCHR | WHITEOUT_MODE, WHITEOUT_DEV);
+	wi = briefs_new_inode(idmap, dir, dentry, S_IFCHR | WHITEOUT_MODE, WHITEOUT_DEV);
 	if (IS_ERR(wi))
 		return PTR_ERR(wi);
 
@@ -1062,7 +1063,7 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 	 * old_dentry still carries the old name here (the VFS d_move()s it to the
 	 * new name only after ->rename returns). */
 	if (flags & RENAME_WHITEOUT) {
-		ret = briefs_make_whiteout(old_dir, old_dentry);
+		ret = briefs_make_whiteout(idmap, old_dir, old_dentry);
 		if (ret)
 			goto fail;
 	}
