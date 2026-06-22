@@ -94,7 +94,13 @@ export MKFS_PROG=/go/bin/mkfs.briefs
 # and common/config never touches it, so the child inherits the real mkfs.briefs.
 export MKFS_BRIEFS_PROG=/go/bin/mkfs.briefs
 export FSCK_PROG=/go/bin/fsck.briefs
-export MKFS_OPTIONS=""
+# mkfs.briefs refuses to overwrite a device whose first block is non-zero
+# (i.e. one that already holds a filesystem -- its own or a foreign one;
+# see generic/740) unless given --force/-f.  xfstests reformats the scratch
+# device before every test, so every _scratch_mkfs/_test_mkfs must force.
+# common/config does not reset MKFS_OPTIONS for briefs, so this survives
+# into each test's child shell.
+export MKFS_OPTIONS="-f"
 export MOUNT_OPTIONS=""
 export FSCK_OPTIONS="-n"
 EOF
@@ -106,7 +112,7 @@ fi
 echo "=== smoke test ==="
 modprobe -r fs-briefs 2>/dev/null || true
 modprobe fs-briefs && echo "  PASS: modprobe fs-briefs" || { echo "  FAIL: modprobe fs-briefs" >&2; exit 1; }
-/go/bin/mkfs.briefs "$TEST_LOOP" >/dev/null 2>&1 && echo "  PASS: mkfs" || { echo "  FAIL: mkfs" >&2; exit 1; }
+/go/bin/mkfs.briefs -f "$TEST_LOOP" >/dev/null 2>&1 && echo "  PASS: mkfs" || { echo "  FAIL: mkfs" >&2; exit 1; }
 mount -t briefs "$TEST_LOOP" "$TEST_MNT" && echo "  PASS: mount -t briefs" || { echo "  FAIL: mount" >&2; exit 1; }
 # O_DIRECT must be rejected at open (-EINVAL) so xfstests _require_odirect skips.
 if xfs_io -d -f -c "pwrite -S 0x55 0 4k" "$TEST_MNT/odirect_test" >/dev/null 2>&1; then
