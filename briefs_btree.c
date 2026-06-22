@@ -459,13 +459,20 @@ static int btree_leaf_insert(struct super_block *sb, struct briefs_inode *di,
 		}
 	}
 
-	/* Merge with the left neighbor (extent just before the insertion slot). */
+	/* Merge with the left neighbor (extent just before the insertion slot).
+	 * Only merge extents of the same state: a written neighbor must not
+	 * absorb an unwritten new extent (or vice versa), or the merged extent
+	 * would inherit the neighbor's flag and the unwritten range would read
+	 * back as zeros-valid data / lose its preallocated-state semantics
+	 * (generic/092: fallocate adjoining a written extent must produce a
+	 * separate unwritten extent, not a single written one). */
 	if (pos > 0) {
 		struct briefs_extent left;
 
 		briefs_disk_extent_to_cpu(&ents[pos - 1], &left);
 		if (left.offset + left.len == ext->offset &&
-		    left.phys + left.len == ext->phys) {
+		    left.phys + left.len == ext->phys &&
+		    left.flags == ext->flags) {
 			left.len += ext->len;
 			briefs_cpu_extent_to_disk(&left, &ents[pos - 1]);
 			btree_commit_node(bh);
@@ -483,7 +490,8 @@ static int btree_leaf_insert(struct super_block *sb, struct briefs_inode *di,
 
 		briefs_disk_extent_to_cpu(&ents[pos], &right);
 		if (ext->offset + ext->len == right.offset &&
-		    ext->phys + ext->len == right.phys) {
+		    ext->phys + ext->len == right.phys &&
+		    ext->flags == right.flags) {
 			right.offset = ext->offset;
 			right.phys = ext->phys;
 			right.len += ext->len;
@@ -716,7 +724,8 @@ static int btree_spill_inline(struct super_block *sb, struct briefs_inode *di,
 	for (i = 0; i < n; i++) {
 		if (m > 0 &&
 		    merged[m - 1].offset + merged[m - 1].len == tmp[i].offset &&
-		    merged[m - 1].phys + merged[m - 1].len == tmp[i].phys) {
+		    merged[m - 1].phys + merged[m - 1].len == tmp[i].phys &&
+		    merged[m - 1].flags == tmp[i].flags) {
 			merged[m - 1].len += tmp[i].len;
 		} else {
 			merged[m++] = tmp[i];
@@ -800,7 +809,8 @@ static int btree_inline_insert(struct super_block *sb, struct briefs_inode *di,
 	if (pos > 0) {
 		struct briefs_extent *left = &di->inline_extents[pos - 1];
 		if (left->offset + left->len == ext->offset &&
-		    left->phys + left->len == ext->phys) {
+		    left->phys + left->len == ext->phys &&
+		    left->flags == ext->flags) {
 			left->len += ext->len;
 			briefs_journal_extent_alloc(bsi->journal,
 						    di->inode_number, ext->offset,
@@ -813,7 +823,8 @@ static int btree_inline_insert(struct super_block *sb, struct briefs_inode *di,
 	if (pos < n) {
 		struct briefs_extent *right = &di->inline_extents[pos];
 		if (ext->offset + ext->len == right->offset &&
-		    ext->phys + ext->len == right->phys) {
+		    ext->phys + ext->len == right->phys &&
+		    ext->flags == right->flags) {
 			right->offset = ext->offset;
 			right->phys = ext->phys;
 			right->len += ext->len;

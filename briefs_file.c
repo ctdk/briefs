@@ -866,8 +866,25 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	new_size = attr->ia_size;
 	old_size = inode->i_size;
 
-	if (new_size == old_size)
-		goto out_copy;
+	if (new_size == old_size) {
+		/*
+		 * Truncate to the current i_size.  ext4 still runs ext4_truncate()
+		 * in this case (ia_size == oldsize) to release any preallocated
+		 * blocks past i_size; do the same so a fallocate-then-truncate-to-
+		 * i_size trims the preallocated tail (generic/092).  cached_max_end
+		 * is an overstatement of the highest extent end (>= the real max,
+		 * never under), so if it does not exceed trunc_block there is
+		 * definitely nothing past i_size and this is a true no-op -- take
+		 * the lightweight out_copy path.  Otherwise fall through to the
+		 * shrink free-path below; its pagecache steps are guarded by
+		 * (new_size < old_size) and so are skipped for the equal case,
+		 * leaving just the extent-free past trunc_block.
+		 */
+		trunc_block = (new_size + BRIEFS_BLOCK_SIZE - 1) / BRIEFS_BLOCK_SIZE;
+		if (binfo->disk_inode.num_extents_total == 0 ||
+		    binfo->cached_max_end <= trunc_block)
+			goto out_copy;
+	}
 
 	/* A size change updates mtime and ctime.  notify_change() populates
 	 * attr->ia_mtime/ia_ctime but, for a plain truncate, does NOT set the
