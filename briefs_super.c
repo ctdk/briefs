@@ -317,9 +317,40 @@ void briefs_put_super(struct super_block *sb) {
 			briefs_sb_list_del(bsi);
 		briefs_sysfs_remove_sb(sb);
 
-		/* Sync journal before unmount */
-		if (bsi->journal && bsi->journal->dirty) {
-			briefs_journal_checkpoint(bsi->journal);
+		/*
+		 * Always checkpoint the journal before unmount.
+		 *
+		 * briefs_journal_sync() (called by sync(2)/syncfs(2) via
+		 * briefs_sync_fs) flushes pending record buffers to disk and
+		 * clears ->dirty, but it does NOT advance journal_log_start:
+		 * only a checkpoint does that.  If we gate the unmount
+		 * checkpoint on ->dirty, a workload that ran sync but not
+		 * fsync leaves the journal with log_start < log_end and
+		 * ->dirty == false, so this checkpoint is skipped and the
+		 * uncheckpointed records survive into the next mount.  Remount
+		 * then replays them, and replay_dir_update() ->
+		 * briefs_trie_insert() -> briefs_trie_page_init() can allocate
+		 * a fresh trie page out of a block the (stale, replay-rebuilt)
+		 * allocator considers free but that is actually in use as file
+		 * data -- briefs_trie_page_init() zeroes it and writes the
+		 * TRNP magic, clobbering the file's data block.  generic/029,
+		 * 030, and 032 all hit this on a clean unmount+remount (the
+		 * file's block-at-offset-0 becomes a trie page; 030 subtest 3
+		 * loses the whole file).  Dropping the ->dirty guard makes a
+		 * clean unmount always advance log_start to log_end, so the
+		 * journal is clean on disk and remount replays nothing.
+		 * __briefs_journal_checkpoint_locked() is a no-op-plus-redundant
+		 * checkpoint-block-write when the journal is already clean, so
+		 * this is safe for the nothing-pending case.  This fixes the
+		 * clean-unmount replay family only; the crash-replay family
+		 * (generic/547 #2, dm-thin drop-writes) is separate and still
+		 * needs defer-trie-free-until-checkpoint.
+		 */
+		if (bsi->journal && !sb_rdonly(sb)) {
+			int ckret = briefs_journal_checkpoint(bsi->journal);
+			if (ckret)
+				pr_err("briefs: unmount checkpoint failed (err=%d); journal may replay on next mount\n",
+				       ckret);
 		}
 
 		/* Sync allocation trie to disk */
