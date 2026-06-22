@@ -834,21 +834,30 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	int ret;
 
 	/*
-	 * Enforce filesystem and ulimit size constraints on a size change.
-	 * notify_change() does NOT call setattr_prepare() for us -- it calls
-	 * this ->setattr directly -- so the RLIMIT_FSIZE / s_maxbytes check
-	 * that other filesystems get via setattr_prepare()->inode_newsize_ok()
-	 * is the filesystem's job here.  inode_newsize_ok() sends SIGXFSZ and
-	 * returns -EFBIG when the new size grows beyond RLIMIT_FSIZE
-	 * (generic/394: ftruncate past the FSIZE ulimit must fail with "File
-	 * size limit exceeded").  The inode is locked by do_truncate() before
-	 * notify_change(), as inode_newsize_ok() requires.
+	 * Validate the attribute change.  notify_change() calls this
+	 * ->setattr directly and does NOT run setattr_prepare() for us, so the
+	 * permission checks other filesystems inherit from it are ours to do:
+	 *
+	 *  - utime(2) semantics (generic/087): setting a *specific* timestamp
+	 *    (ATTR_ATIME_SET / ATTR_MTIME_SET) requires the caller be the owner
+	 *    or hold CAP_FOWNER; only setting the *current* time
+	 *    (ATTR_ATIME / ATTR_MTIME) is permitted by write permission alone.
+	 *    Without this check a non-owner with write access wrongly succeeds
+	 *    at setting an arbitrary timestamp.
+	 *  - size limits (generic/394): setattr_prepare()->inode_newsize_ok()
+	 *    enforces RLIMIT_FSIZE / s_maxbytes on a grow, sending SIGXFSZ +
+	 *    -EFBIG (this supersedes the explicit inode_newsize_ok() that was
+	 *    here before).
+	 *  - chown/chmod/setgid-strip POSIX permission rules.
+	 *
+	 * setattr_prepare() only validates; it applies nothing, so the size and
+	 * out_copy paths below remain unchanged.  notify_change() holds
+	 * inode_lock across ->setattr (do_truncate() for size), which
+	 * inode_permission() inside inode_change_ok() is safe under.
 	 */
-	if (attr->ia_valid & ATTR_SIZE) {
-		ret = inode_newsize_ok(inode, attr->ia_size);
-		if (ret)
-			return ret;
-	}
+	ret = setattr_prepare(idmap, dentry, attr);
+	if (ret)
+		return ret;
 
 	/* Only handle size changes here. */
 	if (!(attr->ia_valid & ATTR_SIZE))
