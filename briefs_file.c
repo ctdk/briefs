@@ -15,6 +15,7 @@
 #include <linux/writeback.h>
 #include <linux/blkdev.h>
 #include <linux/mm.h>
+#include <linux/uaccess.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
@@ -526,6 +527,40 @@ int briefs_open(struct inode *inode, struct file *file) {
 int briefs_release(struct inode *inode, struct file *file) {
 	pr_debug("briefs: release inode %lu\n", inode->i_ino);
 	return 0;
+}
+
+/*
+ * briefs_ioctl - file and directory ioctl handler.
+ *
+ * BrieFS carries no xfs-style extended inode attributes (xflags, extsize,
+ * projid, CoW extent size), so the one ioctl userspace routinely issues that
+ * we must answer is FS_IOC_FSGETXATTR: xfs_io(1)'s `stat` command issues it on
+ * every stat call, and on ENOTTY prints "FS_IOC_GETXATTR: Inappropriate ioctl
+ * for device" to stderr.  That stderr is not stripped by tests that filter
+ * only stdout (generic/169's _show_wrote_and_stat_only, generic/420's
+ * `grep -F stat.size`), so the error line leaks into the compared output and
+ * fails tests whose data is otherwise correct.  Return a zeroed fsxattr so
+ * xfs_io prints the (stdout, filtered) fsx fields and emits no error line.
+ *
+ * FS_IOC_FSSETXATTR and every other cmd fall through to -ENOTTY, preserving
+ * the prior behavior (no handler existed, so the VFS returned -ENOTTY for all
+ * ioctls): xflag/chattr-style tests that expect the feature unsupported keep
+ * failing/notrun cleanly rather than silently no-op'ing.
+ */
+long briefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	switch (cmd) {
+	case FS_IOC_FSGETXATTR: {
+		struct fsxattr fsx;
+
+		memset(&fsx, 0, sizeof(fsx));
+		if (copy_to_user((void __user *)arg, &fsx, sizeof(fsx)))
+			return -EFAULT;
+		return 0;
+	}
+	}
+
+	return -ENOTTY;
 }
 
 /*

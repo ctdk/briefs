@@ -1125,6 +1125,7 @@ int briefs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync);
 int briefs_open(struct inode *inode, struct file *file);
 int briefs_release(struct inode *inode, struct file *file);
+long briefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 
 /* Directory operations */
 int briefs_readdir(struct file *file, struct dir_context *ctx);

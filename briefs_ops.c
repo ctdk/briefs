@@ -6,6 +6,7 @@
 #include <linux/fs.h>
 #include <linux/statfs.h>
 #include <linux/slab.h>
+#include <linux/compat.h>
 #include <linux/buffer_head.h>
 #include <linux/mpage.h>
 #include <linux/seqlock.h>
@@ -46,6 +47,8 @@ const struct file_operations briefs_dir_operations = {
 	.open = briefs_dir_open,
 	.release = briefs_dir_release,
 	.fsync = briefs_fsync,
+	.unlocked_ioctl = briefs_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 };
 
 /* File operations for regular files */
@@ -58,6 +61,8 @@ const struct file_operations briefs_file_operations = {
 	.mmap = generic_file_mmap,
 	.fsync = briefs_fsync,
 	.fallocate = briefs_fallocate,
+	.unlocked_ioctl = briefs_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 	/*
 	 * Splice ops are required for copy_file_range() to work: the VFS
 	 * vfs_copy_file_range() same-sb fallback path (used when a filesystem
