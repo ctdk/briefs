@@ -280,10 +280,22 @@ out_release:
 	goto out;
 
 out_bad_hblock:
+	ret = -EINVAL;
 	pr_err("BrieFS: blocksize too small for device.\n");
 	goto out;
 
 out_bad_sb:
+	/*
+	 * sb_bread() of the superblock failed.  ret may be 0 here:
+	 * briefs_parse_options() ran successfully and reset ret to 0, and the
+	 * -EINVAL initializer at the top of fill_super was overwritten.  Without
+	 * an explicit error here, fill_super returns 0 without ever setting
+	 * sb->s_root, so mount_bdev() returns dget(NULL) == NULL -- a NULL
+	 * root dentry.  legacy_get_tree() then dereferences root->d_sb and
+	 * oopses (a superblock I/O error becomes a kernel NULL-deref instead
+	 * of a clean -EIO mount failure).  Set the error explicitly.
+	 */
+	ret = -EIO;
 	pr_err("BrieFS: unable to read superblock.\n");
 
 out:
