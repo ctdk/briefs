@@ -807,64 +807,292 @@ fail:
 }
 
 /*
- * briefs_make_whiteout - create a whiteout (char device 0/0) directory entry
- * for RENAME_WHITEOUT.  @dentry->d_name is the old name (the VFS has not yet
- * d_move()d old_dentry, so it still carries the old name); the old entry has
- * already been removed by the rename, so the name is free.  The whiteout inode
- * is journaled as a full snapshot BEFORE the dir-add record so replay
- * reconstructs the char-dev inode before any lookup references it.  No
- * d_instantiate: the whiteout has no dentry until the next lookup; the VFS
- * d_move()s old_dentry to the new name after ->rename returns.
+ * briefs_repoint_dir_entry - update the inode and file type of an existing
+ * directory entry IN PLACE, without removing and re-inserting it.  Unlike
+ * briefs_add_dir_entry, this performs no trie allocation, so it cannot fail
+ * ENOSPC and frees no trie page.  Used by briefs_rename_whiteout to repoint
+ * the old entry at the whiteout inode (and to restore it back to the source
+ * on rollback) without touching the block allocator.
  */
-static int briefs_make_whiteout(struct mnt_idmap *idmap, struct inode *dir,
-                                struct dentry *dentry)
+static int briefs_repoint_dir_entry(struct inode *dir, const char *name,
+				     size_t name_len, u64 new_ino, u8 new_type)
 {
-	struct briefs_sb_info *bsi = dir->i_sb->s_fs_info;
-	struct inode *wi;
-	struct briefs_inode_info *wbinfo;
-	struct briefs_disk_inode disk_di;
-	u8 ftype = S_IFCHR >> 12;
+	struct briefs_inode_info *binfo = briefs_i(dir);
 	int ret;
 
-	wi = briefs_new_inode(idmap, dir, dentry, S_IFCHR | WHITEOUT_MODE, WHITEOUT_DEV);
-	if (IS_ERR(wi))
-		return PTR_ERR(wi);
+	mutex_lock(&binfo->trie_lock);
+	ret = briefs_trie_update_entry(dir->i_sb, &binfo->disk_inode,
+				       name, name_len, new_ino, new_type);
+	if (ret == 0)
+		binfo->trie_gen++;
+	mutex_unlock(&binfo->trie_lock);
+	return ret;
+}
 
-	ret = briefs_add_dir_entry(dir, dentry->d_name.name, dentry->d_name.len,
-				   wi->i_ino, ftype);
-	if (ret) {
-		briefs_create_abort(dir->i_sb, dir, wi, &dentry->d_name, false);
-		return ret;
+/*
+ * briefs_rename_whiteout - RENAME_WHITEOUT with the in-place repoint ordering
+ * from ext4 commit 6b4b8e6b4ad8 ("ext4: fix bug for rename with RENAME_WHITEOUT")
+ * so the source cannot be lost under ENOSPC.
+ *
+ * Order:
+ *   1. Remove an existing target (if any).  A failure here is before any
+ *      source mutation, so the source is untouched (restore target + return).
+ *   2. Allocate the whiteout inode -- the ENOSPC-prone step against the inode
+ *      table.  Failure here aborts before the source entry is touched.
+ *   3. Repoint the old entry to the whiteout IN PLACE.  No trie allocation,
+ *      so this cannot fail ENOSPC and frees no trie page.
+ *   4. Add the new entry pointing at the source inode -- the ENOSPC-prone trie
+ *      step.  On failure, restore the old entry back to the source IN PLACE
+ *      (again no allocation) and abort the whiteout; the source is intact and
+ *      no rollback allocation is needed.
+ *   5. Cross-dir nlink/parent, parent-dir mtimes, source ctime, whiteout inode
+ *      snapshot.
+ *
+ * The old order (used by the former briefs_make_whiteout, called AFTER the
+ * rename) removed the old entry, added the new entry, and only then created
+ * the whiteout at the old name.  Under ENOSPC the rollback's re-add of the old
+ * name could itself fail: briefs_trie_free_node() frees a trie page back to the
+ * block allocator once it becomes empty, and the new entry's add could consume
+ * that freed block, so the re-add had no free block and silently dropped the
+ * source (generic/626).  Repointing in place never frees the old entry's page,
+ * so the only allocation that can fail is the whiteout inode (step 2) and the
+ * new-entry add (step 4) -- both performed before the source entry is mutated
+ * or restored in place without allocation.
+ *
+ * Journal: the live repoint is recorded as a remove(old) + add(whiteout@old)
+ * pair so crash replay re-derives old->whiteout.  A failed rename records the
+ * compensating remove(whiteout@old) + add(source@old) so replay restores
+ * old->source, plus inode_free(whiteout) so the whiteout inode is reclaimed.
+ */
+static int briefs_rename_whiteout(struct mnt_idmap *idmap,
+				   struct inode *old_dir, struct dentry *old_dentry,
+				   struct inode *new_dir, struct dentry *new_dentry,
+				   struct inode *inode, u8 ftype)
+{
+	struct briefs_sb_info *bsi = old_dir->i_sb->s_fs_info;
+	struct inode *whiteout_inode = NULL;
+	struct inode *old_target = NULL;
+	struct briefs_inode_info *moved_binfo = NULL;
+	struct briefs_inode_info *old_target_binfo = NULL;
+	unsigned int old_olddir_nlink = old_dir->i_nlink;
+	unsigned int old_newdir_nlink = new_dir->i_nlink;
+	u64 old_parent_ino = 0;
+	u8 old_target_ftype = 0;
+	const u8 whiteout_ftype = S_IFCHR >> 12;
+	int ret;
+	bool target_removed = false;
+	bool old_repointed = false;
+	bool new_added = false;
+	bool crossdir_changed = false;
+
+	/* 1. Replace an existing target.  Failure here is before any source
+	 *    mutation, so the source is untouched. */
+	if (d_really_is_positive(new_dentry)) {
+		old_target = d_inode(new_dentry);
+		if (old_target) {
+			old_target_binfo = briefs_i(old_target);
+			old_target_ftype = (old_target->i_mode & S_IFMT) >> 12;
+		}
+		if (old_target && S_ISDIR(old_target->i_mode)) {
+			int eret = 0;
+			if (!briefs_empty_dir(old_target, &eret))
+				return eret;
+		}
+		ret = briefs_remove_dir_entry(new_dir, new_dentry->d_name.name,
+					      new_dentry->d_name.len);
+		if (ret)
+			return ret;
+		target_removed = true;
+		ret = briefs_journal_dir_del(bsi->journal, new_dir->i_ino, new_dentry);
+		if (ret)
+			goto fail_target;
+		if (old_target) {
+			if (S_ISDIR(old_target->i_mode)) {
+				drop_nlink(new_dir);
+				clear_nlink(old_target);
+			} else {
+				drop_nlink(old_target);
+				mark_inode_dirty(old_target);
+			}
+			old_target_binfo->disk_inode.nlinks = old_target->i_nlink;
+			briefs_journal_inode_update(bsi->journal, old_target);
+			ret = briefs_persist_disk_inode(old_target->i_sb,
+							old_target->i_ino,
+							&old_target_binfo->disk_inode,
+							false);
+			if (ret)
+				goto fail_target;
+		}
+		ret = briefs_update_parent_dir(new_dir, bsi, 0, 0);
+		if (ret)
+			goto fail_target;
 	}
 
-	wbinfo = briefs_i(wi);
-	briefs_cpu_inode_to_disk(&wbinfo->disk_inode, &disk_di);
-	ret = briefs_journal_inode_full(bsi->journal, wi->i_ino, &disk_di);
-	if (ret) {
-		briefs_create_abort(dir->i_sb, dir, wi, &dentry->d_name, true);
-		return ret;
+	/* 2. Allocate the whiteout inode before mutating the source entry. */
+	whiteout_inode = briefs_new_inode(idmap, old_dir, old_dentry,
+					  S_IFCHR | WHITEOUT_MODE, WHITEOUT_DEV);
+	if (IS_ERR(whiteout_inode)) {
+		ret = PTR_ERR(whiteout_inode);
+		whiteout_inode = NULL;
+		goto fail_target;
 	}
 
-	ret = briefs_journal_dir_update(bsi->journal, dir->i_ino, wi->i_ino,
-					dentry->d_name.name, dentry->d_name.len,
-					0, ftype);
-	if (ret) {
-		briefs_create_abort(dir->i_sb, dir, wi, &dentry->d_name, true);
-		return ret;
+	/* Journal the whiteout inode snapshot BEFORE any dir record that
+	 * references it, so crash replay reconstructs the char-dev inode
+	 * before a lookup can resolve the old name to it.  The whiteout's
+	 * on-disk inode is stable after briefs_new_inode (no extents, no
+	 * parent_inode for a chardev), so this snapshot is final. */
+	{
+		struct briefs_inode_info *wbinfo = briefs_i(whiteout_inode);
+		struct briefs_disk_inode disk_di;
+
+		briefs_cpu_inode_to_disk(&wbinfo->disk_inode, &disk_di);
+		ret = briefs_journal_inode_full(bsi->journal, whiteout_inode->i_ino,
+						&disk_di);
+		if (ret)
+			goto fail_whiteout_inode;
 	}
 
-	ret = briefs_update_parent_dir(dir, bsi,
-				       BRIEFS_DIR_ENTRY_PREFIX_LEN + dentry->d_name.len,
-				       0);
-	if (ret) {
-		briefs_create_abort(dir->i_sb, dir, wi, &dentry->d_name, true);
-		return ret;
+	/* 3. Repoint the old entry to the whiteout in place (no allocation). */
+	ret = briefs_repoint_dir_entry(old_dir, old_dentry->d_name.name,
+				       old_dentry->d_name.len,
+				       whiteout_inode->i_ino, whiteout_ftype);
+	if (ret)
+		goto fail_whiteout_inode;
+	old_repointed = true;
+	/* Replay re-derives this as remove(source@old) + add(whiteout@old). */
+	ret = briefs_journal_dir_del(bsi->journal, old_dir->i_ino, old_dentry);
+	if (ret)
+		goto fail;
+	ret = briefs_journal_dir_update(bsi->journal, old_dir->i_ino,
+					whiteout_inode->i_ino,
+					old_dentry->d_name.name,
+					old_dentry->d_name.len, 0, whiteout_ftype);
+	if (ret)
+		goto fail;
+
+	/* 4. Add the new entry pointing at the source inode.  ENOSPC-prone; on
+	 *    failure the fail path restores the old entry in place (no alloc). */
+	ret = briefs_add_dir_entry(new_dir, new_dentry->d_name.name,
+				   new_dentry->d_name.len, inode->i_ino, ftype);
+	if (ret)
+		goto fail;
+	new_added = true;
+	ret = briefs_journal_dir_add(bsi->journal, new_dir->i_ino, inode->i_ino,
+				     new_dentry, ftype);
+	if (ret)
+		goto fail;
+
+	/* 5. Cross-directory rename nlink/parent_inode. */
+	if (old_dir != new_dir && S_ISDIR(inode->i_mode)) {
+		moved_binfo = briefs_i(inode);
+		old_parent_ino = moved_binfo->disk_inode.parent_inode;
+		drop_nlink(old_dir);
+		inc_nlink(new_dir);
+		moved_binfo->disk_inode.parent_inode = new_dir->i_ino;
+		crossdir_changed = true;
+		briefs_journal_inode_update(bsi->journal, old_dir);
+		briefs_journal_inode_update(bsi->journal, new_dir);
+		briefs_journal_inode_update(bsi->journal, inode);
+		ret = briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+						&moved_binfo->disk_inode, false);
+		if (ret)
+			goto fail;
 	}
 
-	mark_inode_dirty(wi);
-	/* nlink=1 keeps the inode resident on disk; drop our reference. */
-	iput(wi);
+	ret = briefs_update_parent_dir(old_dir, bsi, 0, 0);
+	if (ret)
+		goto fail;
+	if (old_dir != new_dir) {
+		ret = briefs_update_parent_dir(new_dir, bsi, 0, 0);
+		if (ret)
+			goto fail;
+	}
+
+	/* Renaming moves which entry points at @inode, so its ctime advances. */
+	{
+		struct briefs_inode_info *minfo = briefs_i(inode);
+		struct briefs_disk_inode disk_di;
+		struct timespec64 now = current_time(inode);
+
+		inode->i_ctime_sec = now.tv_sec;
+		inode->i_ctime_nsec = now.tv_nsec;
+		briefs_sync_inode_times(inode, &minfo->disk_inode);
+		ret = briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+						&minfo->disk_inode, false);
+		if (ret)
+			goto fail;
+		briefs_cpu_inode_to_disk(&minfo->disk_inode, &disk_di);
+		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+		mark_inode_dirty(inode);
+	}
+
+	/* Parent-dir mtime/size for the new whiteout entry at the old name. */
+	{
+		ret = briefs_update_parent_dir(old_dir, bsi,
+				BRIEFS_DIR_ENTRY_PREFIX_LEN + old_dentry->d_name.len, 0);
+		if (ret)
+			goto fail;
+		mark_inode_dirty(whiteout_inode);
+		/* nlink=1 keeps the whiteout inode resident on disk; drop our ref. */
+		iput(whiteout_inode);
+		whiteout_inode = NULL;
+	}
+
+	pr_debug("briefs: renamed (whiteout) %pd -> %pd\n", old_dentry, new_dentry);
 	return 0;
+
+fail:
+	/* Undo in reverse order.  Restore the old entry to the source IN PLACE
+	 * first (overwriting the whiteout link) so aborting the whiteout inode
+	 * leaves no dangling dir entry.  None of this allocates, so it cannot
+	 * fail ENOSPC. */
+	if (crossdir_changed) {
+		set_nlink(old_dir, old_olddir_nlink);
+		set_nlink(new_dir, old_newdir_nlink);
+		moved_binfo->disk_inode.parent_inode = old_parent_ino;
+		briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+					  &moved_binfo->disk_inode, false);
+		briefs_journal_inode_update(bsi->journal, old_dir);
+		briefs_journal_inode_update(bsi->journal, new_dir);
+		briefs_journal_inode_update(bsi->journal, inode);
+	}
+	if (new_added) {
+		briefs_remove_dir_entry(new_dir, new_dentry->d_name.name,
+					new_dentry->d_name.len);
+		briefs_journal_dir_del(bsi->journal, new_dir->i_ino, new_dentry);
+	}
+	if (old_repointed) {
+		briefs_repoint_dir_entry(old_dir, old_dentry->d_name.name,
+					 old_dentry->d_name.len,
+					 inode->i_ino, ftype);
+		briefs_journal_dir_del(bsi->journal, old_dir->i_ino, old_dentry);
+		briefs_journal_dir_add(bsi->journal, old_dir->i_ino, inode->i_ino,
+				      old_dentry, ftype);
+	}
+	if (whiteout_inode) {
+		briefs_create_abort(old_dir->i_sb, old_dir, whiteout_inode,
+				    NULL, false);
+		whiteout_inode = NULL;
+	}
+	return ret;
+
+fail_whiteout_inode:
+	/* Repoint failed before the old entry was mutated.  Abort the whiteout
+	 * and restore the target if one was removed. */
+	briefs_create_abort(old_dir->i_sb, old_dir, whiteout_inode, NULL, false);
+	whiteout_inode = NULL;
+fail_target:
+	if (target_removed) {
+		if (briefs_add_dir_entry(new_dir, new_dentry->d_name.name,
+					 new_dentry->d_name.len,
+					 new_dentry->d_inode ? new_dentry->d_inode->i_ino : 0,
+					 old_target_ftype) == 0)
+			briefs_journal_dir_add(bsi->journal, new_dir->i_ino,
+					       new_dentry->d_inode ? new_dentry->d_inode->i_ino : 0,
+					       new_dentry, old_target_ftype);
+	}
+	return ret;
 }
 
 /* briefs_rename - rename a directory entry */
@@ -898,6 +1126,14 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 	 * rejects EXCHANGE combined with NOREPLACE/WHITEOUT, so handle it alone. */
 	if (flags & RENAME_EXCHANGE)
 		return briefs_rename_exchange(old_dir, old_dentry, new_dir, new_dentry);
+
+	/* RENAME_WHITEOUT must allocate the whiteout inode and repoint the old
+	 * entry to it BEFORE adding the new entry, so an ENOSPC aborts with the
+	 * source intact (ext4 commit 6b4b8e6b4ad8).  Handle it in a dedicated
+	 * helper; the plain-rename path below never sees RENAME_WHITEOUT. */
+	if (flags & RENAME_WHITEOUT)
+		return briefs_rename_whiteout(idmap, old_dir, old_dentry,
+					       new_dir, new_dentry, inode, ftype);
 
 	if (flags & RENAME_NOREPLACE) {
 		if (d_really_is_positive(new_dentry))
@@ -1056,16 +1292,6 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 		briefs_cpu_inode_to_disk(&minfo->disk_inode, &disk_di);
 		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
 		mark_inode_dirty(inode);
-	}
-
-	/* RENAME_WHITEOUT: the move above is plain rename semantics; now create a
-	 * whiteout char device at the (now-vacated) old name in the old dir.  The
-	 * old_dentry still carries the old name here (the VFS d_move()s it to the
-	 * new name only after ->rename returns). */
-	if (flags & RENAME_WHITEOUT) {
-		ret = briefs_make_whiteout(idmap, old_dir, old_dentry);
-		if (ret)
-			goto fail;
 	}
 
 	pr_debug("briefs: renamed %pd -> %pd\n", old_dentry, new_dentry);
