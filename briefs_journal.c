@@ -1312,10 +1312,59 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j) {
 	j->dirty = false;
 
 	/*
+	 * Flush the trie/inode metadata buffers the just-written journal records
+	 * reference BEFORE those journal blocks reach disk.  Dir-entry insertion
+	 * (briefs_trie_insert -> briefs_trie_page_init) and inode mutation
+	 * (briefs_write_inode) only mark_buffer_dirty() the trie page / inode
+	 * block; they are NOT force-synced on the fsync(2) path
+	 * (briefs_fsync does file data + inode metadata + journal only).  Without
+	 * this, an fsync that lands between checkpoints (the common case:
+	 * JRN_CHECKPOINT_INTERVAL is 1024 records) durably persists the JRN_DIR_UPDATE
+	 * / JRN_TRIE_ALLOC journal records but leaves the on-disk trie page they
+	 * mutated stale.  A crash then replays those records against the stale
+	 * trie: briefs_trie_page_init() cannot find the page on disk, calls
+	 * briefs_alloc_block() for a FRESH block, and zeroes it -- clobbering an
+	 * in-use data/trie block (generic/547 Mode A bad-magic / Mode B data
+	 * mismatch).  Syncing the referenced buffers first makes the on-disk trie
+	 * match the journaled state, so replay's re-derivation is idempotent --
+	 * briefs_trie_insert() returns -EEXIST and briefs_trie_remove() -ENOENT,
+	 * both already tolerated by replay_dir_update() -- and no fresh allocation
+	 * happens.  This is the same sync_blockdev() the checkpoint path uses
+	 * (see __briefs_journal_checkpoint_locked()); fsync(2) was the gap.
+	 *
+	 * The journal commit point is journal_log_end, advanced (with the
+	 * superblock sync) only AFTER this flush and the journal-block loop below,
+	 * so the on-disk ordering is metadata-before-commit: a crash before
+	 * log_end is advanced leaves these records beyond the committed tail and
+	 * they are not replayed; a crash after leaves the trie already durable, so
+	 * replay is a no-op.  sync_blockdev() waits on every dirty buffer on
+	 * s_bdev (trie, inode, and the just-dirtied journal block at write_pos),
+	 * so by the time it returns all of them are on disk.  The per-block
+	 * sync_dirty_buffer() loop below then re-reads those journal buffers and
+	 * no-ops on the now-clean ones.  Same self-deadlock argument as the
+	 * checkpoint path holds: no BrieFS metadata-writeback path takes
+	 * j->write_lock during buffer I/O.
+	 *
+	 * This is a full-device flush on every fsync -- heavier than ideal.  A
+	 * targeted flush of only the dirtied trie/inode buffers is the natural
+	 * refinement once BrieFS moves off buffer_heads to iomap.
+	 */
+	{
+		int err = sync_blockdev(j->vfs_sb->s_bdev);
+		if (err) {
+			pr_err("briefs: fsync metadata buffer flush failed: %d\n", err);
+			return err;
+		}
+	}
+
+	/*
 	 * Force every journal block dirtied since the last sync to disk.  Each
 	 * sb_bread() is a cache hit returning the uptodate buffer that
 	 * briefs_journal_write_block() left dirty; sync_dirty_buffer() submits
-	 * the write and waits.  This is the durable flush fsync(2) was missing.
+	 * the write and waits.  sync_blockdev() above already wrote the journal
+	 * block at write_pos, so these are now clean and the sync_dirty_buffer()
+	 * calls are no-ops; the loop is retained as an explicit durable flush of
+	 * the journal range.
 	 */
 	for (pos = sync_start; ; pos = briefs_journal_next_block(j, pos)) {
 		struct buffer_head *bh = sb_bread(j->vfs_sb, pos);
