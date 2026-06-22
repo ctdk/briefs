@@ -681,6 +681,42 @@ struct inode *briefs_iget_with_gen(struct super_block *sb, u64 ino, u32 gen)
 		return ERR_PTR(-EIO);
 	}
 
+	/*
+	 * Reject a freed/invalid handle BEFORE iget5_locked() hashes a phantom
+	 * VFS inode for it.  iget5_locked() inserts a newly-allocated inode into
+	 * the inode hash before the caller fills it; if the fill then fails (the
+	 * on-disk block was zeroed when the inode was freed, so the magic check
+	 * in briefs_read_and_fill_inode() fails), the inode is left with the
+	 * default i_nlink=1 (inode_init_always) and BrieFS's default
+	 * generic_drop_inode (which only evicts i_nlink==0 or unhashed inodes)
+	 * parks it on the LRU, still findable by iget_locked().  A subsequent
+	 * briefs_alloc_inode() reuse of the freed number then collides with the
+	 * phantom in briefs_new_inode()'s iget_locked() and returns a spurious
+	 * -EEXIST — observed as rmdir of a directory whose NFS handle was
+	 * encoded, followed by re-creation of the same name, failing with
+	 * EEXIST while the on-disk trie is clean (generic/467).  Peeking the
+	 * on-disk magic first returns -ESTALE without ever hashing a phantom.
+	 *
+	 * Only real file handles carry a generation to validate (gen != 0);
+	 * internal callers pass gen == 0 with a trusted inode number and keep
+	 * the existing path.  ino == 0 is never a valid inode number.
+	 */
+	if (gen != 0) {
+		struct buffer_head *bh;
+		struct briefs_disk_inode *di;
+		struct briefs_inode cpu_di;
+
+		if (ino == 0)
+			return ERR_PTR(-ESTALE);
+		bh = briefs_read_inode_block(sb, ino, &di);
+		if (IS_ERR(bh))
+			return ERR_PTR(-EIO);
+		briefs_disk_inode_to_cpu(di, &cpu_di);
+		brelse(bh);
+		if (cpu_di.magic != _BRIEFS_INODE_MAGIC)
+			return ERR_PTR(-ESTALE);
+	}
+
 	inode = iget5_locked(sb, ino, briefs_iget5_test, briefs_iget5_set, &data);
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
