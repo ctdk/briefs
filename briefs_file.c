@@ -833,6 +833,23 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	u64 new_size, old_size, trunc_block;
 	int ret;
 
+	/*
+	 * Enforce filesystem and ulimit size constraints on a size change.
+	 * notify_change() does NOT call setattr_prepare() for us -- it calls
+	 * this ->setattr directly -- so the RLIMIT_FSIZE / s_maxbytes check
+	 * that other filesystems get via setattr_prepare()->inode_newsize_ok()
+	 * is the filesystem's job here.  inode_newsize_ok() sends SIGXFSZ and
+	 * returns -EFBIG when the new size grows beyond RLIMIT_FSIZE
+	 * (generic/394: ftruncate past the FSIZE ulimit must fail with "File
+	 * size limit exceeded").  The inode is locked by do_truncate() before
+	 * notify_change(), as inode_newsize_ok() requires.
+	 */
+	if (attr->ia_valid & ATTR_SIZE) {
+		ret = inode_newsize_ok(inode, attr->ia_size);
+		if (ret)
+			return ret;
+	}
+
 	/* Only handle size changes here. */
 	if (!(attr->ia_valid & ATTR_SIZE))
 		goto out_copy;
@@ -1777,6 +1794,24 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 		return -EINVAL;
 
 	inode_lock(inode);
+
+	/*
+	 * Enforce RLIMIT_FSIZE on an allocation that grows i_size.  The VFS
+	 * fallocate path does not run setattr_prepare() for us, so -- as in
+	 * briefs_setattr() -- the ulimit check that other filesystems get via
+	 * inode_newsize_ok() is ours to do.  inode_newsize_ok() sends SIGXFSZ
+	 * and returns -EFBIG when end grows beyond RLIMIT_FSIZE
+	 * (generic/228: fallocate past the FSIZE ulimit must fail with "File
+	 * too large").  KEEP_SIZE and PUNCH_HOLE never grow i_size, so they
+	 * are exempt.  The inode is now locked, as inode_newsize_ok() requires.
+	 */
+	if (!(mode & FALLOC_FL_KEEP_SIZE) && end > inode->i_size) {
+		ret = inode_newsize_ok(inode, end);
+		if (ret) {
+			inode_unlock(inode);
+			return ret;
+		}
+	}
 
 	if (mode & FALLOC_FL_PUNCH_HOLE) {
 		briefs_stat_inc(bsi, punch_holes);
