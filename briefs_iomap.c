@@ -2,11 +2,10 @@
 /*
  * briefs_iomap.c - iomap-based file data path for BrieFS.
  *
- * BrieFS's file data mapping is built on the buffer_head get_block stack
- * (briefs_get_block / briefs_get_block_write).  This file re-expresses the
- * same extent index as struct iomap, the buffer_head-free data path shared by
- * buffered read/write, fiemap, fallocate tail-zeroing, direct I/O, swapfile and
- * bmap.
+ * BrieFS's file data mapping is expressed here as struct iomap: the
+ * buffer_head-free data path shared by buffered read/write, fiemap, fallocate
+ * tail-zeroing, direct I/O, swapfile and bmap.  (The former buffer_head
+ * get_block data path has been removed; metadata remains buffer_head-backed.)
  *
  * Scope: ONLY the per-inode file data mapping is described here.  Metadata
  * (inode table, directory trie pages, btree extent-index nodes, allocator

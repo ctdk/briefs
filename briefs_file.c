@@ -9,7 +9,6 @@
 #include <linux/statfs.h>
 #include <linux/slab.h>
 #include <linux/buffer_head.h>
-#include <linux/mpage.h>
 #include <linux/seqlock.h>
 #include <linux/pagemap.h>
 #include <linux/writeback.h>
@@ -27,345 +26,18 @@
 /* address_space_operations wrappers (kernel 6.12 folio-based APIs). */
 
 /*
- * briefs_iomap_data_path -- select the file data path.
- *
- * true (default): the iomap data path.  Buffered read/write, writeback, and
- * folio reclaim all go through iomap; no buffer_head ever attaches to a data
- * folio, so there is no iomap-read / buffer_head-write bio mix on shared pages
- * (the combination that crashed the kernel when only read was moved to iomap).
- * Metadata stays on buffer_head regardless.
- *
- * false: the buffer_head fallback (briefs_aops + generic_file_write_iter).  Kept
- * as a runtime bisect switch so a regression in the iomap path can be isolated
- * to the begin/alloc side vs the writeback side without rebuilding.
+ * BrieFS regular-file data path: iomap.  Buffered read/write, writeback, and
+ * folio reclaim all go through iomap (briefs_iomap_aops); no buffer_head ever
+ * attaches to a data folio, so there is no iomap-read / buffer_head-write bio
+ * mix on shared pages (the combination that crashed the kernel when only read
+ * was moved to iomap).  Metadata stays on buffer_head regardless.
  */
-static bool briefs_iomap_data_path = true;
-module_param_named(iomap_data, briefs_iomap_data_path, bool, 0644);
-MODULE_PARM_DESC(iomap_data,
-		 "on (default): iomap file data path; off: buffer_head fallback");
-
-bool briefs_use_iomap_data_path(void)
-{
-	return briefs_iomap_data_path;
-}
-
 const struct address_space_operations *briefs_get_file_aops(void)
 {
-	return briefs_iomap_data_path ? &briefs_iomap_aops : &briefs_aops;
+	return &briefs_iomap_aops;
 }
 
 
-/* read_folio: wrapper calling mpage_read_folio with our get_block */
-static int briefs_read_folio(struct file *file, struct folio *folio)
-{
-	struct inode *inode = folio->mapping->host;
-	struct briefs_inode_info *binfo = briefs_i(inode);
-
-	if (binfo->disk_inode.flags & InodeFlagInlineData) {
-		loff_t pos = (loff_t)folio->index << PAGE_SHIFT;
-		size_t folio_size = PAGE_SIZE;
-		void *addr = folio_address(folio);
-		size_t copy_len;
-
-		if (pos >= inode->i_size) {
-			memset(addr, 0, folio_size);
-		} else {
-			copy_len = min_t(size_t, inode->i_size - pos, folio_size);
-			memcpy(addr, binfo->disk_inode.inline_data + pos, copy_len);
-			if (copy_len < folio_size)
-				memset((u8 *)addr + copy_len, 0, folio_size - copy_len);
-		}
-
-		flush_dcache_folio(folio);
-		folio_mark_uptodate(folio);
-		folio_unlock(folio);
-		return 0;
-	}
-
-	{
-		int rf_ret = mpage_read_folio(folio, briefs_get_block);
-		return rf_ret;
-	}
-}
-/*
- * #6 Step 3: run-allocating writepages.
- *
- * write_begin defers allocation (BH_Delay); this writepages coalesces the
- * resulting dirty delayed folios into contiguous runs and allocates each run
- * with ONE briefs_alloc_blocks(run) call and ONE extent append -- which emits
- * ONE JRN_EXTENT_ALLOC(len=run) journal record instead of one per block.  On a
- * fresh/unfragmented fs the per-run extents also merge into a single extent
- * for the whole sequential write (the alloc blocks come back contiguous, so
- * briefs_btree_insert_locked's merge-with-neighbor branch grows the last extent by `run`).
- *
- * writeback_iter() hands us the dirty folios of the wbc range one at a time,
- * ascending, locked and with the pagecache dirty tag already cleared (ready to
- * write).  We accumulate a maximal run of consecutive single-block delayed
- * folios (blocksize == PAGE_SIZE -> 1 block/folio), holding them locked, then
- * flush the run: allocate a contiguous physical run, append one extent for it,
- * and write each folio back bound to phys_run+i.  Folios that are not run
- * candidates (already-mapped overwrites, multi-block folios, or non-delay
- * dirty buffers) break the run and are written via the normal buffer path.
- *
- * Crash ordering is unchanged from Step 2: allocation + extent append happen
- * here in .writepages, strictly before briefs_write_inode (->journal_inode_full)
- * runs; fsync does file_write_and_wait_range (writeback) before
- * sync_inode_metadata.  Every block of a run is written in the same writeback
- * pass that appends its extent, so the extent is never journaled ahead of its
- * data.  mark_inode_dirty is called once per writeback (after all runs), not
- * per block.
- *
- * Bounding the run caps the number of folios held locked at once; on kmalloc
- * failure we fall back to mpage_writepages (the Step 2 per-block path).
- */
-
-/* block_write_full_folio() isn't exported to modules (only __block_write_full_
- * folio is), so replicate its i_size handling around the exported primitive.
- * Used for the non-run writeback path (overwrites / multi-block folios). */
-static int briefs_block_write_full_folio(struct folio *folio,
-					 struct writeback_control *wbc,
-					 get_block_t get_block)
-{
-	struct inode *inode = folio->mapping->host;
-	loff_t i_size = i_size_read(inode);
-
-	if (folio_pos(folio) + folio_size(folio) <= i_size)
-		return __block_write_full_folio(inode, folio, get_block, wbc);
-	if (folio_pos(folio) >= i_size) {
-		folio_unlock(folio);
-		return 0;
-	}
-	folio_zero_segment(folio, offset_in_folio(folio, i_size),
-			   folio_size(folio));
-	return __block_write_full_folio(inode, folio, get_block, wbc);
-}
-
-/* Write a folio whose single buffer has already been mapped to @phys (no
- * get_block call).  The folio data (user bytes + zeroed tails from
- * briefs_write_begin) is correct, so we must not zero -- only invalidate any
- * stale blockdev alias for the freshly allocated physical block, mirroring what
- * __block_write_full_folio does in its get_block path (set_buffer_new +
- * clean_bdev_bh_alias).  __block_write_full_folio then sees a mapped, !delay
- * buffer and submits it directly.  Run folios are delayed write folios, hence
- * within i_size with tails already zeroed by write_begin, so the i_size-straddle
- * wrapper isn't needed here.  It unlocks the folio. */
-static int briefs_write_folio_mapped(struct inode *inode,
-				     struct writeback_control *wbc,
-				     struct folio *folio, sector_t phys)
-{
-	struct buffer_head *bh = folio_buffers(folio);
-
-	map_bh(bh, inode->i_sb, phys);
-	clear_buffer_delay(bh);
-	set_buffer_new(bh);
-	clean_bdev_bh_alias(bh);
-	clear_buffer_new(bh);
-	return __block_write_full_folio(inode, folio, briefs_get_block, wbc);
-}
-
-/* Per-block fallback: allocate one block, append a len=1 extent, map, and write
- * the folio.  This is the Step 2 writeback path (one JRN_EXTENT_ALLOC(len=1)
- * per block), used when no contiguous run of `n` could be allocated or when a
- * run extent append failed.  On ENOSPC the folio is redirtied so writeback
- * retries later and the error is stashed via mapping_set_error. */
-static int briefs_write_folio_alloc_one(struct inode *inode,
-					struct writeback_control *wbc,
-					struct folio *folio, bool *any_alloc)
-{
-	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
-	struct briefs_inode_info *binfo = briefs_i(inode);
-	u64 rel, phys, iblock;
-	struct briefs_extent ext;
-	int ret;
-
-	iblock = folio_pos(folio) >> BRIEFS_BLOCK_SHIFT;
-	rel = briefs_alloc_block(&bsi->alloc);
-	if (rel == 0) {
-		/* No free block: fail the folio via __block_write_full_folio's
-		 * recover path instead of redirtying it.  Redirtying leaves the
-		 * dirty count unchanged and wedges balance_dirty_pages on a full
-		 * filesystem (generic/015).  briefs_get_block re-attempts the
-		 * alloc and, still finding none, returns -ENOSPC, which makes
-		 * __block_write_full_folio clear dirty on the unconverted delayed
-		 * buffer, set AS_ENOSPC on the mapping, and end writeback -- so
-		 * the dirty page drops and writeback makes progress.  The folio's
-		 * unwritten data is discarded; the error is surfaced via fsync. */
-		return briefs_block_write_full_folio(folio, wbc, briefs_get_block);
-	}
-	phys = data_to_abs(bsi->sb, rel);
-	ext.offset = iblock;
-	ext.phys = phys;
-	ext.len = 1;
-	ext.flags = 0;
-	ret = briefs_append_extent_nojournal(inode->i_sb, &binfo->disk_inode, &ext);
-	if (ret == -EEXIST) {
-		/*
-		 * Lost a race: the block is already mapped.  Free our block and
-		 * write the folio through the existing mapping via briefs_get_block
-		 * (which re-looks it up).  Falling through to the redirty path would
-		 * loop forever, since the next attempt would hit -EEXIST again.
-		 */
-		briefs_free_block(&bsi->alloc, rel);
-		return briefs_block_write_full_folio(folio, wbc, briefs_get_block);
-	}
-	if (ret) {
-		briefs_free_block(&bsi->alloc, rel);
-		if (ret == -ENOSPC) {
-			/* Extent append failed for lack of a btree chain block:
-			 * same full-fs condition as above -- fail the folio so
-			 * writeback makes progress instead of redirtying forever. */
-			return briefs_block_write_full_folio(folio, wbc,
-							     briefs_get_block);
-		}
-		folio_redirty_for_writepage(wbc, folio);
-		folio_unlock(folio);
-		mapping_set_error(inode->i_mapping, ret);
-		return ret;
-	}
-	*any_alloc = true;
-	return briefs_write_folio_mapped(inode, wbc, folio, phys);
-}
-
-/* Flush one accumulated run of `n` consecutive dirty delayed folios starting at
- * logical block blk0.  Try to allocate the whole run contiguously and append a
- * single len=n extent; on success write each folio bound to phys_run+i.  If no
- * contiguous run of n fits, or the extent append fails, fall back to the
- * per-block path for every folio (never regresses on ENOSPC/fragmentation). */
-static int briefs_flush_run(struct inode *inode, struct address_space *mapping,
-			    struct writeback_control *wbc,
-			    struct folio **run, int n, bool *any_alloc)
-{
-	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
-	struct briefs_inode_info *binfo = briefs_i(inode);
-	u64 blk0 = folio_pos(run[0]) >> BRIEFS_BLOCK_SHIFT;
-	u64 rel, phys_run;
-	struct briefs_extent ext;
-	int ret = 0, i, r;
-
-	rel = briefs_alloc_blocks(&bsi->alloc, (u64)n);
-	if (rel != 0) {
-		phys_run = data_to_abs(bsi->sb, rel);
-		ext.offset = blk0;
-		ext.phys = phys_run;
-		ext.len = (u64)n;
-		ext.flags = 0;
-		r = briefs_append_extent_nojournal(inode->i_sb,
-						   &binfo->disk_inode, &ext);
-		if (r == 0) {
-			*any_alloc = true;
-			for (i = 0; i < n; i++) {
-				r = briefs_write_folio_mapped(inode, wbc,
-							      run[i],
-							      phys_run + (u64)i);
-				if (r) {
-					mapping_set_error(mapping, r);
-					if (!ret)
-						ret = r;
-				}
-			}
-			return ret;
-		}
-		/* Append failed (e.g. chain block ENOSPC): free the run
-		 * per-block and fall through to the per-block path. */
-		for (i = 0; i < n; i++)
-			briefs_free_block(&bsi->alloc, rel + (u64)i);
-	}
-
-	/* Per-block fallback. */
-	for (i = 0; i < n; i++) {
-		r = briefs_write_folio_alloc_one(inode, wbc, run[i], any_alloc);
-		if (r == -ENOSPC) {
-			/* Fs is full: briefs_write_folio_alloc_one already
-			 * failed run[i] through __block_write_full_folio's
-			 * recover.  Fail the remaining folios the same way
-			 * (discard + AS_ENOSPC + end writeback) rather than
-			 * redirtying, so balance_dirty_pages can make progress. */
-			mapping_set_error(mapping, -ENOSPC);
-			while (++i < n)
-				briefs_block_write_full_folio(run[i], wbc,
-							     briefs_get_block);
-			return -ENOSPC;
-		} else if (r) {
-			mapping_set_error(mapping, r);
-			if (!ret)
-				ret = r;
-		}
-	}
-	return ret;
-}
-
-static int briefs_writepages(struct address_space *mapping,
-			     struct writeback_control *wbc)
-{
-	struct inode *inode = mapping->host;
-	struct folio *folio = NULL;
-	struct folio **run;
-	int run_n = 0, error = 0, r;
-	bool any_alloc = false;
-	struct blk_plug plug;
-
-	run = kmalloc_array(BRIEFS_DELALLOC_RUN_MAX, sizeof(*run), GFP_KERNEL);
-	if (!run) {
-		/* No memory for the run buffer: fall back to the Step 2
-		 * per-block writeback path (mpage_writepages). */
-		return mpage_writepages(mapping, wbc, briefs_get_block);
-	}
-
-	blk_start_plug(&plug);
-	while ((folio = writeback_iter(mapping, wbc, folio, &error))) {
-		struct buffer_head *bh = folio_buffers(folio);
-
-		if (folio_order(folio) == 0 && bh && buffer_delay(bh)) {
-			/* Run candidate: a delayed single-block folio. */
-			if (run_n > 0 &&
-			    folio->index == run[run_n - 1]->index + 1 &&
-			    run_n < BRIEFS_DELALLOC_RUN_MAX) {
-				run[run_n++] = folio;
-				error = 0;
-				continue;
-			}
-			/* Gap or run full: flush, then start a new run. */
-			if (run_n > 0) {
-				error = briefs_flush_run(inode, mapping, wbc,
-							 run, run_n, &any_alloc);
-				run_n = 0;
-			}
-			run[run_n++] = folio;
-			error = 0;
-			continue;
-		}
-
-		/* Not a run candidate: flush any open run, then write via the
-		 * normal buffer path.  For a mapped !delay buffer
-		 * block_write_full_folio skips get_block and just submits; for
-		 * a delayed buffer it calls briefs_get_block (one-block alloc). */
-		if (run_n > 0) {
-			error = briefs_flush_run(inode, mapping, wbc,
-						 run, run_n, &any_alloc);
-			run_n = 0;
-		}
-		error = briefs_block_write_full_folio(folio, wbc, briefs_get_block);
-		if (error)
-			mapping_set_error(mapping, error);
-	}
-	if (run_n > 0) {
-		r = briefs_flush_run(inode, mapping, wbc, run, run_n, &any_alloc);
-		if (!error)
-			error = r;
-	}
-	blk_finish_plug(&plug);
-
-	if (any_alloc)
-		mark_inode_dirty(inode);
-
-	kfree(run);
-	return error;
-}
-/* bmap: map file block to physical block */
-static sector_t briefs_bmap(struct address_space *mapping, sector_t block)
-{
-	return generic_block_bmap(mapping, block, briefs_get_block);
-}
 /*
  * briefs_zero_eof_tail - zero [eof, block_end) of the block containing @eof.
  *
@@ -377,17 +49,10 @@ static sector_t briefs_bmap(struct address_space *mapping, sector_t block)
  * leaks as valid data once i_size later grows past the block (generic/363: fsx
  * READ BAD DATA at the old EOF).
  *
- * ext4 handles this in cont_write_begin/cont_expand_zero, which BrieFS does not
- * use (plain block_write_begin).  We cannot use block_truncate_page here: with
- * delayed allocation the EOF block is typically BH_Delay (not yet allocated), so
- * __block_truncate_page's create=0 get_block returns unmapped and SKIPS the
- * zeroing -- and fsx pollutes via mmap then immediately extends, so the polluted
- * folio is a cached delayed folio at this point (the exact case
- * block_truncate_page cannot touch).  Zero the pagecache folio's tail directly
- * and leave it dirty: writeback (briefs_block_write_full_folio ->
- * briefs_get_block create=1) allocates the block and persists the zeroed folio.
- * Assumes bs == PAGE_SIZE (BrieFS 4K blocks on 4K pages), matching
- * briefs_block_write_full_folio; a cached delayed folio is always uptodate.
+ * Zero the pagecache folio's tail directly and leave it dirty; iomap writeback
+ * (briefs_iomap_writepages -> briefs_writeback_ops) allocates the block, if not
+ * already mapped, and persists the zeroed folio.  Assumes bs == PAGE_SIZE
+ * (BrieFS 4K blocks on 4K pages); a cached folio is always uptodate.
  */
 static void briefs_zero_eof_tail(struct address_space *mapping, loff_t eof)
 {
@@ -412,111 +77,6 @@ static void briefs_zero_eof_tail(struct address_space *mapping, loff_t eof)
 	folio_put(folio);
 }
 
-/* cribbed from xiafs, at least for now.
- *
- * Uses briefs_get_block_write, which DEFERS block allocation: an unmapped
- * block is marked BH_Delay (no allocation, no extent append, no journal record)
- * and is allocated later at writeback by briefs_get_block via mpage /
- * __block_write_full_folio.  This moves the per-block alloc/extent-append/
- * journal off the write() path and onto writeback (#6 delayed allocation).
- *
- * __block_write_begin_int suppresses both the read and the buffer_new partial-
- * tail zeroing for a BH_Delay buffer.  A partial write to a fresh (delayed)
- * block would otherwise leave stale folio bytes in the unwritten head/tail,
- * which writeback would then persist.  Zero those segments here, mirroring the
- * kernel's buffer_new zeroing (fs/buffer.c __block_write_begin_int).  Guarded
- * by !uptodate: if the folio is already uptodate its contents are valid.
- */
-static int briefs_write_begin(struct file *file, struct address_space *mapping, loff_t pos, unsigned len, struct folio **foliop, void **fsdata) {
-	struct super_block *sb = mapping->host->i_sb;
-	struct briefs_sb_info *bsi = sb->s_fs_info;
-	struct folio *folio;
-	struct buffer_head *bh, *head;
-	size_t from, to, block_start, block_end, blocksize;
-	int ret;
-	get_block_t *gb;
-
-	/*
-	 * Delayed-allocation switch (mirrors ext4's nonda_switch).  With free
-	 * space plentiful we defer block allocation to writeback
-	 * (briefs_get_block_write -> BH_Delay) for write() throughput.  Once
-	 * free space drops below the watermark (a quarter of the data pool,
-	 * sized above the per-bdi dirty threshold) we allocate immediately at
-	 * write_begin (briefs_get_block) so that ENOSPC is returned
-	 * synchronously from write() instead of being discovered in writeback,
-	 * where a delayed folio that cannot be allocated would otherwise be
-	 * redirtied forever and wedge balance_dirty_pages (generic/015).
-	 * Immediate alloc is overwrite-aware: briefs_get_block maps an already
-	 * allocated block without touching the free pool, so overwriting an
-	 * existing file succeeds even on a full filesystem.  free_count is read
-	 * without alloc->lock as a heuristic; a stale read only shifts the
-	 * switch point slightly.  briefs_get_block does not journal the extent
-	 * (it calls briefs_btree_insert_locked, not _append_extent), so moving
-	 * allocation from writeback to write_begin preserves the invariant that
-	 * an extent is never journaled ahead of its data.
-	 */
-	gb = (bsi->alloc.free_count < (bsi->alloc.block_count >> 2))
-	     ? briefs_get_block : briefs_get_block_write;
-
-	/* Zero-fill the tail of the block containing the current EOF when this
-	 * write jumps past EOF (pos > i_size) and EOF is mid-block.  The tail
-	 * [i_size, block_end) is beyond the file's valid data but inside the
-	 * EOF block; without zeroing it here, bytes there -- written by an mmap
-	 * store beyond EOF (fsx -e EOF pollution) or left over from a prior,
-	 * smaller i_size -- persist and leak as valid data once i_size later
-	 * grows past the block (generic/363: fsx READ BAD DATA at the old EOF).
-	 * Plain block_write_begin does NOT do this zeroing (only cont_write_begin
-	 * / cont_expand_zero does, which ext4 uses).  Use briefs_zero_eof_tail,
-	 * NOT block_truncate_page: under delalloc the EOF block is typically
-	 * BH_Delay (unmapped), so block_truncate_page's create=0 get_block
-	 * returns unmapped and skips the zeroing -- exactly the fsx case.
-	 */
-	if (pos > i_size_read(mapping->host))
-		briefs_zero_eof_tail(mapping, i_size_read(mapping->host));
-
-	ret = block_write_begin(mapping, pos, len, foliop, gb);
-
-	/*
-	 * Don't free data on error — the VFS / caller will handle cleanup
-	 * on the inode.  The old code called briefs_free_inode_data here,
-	 * which freed ALL extents even on a partial write, leaving
-	 * dangling buffer_heads in the page cache that caused
-	 * use-after-free crashes in kswapd and writeback.
-	 *
-	 * If block_write_begin partially allocated blocks and then
-	 * failed, those blocks remain allocated on disk (a minor leak)
-	 * until the inode itself is evicted, at which point
-	 * briefs_evict_inode will free them properly.
-	 */
-	if (ret)
-		return ret;
-
-	folio = *foliop;
-	if (folio_test_uptodate(folio))
-		return 0;		/* existing data is valid, no tails to zero */
-
-	from = offset_in_folio(folio, pos);
-	to = from + len;
-
-	head = folio_buffers(folio);
-	if (!head)
-		return 0;
-	blocksize = head->b_size;
-
-	bh = head;
-	block_start = 0;
-	do {
-		block_end = block_start + blocksize;
-		if (buffer_delay(bh) &&
-		    (block_end > to || block_start < from))
-			folio_zero_segments(folio, to, block_end,
-			                    block_start, from);
-		block_start = block_end;
-		bh = bh->b_this_page;
-	} while (bh != head);
-
-	return 0;
-}
 /* briefs_fsync - sync file data and metadata to disk */
 int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
 	struct inode *inode = file->f_mapping->host;
@@ -544,8 +104,9 @@ int briefs_open(struct inode *inode, struct file *file) {
 
 	/* Direct I/O is handled by the iter functions (briefs_read_iter /
 	 * briefs_write_iter route IOCB_DIRECT to iomap_dio_rw); nothing to do
-	 * here.  The iomap aops .direct_IO stays noop_direct_IO (unused by the
-	 * iomap DIO path, which bypasses the aops write_begin/end).
+	 * here.  The aops .direct_IO is noop_direct_IO, only there so dentry_open()
+	 * allows O_DIRECT opens; the iomap DIO path bypasses the aops
+	 * write_begin/end.
 	 */
 	return 0;
 }
@@ -880,22 +441,19 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	inode_unlock(inode);
 	/* Direct writes bypass the page cache.  On -ENOTBLK (page cache could not
 	 * be invalidated, e.g. the range is mmap'd) fall back to the buffered path,
-	 * as the iomap DIO callers (zonefs/gfs2) do.  The buffer_head fallback
-	 * (briefs_use_iomap_data_path() == 0) has no DIO path, so it stays buffered.
-	 * generic_write_checks truncates `from` rather than advancing it, so a
-	 * -ENOTBLK fallback to briefs_iomap_buffered_write re-checks idempotently
-	 * and writes the same (truncated) range.
+	 * as the iomap DIO callers (zonefs/gfs2) do.  generic_write_checks truncates
+	 * `from` rather than advancing it, so a -ENOTBLK fallback to
+	 * briefs_iomap_buffered_write re-checks idempotently and writes the same
+	 * (truncated) range.
 	 */
-	if ((iocb->ki_flags & IOCB_DIRECT) && briefs_use_iomap_data_path()) {
+	if (iocb->ki_flags & IOCB_DIRECT) {
 		ssize_t ret = briefs_dio_write(iocb, from);
 
 		if (ret != -ENOTBLK)
 			return ret;
 		/* Fall back to buffered I/O. */
 	}
-	if (briefs_use_iomap_data_path())
-		return briefs_iomap_buffered_write(iocb, from);
-	return generic_file_write_iter(iocb, from);
+	return briefs_iomap_buffered_write(iocb, from);
 }
 
 /*
@@ -1083,12 +641,13 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	 * Truncate the pagecache beyond the new size BEFORE taking extent_lock.
 	 * truncate_setsize() -> truncate_pagecache() waits for any in-flight
 	 * writeback on the pages it drops; meanwhile ->writepages
-	 * (briefs_writepages -> briefs_flush_run -> briefs_append_extent_nojournal)
-	 * acquires extent_lock to map blocks.  Holding extent_lock across that
-	 * wait deadlocks writeback against truncate (AB-BA): the writeback of the
-	 * very pages truncate is waiting on blocks on the lock truncate holds.
-	 * This is the generic/074 mmap hang (kworker flush wedged in
-	 * briefs_append_extent_nojournal, fstest wedged in truncate_pagecache).
+	 * (briefs_iomap_writepages -> briefs_writeback_ops ->
+	 * briefs_append_extent_nojournal) acquires extent_lock to map blocks.
+	 * Holding extent_lock across that wait deadlocks writeback against
+	 * truncate (AB-BA): the writeback of the very pages truncate is waiting
+	 * on blocks on the lock truncate holds.  This is the generic/074 mmap
+	 * hang (kworker flush wedged in briefs_append_extent_nojournal, fstest
+	 * wedged in truncate_pagecache).
 	 *
 	 * Doing this first is also the correct block-freeing order: by the time
 	 * we drop extent_lock below and free the backing extents' data blocks,
@@ -1106,41 +665,19 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 * keeps its pre-truncate data on disk; a later file extension that
 		 * spans the old EOF then reads back that stale content
 		 * (generic/363 EOF-pollution: TRUNCATE DOWN then WRITE-HOLE leaves
-		 * the gap non-zero).  Every block-based FS (ext2/ext3/minix/fat)
-		 * does exactly this block_truncate_page() before truncate_setsize().
-		 *
-		 * Under delalloc the block at new_size is typically BH_Delay (not
-		 * yet allocated), so block_truncate_page's create=0 get_block returns
-		 * unmapped and SKIPS the zeroing -- the exact case here (op 471
-		 * delalloc WRITE then op 472 TRUNCATE DOWN left the tail pattern,
-		 * read back stale after op 473 FALLOC EXTENDING).  briefs_zero_eof_tail
-		 * zeroes the cached delayed folio's tail directly first; the
-		 * block_truncate_page below then handles the allocated-block case
-		 * (read+zero+dirty) and is a no-op for the already-zeroed delayed
-		 * folio.  Called before extent_lock: briefs_get_block takes
-		 * extent_lock internally and is released before this returns, and
-		 * this does not wait on writeback (unlike truncate_setsize's
-		 * truncate_pagecache), so there is no AB-BA with the writeback path
-		 * described below. */
-		if (briefs_use_iomap_data_path()) {
-			/* iomap data path: iomap_truncate_page zeroes [new_size,
-			 * end-of-block) through iomap (read+zero+dirty the EOF block
-			 * if it was evicted, no-op if cached/uptodate) WITHOUT
-			 * attaching buffer_heads to the data folio.  A buffer_head on
-			 * a data folio is fatal here: iomap's iomap_set_range_uptodate
-			 * reads folio->private as a struct iomap_folio_state and spins
-			 * on that (buffer_head) memory as ifs->state_lock -> soft
-			 * lockup + IPI freeze (generic/075 fsx truncate-then-write). */
+		 * the gap non-zero).  iomap_truncate_page handles this without
+		 * attaching buffer_heads to the data folio; a buffer_head on a data
+		 * folio is fatal here (iomap's iomap_set_range_uptodate reads
+		 * folio->private as a struct iomap_folio_state and spins on that
+		 * memory as ifs->state_lock -> soft lockup + IPI freeze, generic/075
+		 * fsx truncate-then-write).  Called before extent_lock and without
+		 * waiting on writeback (unlike truncate_setsize's truncate_pagecache),
+		 * so there is no AB-BA with the writeback path described below. */
+		{
 			bool did_zero = false;
 
 			ret = iomap_truncate_page(inode, new_size, &did_zero,
 						  &briefs_write_iomap_ops);
-			if (ret)
-				return ret;
-		} else {
-			briefs_zero_eof_tail(inode->i_mapping, new_size);
-			ret = block_truncate_page(inode->i_mapping, new_size,
-						  briefs_get_block);
 			if (ret)
 				return ret;
 		}
@@ -1153,12 +690,10 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	 * mmap store past EOF (fsx -e EOF pollution) or stale content from a prior
 	 * smaller i_size; once truncate_setsize grows i_size past the block,
 	 * writeback's [i_size,block_end) zeroing no longer covers it and the stale
-	 * tail leaks as valid data (generic/363).  Use briefs_zero_eof_tail, NOT
-	 * block_truncate_page: under delalloc the old-EOF block may be BH_Delay
-	 * (unmapped), so block_truncate_page's create=0 get_block would skip it.
-	 * Inline-data grows manage their bytes directly under extent_lock below,
-	 * so they are excluded.  Pre-extent_lock for the same AB-BA reason as the
-	 * shrink path (briefs_get_block takes extent_lock internally); this helper
+	 * tail leaks as valid data (generic/363).  briefs_zero_eof_tail zeroes the
+	 * cached folio's tail directly (path-agnostic pagecache manipulation, no
+	 * buffer_heads).  Inline-data grows manage their bytes directly under
+	 * extent_lock below, so they are excluded.  Pre-extent_lock: this helper
 	 * takes no locks and waits on no writeback.  Only the partial old-EOF block
 	 * needs this; whole-block gaps in [old_size,new_size) read as zeros. */
 	if (new_size > old_size &&
@@ -1169,8 +704,8 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	/*
 	 * From this point on we may manipulate the extent list or the chain
 	 * blocks that back it.  Hold the per-inode extent lock to serialize
-	 * with concurrent appends (briefs_append_extent / briefs_get_block)
-	 * and with writeback that maps blocks through the extent list.
+	 * with concurrent appends (briefs_append_extent) and with writeback
+	 * that maps blocks through the extent list.
 	 */
 	mutex_lock(&binfo->extent_lock);
 
@@ -2402,31 +1937,6 @@ const char *briefs_get_link(struct dentry *dentry, struct inode *inode,
 	set_delayed_call(done, kfree_link, link);
 	return link;
 }
-/* Forward decl: defined with the iomap aops below, used by both aops. */
-static int briefs_iomap_swap_activate(struct swap_info_struct *sis,
-				      struct file *file, sector_t *span);
-
-/* address_space_operations for BrieFS regular files.
- * Only read_folio and bmap are used (for mmap/exec).
- * address_space_operations for BrieFS regular files.
- * All writes go through page cache via write_begin/write_end/writepages.
- *
- * Taking some inspiration from xiafs for some of these operations.
- */
-const struct address_space_operations briefs_aops = {
-	.dirty_folio	= block_dirty_folio,
-	.invalidate_folio = block_invalidate_folio,
-	.read_folio	= briefs_read_folio,
-	.writepages	= briefs_writepages,
-	.bmap		= briefs_bmap,
-	.migrate_folio	= buffer_migrate_folio,
-	.is_partially_uptodate = block_is_partially_uptodate,
-	.direct_IO  	= noop_direct_IO,
-	.swap_activate	= briefs_iomap_swap_activate,
-	.write_begin 	= briefs_write_begin,
-	.write_end 	= generic_write_end,
-};
-
 /*
  * iomap address_space_operations for BrieFS regular files.
  *
@@ -2436,14 +1946,15 @@ const struct address_space_operations briefs_aops = {
  * and block_write_begin never attaches a buffer_head head to a data folio.  With
  * no buffer_heads on data folios, iomap-submitted read/write bios never race a
  * buffer_head completion handler on a shared page -- the mix that crashed the
- * kernel when only read was on iomap.  Metadata inodes keep briefs_aops via
- * their own paths; only regular-file data uses this.
+ * kernel when only read was on iomap.  Metadata inodes use buffer_head via their
+ * own paths; only regular-file data uses this.
  *
- * .bmap uses iomap_bmap (Phase 5); the buffer_head aops keeps briefs_bmap
- * (generic_block_bmap + briefs_get_block, retained for symlinks).  .swap_activate
- * (Phase 5) wraps iomap_swapfile_activate.  .direct_IO is noop_direct_IO: unused
- * by the iomap DIO path (briefs_read_iter/briefs_write_iter route IOCB_DIRECT
- * to iomap_dio_rw directly, bypassing the aops write_begin/end).
+ * .bmap uses iomap_bmap (FIBMAP + the swapfile activation fallback);
+ * .swap_activate wraps iomap_swapfile_activate.  .direct_IO is noop_direct_IO:
+ * it is never called -- DIO is routed by briefs_read_iter/briefs_write_iter to
+ * iomap_dio_rw directly, bypassing the aops write_begin/end -- but dentry_open()
+ * gates O_DIRECT opens on a_ops->direct_IO being non-NULL (it sets
+ * FMODE_CAN_ODIRECT from it, else returns -EINVAL), so the no-op must stay.
  */
 static int briefs_iomap_read_folio(struct file *file, struct folio *folio)
 {
@@ -2468,7 +1979,7 @@ static int briefs_iomap_writepages(struct address_space *mapping,
  * block via the iomap extent map.  Used by FIBMAP and by the swapfile
  * activation fallback.  iomap_bmap walks briefs_iomap_ops (the read/report
  * translation) and returns the absolute physical block for a mapped block or 0
- * for a hole, matching what briefs_get_block exposed through generic_block_bmap.
+ * for a hole.
  */
 static sector_t briefs_iomap_bmap(struct address_space *mapping, sector_t block)
 {
@@ -2481,9 +1992,8 @@ static sector_t briefs_iomap_bmap(struct address_space *mapping, sector_t block)
  * briefs_iomap_ops (IOMAP_REPORT), rejecting holes, unwritten extents, inline
  * data, and delalloc -- a swapfile must be fully of mapped, written, contiguous
  * extents -- and builds the swap extent list the swap layer consumes.  The test
- * creates the swapfile by writing it out, so every block is MAPPED.  Used on
- * both aops: the iomap data path and the buffer_head fallback, since the
- * extent map is independent of the data read/write path.
+ * creates the swapfile by writing it out, so every block is MAPPED.  The extent
+ * map is independent of the data read/write path.
  */
 static int briefs_iomap_swap_activate(struct swap_info_struct *sis,
 				      struct file *file, sector_t *span)
@@ -2508,15 +2018,15 @@ const struct address_space_operations briefs_iomap_aops = {
 /*
  * mmap write support via .page_mkwrite.
  *
- * The buffer_head path (generic_file_mmap -> generic_file_vm_ops) has no
- * .page_mkwrite: a write fault into a hole reads the folio (zero-filled by
- * iomap_read_folio) and the PTE dirties it without ever allocating a block.
- * The block is then allocated during ->writeback by briefs_writeback_map_blocks
- * (write=true) -- i.e. the writeback worker takes extent_lock, runs
- * briefs_btree_insert_locked and mark_inode_dirty, and reaches the journal,
- * all from inside the writeback path.  Under the fsx+mmap workload of
- * generic/127 that writeback-time allocation deadlocks (silent full freeze,
- * no soft-lockup trace: both CPUs stuck with IRQs disabled).
+ * A plain generic_file_mmap path (no .page_mkwrite) would let a write fault
+ * into a hole read the folio (zero-filled by iomap_read_folio) and dirty the
+ * PTE without ever allocating a block; the block would then be allocated
+ * during ->writeback by briefs_writeback_map_blocks (write=true) -- i.e. the
+ * writeback worker takes extent_lock, runs briefs_btree_insert_locked and
+ * mark_inode_dirty, and reaches the journal, all from inside the writeback
+ * path.  Under the fsx+mmap workload of generic/127 that writeback-time
+ * allocation deadlocks (silent full freeze, no soft-lockup trace: both CPUs
+ * stuck with IRQs disabled).
  *
  * iomap_page_mkwrite instead allocates the block at fault time -- in the
  * faulting task, through briefs_write_iomap_ops.begin -- and marks the folio
@@ -2525,8 +2035,7 @@ const struct address_space_operations briefs_iomap_aops = {
  * no extent_lock, no mark_inode_dirty, no journal) and writeback submits a
  * plain bio.  This is the zonefs pattern: sb_start_pagefault / file_update_time
  * / filemap_invalidate_lock_shared around iomap_page_mkwrite, with
- * filemap_fault + filemap_map_pages for read faults.  The buffer_head fallback
- * (iomap_data=0) keeps generic_file_mmap and its pre-existing mmap behaviour.
+ * filemap_fault + filemap_map_pages for read faults.
  */
 static vm_fault_t briefs_vm_page_mkwrite(struct vm_fault *vmf)
 {
@@ -2550,9 +2059,6 @@ static const struct vm_operations_struct briefs_file_vm_ops = {
 
 int briefs_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	if (!briefs_use_iomap_data_path())
-		return generic_file_mmap(file, vma);
-
 	vma->vm_ops = &briefs_file_vm_ops;
 	return 0;
 }

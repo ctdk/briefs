@@ -70,8 +70,8 @@ const struct file_operations briefs_file_operations = {
 	 * copy through do_splice_direct(), which returns -EINVAL unless both
 	 * ->splice_read and ->splice_write are present.  BrieFS is fully
 	 * pagecache-backed (briefs_read_iter/briefs_write_iter delegate to the
-	 * generic iter helpers; briefs_aops provides read_folio/write_begin/
-	 * write_end), so the generic splice implementations are correct here and
+	 * generic iter helpers; briefs_iomap_aops provides read_folio and iomap
+	 * writeback), so the generic splice implementations are correct here and
 	 * route through the same pagecache paths as read/write/mmap.
 	 * (generic/075: fsx copy_file_range "do_copy_range: Invalid argument".)
 	 */

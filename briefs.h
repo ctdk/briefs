@@ -896,20 +896,13 @@ extern const struct file_operations briefs_dir_operations;
 extern const struct file_operations briefs_file_operations;
 
 /* address_space_operations */
-extern const struct address_space_operations briefs_aops;
 extern const struct address_space_operations briefs_iomap_aops;
 
-/* Select the regular-file data-path aops (iomap vs buffer_head fallback). */
-bool briefs_use_iomap_data_path(void);
+/* Select the regular-file data-path aops (iomap). */
 const struct address_space_operations *briefs_get_file_aops(void);
 
-/* mmap: iomap path wires a custom vm_ops with .page_mkwrite; buffer_head
- * fallback keeps generic_file_mmap. */
+/* mmap: wires a custom vm_ops with .page_mkwrite. */
 int briefs_file_mmap(struct file *file, struct vm_area_struct *vma);
-
-/* get_block callback - maps inode+iblock to buffer_head */
-int briefs_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create);
-int briefs_get_block_write(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create);
 
 /* super_operations */
 extern const struct super_operations briefs_super_ops;
