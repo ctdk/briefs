@@ -121,6 +121,65 @@ int briefs_inode_lookup_iblock(struct super_block *sb,
 }
 
 /*
+ * briefs_next_extent - lower-bound: the first extent with offset > @iblock (the
+ * extent that bounds a hole at @iblock on the right). Used by the iomap path to
+ * bound a hole mapping so the iomap iterator advances past the whole hole in one
+ * step instead of one block at a time (which on a query to s_maxbytes would soft-
+ * lockup). Dispatches on InodeFlagIndexed: tree-backed inodes use
+ * briefs_btree_next_extent (O(log E)); inline-only inodes scan the <=8-entry
+ * inline array. Returns 0 + *ext, -ENOENT if no extent has offset > @iblock (the
+ * hole runs to EOF / the query end), or -EIO. @trust_verified is forwarded like
+ * briefs_inode_lookup_iblock.
+ */
+int briefs_next_extent(struct super_block *sb, struct briefs_inode_info *binfo,
+		       u64 iblock, struct briefs_extent *ext, bool trust_verified)
+{
+	struct briefs_inode *di = &binfo->disk_inode;
+
+	if (di->flags & InodeFlagIndexed) {
+		u64 base;
+		unsigned seq;
+
+		do {
+			seq = read_seqcount_begin(&binfo->extent_seq);
+			base = di->extent_inline_base;
+		} while (read_seqcount_retry(&binfo->extent_seq, seq));
+		return briefs_btree_next_extent(sb, base, iblock, ext,
+						trust_verified);
+	}
+
+	{
+		struct briefs_extent snap[8];
+		unsigned seq;
+		int n, k;
+		u64 best_off = U64_MAX;
+		int best = -1;
+
+		do {
+			seq = read_seqcount_begin(&binfo->extent_seq);
+			n = di->num_extents_inline;
+			if (n > 8)
+				n = 8;
+			for (k = 0; k < n; k++)
+				snap[k] = di->inline_extents[k];
+		} while (read_seqcount_retry(&binfo->extent_seq, seq));
+
+		for (k = 0; k < n; k++) {
+			u64 off = snap[k].offset;
+
+			if (off > iblock && off < best_off) {
+				best_off = off;
+				best = k;
+			}
+		}
+		if (best < 0)
+			return -ENOENT;
+		*ext = snap[best];
+		return 0;
+	}
+}
+
+/*
  * briefs_clear_extent_unwritten - convert the unwritten extent covering
  * @iblock to written (clear BRIEFS_EXT_UNWRITTEN, in place -- no split, no
  * block free).  Called by the write paths (briefs_get_block /

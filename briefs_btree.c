@@ -190,6 +190,90 @@ static int btree_lookup_block(struct super_block *sb, u64 block, u64 iblock,
 	}
 }
 
+/* Lower-bound descent: find the first extent with offset > @iblock (the extent
+ * that bounds a hole at @iblock on the right). Used by the iomap path to bound a
+ * hole mapping so the iomap iterator does not crawl one block at a time, and so a
+ * hole past the last extent (or on an inode whose cached_max_end is unknown)
+ * terminates in one step.
+ *
+ * Descends exactly like btree_lookup_block (to the leaf whose subtree holds
+ * @iblock's range), then scans that leaf for the first extent with offset >
+ * @iblock. If the leaf holds no such extent (every extent there ends at or before
+ * @iblock, i.e. @iblock sits in a hole that spans into the next leaf), follows
+ * next_leaf once and returns its first extent. Returns 0 and fills *ext, -ENOENT
+ * if no extent has offset > @iblock (hole runs to EOF / the query end), or -EIO
+ * on a read/checksum failure. */
+static int btree_lower_bound_block(struct super_block *sb, u64 block, u64 iblock,
+				   struct briefs_extent *ext, bool trust_verified)
+{
+	struct buffer_head *bh;
+	struct briefs_extent_btree_node *node;
+	int ret;
+
+	node = btree_read_node(sb, block, trust_verified, &bh);
+	if (!node)
+		return -EIO;
+
+	if (btree_node_is_leaf(node)) {
+		int i, num_keys = le16_to_cpu(node->hdr.num_keys);
+
+		for (i = 0; i < num_keys; i++) {
+			struct briefs_disk_extent *de = &node->u.leaf.extents[i];
+			u64 off = le64_to_cpu(de->offset);
+
+			if (off > iblock) {
+				briefs_disk_extent_to_cpu(de, ext);
+				brelse(bh);
+				return 0;
+			}
+		}
+		/* No extent > @iblock in this leaf: the bound (if any) is the
+		 * first extent of the next leaf. */
+		{
+			u64 next = le64_to_cpu(node->hdr.next_leaf);
+
+			brelse(bh);
+			if (next == 0)
+				return -ENOENT;
+			node = btree_read_node(sb, next, trust_verified, &bh);
+			if (!node)
+				return -EIO;
+			if (le16_to_cpu(node->hdr.num_keys) > 0) {
+				briefs_disk_extent_to_cpu(&node->u.leaf.extents[0],
+							 ext);
+				brelse(bh);
+				return 0;
+			}
+			brelse(bh);
+			return -ENOENT;
+		}
+	}
+
+	{
+		int p = btree_internal_find_child(node, iblock);
+		u64 child = (p < le16_to_cpu(node->hdr.num_keys))
+			    ? le64_to_cpu(node->u.internal.idx[p].child)
+			    : le64_to_cpu(node->u.internal.trailing_child);
+		brelse(bh);
+		if (child == 0) {
+			pr_err("briefs: btree: internal node %llu has null child\n",
+			       block);
+			return -EIO;
+		}
+		ret = btree_lower_bound_block(sb, child, iblock, ext,
+					       trust_verified);
+		return ret;
+	}
+}
+
+int briefs_btree_next_extent(struct super_block *sb, u64 root_block, u64 iblock,
+			     struct briefs_extent *ext, bool trust_verified)
+{
+	if (root_block == 0)
+		return -ENOENT;
+	return btree_lower_bound_block(sb, root_block, iblock, ext, trust_verified);
+}
+
 int briefs_btree_lookup(struct super_block *sb, u64 root_block, u64 iblock,
 			struct briefs_extent *ext, bool trust_verified)
 {

@@ -962,6 +962,11 @@ int briefs_read_extent(struct super_block *sb, struct briefs_inode *di, int inde
 int briefs_inode_lookup_iblock(struct super_block *sb, struct briefs_inode_info *binfo,
 			       u64 iblock, struct briefs_extent *ext, bool trust_verified);
 
+/* Lower-bound: first extent with offset > @iblock (bounds a hole at @iblock on
+ * the right). 0 + *ext, -ENOENT if none (hole to EOF), or -EIO. */
+int briefs_next_extent(struct super_block *sb, struct briefs_inode_info *binfo,
+		       u64 iblock, struct briefs_extent *ext, bool trust_verified);
+
 /* Convert the unwritten extent covering @iblock to written (clear
  * BRIEFS_EXT_UNWRITTEN in place).  Caller holds binfo->extent_lock.  Returns 0
  * if an extent covered @iblock, -ENOENT otherwise. */
@@ -995,6 +1000,12 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc);
  * unlocked scanners verify every time). */
 int briefs_btree_lookup(struct super_block *sb, u64 root_block, u64 iblock,
 			struct briefs_extent *ext, bool trust_verified);
+
+/* Lower-bound: find the first extent with offset > @iblock (the extent that
+ * bounds a hole at @iblock on the right). Returns 0 + *ext, -ENOENT if none (hole
+ * runs to EOF), or -EIO. trust_verified as in briefs_btree_lookup. */
+int briefs_btree_next_extent(struct super_block *sb, u64 root_block, u64 iblock,
+			     struct briefs_extent *ext, bool trust_verified);
 
 /* Insert @ext into the index (caller holds extent_lock). Performs sorted insert
  * (inline or tree), merge-with-offset-neighbor, inline->tree spill, and B+ tree

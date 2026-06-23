@@ -20,6 +20,7 @@
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
 #include "briefs_debug.h"
+#include "briefs_iomap.h"
 
 /* address_space_operations wrappers (kernel 6.12 folio-based APIs). */
 
@@ -1284,95 +1285,37 @@ int briefs_getattr(struct mnt_idmap *idmap, const struct path *path,
 
 /* briefs_fiemap - report the file extent map (FS_IOC_FIEMAP).
  *
- * BrieFS has no hole extents: punch-hole removes extents and frees their
- * blocks, so holes are gaps in logical coverage. We emit only the real
- * allocated extents in ascending logical order; holes are implied by the
- * gaps between them (per the fiemap spec). Preallocated blocks are normal
- * extents (flags == 0). Inline-data inodes report a single DATA_INLINE extent.
+ * Delegates to iomap_fiemap, which walks briefs_iomap_ops and emits one
+ * fiemap extent per iomap mapping, skipping holes (BrieFS has no hole extents:
+ * punch-hole removes extents and frees their blocks, so holes are gaps in
+ * logical coverage, implied by the gaps between emitted extents per the fiemap
+ * spec).  iomap maps IOMAP_INLINE -> FIEMAP_EXTENT_DATA_INLINE and
+ * IOMAP_UNWRITTEN -> FIEMAP_EXTENT_UNWRITTEN; FIEMAP_EXTENT_LAST is set by
+ * iomap_fiemap itself on the final extent.
+ *
+ * The range flush before iomap_fiemap is the delayed-allocation case: written-
+ * but-not-yet-written-back blocks are BH_Delay in the page cache and absent
+ * from the extent list.  BrieFS has no extent-status tree (like ext4_es) to
+ * synthesize DELALLOC extents, so we force writeback of the queried range
+ * first and then report the now-allocated physical extents.  iomap_fiemap
+ * re-runs fiemap_prep internally; that second call is harmless (len is already
+ * clipped, and the incompat-flag check is idempotent).
  */
 int briefs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 		  u64 start, u64 len)
 {
-	struct briefs_inode_info *binfo = briefs_i(inode);
-	struct briefs_inode *di = &binfo->disk_inode;
-	struct super_block *sb = inode->i_sb;
-	u64 isize = i_size_read(inode);
-	u64 end;
-	struct briefs_extent *arr;
-	int snap_total, ret, i;
+	int ret;
 
-	/* Validate/clip the range; flush dirty pages if FIEMAP_FLAG_SYNC was
-	 * requested. supported_flags = 0 means we accept only FIEMAP_FLAG_SYNC
-	 * (added by fiemap_prep); FIEMAP_FLAG_XATTR requests get -EBADR since
-	 * BrieFS has no xattrs. */
 	ret = fiemap_prep(inode, fieinfo, start, &len, 0);
 	if (ret)
 		return ret;
-	end = start + len;   /* len is now clipped by fiemap_prep */
 
-	/* Inline-data inode: a single inline extent covers [0, isize). */
-	if (di->flags & InodeFlagInlineData) {
-		if (start < isize) {
-			ret = fiemap_fill_next_extent(fieinfo, 0, 0, isize,
-				FIEMAP_EXTENT_DATA_INLINE | FIEMAP_EXTENT_LAST);
-			/* helper also sets FIEMAP_EXTENT_NOT_ALIGNED for us */
-			if (ret < 0)
-				return ret;
-		}
-		return 0;   /* ret == 1 (done) -> return 0; never return 1 */
-	}
-
-	/* Delayed allocation (#6): written-but-not-yet-written-back blocks are
-	 * BH_Delay in the page cache and absent from the extent list, so without
-	 * this flush fiemap would report them as holes.  BrieFS has no
-	 * extent-status tree (like ext4_es) to describe delayed extents, so --
-	 * unlike ext4, which synthesizes DELALLOC extents -- we force writeback
-	 * of the queried range first and then report the now-allocated physical
-	 * extents.  This makes fiemap reflect the real post-writeback layout.
-	 */
-	ret = filemap_write_and_wait_range(inode->i_mapping, start, end - 1);
+	ret = filemap_write_and_wait_range(inode->i_mapping, start,
+					  start + len - 1);
 	if (ret)
 		return ret;
 
-	/* Collect every extent in ascending offset order. The B+ tree (and the
-	 * inline array) keep extents sorted by offset, so no sort() is needed
-	 * — the headline complexity win of the tree conversion. */
-	ret = briefs_collect_all_extents(sb, di, &arr, &snap_total);
-	if (ret)
-		return ret;
-	if (snap_total == 0)
-		return 0;   /* fully sparse / empty extent-backed file */
-
-	for (i = 0; i < snap_total; i++) {
-		u64 logical   = arr[i].offset << BRIEFS_BLOCK_SHIFT;
-		u64 ext_bytes = arr[i].len    << BRIEFS_BLOCK_SHIFT;
-		u64 ext_end   = logical + ext_bytes;
-		u32 flags = 0;
-
-		if (ext_end <= start)
-			continue;          /* entirely before the query range */
-		if (logical >= end)
-			break;             /* sorted -> no more overlap */
-
-		if (i + 1 == snap_total)
-			flags |= FIEMAP_EXTENT_LAST;
-
-		if (arr[i].flags & BRIEFS_EXT_UNWRITTEN)
-			flags |= FIEMAP_EXTENT_UNWRITTEN;
-
-		ret = fiemap_fill_next_extent(fieinfo, logical,
-			arr[i].phys << BRIEFS_BLOCK_SHIFT, ext_bytes, flags);
-		if (ret < 0)
-			goto out;          /* -EFAULT: propagate */
-		if (ret == 1)
-			goto done;         /* buffer full or LAST emitted: success */
-		/* ret == 0: continue */
-	}
-done:
-	ret = 0;
-out:
-	kvfree(arr);
-	return ret;
+	return iomap_fiemap(inode, fieinfo, start, len, &briefs_iomap_ops);
 }
 
 /*
