@@ -23,8 +23,9 @@
  *
  * Both mirror briefs_get_block (briefs_extent.c) exactly: the cached_max_end
  * tail-cache fast path, the unlocked lookup with a locked re-check on a write
- * miss, in-place unwritten conversion, single-block allocation under
- * extent_lock, and the -EEXIST race adoption.
+ * miss, in-place unwritten conversion, run-coalesced allocation under
+ * extent_lock (one len<=256 extent per write_begin, with a single-block
+ * fallback), and the -EEXIST race adoption.
  */
 #include <linux/iomap.h>
 #include <linux/fs.h>
@@ -121,7 +122,7 @@ static int briefs_iomap_begin_common(struct inode *inode, loff_t pos,
 	struct briefs_inode *di = &binfo->disk_inode;
 	u64 iblock = pos >> BRIEFS_BLOCK_SHIFT;
 	struct briefs_extent ext, new_ext;
-	u64 rel, phys;
+	u64 rel, phys, full_blocks, n_blocks, i;
 	unsigned seq;
 	u64 snap_max_end;
 	int ret;
@@ -206,6 +207,61 @@ locked_create:
 	}
 
 do_alloc:
+	/* Size the allocation as a contiguous run, not a single block, so a
+	 * large sequential write maps N blocks as one extent instead of N.
+	 * The run covers only the FULL blocks remaining in this write
+	 * (floor(length/block)); any trailing partial block is mapped by a
+	 * separate begin call, so every block in the run is fully written and
+	 * iomap's IOMAP_F_NEW head/tail zeroing never leaves a stale tail
+	 * inside it.  Cap the run at BRIEFS_DELALLOC_RUN_MAX and bound it by
+	 * the next existing extent so it never overlaps a later mapping:
+	 * iblock itself is unmapped (the re-check above), but iblock+k may
+	 * already be mapped.  Writeback calls here with len == 1 block, so
+	 * full_blocks == 1 and this collapses to the single-block path.
+	 */
+	full_blocks = (u64)length >> BRIEFS_BLOCK_SHIFT;
+	n_blocks = full_blocks ? min_t(u64, full_blocks,
+				       BRIEFS_DELALLOC_RUN_MAX) : 1;
+	if (n_blocks > 1) {
+		ret = briefs_next_extent(inode->i_sb, binfo, iblock, &ext,
+					 true);
+		if (ret == 0 && ext.offset > iblock)
+			n_blocks = min_t(u64, n_blocks, ext.offset - iblock);
+		/* -ENOENT: no later extent, no bound.  -EIO: ignore; the insert
+		 * below will fail and drop to the single-block path.
+		 */
+	}
+
+	rel = briefs_alloc_blocks(&bsi->alloc, n_blocks);
+	if (rel != 0) {
+		phys = data_to_abs(bsi->sb, rel);
+		new_ext.offset = iblock;
+		new_ext.phys = phys;
+		new_ext.len = n_blocks;
+		new_ext.flags = 0;
+
+		ret = briefs_btree_insert_locked(inode->i_sb,
+						 &binfo->disk_inode, &new_ext);
+		if (ret == 0) {
+			mark_inode_dirty(inode);
+			briefs_iomap_fill_mapped(inode, &new_ext,
+						 IOMAP_F_NEW, iomap);
+			mutex_unlock(&binfo->extent_lock);
+			return 0;
+		}
+		/* Run insert failed (tree-grow ENOSPC, or a race -EEXIST the
+		 * bound above should have prevented): free the run per-block
+		 * (briefs_free_blocks_range 1M-caps; a 256-block run sits at
+		 * the cap) and drop to the single-block path.
+		 */
+		for (i = 0; i < n_blocks; i++)
+			briefs_free_block(&bsi->alloc, rel + i);
+	}
+
+	/* Single-block fallback: briefs_alloc_blocks could not obtain a
+	 * contiguous physical run of n_blocks (fragmentation), or the run
+	 * insert failed.  Allocate one block and insert a len=1 extent.
+	 */
 	rel = briefs_alloc_block(&bsi->alloc);
 	if (rel == 0) {
 		mutex_unlock(&binfo->extent_lock);
@@ -267,11 +323,15 @@ static int briefs_iomap_begin_write(struct inode *inode, loff_t pos,
 }
 
 /*
- * briefs_write_iomap_end -- commit a write that allocated blocks (IOMAP_F_NEW).
- * A short write (written < length) leaves the tail blocks allocated but
- * unwritten; briefs_setattr / truncate will reclaim them, and mark_inode_dirty
- * was already done in begin, so there is nothing to unreserve here.  We keep
- * the hook for the Phase-3 delalloc / unreserve work.
+ * briefs_write_iomap_end -- commit a write that allocated a run (IOMAP_F_NEW).
+ * The run is sized to the FULL blocks remaining in the write, so in the normal
+ * case every block in the run is fully written (the trailing partial block, if
+ * any, is mapped by a separate begin call) and there is nothing to unreserve.
+ * mark_inode_dirty was done in begin.  The only short write is an EFAULT /
+ * balance_dirty_pages error mid-run, which leaves the unwritten run tail
+ * allocated but past i_size; it is invisible to ordinary reads and reclaimed by
+ * a later truncate.  Freeing that tail here (a sub-range extent delete) is
+ * correct but not yet wired -- add it if a stale-tail regression appears.
  */
 static int briefs_write_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 				  ssize_t written, unsigned flags,

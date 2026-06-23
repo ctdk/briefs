@@ -117,7 +117,6 @@ static int briefs_read_folio(struct file *file, struct folio *folio)
  * Bounding the run caps the number of folios held locked at once; on kmalloc
  * failure we fall back to mpage_writepages (the Step 2 per-block path).
  */
-#define BRIEFS_DELALLOC_RUN_MAX	256
 
 /* block_write_full_folio() isn't exported to modules (only __block_write_full_
  * folio is), so replicate its i_size handling around the exported primitive.

@@ -30,6 +30,7 @@
 #define BRIEFS_INODE_SIZE 512
 #define BRIEFS_INODE_INLINE_DATA_SIZE 256
 #define BRIEFS_NAME_LEN 255
+#define BRIEFS_DELALLOC_RUN_MAX 256	/* max blocks per coalesced write run */
 
 /* Semantic versioning, yo */
 #define _BRIEFS_MAJOR_VER 0
