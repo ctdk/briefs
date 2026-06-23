@@ -16,6 +16,7 @@
 #include <linux/blkdev.h>
 #include <linux/mm.h>
 #include <linux/uaccess.h>
+#include <linux/migrate.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
@@ -23,6 +24,35 @@
 #include "briefs_iomap.h"
 
 /* address_space_operations wrappers (kernel 6.12 folio-based APIs). */
+
+/*
+ * briefs_iomap_data_path -- select the file data path.
+ *
+ * true (default): the iomap data path.  Buffered read/write, writeback, and
+ * folio reclaim all go through iomap; no buffer_head ever attaches to a data
+ * folio, so there is no iomap-read / buffer_head-write bio mix on shared pages
+ * (the combination that crashed the kernel when only read was moved to iomap).
+ * Metadata stays on buffer_head regardless.
+ *
+ * false: the buffer_head fallback (briefs_aops + generic_file_write_iter).  Kept
+ * as a runtime bisect switch so a regression in the iomap path can be isolated
+ * to the begin/alloc side vs the writeback side without rebuilding.
+ */
+static bool briefs_iomap_data_path = true;
+module_param_named(iomap_data, briefs_iomap_data_path, bool, 0644);
+MODULE_PARM_DESC(iomap_data,
+		 "on (default): iomap file data path; off: buffer_head fallback");
+
+bool briefs_use_iomap_data_path(void)
+{
+	return briefs_iomap_data_path;
+}
+
+const struct address_space_operations *briefs_get_file_aops(void)
+{
+	return briefs_iomap_data_path ? &briefs_iomap_aops : &briefs_aops;
+}
+
 
 /* read_folio: wrapper calling mpage_read_folio with our get_block */
 static int briefs_read_folio(struct file *file, struct folio *folio)
@@ -683,6 +713,45 @@ ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 }
 
 /*
+ * briefs_iomap_buffered_write - extent-backed buffered write via iomap.
+ *
+ * Mirrors generic_file_write_iter / __generic_file_write_iter but drives the
+ * page-cache copy through iomap_file_buffered_write (briefs_write_iomap_ops,
+ * which allocates on a miss and converts unwritten extents in place) instead of
+ * generic_perform_write -> aops.write_begin.  generic_write_checks handles
+ * O_APPEND / O_TRUNC / RLIMIT_FSIZE (SIGXFSZ) / s_maxbytes exactly as the
+ * buffer_head path does through generic_file_write_iter; file_update_time +
+ * file_remove_privs supply the mtime/ctime/priv updates that the buffer_head
+ * path got from __generic_file_write_iter (generic/003/313/423/755).  iomap
+ * updates i_size itself; generic_write_sync honours IOCB_SYNC.  The inode lock
+ * is taken here (the inline section above already released it).
+ */
+static ssize_t briefs_iomap_buffered_write(struct kiocb *iocb,
+					    struct iov_iter *from)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	ssize_t ret;
+
+	inode_lock(inode);
+	ret = generic_write_checks(iocb, from);
+	if (ret <= 0)
+		goto out_unlock;
+	ret = file_remove_privs(iocb->ki_filp);
+	if (ret)
+		goto out_unlock;
+	ret = file_update_time(iocb->ki_filp);
+	if (ret)
+		goto out_unlock;
+	ret = iomap_file_buffered_write(iocb, from, &briefs_write_iomap_ops,
+					 NULL);
+out_unlock:
+	inode_unlock(inode);
+	if (ret > 0)
+		ret = generic_write_sync(iocb, ret);
+	return ret;
+}
+
+/*
  * briefs_write_iter - write to a regular file.
  *
  * Small writes that fit inside the 256-byte inline region are stored directly
@@ -758,6 +827,8 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	}
 
 	inode_unlock(inode);
+	if (briefs_use_iomap_data_path())
+		return briefs_iomap_buffered_write(iocb, from);
 	return generic_file_write_iter(iocb, from);
 }
 
@@ -985,11 +1056,28 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 * this does not wait on writeback (unlike truncate_setsize's
 		 * truncate_pagecache), so there is no AB-BA with the writeback path
 		 * described below. */
-		briefs_zero_eof_tail(inode->i_mapping, new_size);
-		ret = block_truncate_page(inode->i_mapping, new_size,
-					  briefs_get_block);
-		if (ret)
-			return ret;
+		if (briefs_use_iomap_data_path()) {
+			/* iomap data path: iomap_truncate_page zeroes [new_size,
+			 * end-of-block) through iomap (read+zero+dirty the EOF block
+			 * if it was evicted, no-op if cached/uptodate) WITHOUT
+			 * attaching buffer_heads to the data folio.  A buffer_head on
+			 * a data folio is fatal here: iomap's iomap_set_range_uptodate
+			 * reads folio->private as a struct iomap_folio_state and spins
+			 * on that (buffer_head) memory as ifs->state_lock -> soft
+			 * lockup + IPI freeze (generic/075 fsx truncate-then-write). */
+			bool did_zero = false;
+
+			ret = iomap_truncate_page(inode, new_size, &did_zero,
+						  &briefs_write_iomap_ops);
+			if (ret)
+				return ret;
+		} else {
+			briefs_zero_eof_tail(inode->i_mapping, new_size);
+			ret = block_truncate_page(inode->i_mapping, new_size,
+						  briefs_get_block);
+			if (ret)
+				return ret;
+		}
 		truncate_setsize(inode, new_size);
 	}
 
@@ -2221,3 +2309,102 @@ const struct address_space_operations briefs_aops = {
 	.write_begin 	= briefs_write_begin,
 	.write_end 	= generic_write_end,
 };
+
+/*
+ * iomap address_space_operations for BrieFS regular files.
+ *
+ * Read, writeback, and folio reclaim all go through iomap; the buffered-write
+ * path (briefs_write_iter -> briefs_iomap_buffered_write) calls
+ * iomap_file_buffered_write directly, so this aops has no write_begin/write_end
+ * and block_write_begin never attaches a buffer_head head to a data folio.  With
+ * no buffer_heads on data folios, iomap-submitted read/write bios never race a
+ * buffer_head completion handler on a shared page -- the mix that crashed the
+ * kernel when only read was on iomap.  Metadata inodes keep briefs_aops via
+ * their own paths; only regular-file data uses this.
+ *
+ * .bmap reuses briefs_bmap (generic_block_bmap + briefs_get_block, which is
+ * retained for symlinks); Phase 5 replaces it with iomap_bmap.  .direct_IO is
+ * noop until Phase 4 (briefs_open still rejects O_DIRECT).
+ */
+static int briefs_iomap_read_folio(struct file *file, struct folio *folio)
+{
+	return iomap_read_folio(folio, &briefs_iomap_ops);
+}
+
+static void briefs_iomap_readahead(struct readahead_control *rac)
+{
+	iomap_readahead(rac, &briefs_iomap_ops);
+}
+
+static int briefs_iomap_writepages(struct address_space *mapping,
+				   struct writeback_control *wbc)
+{
+	struct iomap_writepage_ctx wpc = { };
+
+	return iomap_writepages(mapping, wbc, &wpc, &briefs_writeback_ops);
+}
+
+const struct address_space_operations briefs_iomap_aops = {
+	.read_folio	= briefs_iomap_read_folio,
+	.readahead	= briefs_iomap_readahead,
+	.writepages	= briefs_iomap_writepages,
+	.dirty_folio	= iomap_dirty_folio,
+	.invalidate_folio = iomap_invalidate_folio,
+	.release_folio	= iomap_release_folio,
+	.is_partially_uptodate = iomap_is_partially_uptodate,
+	.migrate_folio	= filemap_migrate_folio,
+	.bmap		= briefs_bmap,
+	.direct_IO	= noop_direct_IO,
+};
+
+/*
+ * mmap write support via .page_mkwrite.
+ *
+ * The buffer_head path (generic_file_mmap -> generic_file_vm_ops) has no
+ * .page_mkwrite: a write fault into a hole reads the folio (zero-filled by
+ * iomap_read_folio) and the PTE dirties it without ever allocating a block.
+ * The block is then allocated during ->writeback by briefs_writeback_map_blocks
+ * (write=true) -- i.e. the writeback worker takes extent_lock, runs
+ * briefs_btree_insert_locked and mark_inode_dirty, and reaches the journal,
+ * all from inside the writeback path.  Under the fsx+mmap workload of
+ * generic/127 that writeback-time allocation deadlocks (silent full freeze,
+ * no soft-lockup trace: both CPUs stuck with IRQs disabled).
+ *
+ * iomap_page_mkwrite instead allocates the block at fault time -- in the
+ * faulting task, through briefs_write_iomap_ops.begin -- and marks the folio
+ * dirty, so by the time writeback runs the folio is already MAPPED and
+ * briefs_writeback_map_blocks just returns the cached mapping (no allocation,
+ * no extent_lock, no mark_inode_dirty, no journal) and writeback submits a
+ * plain bio.  This is the zonefs pattern: sb_start_pagefault / file_update_time
+ * / filemap_invalidate_lock_shared around iomap_page_mkwrite, with
+ * filemap_fault + filemap_map_pages for read faults.  The buffer_head fallback
+ * (iomap_data=0) keeps generic_file_mmap and its pre-existing mmap behaviour.
+ */
+static vm_fault_t briefs_vm_page_mkwrite(struct vm_fault *vmf)
+{
+	struct inode *inode = file_inode(vmf->vma->vm_file);
+	vm_fault_t ret;
+
+	sb_start_pagefault(inode->i_sb);
+	file_update_time(vmf->vma->vm_file);
+	filemap_invalidate_lock_shared(inode->i_mapping);
+	ret = iomap_page_mkwrite(vmf, &briefs_write_iomap_ops);
+	filemap_invalidate_unlock_shared(inode->i_mapping);
+	sb_end_pagefault(inode->i_sb);
+	return ret;
+}
+
+static const struct vm_operations_struct briefs_file_vm_ops = {
+	.fault		= filemap_fault,
+	.map_pages	= filemap_map_pages,
+	.page_mkwrite	= briefs_vm_page_mkwrite,
+};
+
+int briefs_file_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	if (!briefs_use_iomap_data_path())
+		return generic_file_mmap(file, vma);
+
+	vma->vm_ops = &briefs_file_vm_ops;
+	return 0;
+}

@@ -290,3 +290,42 @@ const struct iomap_ops briefs_write_iomap_ops = {
 	.iomap_begin	= briefs_iomap_begin_write,
 	.iomap_end	= briefs_write_iomap_end,
 };
+
+/*
+ * Writeback mapping.  This mirrors briefs_get_block(create=1) from the old
+ * buffer_head writeback path: allocate a block on a miss and convert an
+ * unwritten extent to written in place (write=true).
+ *
+ * Most dirty folios were allocated at write_begin time
+ * (briefs_write_iomap_ops.begin) or at mmap-fault time (briefs_vm_page_mkwrite
+ * -> iomap_page_mkwrite, briefs_file.c) and arrive here already mapped, so
+ * writeback just re-maps them and submits a bio -- the write=true lookup hits
+ * and takes no locks beyond the seqcount read.  write=true (allocate on a miss,
+ * convert unwritten in place) is kept as the safety net for any dirty hole that
+ * reaches writeback without having gone through write_begin or page_mkwrite:
+ * with write=false the iomap core would skip an IOMAP_HOLE (case IOMAP_HOLE:
+ * break) and end writeback without writing, but the folio would still be
+ * mapped-dirty and re-queued forever, busy-looping the writeback worker.  On a
+ * miss write=true allocates the block here, exactly as
+ * briefs_get_block(create=1) did, and iomap_add_to_ioend writes the (already
+ * zero-filled, uptodate) folio to it.
+ *
+ * The cached wpc->iomap is reused while it still covers the requested offset,
+ * so one begin call serves every folio inside a single extent (matching the
+ * coalescing the old run-allocating writeback got for free).
+ */
+static int briefs_writeback_map_blocks(struct iomap_writepage_ctx *wpc,
+				       struct inode *inode, loff_t offset,
+				       unsigned int len)
+{
+	if (offset >= wpc->iomap.offset &&
+	    offset < wpc->iomap.offset + wpc->iomap.length)
+		return 0;
+
+	return briefs_iomap_begin_common(inode, offset, len, IOMAP_WRITE,
+					  &wpc->iomap, true);
+}
+
+const struct iomap_writeback_ops briefs_writeback_ops = {
+	.map_blocks	= briefs_writeback_map_blocks,
+};

@@ -261,7 +261,7 @@ struct inode *briefs_new_inode(struct mnt_idmap *idmap, struct inode *dir,
 	} else if (S_ISREG(mode)) {
 		inode->i_op = &briefs_file_inode_ops;
 		inode->i_fop = &briefs_file_operations;
-		inode->i_mapping->a_ops = &briefs_aops;
+		inode->i_mapping->a_ops = briefs_get_file_aops();
 	} else if (S_ISLNK(mode)) {
 		inode->i_op = &briefs_symlink_inode_ops;
 	} else if (S_ISBLK(mode) || S_ISCHR(mode) ||
@@ -578,7 +578,7 @@ static int briefs_read_and_fill_inode(struct inode *inode)
 	} else if (S_ISREG(inode->i_mode)) {
 		inode->i_op = &briefs_file_inode_ops;
 		inode->i_fop = &briefs_file_operations;
-		inode->i_mapping->a_ops = &briefs_aops;
+		inode->i_mapping->a_ops = briefs_get_file_aops();
 	} else if (S_ISLNK(inode->i_mode)) {
 		inode->i_op = &briefs_symlink_inode_ops;
 		/* no i_fop for symlinks */

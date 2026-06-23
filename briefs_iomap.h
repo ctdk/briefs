@@ -26,4 +26,11 @@ extern const struct iomap_ops briefs_iomap_ops;
  */
 extern const struct iomap_ops briefs_write_iomap_ops;
 
+/*
+ * briefs_writeback_ops - iomap writeback translation.  Phase 3a: blocks are
+ * allocated at write_begin, so map_blocks only re-maps them (read/report) and
+ * iomap_writepages submits the bios.  Used from the iomap address_space path.
+ */
+extern const struct iomap_writeback_ops briefs_writeback_ops;
+
 #endif /* BRIEFS_IOMAP_H */
