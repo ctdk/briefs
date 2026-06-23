@@ -389,3 +389,39 @@ static int briefs_writeback_map_blocks(struct iomap_writepage_ctx *wpc,
 const struct iomap_writeback_ops briefs_writeback_ops = {
 	.map_blocks	= briefs_writeback_map_blocks,
 };
+
+/*
+ * briefs_dio_write_end_io - complete a direct-I/O write.
+ *
+ * iomap_dio_rw advances iocb->ki_pos in iomap_dio_complete AFTER end_io
+ * returns, so ki_pos here is still the ORIGINAL write offset and
+ * ki_pos + size is the new EOF when the write extended the file.  Update
+ * i_size and mark the inode dirty so briefs_write_inode persists the new
+ * disk_inode.filesize (briefs_inode.c briefs_write_inode copies inode->i_size
+ * to binfo->disk_inode.filesize).  mark_inode_dirty is needed even when begin
+ * hit an already-allocated extent (no allocation -> no mark_inode_dirty there):
+ * without it a DIO write that only extends EOF into a pre-existing block would
+ * not have its i_size persisted.
+ *
+ * BrieFS allocates blocks WRITTEN at begin time and iomap_dio zeroes the
+ * head/tail of IOMAP_F_NEW blocks, so there are no unwritten extents to convert
+ * here and IOMAP_DIO_UNWRITTEN is never raised.  On error, propagate it so the
+ * caller (and generic_write_sync for O_SYNC) sees it.
+ */
+static int briefs_dio_write_end_io(struct kiocb *iocb, ssize_t size,
+				   int error, unsigned int flags)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+
+	if (error)
+		return error;
+	if (size > 0 && iocb->ki_pos + size > i_size_read(inode)) {
+		i_size_write(inode, iocb->ki_pos + size);
+		mark_inode_dirty(inode);
+	}
+	return 0;
+}
+
+const struct iomap_dio_ops briefs_dio_write_ops = {
+	.end_io		= briefs_dio_write_end_io,
+};

@@ -14,6 +14,7 @@
 #include <linux/pagemap.h>
 #include <linux/writeback.h>
 #include <linux/blkdev.h>
+#include <linux/bio.h>
 #include <linux/mm.h>
 #include <linux/uaccess.h>
 #include <linux/migrate.h>
@@ -541,16 +542,11 @@ int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
 int briefs_open(struct inode *inode, struct file *file) {
 	pr_debug("briefs: open inode %lu\n", inode->i_ino);
 
-	/* Direct I/O is not implemented: BrieFS serves all I/O through the page
-	 * cache (the address_space .direct_IO is noop_direct_IO, so an O_DIRECT
-	 * open would otherwise succeed while reads/writes silently stay
-	 * buffered). Reject O_DIRECT at open with a clear -EINVAL instead. This
-	 * makes xfstests' _require_odirect cleanly skip the whole DIO test class
-	 * (rather than running those tests against silently-buffered I/O and
-	 * producing spurious failures) until real DIO support exists. */
-	if (file->f_flags & O_DIRECT)
-		return -EINVAL;
-
+	/* Direct I/O is handled by the iter functions (briefs_read_iter /
+	 * briefs_write_iter route IOCB_DIRECT to iomap_dio_rw); nothing to do
+	 * here.  The iomap aops .direct_IO stays noop_direct_IO (unused by the
+	 * iomap DIO path, which bypasses the aops write_begin/end).
+	 */
 	return 0;
 }
 /* Release file */
@@ -708,6 +704,21 @@ ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		return copied;
 	}
 
+	/* Direct reads bypass the page cache.  Take the inode lock shared to
+	 * exclude concurrent writers (which hold it exclusive); iomap_dio_rw
+	 * manages the inode_dio count itself.  No dops: reads need no completion
+	 * work.  Inline-data inodes stay on the inline bypass above (their data
+	 * lives in the inode block, so a "direct" read is just the memcpy there).
+	 */
+	if (iocb->ki_flags & IOCB_DIRECT) {
+		ssize_t ret;
+
+		inode_lock_shared(inode);
+		ret = iomap_dio_rw(iocb, to, &briefs_iomap_ops, NULL, 0, NULL, 0);
+		inode_unlock_shared(inode);
+		return ret;
+	}
+
 	return generic_file_read_iter(iocb, to);
 }
 
@@ -743,6 +754,47 @@ static ssize_t briefs_iomap_buffered_write(struct kiocb *iocb,
 		goto out_unlock;
 	ret = iomap_file_buffered_write(iocb, from, &briefs_write_iomap_ops,
 					 NULL);
+out_unlock:
+	inode_unlock(inode);
+	if (ret > 0)
+		ret = generic_write_sync(iocb, ret);
+	return ret;
+}
+
+/*
+ * briefs_dio_write - extent-backed direct-I/O write.
+ *
+ * Mirrors briefs_iomap_buffered_write's checks (generic_write_checks for
+ * O_APPEND / O_TRUNC / RLIMIT_FSIZE / s_maxbytes; file_remove_privs +
+ * file_update_time for the metadata the buffer_head path got from
+ * __generic_file_write_iter) but drives iomap_dio_rw instead of the page-cache
+ * copy.  briefs_write_iomap_ops is reused: begin allocates on a write miss
+ * (returning IOMAP_F_NEW, whose head/tail iomap_dio zeroes) and converts an
+ * unwritten extent in place, so a DIO write that extends the file allocates the
+ * new blocks directly written (no delalloc, no unwritten conversion needed in
+ * end_io).  briefs_dio_write_ops.end_io updates i_size on a file-extending
+ * write.  -ENOTBLK means the page cache could not be invalidated (the range is
+ * mmap'd); the caller falls back to briefs_iomap_buffered_write.  inline-data
+ * inodes never reach here (the inline section in briefs_write_iter handles
+ * them, and they are already effectively direct).
+ */
+static ssize_t briefs_dio_write(struct kiocb *iocb, struct iov_iter *from)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	ssize_t ret;
+
+	inode_lock(inode);
+	ret = generic_write_checks(iocb, from);
+	if (ret <= 0)
+		goto out_unlock;
+	ret = file_remove_privs(iocb->ki_filp);
+	if (ret)
+		goto out_unlock;
+	ret = file_update_time(iocb->ki_filp);
+	if (ret)
+		goto out_unlock;
+	ret = iomap_dio_rw(iocb, from, &briefs_write_iomap_ops,
+			   &briefs_dio_write_ops, 0, NULL, 0);
 out_unlock:
 	inode_unlock(inode);
 	if (ret > 0)
@@ -826,6 +878,21 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	}
 
 	inode_unlock(inode);
+	/* Direct writes bypass the page cache.  On -ENOTBLK (page cache could not
+	 * be invalidated, e.g. the range is mmap'd) fall back to the buffered path,
+	 * as the iomap DIO callers (zonefs/gfs2) do.  The buffer_head fallback
+	 * (briefs_use_iomap_data_path() == 0) has no DIO path, so it stays buffered.
+	 * generic_write_checks truncates `from` rather than advancing it, so a
+	 * -ENOTBLK fallback to briefs_iomap_buffered_write re-checks idempotently
+	 * and writes the same (truncated) range.
+	 */
+	if ((iocb->ki_flags & IOCB_DIRECT) && briefs_use_iomap_data_path()) {
+		ssize_t ret = briefs_dio_write(iocb, from);
+
+		if (ret != -ENOTBLK)
+			return ret;
+		/* Fall back to buffered I/O. */
+	}
 	if (briefs_use_iomap_data_path())
 		return briefs_iomap_buffered_write(iocb, from);
 	return generic_file_write_iter(iocb, from);
@@ -1439,29 +1506,75 @@ static int briefs_zero_block(struct super_block *sb, u64 abs_block)
 }
 
 /*
- * briefs_zero_block_range - zero bytes [start, end) inside the physical
+ * briefs_zero_block_range - zero bytes [start, end) inside the physical data
  * block at @abs_block.  Used by punch-hole to zero the portion of a
  * partially-holed block that remains allocated.
+ *
+ * The zeroing goes through the block device with a synchronous READ + zero +
+ * WRITE bio and never touches the bdev buffer cache.  This matters under the
+ * iomap data path: file data lives in the inode page cache and direct-I/O
+ * writes reach the disk via bios that bypass the buffer cache.  A data block
+ * once sb_bread'd (by an earlier punch, or by the buffer_head fallback path)
+ * stays cached in the bdev buffer cache with possibly-stale content; a later
+ * DIO write to the reused block changes the disk under that cached buffer, so a
+ * subsequent sb_bread here would hand back the stale buffer and
+ * sync_dirty_buffer would write it back, clobbering the DIO-written data
+ * (generic/091 and the rest of the fsx direct-I/O group).  Using our own bio
+ * reads the current on-disk contents and writes the zeroed range back directly,
+ * keeping data blocks out of the buffer cache entirely.
+ *
+ * The caller (punch-hole) is responsible for page-cache invalidation of the
+ * logical range; this helper only touches the disk, mirroring the sb_bread
+ * variant it replaces.
  */
 static int briefs_zero_block_range(struct super_block *sb, u64 abs_block,
-                                   u32 start, u32 end)
+				   u32 start, u32 end)
 {
-	struct buffer_head *bh;
+	struct block_device *bdev = sb->s_bdev;
+	u32 blocksize = sb->s_blocksize;
+	sector_t sector = abs_block << (sb->s_blocksize_bits - SECTOR_SHIFT);
+	struct page *page;
+	struct bio *bio;
+	int ret;
 
 	if (start >= end)
 		return 0;
-	if (end > sb->s_blocksize)
+	if (end > blocksize)
 		return -EINVAL;
 
-	bh = sb_bread(sb, abs_block);
-	if (!bh)
-		return -EIO;
+	page = alloc_page(GFP_NOFS);
+	if (!page)
+		return -ENOMEM;
 
-	memset(bh->b_data + start, 0, end - start);
-	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
-	brelse(bh);
-	return 0;
+	/* Read the current block contents fresh from disk. */
+	bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_NOFS);
+	if (!bio) {
+		ret = -ENOMEM;
+		goto out_page;
+	}
+	bio->bi_iter.bi_sector = sector;
+	__bio_add_page(bio, page, blocksize, 0);
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+	if (ret)
+		goto out_page;
+
+	/* Zero the requested sub-range and write the whole block back. */
+	memset(page_address(page) + start, 0, end - start);
+
+	bio = bio_alloc(bdev, 1, REQ_OP_WRITE, GFP_NOFS);
+	if (!bio) {
+		ret = -ENOMEM;
+		goto out_page;
+	}
+	bio->bi_iter.bi_sector = sector;
+	__bio_add_page(bio, page, blocksize, 0);
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+
+out_page:
+	put_page(page);
+	return ret;
 }
 
 /*

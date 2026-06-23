@@ -33,4 +33,12 @@ extern const struct iomap_ops briefs_write_iomap_ops;
  */
 extern const struct iomap_writeback_ops briefs_writeback_ops;
 
+/*
+ * briefs_dio_write_ops - direct-I/O write completion.  .end_io updates i_size
+ * on a file-extending write (ki_pos is the original offset in end_io) and
+ * marks the inode dirty so briefs_write_inode persists the new filesize.
+ * Reads pass a NULL dops to iomap_dio_rw (no completion work needed).
+ */
+extern const struct iomap_dio_ops briefs_dio_write_ops;
+
 #endif /* BRIEFS_IOMAP_H */
