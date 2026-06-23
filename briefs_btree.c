@@ -1507,8 +1507,12 @@ static void btree_drain_subtree(struct super_block *sb, u64 block, u64 *cap)
 			block);
 		return;
 	}
-	if (buffer_dirty(bh))
+	if (buffer_dirty(bh)) {
 		sync_dirty_buffer(bh);
+		if (briefs_check_meta_write_error(bh))
+			pr_warn("briefs: btree drain: node %llu write failed\n",
+				block);
+	}
 
 	node = (struct briefs_extent_btree_node *)bh->b_data;
 	if (le32_to_cpu(node->hdr.magic) == BRIEFS_BTREE_MAGIC &&

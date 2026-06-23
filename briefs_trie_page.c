@@ -300,16 +300,14 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 	 * reads it logs "trie page N has bad magic 0x0" and the dir op fails;
 	 * the caller (briefs_trie_alloc_node) would also re-mark this buffer
 	 * dirty, tripping the kernel's mark_buffer_dirty() write-error WARN.
-	 * Detect the error, abandon the block (clear dirty so pdflush does not
-	 * later write stale trie content to a block we just freed, and clear
-	 * the EIO flag so a future re-allocation of this block via
-	 * briefs_get_zero_block() -- which memsets+set_buffer_uptodate+re-dirties
-	 * -- does not WARN), free it, and propagate -EIO so the caller unwinds
-	 * (does not insert a dir entry pointing at the zeroed page).
+	 * Detect the error (clearing dirty+EIO via the shared helper so pdflush
+	 * does not later write stale trie content to the freed block and a future
+	 * re-allocation via briefs_get_zero_block() -- which memsets +
+	 * set_buffer_uptodate + re-dirties -- does not WARN), free the block, and
+	 * propagate -EIO so the caller unwinds (does not insert a dir entry
+	 * pointing at the zeroed page).
 	 */
-	if (buffer_write_io_error(bh)) {
-		clear_buffer_dirty(bh);
-		clear_buffer_write_io_error(bh);
+	if (briefs_check_meta_write_error(bh)) {
 		briefs_free_block(&bsi->alloc, rel);
 		brelse(bh);
 		return -EIO;
@@ -713,9 +711,17 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 		/*
 		 * Sync the now-empty page header to disk before returning the
 		 * block to the allocator.  This prevents a later allocation from
-		 * seeing stale trie metadata in the on-disk block.
+		 * seeing stale trie metadata in the on-disk block.  A failing
+		 * device (dm-error/dm-thin) can fail this write; clear the
+		 * dirty+EIO flags (the block is being freed, and its next
+		 * allocation memset+re-dirties via briefs_get_zero_block(), so a
+		 * stale on-disk header is overwritten before any reader sees it)
+		 * and warn rather than abort the directory op.
 		 */
 		sync_dirty_buffer(bh);
+		if (briefs_check_meta_write_error(bh))
+			pr_warn("briefs: trie free: page %llu header write failed\n",
+				block);
 		brelse(bh);
 		/* Journal the trie page free so recovery does not leave it allocated. */
 		briefs_journal_trie_free(bsi->journal, block);

@@ -1065,6 +1065,7 @@ int briefs_btree_clear_unwritten(struct super_block *sb, struct briefs_inode *di
 /* Disk inode I/O helpers (briefs_inode.c) */
 struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
                                              struct briefs_disk_inode **di);
+bool briefs_check_meta_write_error(struct buffer_head *bh);
 int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
                                const struct briefs_inode *src, bool sync);
 struct buffer_head *briefs_get_zero_block(struct super_block *sb, u64 block);

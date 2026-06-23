@@ -61,6 +61,30 @@ struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
 }
 
 /*
+ * Detect and clear a failed synchronous metadata-buffer write, returning true
+ * if the just-completed sync_dirty_buffer() reported an I/O error.
+ *
+ * Several BrieFS metadata sync_dirty_buffer() sites run OUTSIDE the
+ * sync_blockdev() that the fsync/checkpoint paths use, so a write failure on a
+ * failing device (dm-error sudden death, dm-thin pool exhaustion, a failing
+ * loop backing store) would otherwise go unchecked: the buffer is left dirty
+ * with BH_Write_EIO pending, pdflush later re-writes stale content to the
+ * block, and the next mark_buffer_dirty() trips the kernel write-error WARN.
+ * Mirroring the generic/347 fix in briefs_trie_page_init(), clear BH_Dirty and
+ * BH_Write_EIO so the buffer is quiesced, and let the caller unwind (abort the
+ * checkpoint/fsync, free the just-allocated block, or warn-and-continue per its
+ * own contract).  Returns true iff the buffer had a write error.
+ */
+bool briefs_check_meta_write_error(struct buffer_head *bh)
+{
+	if (!bh || !buffer_write_io_error(bh))
+		return false;
+	clear_buffer_dirty(bh);
+	clear_buffer_write_io_error(bh);
+	return true;
+}
+
+/*
  * Persist a complete struct briefs_inode to disk for the given inode number.
  * If sync is true, also sync the buffer to ensure durability (used during
  * journal replay).  Returns 0 on success, negative errno on error.

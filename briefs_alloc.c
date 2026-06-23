@@ -597,6 +597,12 @@ static int briefs_alloc_sync_level(struct briefs_alloc *alloc, u64 *array,
 		if (dirty) {
 			mark_buffer_dirty(bh);
 			sync_dirty_buffer(bh);
+			if (briefs_check_meta_write_error(bh)) {
+				pr_err("briefs: alloc bitmap L%d block %llu write failed\n",
+				       level, offset);
+				brelse(bh);
+				return -EIO;
+			}
 		}
 		brelse(bh);
 	}
@@ -659,6 +665,13 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 			hdr->free_count = cpu_to_le64(alloc->free_count);
 			mark_buffer_dirty(bh);
 			sync_dirty_buffer(bh);
+			if (briefs_check_meta_write_error(bh)) {
+				pr_err("briefs: alloc header block %llu write failed\n",
+				       alloc->alloc_pool_start);
+				brelse(bh);
+				mutex_unlock(&alloc->lock);
+				return -EIO;
+			}
 			brelse(bh);
 		}
 	}
