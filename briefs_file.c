@@ -2402,6 +2402,10 @@ const char *briefs_get_link(struct dentry *dentry, struct inode *inode,
 	set_delayed_call(done, kfree_link, link);
 	return link;
 }
+/* Forward decl: defined with the iomap aops below, used by both aops. */
+static int briefs_iomap_swap_activate(struct swap_info_struct *sis,
+				      struct file *file, sector_t *span);
+
 /* address_space_operations for BrieFS regular files.
  * Only read_folio and bmap are used (for mmap/exec).
  * address_space_operations for BrieFS regular files.
@@ -2418,6 +2422,7 @@ const struct address_space_operations briefs_aops = {
 	.migrate_folio	= buffer_migrate_folio,
 	.is_partially_uptodate = block_is_partially_uptodate,
 	.direct_IO  	= noop_direct_IO,
+	.swap_activate	= briefs_iomap_swap_activate,
 	.write_begin 	= briefs_write_begin,
 	.write_end 	= generic_write_end,
 };
@@ -2434,9 +2439,11 @@ const struct address_space_operations briefs_aops = {
  * kernel when only read was on iomap.  Metadata inodes keep briefs_aops via
  * their own paths; only regular-file data uses this.
  *
- * .bmap reuses briefs_bmap (generic_block_bmap + briefs_get_block, which is
- * retained for symlinks); Phase 5 replaces it with iomap_bmap.  .direct_IO is
- * noop until Phase 4 (briefs_open still rejects O_DIRECT).
+ * .bmap uses iomap_bmap (Phase 5); the buffer_head aops keeps briefs_bmap
+ * (generic_block_bmap + briefs_get_block, retained for symlinks).  .swap_activate
+ * (Phase 5) wraps iomap_swapfile_activate.  .direct_IO is noop_direct_IO: unused
+ * by the iomap DIO path (briefs_read_iter/briefs_write_iter route IOCB_DIRECT
+ * to iomap_dio_rw directly, bypassing the aops write_begin/end).
  */
 static int briefs_iomap_read_folio(struct file *file, struct folio *folio)
 {
@@ -2456,6 +2463,34 @@ static int briefs_iomap_writepages(struct address_space *mapping,
 	return iomap_writepages(mapping, wbc, &wpc, &briefs_writeback_ops);
 }
 
+/*
+ * briefs_iomap_bmap - translate a logical file block to its physical device
+ * block via the iomap extent map.  Used by FIBMAP and by the swapfile
+ * activation fallback.  iomap_bmap walks briefs_iomap_ops (the read/report
+ * translation) and returns the absolute physical block for a mapped block or 0
+ * for a hole, matching what briefs_get_block exposed through generic_block_bmap.
+ */
+static sector_t briefs_iomap_bmap(struct address_space *mapping, sector_t block)
+{
+	return iomap_bmap(mapping, block, &briefs_iomap_ops);
+}
+
+/*
+ * briefs_iomap_swap_activate - activate a regular file as a swapfile via the
+ * iomap extent map.  iomap_swapfile_activate walks the file with
+ * briefs_iomap_ops (IOMAP_REPORT), rejecting holes, unwritten extents, inline
+ * data, and delalloc -- a swapfile must be fully of mapped, written, contiguous
+ * extents -- and builds the swap extent list the swap layer consumes.  The test
+ * creates the swapfile by writing it out, so every block is MAPPED.  Used on
+ * both aops: the iomap data path and the buffer_head fallback, since the
+ * extent map is independent of the data read/write path.
+ */
+static int briefs_iomap_swap_activate(struct swap_info_struct *sis,
+				      struct file *file, sector_t *span)
+{
+	return iomap_swapfile_activate(sis, file, span, &briefs_iomap_ops);
+}
+
 const struct address_space_operations briefs_iomap_aops = {
 	.read_folio	= briefs_iomap_read_folio,
 	.readahead	= briefs_iomap_readahead,
@@ -2465,8 +2500,9 @@ const struct address_space_operations briefs_iomap_aops = {
 	.release_folio	= iomap_release_folio,
 	.is_partially_uptodate = iomap_is_partially_uptodate,
 	.migrate_folio	= filemap_migrate_folio,
-	.bmap		= briefs_bmap,
+	.bmap		= briefs_iomap_bmap,
 	.direct_IO	= noop_direct_IO,
+	.swap_activate	= briefs_iomap_swap_activate,
 };
 
 /*
