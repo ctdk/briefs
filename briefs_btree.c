@@ -62,6 +62,16 @@ btree_read_node(struct super_block *sb, u64 block, bool trust_verified,
 	struct buffer_head *bh;
 	struct briefs_extent_btree_node *node;
 
+	/* A stale/corrupt extent-tree pointer can name a block past the device
+	 * end; sb_bread() would then busy-loop unkillably (grow_buffers returns
+	 * NULL, __bread_gfp retries forever with no signal-check point). Reject
+	 * it before the read instead of wedging the box.
+	 */
+	if (block >= (bdev_nr_bytes(sb->s_bdev) >> sb->s_blocksize_bits)) {
+		pr_err("briefs: btree: node %llu out of range\n", block);
+		return NULL;
+	}
+
 	bh = sb_bread(sb, block);
 	if (!bh) {
 		pr_err("briefs: btree: failed to read node %llu\n", block);
@@ -1485,6 +1495,11 @@ static void btree_drain_subtree(struct super_block *sb, u64 block, u64 *cap)
 	if (block == 0 || *cap == 0)
 		return;
 	(*cap)--;
+
+	if (block >= (bdev_nr_bytes(sb->s_bdev) >> sb->s_blocksize_bits)) {
+		pr_warn("briefs: btree drain: node %llu out of range\n", block);
+		return;
+	}
 
 	bh = sb_bread(sb, block);
 	if (!bh) {

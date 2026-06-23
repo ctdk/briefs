@@ -31,10 +31,24 @@ struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
 	if (!bsi || !bsi->sb)
 		return ERR_PTR(-EIO);
 
+	/* ino == 0 would wrap inodeIndex to ~0ULL; a corrupt dir entry pointing
+	 * at a garbage ino yields an inode block past the device end, which
+	 * sb_bread() would busy-loop on unkillably (see briefs_trie_read_page()).
+	 * Reject before the read.
+	 */
+	if (ino == 0)
+		return ERR_PTR(-EINVAL);
+
 	inodeTableBlock = briefs_inode_table_start(bsi->sb);
 	inodeIndex = ino - 1;
 	inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
 	inodeOffset = (inodeIndex % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+
+	if (inodeTableBlock + inodeBlock >=
+	    (bdev_nr_bytes(sb->s_bdev) >> sb->s_blocksize_bits)) {
+		pr_err("briefs: inode %llu maps to out-of-range block\n", ino);
+		return ERR_PTR(-EIO);
+	}
 
 	bh = sb_bread(sb, inodeTableBlock + inodeBlock);
 	if (!bh) {

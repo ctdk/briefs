@@ -165,6 +165,14 @@ struct buffer_head *briefs_trie_read_page(struct super_block *sb, u64 node_ref,
 	if (slot >= TRIE_SLOTS_PER_BLOCK)
 		return ERR_PTR(-EINVAL);
 
+	/* A stale/corrupt trie ref can decode to a block past the device end.
+	 * sb_bread() of such a block busy-loops unkillably (grow_buffers returns
+	 * NULL, __bread_gfp retries forever with no signal-check point), so reject
+	 * it here instead of looping the whole box into an unkillable wedge.
+	 */
+	if (block >= (bdev_nr_bytes(sb->s_bdev) >> sb->s_blocksize_bits))
+		return ERR_PTR(-EIO);
+
 	bh = sb_bread(sb, block);
 	if (!bh)
 		return ERR_PTR(-EIO);
@@ -199,6 +207,9 @@ struct buffer_head *briefs_trie_get_page(struct super_block *sb, u64 node_ref,
 	slot = TRIE_REF_SLOT(node_ref);
 	if (slot >= TRIE_SLOTS_PER_BLOCK)
 		return ERR_PTR(-EINVAL);
+
+	if (block >= (bdev_nr_bytes(sb->s_bdev) >> sb->s_blocksize_bits))
+		return ERR_PTR(-EIO);
 
 	bh = sb_getblk(sb, block);
 	if (!bh)
