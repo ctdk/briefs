@@ -129,18 +129,35 @@ static int briefs_iomap_begin_common(struct inode *inode, loff_t pos,
 
 	/* Inline-data inodes carry their data in the inode block; the iter-level
 	 * read/write bypass handles them directly.  The pagecache/fiemap path
-	 * sees a single inline mapping covering [0, isize). */
+	 * sees a single inline mapping covering [0, isize).
+	 *
+	 * A query AT OR PAST EOF (pos >= isize) has no inline mapping.  fiemap
+	 * (IOMAP_REPORT) is run with a length clamped only to s_maxbytes, so it
+	 * walks well past isize; returning the fixed [0, isize) mapping there
+	 * would hand the iterator a mapping that does not cover pos, tripping
+	 * iomap_iter_done's WARN_ON_ONCE (offset+length <= pos) and re-querying
+	 * forever at pos == isize.  Match gfs2's stuffed-inode idiom: report
+	 * paths return -ENOENT (iomap_fiemap treats it as "no more mappings"),
+	 * read paths see a hole to the end of the query.  An inline inode has
+	 * no extents, so the hole runs straight to the query end (tail=true).
+	 */
 	if (di->flags & InodeFlagInlineData) {
 		u64 isize = i_size_read(inode);
 
-		iomap->bdev = inode->i_sb->s_bdev;
-		iomap->offset = 0;
-		iomap->length = isize;
-		iomap->addr = IOMAP_NULL_ADDR;
-		iomap->flags = 0;
-		iomap->type = IOMAP_INLINE;
-		iomap->inline_data = di->inline_data;
-		return 0;
+		if (pos < isize) {
+			iomap->bdev = inode->i_sb->s_bdev;
+			iomap->offset = 0;
+			iomap->length = isize;
+			iomap->addr = IOMAP_NULL_ADDR;
+			iomap->flags = 0;
+			iomap->type = IOMAP_INLINE;
+			iomap->inline_data = di->inline_data;
+			return 0;
+		}
+		if (flags & IOMAP_REPORT)
+			return -ENOENT;
+		return briefs_iomap_fill_hole(inode, pos, length, iblock,
+					      true, binfo, iomap);
 	}
 
 	/* Tail-cache fast path (verbatim from briefs_get_block): snapshot under
