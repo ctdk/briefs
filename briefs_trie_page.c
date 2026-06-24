@@ -248,7 +248,26 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 
 	*out_ref = 0;
 
-	rel = briefs_alloc_block(&bsi->alloc);
+	/*
+	 * During journal replay, reuse a trie-block that pass-1 reserved from a
+	 * JRN_TRIE_ALLOC record instead of re-allocating from the data allocator.
+	 * Re-allocating would (a) -ENOSPC on a full fs -- the blocks are already
+	 * reserved and thus invisible to briefs_alloc_block()'s free-scan
+	 * (generic/475), and (b) risk aliasing a later-reserved data block.  The
+	 * FIFO holds exactly the trie blocks the journal recorded; popping one in
+	 * replay page_init order yields a self-consistent re-derived trie (parent
+	 * child-pointers reference whatever block we return) even though the
+	 * physical block number need not match the live path's assignment.  If the
+	 * FIFO is empty (more page_inits than recorded allocs -- should not happen
+	 * with pool seeding + the unbounded scan, see briefs_trie_alloc_node),
+	 * fall back to the normal allocator, preserving today's behaviour.
+	 */
+	if (bsi->journal && bsi->journal->in_replay &&
+	    briefs_journal_replay_pop_trie_block(bsi->journal, &rel) == 0) {
+		/* reused a reserved trie block */
+	} else {
+		rel = briefs_alloc_block(&bsi->alloc);
+	}
 	if (rel == 0)
 		return -ENOSPC;
 	block = data_to_abs(bsi->sb, rel);
@@ -313,8 +332,13 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 		return -EIO;
 	}
 
-	/* Journal the trie page allocation so recovery knows this block is in use. */
-	briefs_journal_trie_alloc(bsi->journal, block);
+	/* Journal the trie page allocation so recovery knows this block is in use.
+	 * Skip during replay: this block came from a JRN_TRIE_ALLOC record already
+	 * in the journal, and appending a fresh record would advance write_pos into
+	 * the range still being replayed, clobbering unprocessed records.
+	 */
+	if (!bsi->journal || !bsi->journal->in_replay)
+		briefs_journal_trie_alloc(bsi->journal, block);
 
 	brelse(bh);
 
@@ -329,6 +353,20 @@ static inline u16 trie_page_data_end(void)
 {
 	return sizeof(struct briefs_trie_page) +
 		TRIE_SLOTS_PER_BLOCK * sizeof(struct briefs_trie_node);
+}
+
+/*
+ * Does a trie page have room for another node (a free slot AND name-heap
+ * space)?  This is the inverse of the "page became full" check in
+ * trie_alloc_from_block(), i.e. the predicate for "this page belongs in the
+ * partial-page pool".  Exposed so journal replay can seed the pool from the
+ * on-disk trie (briefs_trie_seed_pool).
+ */
+bool briefs_trie_page_has_room(struct briefs_trie_page *page)
+{
+	return trie_page_free_slots(page) != 0 &&
+	       trie_page_free_name_off(page) <
+			(BRIEFS_BLOCK_SIZE - trie_page_data_end());
 }
 
 /*
@@ -550,7 +588,18 @@ u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len)
 	 */
 	{
 		int scanned = 0;
-		const int max_scan = 64;
+		/*
+		 * Bound the scan so a very long partial list does not stall every
+		 * allocation.  During journal replay the pool is seeded from the
+		 * on-disk trie and the scan must be UNBOUNDED: a large directory can
+		 * have more than 64 partial pages, and a bounded scan could miss the
+		 * page live reused (forcing a fresh page_init -> re-alloc -> -ENOSPC on
+		 * a full fs, generic/475).  Replay is one-shot and single-threaded, so
+		 * an unbounded scan is acceptable.
+		 */
+		struct briefs_sb_info *bsi = sb->s_fs_info;
+		const int max_scan = (bsi && bsi->journal && bsi->journal->in_replay)
+				     ? INT_MAX : 64;
 
 		list_for_each_entry_safe(entry, tmp, &pages->partial, list) {
 			if (scanned++ >= max_scan)

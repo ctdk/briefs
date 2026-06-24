@@ -536,6 +536,31 @@ static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
 	binfo = briefs_i(parent);
 	mutex_lock(&binfo->trie_lock);
 
+	/*
+	 * Seed this directory's partial-page pool from its on-disk trie once,
+	 * the first time replay touches it.  The pool is otherwise built lazily
+	 * by live trie mutations and starts empty on the freshly-iget'd inode,
+	 * which makes replay over-allocate trie pages (page_init where live
+	 * reused a free slot) and -ENOSPC on a full fs (generic/475).  Seeding
+	 * from the on-disk trie reproduces live's pool state at the last sync
+	 * point so replay's reuse-vs-alloc decisions match live.  Only while
+	 * in_replay is set; the live post-mount path keeps the pool lazy.
+	 */
+	{
+		struct briefs_journal *j = briefs_sb(sb)->journal;
+
+		if (j && j->in_replay && !binfo->trie_pool_seeded) {
+			if (!TRIE_REF_IS_NULL(binfo->disk_inode.dir_trie_root)) {
+				int sret = briefs_trie_seed_pool(sb,
+						binfo->disk_inode.dir_trie_root);
+				if (sret)
+					pr_warn("briefs: replay pool seed for ino %llu failed: %d\n",
+						parent_ino, sret);
+			}
+			binfo->trie_pool_seeded = true;
+		}
+	}
+
 	if (rec->op == 0) {
 		/* Add directory entry.  The d_type is carried in the record (set at
 		 * create/link/rename time from the child's i_mode) so we do NOT iget()
@@ -663,7 +688,8 @@ static int replay_extent_free(struct super_block *sb, struct jrn_extent_free *re
  * Updates the data allocator bitmap so that trie page blocks are not
  * reused for file data during recovery.
  */
-static int replay_trie_alloc(struct super_block *sb, struct jrn_trie_alloc *rec)
+static int replay_trie_alloc(struct super_block *sb, struct jrn_trie_alloc *rec,
+			      bool collect)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
 	u64 block = le64_to_cpu(rec->block);
@@ -672,6 +698,24 @@ static int replay_trie_alloc(struct super_block *sb, struct jrn_trie_alloc *rec)
 	if (op == 0) {
 		u64 rel = abs_to_data(bsi->sb, block);
 		briefs_reserve_block(&bsi->alloc, rel);
+		/*
+		 * In the pass-1 reservation pre-scan (collect == true, set from
+		 * apply_record's reserve_only) also record the block in the
+		 * replay pool so pass-2's briefs_trie_page_init() can reuse it
+		 * instead of re-allocating (generic/475).  Pass-2 re-reserves
+		 * idempotently but must NOT re-push (would duplicate and let a
+		 * block be consumed twice).  The pool is consumed LIFO so the
+		 * unsynced-tail (orphan) blocks are reused first; see
+		 * briefs_journal_replay_pop_trie_block().
+		 */
+		if (collect) {
+			struct briefs_replay_trie_block *rb =
+				kmalloc(sizeof(*rb), GFP_KERNEL);
+			if (!rb)
+				return -ENOMEM;
+			rb->rel = rel;
+			list_add_tail(&rb->list, &bsi->journal->replay_trie_blocks);
+		}
 		pr_debug("briefs: replay reserved trie page block %llu\n", block);
 	} else {
 		briefs_free_blocks_range(bsi, block, 1);
@@ -873,8 +917,11 @@ static int apply_record(struct super_block *sb, u32 rec_type, void *rec_data,
 		ret = replay_extent_free(sb, rec_data);
 		break;
 	case JRN_TRIE_ALLOC:
-		/* reserves/frees the trie page block only; safe in both passes */
-		ret = replay_trie_alloc(sb, rec_data);
+		/* reserves/frees the trie page block only; safe in both passes.
+		 * Pass the reserve_only flag so pass-1 also collects the block
+		 * into the replay FIFO (pass-2 re-reserves idempotently).
+		 */
+		ret = replay_trie_alloc(sb, rec_data, reserve_only);
 		break;
 	case JRN_INODE_FULL:
 		if (!reserve_only)
@@ -1005,6 +1052,43 @@ static int walk_journal(struct briefs_journal *j, struct super_block *sb,
 }
 
 /*
+ * Pop the next data-relative trie-block number from the replay trie-block
+ * pool.  Returns 0 and sets *@rel on success, -ENOENT when empty.  Only
+ * consumed from briefs_trie_page_init() while in_replay is set, i.e. during
+ * the single-threaded replay at mount, so no locking is required.
+ *
+ * The pool is collected in journal order (pass-1 walks log_start->log_end):
+ * blocks from records already synced onto the on-disk trie ([log_start, S])
+ * are pushed FIRST, and blocks from the unsynced tail ((S, log_end]) -- whose
+ * page content was synced by briefs_trie_page_init() but whose parent-slot
+ * link was not -- are pushed LAST.  The unsynced-tail blocks are ORPHANS (on
+ * disk but unreferenced); the synced blocks are REFERENCED by the on-disk
+ * trie.  Re-derivation only page_inits for the unsynced records (the synced
+ * ones hit -EEXIST), so it must reuse ORPHANS, not referenced blocks --
+ * overwriting a referenced block would clobber a -EEXIST record's page.
+ *
+ * Popping LIFO (tail-first) yields the orphans (last-pushed), and because
+ * seeding + the unbounded scan keep the re-derivation page_init count M <= the
+ * orphan count N_tail, we stop before reaching the referenced blocks.  If M
+ * ever exceeds N_tail (imperfect seeding), the pool empties and
+ * briefs_trie_page_init() falls back to briefs_alloc_block(), which can only
+ * pick non-referenced free blocks -- so no referenced block is ever clobbered.
+ */
+int briefs_journal_replay_pop_trie_block(struct briefs_journal *j, u64 *rel)
+{
+	struct briefs_replay_trie_block *rb;
+
+	if (list_empty(&j->replay_trie_blocks))
+		return -ENOENT;
+	rb = list_last_entry(&j->replay_trie_blocks,
+			     struct briefs_replay_trie_block, list);
+	*rel = rb->rel;
+	list_del(&rb->list);
+	kfree(rb);
+	return 0;
+}
+
+/*
  * Walks the journal from journal_log_start to journal_log_end and re-applies
  * each record.  After successful replay, the journal is marked clean.
  *
@@ -1037,19 +1121,33 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	u32 records_replayed = 0, blocks_read = 0, errors = 0;
 	int ret;
 
+	/*
+	 * Replay context: collect every JRN_TRIE_ALLOC block into a pool (pass-1,
+	 * journal order) and have briefs_trie_page_init() reuse them during
+	 * re-derivation (pass-2, LIFO so the unsynced-tail orphans are consumed
+	 * first) instead of re-allocating, so a full-fs crash-replay no longer
+	 * -ENOSPC's (generic/475).  Also gates the partial-page pool seeding in
+	 * replay_dir_update() and the unbounded pool scan in
+	 * briefs_trie_alloc_node().  Single-threaded at mount before the fs is
+	 * writable, so the pool needs no locking.
+	 */
+	INIT_LIST_HEAD(&j->replay_trie_blocks);
+	j->in_replay = true;
+
 	/* Pass 1: reserve/free all allocator blocks before re-derivation. */
 	ret = walk_journal(j, sb, true, &pre_records, &pre_blocks, &pre_errors);
 	if (ret)
-		return ret;
+		goto replay_done;
 	if (pre_errors) {
 		pr_err("briefs: journal reservation pre-scan reported %u errors\n", pre_errors);
-		return -EIO;
+		ret = -EIO;
+		goto replay_done;
 	}
 
 	/* Pass 2: apply all records (writes + trie re-derivation). */
 	ret = walk_journal(j, sb, false, &records_replayed, &blocks_read, &errors);
 	if (ret)
-		return ret;
+		goto replay_done;
 
 	pr_info("briefs: journal replay complete (blocks=%u, records=%u, errors=%u)\n",
 		blocks_read, records_replayed, errors);
@@ -1120,7 +1218,26 @@ int briefs_journal_replay(struct briefs_journal *j) {
 			pr_err("briefs: failed to sync superblock after replay: %d\n", sync_ret);
 	}
 
-	return errors ? -EIO : 0;
+	ret = errors ? -EIO : 0;
+
+replay_done:
+	/*
+	 * Tear down the replay context regardless of outcome.  Leftover FIFO
+	 * entries are trie pages already on disk and reserved by pass-1 (their
+	 * correct allocated state), so only the list nodes are freed -- the
+	 * blocks stay allocated.  Clearing in_replay re-enables the live
+	 * (post-mount) alloc paths: briefs_trie_page_init() allocates normally
+	 * and the pool scan reverts to its 64-entry bound.
+	 */
+	j->in_replay = false;
+	while (!list_empty(&j->replay_trie_blocks)) {
+		struct briefs_replay_trie_block *rb =
+			list_first_entry(&j->replay_trie_blocks,
+					 struct briefs_replay_trie_block, list);
+		list_del(&rb->list);
+		kfree(rb);
+	}
+	return ret;
 }
 
 /*

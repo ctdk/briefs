@@ -21,6 +21,11 @@
 
 #define TRIE_ANCESTRY_LIMIT 256
 
+/* Forward decl: briefs_trie_seed_pool() (below) uses the iterator stack before
+ * trie_iter_push() is defined later in this file.
+ */
+static int trie_iter_push(struct trie_iter *iter, u64 ref, u8 emitted);
+
 /*
  * Name pointer for a node slot.  The 2-byte length prefix lives at (base - 2);
  * the name bytes follow it.
@@ -243,6 +248,112 @@ int briefs_trie_create_root(struct super_block *sb, struct briefs_inode *di)
 	briefs_trie_page_add_partial(sb, TRIE_REF_BLOCK(root_ref));
 	di->dir_trie_root = root_ref;
 	return 0;
+}
+
+/*
+ * briefs_trie_seed_pool - populate the partial-page pool from the on-disk trie.
+ *
+ * During journal replay, replay_dir_update() re-derives a directory trie by
+ * re-running briefs_trie_insert() on a freshly briefs_iget()'d parent.  The
+ * per-superblock partial-page pool is normally built lazily by live trie
+ * mutations (create_root / fresh page_init / free), but at replay it starts
+ * EMPTY: briefs_iget() copies dir_trie_root from disk but never scans the trie
+ * pages for free slots.  With an empty pool, replay's first
+ * briefs_trie_alloc_node() per insert takes the fresh-alloc branch (page_init
+ * -> briefs_alloc_block) where the live path reused a free slot on an existing
+ * page, so replay over-allocates trie pages and -ENOSPC's on a full fs
+ * (generic/475).
+ *
+ * Walk every page reachable from @root_ref and add each page that still has
+ * room for another node to the partial pool, reproducing the pool state live
+ * would have had at this trie.  briefs_trie_page_add_partial() dedups by block,
+ * so visiting multiple nodes of the same page is harmless.  Called once per
+ * directory (gated by binfo->trie_pool_seeded) and only while the journal's
+ * in_replay flag is set, so the live post-mount path is unaffected.
+ */
+int briefs_trie_seed_pool(struct super_block *sb, u64 root_ref)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct trie_iter *iter;
+	int ret = 0;
+	u64 visited = 0, added = 0;
+	/*
+	 * A valid trie has at most block_count trie pages (one per data block),
+	 * each holding TRIE_SLOTS_PER_BLOCK nodes, so it can never contain more
+	 * than block_count * TRIE_SLOTS_PER_BLOCK reachable nodes.  Use that as a
+	 * hard visit cap (plus a small margin): it never truncates a legitimate
+	 * trie, but it guarantees termination if the on-disk trie is corrupt with a
+	 * cycle in the first_child/next_sibling graph (dm-error partial sync can
+	 * leave stale pointers forming a back-edge), which would otherwise spin
+	 * here forever and wedge the mount.  Hitting the cap aborts seeding; re-
+	 * derivation then falls back to briefs_alloc_block() (today's behaviour),
+	 * which may -ENOSPC but never hangs.
+	 */
+	u64 cap = bsi->alloc.block_count * TRIE_SLOTS_PER_BLOCK + 1024;
+
+	if (TRIE_REF_IS_NULL(root_ref))
+		return 0;
+
+	iter = briefs_trie_iter_alloc();
+	if (!iter)
+		return -ENOMEM;
+
+	ret = trie_iter_push(iter, root_ref, 0);
+	if (ret)
+		goto out;
+
+	while (iter->sp > 0) {
+		struct buffer_head *bh;
+		struct briefs_trie_page *page;
+		struct briefs_trie_node *node;
+		u64 ref, child, sib;
+
+		if (visited >= cap) {
+			pr_warn("briefs: replay pool seed: visited cap %llu hit (corrupt trie? root=%llu); aborting seed\n",
+				cap, (unsigned long long)root_ref);
+			break;
+		}
+
+		ref = iter->stack[--iter->sp];
+
+		if (trie_read_node(sb, ref, &bh, &page, &node) != 0) {
+			/* Unreadable page during replay: skip it, keep seeding the
+			 * rest.  A later re-derivation step will surface the error.
+			 */
+			continue;
+		}
+		visited++;
+
+		if (briefs_trie_page_has_room(page)) {
+			briefs_trie_page_add_partial(sb, TRIE_REF_BLOCK(ref));
+			added++;
+		}
+
+		child = trie_node_first_child(node);
+		sib = trie_node_next_sibling(node);
+		brelse(bh);
+
+		if (!TRIE_REF_IS_NULL(child)) {
+			ret = trie_iter_push(iter, child, 0);
+			if (ret)
+				goto out;
+		}
+		if (!TRIE_REF_IS_NULL(sib)) {
+			ret = trie_iter_push(iter, sib, 0);
+			if (ret)
+				goto out;
+		}
+
+		if ((visited & 4095) == 0)
+			cond_resched();
+	}
+
+	pr_debug("briefs: replay seed_pool root=%llu: visited=%llu added=%llu\n",
+		 (unsigned long long)root_ref, visited, added);
+
+out:
+	briefs_trie_iter_free(iter);
+	return ret;
 }
 
 /*

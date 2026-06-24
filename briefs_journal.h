@@ -44,6 +44,48 @@ struct briefs_journal {
 	 * spinlock.
 	 */
 	struct mutex write_lock;
+
+	/*
+	 * Replay context.  Set only while briefs_journal_replay() is re-deriving
+	 * directory tries (pass-1 reservation + pass-2 apply), i.e. single-threaded
+	 * at mount before the fs is writable.  Gating alloc/replay behaviour on
+	 * this flag keeps the live (post-mount) hot path untouched.
+	 */
+	bool in_replay;
+
+	/*
+	 * Pool of data-relative block numbers collected from JRN_TRIE_ALLOC records
+	 * during replay pass-1 (journal order: [log_start,S] synced blocks first,
+	 * (S,log_end] unsynced blocks last).  Pass-2's briefs_trie_page_init() pops
+	 * from here instead of calling briefs_alloc_block(), so re-derivation reuses
+	 * the blocks the journal already recorded as trie pages rather than
+	 * re-allocating fresh ones (which -ENOSPC's on a full fs -- generic/475).
+	 *
+	 * Consumed LIFO (tail-first): the unsynced-tail blocks are ORPHANS (page
+	 * content synced by briefs_trie_page_init() but parent-slot link not, so
+	 * unreferenced by the on-disk trie) and land last in journal order, so
+	 * popping the tail reuses orphans.  Re-derivation only page_inits for
+	 * unsynced records (synced ones hit -EEXIST), so it must reuse orphans, not
+	 * the referenced [log_start,S] blocks (overwriting a referenced block would
+	 * clobber a -EEXIST record's page).  Seeding + unbounded scan keep the
+	 * page_init count M <= the orphan count, so we stop before reaching
+	 * referenced blocks; if M exceeds that the pool empties and page_init falls
+	 * back to briefs_alloc_block(), which can only pick non-referenced free
+	 * blocks.  Block NUMBER need not match the live path's assignment because
+	 * each re-derived trie is self-consistent (parent child-pointers reference
+	 * whatever block page_init returned).  Unpopped entries are trie pages
+	 * already on disk (correctly left reserved/allocated); only the list nodes
+	 * are freed after pass-2.
+	 */
+	struct list_head replay_trie_blocks;
+};
+
+/*
+ * One entry in the replay trie-block pool (above).  Lives only during replay.
+ */
+struct briefs_replay_trie_block {
+	struct list_head list;
+	u64 rel;		/* data-relative block number */
 };
 
 /*
@@ -71,6 +113,14 @@ int briefs_journal_checkpoint(struct briefs_journal *j);
 
 /* Mount/recovery: replay journal from last checkpoint */
 int briefs_journal_replay(struct briefs_journal *j);
+
+/*
+ * Pop the next data-relative trie-block number from the replay pool (LIFO:
+ * unsynced-tail orphans first).  Returns 0 and sets *@rel on success, -ENOENT
+ * if the pool is empty (caller falls back to briefs_alloc_block).  Only
+ * meaningful while in_replay is set.
+ */
+int briefs_journal_replay_pop_trie_block(struct briefs_journal *j, u64 *rel);
 
 /* Cleanup journal */
 void briefs_journal_cleanup(struct briefs_journal *j);

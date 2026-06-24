@@ -729,6 +729,8 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
                           u8 node_type, u64 *out_ref);
 void briefs_trie_cleanup_state(struct super_block *sb);
 void briefs_trie_page_add_partial(struct super_block *sb, u64 block);
+bool briefs_trie_page_has_room(struct briefs_trie_page *page);
+int briefs_trie_seed_pool(struct super_block *sb, u64 root_ref);
 int briefs_trie_update_entry(struct super_block *sb, struct briefs_inode *di,
                             const char *name, size_t name_len,
                             u64 new_ino, u8 new_type);
@@ -853,6 +855,13 @@ struct briefs_inode_info {
 	 * 0 = data loss), so it must be updated at every extent-growth site.
 	 */
 	u64 cached_max_end;
+	/*
+	 * Set once the directory's partial-page pool has been seeded from the
+	 * on-disk trie during journal replay, so we walk each dir's trie at most
+	 * once. Only consulted while the journal's in_replay flag is set; ignored
+	 * on the live (post-mount) path, which keeps the pool lazy as before.
+	 */
+	bool trie_pool_seeded;
 };
 
 /* yanked from the xiafs module, which in turn was yanked from minix */

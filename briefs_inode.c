@@ -543,6 +543,14 @@ struct inode *briefs_alloc_vfs_inode(struct super_block *sb) {
 	 * be stale. 0 = unknown/empty -> briefs_get_block skips the fast path.
 	 */
 	binfo->cached_max_end = 0;
+	/*
+	 * Same slab-reuse hazard: trie_pool_seeded must start false so the first
+	 * replay_dir_update() for this dir seeds its partial-page pool.  A stale
+	 * true value (left by a prior dir that was seeded) would skip seeding,
+	 * leaving the pool empty and forcing re-derivation to page_init where the
+	 * live path reused a free slot -> -ENOSPC on a full fs (generic/475).
+	 */
+	binfo->trie_pool_seeded = false;
 	return &binfo->vfs_inode;
 }
 /* briefs_free_inode - free a VFS inode (called by VFS inode cache) */
