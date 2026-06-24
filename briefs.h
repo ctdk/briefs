@@ -1028,9 +1028,12 @@ int briefs_btree_for_each_extent(struct super_block *sb, struct briefs_inode *di
  * the data blocks in the overlap. Empty leaves are freed and dropped from their
  * parents (no rebalancing). An extent straddling @end is split: its head removed,
  * its tail [end, ...) re-inserted with data kept. Recomputes cached_max_end.
- * Caller holds extent_lock. No-op (returns 0) for inline-only inodes. */
+ * Caller holds extent_lock. No-op (returns 0) for inline-only inodes.
+ * @modified is set true iff any extent overlapped [start,end) (a block was
+ * freed or an extent split) -- the mapping changed even when num_extents_total
+ * is unchanged (e.g. an interior split keeps the count). Must be non-NULL. */
 int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
-			      u64 start, u64 end);
+			      u64 start, u64 end, bool *modified);
 
 /* Free every data block referenced by the inode's extents AND every tree node
  * block (leaves + internal levels). Caller holds extent_lock. */

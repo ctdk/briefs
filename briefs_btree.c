@@ -1227,7 +1227,8 @@ void briefs_btree_free_nodes_only(struct super_block *sb, struct briefs_inode *d
 static int btree_leaf_delete_range(struct briefs_extent_btree_node *node,
 				   u64 start, u64 end, struct briefs_inode *di,
 				   struct briefs_sb_info *bsi,
-				   struct briefs_extent *right, int *nright)
+				   struct briefs_extent *right, int *nright,
+				   bool *modified)
 {
 	int n = le16_to_cpu(node->hdr.num_keys);
 	int i, out = 0;
@@ -1249,6 +1250,7 @@ static int btree_leaf_delete_range(struct briefs_extent_btree_node *node,
 		}
 
 		/* Overlap: free the data blocks in [max(offset,start), min(end,ext_end)). */
+		*modified = true;
 		if (ext.phys > 0 && ext.len > 0) {
 			u64 free_start = max(ext.offset, start);
 			u64 free_end = min(ext_end, end);
@@ -1256,6 +1258,7 @@ static int btree_leaf_delete_range(struct briefs_extent_btree_node *node,
 
 			if (free_len > 0) {
 				u64 free_phys = ext.phys + (free_start - ext.offset);
+
 				briefs_journal_extent_free(bsi->journal,
 							   di->inode_number,
 							   free_start, free_phys,
@@ -1299,7 +1302,7 @@ static bool btree_delete_range_subtree(struct super_block *sb,
 				       struct briefs_inode *di, u64 block,
 				       u64 start, u64 end,
 				       struct briefs_extent *right, int *nright,
-				       u64 *cap)
+				       u64 *cap, bool *modified)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
 	struct buffer_head *bh;
@@ -1322,7 +1325,7 @@ static bool btree_delete_range_subtree(struct super_block *sb,
 
 	if (btree_node_is_leaf(node)) {
 		new_n = btree_leaf_delete_range(node, start, end, di, bsi,
-						right, nright);
+						right, nright, modified);
 		if (new_n == 0) {
 			/* Leaf emptied: free it; caller drops the pointer. */
 			brelse(bh);
@@ -1352,7 +1355,8 @@ static bool btree_delete_range_subtree(struct super_block *sb,
 
 		if (child != 0 && low < end && high > start) {
 			if (btree_delete_range_subtree(sb, di, child, start, end,
-						       right, nright, cap))
+						       right, nright, cap,
+						       modified))
 				set_bit(i, child_empty);
 		}
 	}
@@ -1428,7 +1432,7 @@ static int btree_max_cb(const struct briefs_extent *ext, void *ctx)
  * the inode is not tree-backed.
  */
 int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
-			      u64 start, u64 end)
+			      u64 start, u64 end, bool *modified)
 {
 	struct briefs_inode_info *binfo =
 		container_of(di, struct briefs_inode_info, disk_inode);
@@ -1437,6 +1441,8 @@ int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
 	u64 cap;
 	bool root_empty;
 	struct btree_max_ctx mc = { .max_end = 0, .count = 0 };
+
+	*modified = false;
 
 	if (!(di->flags & InodeFlagIndexed) || di->extent_inline_base == 0)
 		return 0;
@@ -1450,11 +1456,13 @@ int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
 		cap = 1ull << 20;
 
 	root_empty = btree_delete_range_subtree(sb, di, di->extent_inline_base,
-						start, end, right, &nright, &cap);
+						start, end, right, &nright, &cap,
+						modified);
 
 	if (root_empty) {
 		/* Every extent was removed: free the root (already freed by the
 		 * subtree walk) and clear the tree-backed state. */
+		*modified = true;
 		write_seqcount_begin(&binfo->extent_seq);
 		di->flags &= ~InodeFlagIndexed;
 		di->extent_inline_base = 0;

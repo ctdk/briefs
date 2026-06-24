@@ -841,9 +841,12 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 * it clears InodeFlagIndexed / extent_inline_base / counts itself.
 		 */
 		if (binfo->disk_inode.flags & InodeFlagIndexed) {
+			bool trunc_modified;
+
 			ret = briefs_btree_delete_range(inode->i_sb,
 							&binfo->disk_inode,
-							trunc_block, U64_MAX);
+							trunc_block, U64_MAX,
+							&trunc_modified);
 			if (ret)
 				goto out_unlock;
 		} else {
@@ -1244,10 +1247,13 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 		u64 total_before = binfo->disk_inode.num_extents_total;
 
 		if (total_before != 0) {
+			bool del_modified = false;
+
 			if (del_start < del_end) {
 				ret = briefs_btree_delete_range(inode->i_sb,
 								&binfo->disk_inode,
-								del_start, del_end);
+								del_start, del_end,
+								&del_modified);
 				if (ret)
 					goto out_unlock;
 			}
@@ -1324,6 +1330,16 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 			}
 
 			if (binfo->disk_inode.num_extents_total != total_before)
+				changed = true;
+			/* An extent split (interior blocks freed, a straddler
+			 * kept) leaves num_extents_total unchanged, but the
+			 * mapping DID change: the freed blocks are now holes and
+			 * their (still-uptodate) pagecache pages hold pre-punch
+			 * data. Without invalidating them, a later read returns
+			 * that stale data (generic/522/616). del_modified reports
+			 * the split; fold it into `changed` so both the
+			 * pagecache invalidation and the mtime/ctime update run. */
+			if (del_modified)
 				changed = true;
 		}
 	} else {
