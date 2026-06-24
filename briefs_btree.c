@@ -225,7 +225,7 @@ static int btree_lower_bound_block(struct super_block *sb, u64 block, u64 iblock
 		return -EIO;
 
 	if (btree_node_is_leaf(node)) {
-		int i, num_keys = le16_to_cpu(node->hdr.num_keys);
+		int i, j, nk, num_keys = le16_to_cpu(node->hdr.num_keys);
 
 		for (i = 0; i < num_keys; i++) {
 			struct briefs_disk_extent *de = &node->u.leaf.extents[i];
@@ -248,11 +248,24 @@ static int btree_lower_bound_block(struct super_block *sb, u64 block, u64 iblock
 			node = btree_read_node(sb, next, trust_verified, &bh);
 			if (!node)
 				return -EIO;
-			if (le16_to_cpu(node->hdr.num_keys) > 0) {
-				briefs_disk_extent_to_cpu(&node->u.leaf.extents[0],
-							 ext);
-				brelse(bh);
-				return 0;
+			/* Scan the next leaf for the first extent > @iblock rather
+			 * than trusting extents[0]: the read path (briefs_iomap_fill_hole)
+			 * calls briefs_next_extent without extent_lock, so a concurrent
+			 * leaf split/merge can repoint next_leaf at a leaf whose first
+			 * extent is at or below @iblock (stale linkage).  Returning that
+			 * would yield a hole mapping ending at or before its start (zero
+			 * length) and trip iomap_iter_done's WARN_ON_ONCE.  Fall back to
+			 * -ENOENT (hole to query end) if the next leaf has no such extent.
+			 */
+			nk = le16_to_cpu(node->hdr.num_keys);
+			for (j = 0; j < nk; j++) {
+				struct briefs_disk_extent *de = &node->u.leaf.extents[j];
+
+				if (le64_to_cpu(de->offset) > iblock) {
+					briefs_disk_extent_to_cpu(de, ext);
+					brelse(bh);
+					return 0;
+				}
 			}
 			brelse(bh);
 			return -ENOENT;

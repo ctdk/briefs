@@ -99,6 +99,18 @@ static int briefs_iomap_fill_hole(struct inode *inode, loff_t pos, loff_t length
 	if (hole_end > query_end)
 		hole_end = query_end;
 
+	/* The lower bound must advance past @iblock.  briefs_next_extent is
+	 * called here on the unlocked read path; a concurrent tree mutation can
+	 * hand back an extent at or below @iblock (stale next_leaf linkage), so
+	 * hole_end can be <= offset.  Reporting a hole that ends at or before its
+	 * start yields a zero/negative-length mapping and trips iomap_iter_done's
+	 * WARN_ON_ONCE(offset+length <= pos).  A non-advancing bound means "no
+	 * usable extent above @iblock" from this (possibly stale) view: run the
+	 * hole to the query end, as the no-next-extent case does.
+	 */
+	if (hole_end <= offset)
+		hole_end = query_end;
+
 	iomap->bdev = inode->i_sb->s_bdev;
 	iomap->offset = offset;
 	iomap->length = hole_end - offset;

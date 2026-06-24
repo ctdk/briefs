@@ -336,7 +336,14 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 
 		ret = briefs_trie_create_root(dir->i_sb, &binfo->disk_inode);
 		if (ret) {
-			pr_err("briefs: failed to create dir trie root for ino %lu\n", inode->i_ino);
+			/* -ENOSPC is an expected, user-visible outcome under space
+			 * pressure (e.g. fsstress + ENOSPC hitters); logging it at
+			 * err level floods dmesg and trips _check_dmesg.  Reserve the
+			 * message for genuine filesystem errors.
+			 */
+			if (ret != -ENOSPC)
+				pr_err("briefs: failed to create dir trie root for ino %lu (err %d)\n",
+				       inode->i_ino, ret);
 			briefs_create_abort(dir->i_sb, dir, inode, &dentry->d_name, false);
 			return ret;
 		}
