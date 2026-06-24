@@ -307,6 +307,22 @@ static ssize_t briefs_iomap_buffered_write(struct kiocb *iocb,
 	ret = generic_write_checks(iocb, from);
 	if (ret <= 0)
 		goto out_unlock;
+	/* Zero the tail of the old EOF block before a write that jumps past EOF
+	 * (pos > i_size).  That tail [i_size, block_end) is beyond the file's
+	 * valid data but inside the already-allocated EOF block, so it may hold
+	 * bytes written by an mmap store past EOF (fsx -e pollute_eofpage) or
+	 * stale content from a prior smaller i_size.  iomap's __iomap_write_begin
+	 * only zeroes IOMAP_F_NEW / unwritten / hole blocks, and this block is
+	 * none of those, so the stale tail would leak as valid data once iomap
+	 * extends i_size past it (generic/363: fsx READ BAD DATA at the old EOF).
+	 * briefs_zero_eof_tail zeroes the cached folio's tail directly
+	 * (path-agnostic pagecache manipulation, no buffer_heads).  Only the
+	 * partial old-EOF block needs this; the write itself covers the new EOF
+	 * block (iomap zeroes an IOMAP_F_NEW tail), and whole-block gaps in
+	 * [old_size, pos) read as holes.  Inline-data inodes never reach here.
+	 */
+	if (iocb->ki_pos > i_size_read(inode))
+		briefs_zero_eof_tail(inode->i_mapping, i_size_read(inode));
 	ret = file_remove_privs(iocb->ki_filp);
 	if (ret)
 		goto out_unlock;
