@@ -364,6 +364,27 @@ static ssize_t briefs_dio_write(struct kiocb *iocb, struct iov_iter *from)
 	ret = generic_write_checks(iocb, from);
 	if (ret <= 0)
 		goto out_unlock;
+	/* Unaligned direct writes (a sub-block head or tail) must be serialized
+	 * against concurrent direct writes.  iomap zeroes the IOMAP_F_NEW head/tail
+	 * of a partial block (need_zeroout) and, for a write at/ past i_size, the
+	 * tail beyond the write; that zero bio is submitted as part of this DIO.
+	 * If a concurrent writer maps the same block first, the first writer sees
+	 * IOMAP_F_NEW and zeroes the partial edge while the second (hitting the
+	 * now-existing extent) does a sub-block bio with no zero -- and the first
+	 * writer's zero bio can land AFTER the second's full write, clobbering it
+	 * (generic/551: overlapping AIO DIO writes, zero window exactly at a
+	 * concurrent unaligned write's end-of-block).  Drain outstanding DIO first
+	 * so unaligned DIO cannot overlap another in-flight DIO, as XFS does for
+	 * unaligned_io.  Aligned full-block DIO need not drain: briefs sizes each
+	 * allocated extent to the write's full-block count, so no IOMAP_F_NEW tail
+	 * extends past the write, and full-block writes have no edge to zero (last
+	 * writer wins per block).  NOWAIT cannot block to drain; the race is then
+	 * inherent to non-blocking overlapping DIO.
+	 */
+	if (!(iocb->ki_flags & IOCB_NOWAIT) &&
+	    (iocb->ki_pos & (BRIEFS_BLOCK_SIZE - 1) ||
+	     iov_iter_count(from) & (BRIEFS_BLOCK_SIZE - 1)))
+		inode_dio_wait(inode);
 	ret = file_remove_privs(iocb->ki_filp);
 	if (ret)
 		goto out_unlock;
