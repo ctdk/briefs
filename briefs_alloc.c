@@ -425,6 +425,30 @@ void briefs_reserve_block(struct briefs_alloc *alloc, u64 rel_block)
 	mutex_unlock(&alloc->lock);
 }
 
+/* A data block that is being freed may still carry a dirty buffer_head in the
+ * block-device buffer cache from a former metadata life -- e.g. an extent-btree
+ * leaf node released by a truncate/punch tree rebuild, or a split rollback.
+ * File data, by contrast, is cached in the address_space page cache, not the
+ * buffer cache.  When such a block is reused as file data, a stale dirty
+ * metadata buffer_head can write back AFTER the data writeback and clobber the
+ * new data with the obsolete metadata content (observed under generic/551 as
+ * extent-btree leaf magic "ERTB" appearing inside file data).  Dropping the
+ * alias here ensures the obsolete content can never be written back to the
+ * now-free block.
+ *
+ * Only the data-block allocator tracks device blocks; the inode allocator
+ * reuses briefs_free_block() for inode *numbers*, which are not device blocks,
+ * so the invalidation is gated on the data allocator.
+ */
+static void briefs_discard_data_buffer(struct briefs_alloc *alloc, u64 rel_block)
+{
+	struct briefs_sb_info *bsi = briefs_sb(alloc->sb);
+
+	if (bsi && alloc == &bsi->alloc)
+		clean_bdev_aliases(alloc->sb->s_bdev,
+				   data_to_abs(bsi->sb, rel_block), 1);
+}
+
 void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block)
 {
 	u64 w2, b2, w1, b1, w0, b0;
@@ -464,6 +488,8 @@ void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block)
 			alloc->l0[w0] |= (1ULL << b0);
 	}
 	mutex_unlock(&alloc->lock);
+
+	briefs_discard_data_buffer(alloc, rel_block);
 }
 
 /*
@@ -540,6 +566,19 @@ void briefs_free_blocks(struct briefs_alloc *alloc, u64 rel_start, u64 n)
 
 	alloc->free_count += freed;
 	mutex_unlock(&alloc->lock);
+
+	/* Same stale-buffer concern as briefs_free_block, applied to the whole
+	 * freed run.  No-op for pure data-block runs (no buffer_heads); cleans
+	 * any metadata aliases that happen to lie in the range.
+	 */
+	{
+		struct briefs_sb_info *bsi = briefs_sb(alloc->sb);
+
+		if (bsi && alloc == &bsi->alloc)
+			clean_bdev_aliases(alloc->sb->s_bdev,
+					   data_to_abs(bsi->sb, rel_start),
+					   end - rel_start);
+	}
 }
 
 /*
