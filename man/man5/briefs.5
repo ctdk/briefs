@@ -1,6 +1,6 @@
 .\" BrieFS on-disk format man page
 .\" To install: cp briefs.5 /usr/share/man/man5/ ; mandb
-.TH BRIEFS 5 "2026-06-21" "BrieFS v0.9.2" "File formats"
+.TH BRIEFS 5 "2026-06-21" "BrieFS v0.9.3" "File formats"
 .SH NAME
 briefs \- the BrieFS extents-and-tries filesystem on-disk format
 .SH DESCRIPTION
@@ -12,7 +12,7 @@ This manual describes the on-disk format used by BrieFS volumes created with
 .BR mkfs.briefs (8)
 and checked with
 .BR fsck.briefs (8).
-The authoritative version is v0.9.2.
+The authoritative version is v0.9.3.
 .SH OVERVIEW
 A BrieFS volume is laid out as a sequence of fixed-size blocks, defaulting to
 4096 bytes.  Block addresses are absolute 64-bit block numbers starting at 0.
@@ -145,7 +145,7 @@ valid depends on the file type and inode flags.
 InodeFlagReserved \- reserved.
 .TP
 .B 0x00000002
-InodeFlagCompressed \- defined but unused in v0.9.2.
+InodeFlagCompressed \- defined but unused in v0.9.3.
 .TP
 .B 0x00000004
 InodeFlagIndexed \- the inode uses a B+ tree extent index for its extents.
@@ -537,7 +537,7 @@ Journal: a fixed-size metadata-only ring, 64 blocks by default
 .RB ( \-j ),
 with a separate checkpoint block. There is no data journaling.
 .SH LIMITATIONS
-The following are intentionally not implemented in v0.9.2:
+The following are intentionally not implemented in v0.9.3:
 .PP
 .IP \(bu 2
 No data journaling: buffered writes require an explicit flush or fsync to be
