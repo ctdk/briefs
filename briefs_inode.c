@@ -536,6 +536,7 @@ struct inode *briefs_alloc_vfs_inode(struct super_block *sb) {
 	seqcount_init(&binfo->extent_seq);
 	mutex_init(&binfo->trie_lock);
 	mutex_init(&binfo->extent_lock);
+	init_rwsem(&binfo->xattr_sem);
 	binfo->trie_gen = 0;
 	/*
 	 * The slab ctor (briefs_init_once) only inits the VFS inode; it does not

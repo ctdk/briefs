@@ -163,6 +163,15 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 	sb->s_op = &briefs_super_ops;
 	/* Enable NFS export with generation-based file handles. */
 	sb->s_export_op = &briefs_export_ops;
+	/*
+	 * Publish the xattr handlers so the VFS resolves get/set/listxattr for
+	 * the user/trusted/security namespaces through them.  This must be set
+	 * before any inode is allocated: alloc_inode() auto-sets IOP_XATTR on
+	 * every inode when sb->s_xattr is non-NULL (fs/inode.c), which gates
+	 * xattr_resolve_name().  The .listxattr inode op (briefs_xattr_list)
+	 * reads the on-disk xattr block directly.
+	 */
+	sb->s_xattr = briefs_xattr_handlers;
 	sb->s_flags |= SB_ACTIVE;
 
 	/* Replay journal on mount (if not clean) */

@@ -6,6 +6,7 @@
 #include "briefs.h"
 #include <linux/blkdev.h>
 #include <linux/mutex.h>
+#include <linux/hashtable.h>
 
 /* Journal constants */
 #define JOURNAL_BLOCK_SIZE 4096
@@ -78,6 +79,28 @@ struct briefs_journal {
 	 * are freed after pass-2.
 	 */
 	struct list_head replay_trie_blocks;
+
+	/*
+	 * Replay pass-1 map: ino -> that inode's final xattr_offset, taken from
+	 * the last JRN_INODE_FULL for the inode in journal order (last-wins).  Pass-2
+	 * replay_xattr_data() restores a JRN_XATTR_DATA block only when the owning
+	 * inode's final xattr_offset still points at it.  A freed xattr block has a
+	 * later JRN_INODE_FULL clearing xattr_offset to 0, so its stale content
+	 * record is skipped instead of clobbering the block after it was freed and
+	 * reused for another inode's data (the generic/547 deferred-free/reuse
+	 * family -- file data blocks have no replayed content record, but xattr
+	 * blocks uniquely do).  Populated/valid only while in_replay is set.
+	 */
+	DECLARE_HASHTABLE(replay_xattr_final, 8);
+};
+
+/*
+ * One entry in the replay xattr-final map (above).  Lives only during replay.
+ */
+struct briefs_replay_xattr_final {
+	struct hlist_node node;
+	u64 ino;
+	u64 xattr_offset;
 };
 
 /*
@@ -188,6 +211,11 @@ int briefs_journal_inode_full(struct briefs_journal *j, u64 ino,
 int briefs_journal_symlink_data(struct briefs_journal *j, u64 ino,
                                 u64 phys, const char *target,
                                 size_t target_len);
+
+/* Log the content of an inode's xattr block (crash-restore). */
+int briefs_journal_xattr_data(struct briefs_journal *j, u64 ino,
+			      u64 phys_block, u32 used_size,
+			      const void *block_data);
 
 /* Persist in-memory superblock fields back to the on-disk superblock */
 int briefs_journal_sync_superblock(struct briefs_journal *j);

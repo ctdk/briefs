@@ -54,6 +54,7 @@ enum journal_record_type {
 	JRN_CHECKPOINT,
 	JRN_INODE_FULL,
 	JRN_SYMLINK_DATA,
+	JRN_XATTR_DATA,
 	JRN_END,
 };
 
@@ -153,6 +154,29 @@ struct jrn_symlink_data {
 	__le64 phys;          /* physical block holding the target */
 	__le32 target_len;    /* number of target bytes that follow */
 	__u8   target[];      /* symlink target bytes (no trailing NUL) */
+};
+
+/* JRN_XATTR_DATA - content of an inode's xattr block (crash-restore).
+ *
+ * xattr blocks hold user data that cannot be re-derived on journal replay
+ * (unlike directory tries, which replay re-derives from JRN_DIR_UPDATE
+ * records), so each block write logs its full content here.  Pass-1 reserves
+ * the named data block (idempotent briefs_reserve_block); pass-2 writes
+ * @used_size bytes of block content back to @phys_block, zeroes the tail, and
+ * recomputes the block CRC (the on-disk CRC at offset 4080 lies beyond
+ * @used_size, so it is not carried in the record).
+ *
+ * A journal record must fit within one 4096-byte journal block, so the total
+ * record payload (this struct) is capped at 4064 bytes (4096 minus the 16-byte
+ * block header and 16-byte record header).  With a 20-byte fixed prefix that
+ * bounds @used_size to BRIEFS_XATTR_MAX_USED (4044); callers that would exceed
+ * it return -ENOSPC/-ERANGE before logging.
+ */
+struct jrn_xattr_data {
+	__le64 ino;           /* owning inode */
+	__le64 phys_block;    /* absolute block holding the xattr block */
+	__le32 used_size;     /* bytes of block content that follow (<=4044) */
+	__u8   data[];        /* xattr block content [0,used_size) */
 };
 
 /* JRN_CHECKPOINT */
@@ -532,6 +556,51 @@ struct briefs_extent_btree_node {
 };                                          /* 4096 bytes */
 
 /*
+ * On-disk extended-attribute block — one 4096-byte block per inode, allocated
+ * from the data block pool (bsi->alloc) and referenced by the inode's
+ * xattr_offset (absolute block number) / xattr_size (bytes used). Both fields
+ * 0 means "no xattrs". xattr_offset != 0 is the sole indicator (no InodeFlag
+ * bit is consumed), mirroring how dir_trie_root / extent_inline_base signal
+ * their structures.
+ *
+ * Layout: a flat header at the start, a fixed-size entry array packed forward,
+ * and the variable-length name/value bytes packed after the entry array
+ * (4-byte aligned). The CRC32C at offset 4080 covers [0, 4080), identical to
+ * the btree-node / chain-block convention (briefs_chain_checksum); bytes
+ * [used_size, 4080) are zero padding, [4088, 4096) are slack.
+ *
+ * Names are stored WITH their namespace prefix (e.g. "user.foo",
+ * "trusted.bar", "security.baz") — simpler for listxattr and for fsck than an
+ * index scheme. A single name+value must fit within BRIEFS_XATTR_MAX_USED
+ * (the journal payload cap); setxattr returns -ERANGE for one entry that
+ * cannot fit and -ENOSPC when the assembled entry set fills the block.
+ */
+#define BRIEFS_XATTR_MAGIC   0x58415454u   /* "XATT" */
+#define BRIEFS_XATTR_VERSION 1u
+
+/*
+ * Maximum bytes of xattr-block content the journal can carry in one record:
+ * 4096 (journal block) - 16 (block header) - 16 (record header) - 20
+ * (jrn_xattr_data fixed prefix) = 4044. xattr blocks may use no more than this
+ * many bytes of header+entries+values.
+ */
+#define BRIEFS_XATTR_MAX_USED 4044u
+
+struct briefs_xattr_header {               /* [0,16) */
+	__le32 magic;                        /* BRIEFS_XATTR_MAGIC */
+	__le32 version;                      /* BRIEFS_XATTR_VERSION */
+	__le32 used_size;                    /* header + entries + values, <=4044 */
+	__le32 entry_count;                  /* number of entries following */
+};
+
+struct briefs_xattr_entry {                 /* 8 bytes, array at [16,...) */
+	__le16 name_len;                     /* full name incl. prefix, no NUL */
+	__le16 value_len;                     /* 0 => empty value */
+	__le16 name_offset;                   /* from start of block */
+	__le16 value_offset;                  /* from start of block, 0 if value_len==0 */
+};
+
+/*
  * Per-buffer_head "CRC already verified" bit, allocated from BH_PrivateStart
  * (the first bit reserved for filesystems). Once a chain block's CRC has been
  * checked, we memoize it here so cached re-reads skip the 4088-byte CRC32C.
@@ -845,6 +914,7 @@ struct briefs_inode_info {
 	seqcount_t extent_seq;   /* protects disk_inode extent fields */
 	struct mutex trie_lock;    /* protects directory trie structure */
 	struct mutex extent_lock;  /* serializes extent list appends */
+	struct rw_semaphore xattr_sem;  /* serializes xattr block read/modify/free */
 	u64 trie_gen;            /* generation counter for trie modifications */
 	/*
 	 * cached_max_end: running max of (extent.offset + extent.len) over all
@@ -899,6 +969,9 @@ static inline u64 briefs_inode_table_start(struct briefs_superblock *sb)
 extern const struct inode_operations briefs_dir_inode_ops;
 extern const struct inode_operations briefs_file_inode_ops;
 extern const struct inode_operations briefs_symlink_inode_ops;
+
+/* Extended-attribute handlers (user/trusted/security), wired to sb->s_xattr. */
+extern const struct xattr_handler * const briefs_xattr_handlers[];
 
 /* File operations */
 extern const struct file_operations briefs_dir_operations;
@@ -1188,6 +1261,15 @@ static inline void briefs_build_bug_on_sizes(void)
 	BUILD_BUG_ON(sizeof(struct jrn_trie_alloc) != 16);
 	BUILD_BUG_ON(sizeof(struct jrn_inode_free) != 32);
 	BUILD_BUG_ON(sizeof(struct jrn_inode_full) != 560);
+	/*
+	 * jrn_xattr_data has __le64 members -> 8-byte struct alignment, so
+	 * sizeof rounds up to 24; the fixed prefix is the offset of data (20).
+	 */
+	BUILD_BUG_ON(offsetof(struct jrn_xattr_data, data) != 20);
+	BUILD_BUG_ON(sizeof(struct briefs_xattr_header) != 16);
+	BUILD_BUG_ON(sizeof(struct briefs_xattr_entry) != 8);
+	/* A full xattr-block content record must fit in one journal block. */
+	BUILD_BUG_ON(offsetof(struct jrn_xattr_data, data) + BRIEFS_XATTR_MAX_USED > 4064);
 }
 
 #endif /* __KERNEL__ */

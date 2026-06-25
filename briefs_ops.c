@@ -14,6 +14,7 @@
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
+#include "briefs_xattr.h"
 
 /* Inode operations for directories */
 const struct inode_operations briefs_dir_inode_ops = {
@@ -26,6 +27,7 @@ const struct inode_operations briefs_dir_inode_ops = {
 	.unlink = briefs_unlink,
 	.rmdir = briefs_rmdir,
 	.rename = briefs_rename,
+	.listxattr = briefs_xattr_list,
 };
 
 /* Inode operations for files */
@@ -33,11 +35,13 @@ const struct inode_operations briefs_file_inode_ops = {
 	.setattr = briefs_setattr,
 	.getattr = briefs_getattr,
 	.fiemap = briefs_fiemap,
+	.listxattr = briefs_xattr_list,
 };
 
 /* Inode operations for symlinks */
 const struct inode_operations briefs_symlink_inode_ops = {
 	.get_link = briefs_get_link,
+	.listxattr = briefs_xattr_list,
 };
 
 /* File operations for directories */

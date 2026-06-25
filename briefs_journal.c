@@ -868,6 +868,101 @@ static int replay_symlink_data(struct super_block *sb, struct jrn_symlink_data *
 }
 
 /*
+ * Pass-1 helper: record @ino's final xattr_offset (last JRN_INODE_FULL in
+ * journal order wins).  Called from apply_record() during the reservation
+ * pre-scan so pass-2's replay_xattr_data() can decide whether a stale content
+ * record still belongs to its owning inode.  Single-threaded at mount, no
+ * locking.  Idempotent: a later record for the same ino overwrites the entry.
+ */
+static int replay_xattr_final_set(struct briefs_journal *j, u64 ino,
+				  u64 xattr_offset)
+{
+	struct briefs_replay_xattr_final *e;
+
+	hash_for_each_possible(j->replay_xattr_final, e, node, ino)
+		if (e->ino == ino) {
+			e->xattr_offset = xattr_offset;
+			return 0;
+		}
+	e = kmalloc(sizeof(*e), GFP_KERNEL);
+	if (!e)
+		return -ENOMEM;
+	e->ino = ino;
+	e->xattr_offset = xattr_offset;
+	hash_add(j->replay_xattr_final, &e->node, ino);
+	return 0;
+}
+
+/* Pass-2 helper: look up @ino's final xattr_offset, or 0 if none recorded. */
+static u64 replay_xattr_final_get(struct briefs_journal *j, u64 ino)
+{
+	struct briefs_replay_xattr_final *e;
+
+	hash_for_each_possible(j->replay_xattr_final, e, node, ino)
+		if (e->ino == ino)
+			return e->xattr_offset;
+	return 0;
+}
+
+/*
+ * Replay a JRN_XATTR_DATA record.
+ * Restores @used_size bytes of an inode's xattr block content at phys_block,
+ * zeroes the tail [used_size, 4080), and recomputes the block CRC at offset
+ * 4080 (the CRC is not carried in the record since it lives beyond used_size).
+ *
+ * The block is restored ONLY when the owning inode's final xattr_offset (from
+ * the pass-1 last-JRN_INODE_FULL map) still equals phys_block.  A freed xattr
+ * block has a later JRN_INODE_FULL clearing xattr_offset to 0 (and a
+ * JRN_EXTENT_FREE that frees it in pass-1); if it was then reused for another
+ * inode's data, replaying the stale content here would clobber that data --
+ * the generic/547 deferred-free/reuse family (file data blocks carry no
+ * replayed content record, but xattr blocks uniquely do).  Skipping the
+ * restore leaves the reused block's on-disk content intact.
+ */
+static int replay_xattr_data(struct super_block *sb, struct jrn_xattr_data *rec)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct buffer_head *bh;
+	u64 phys, ino, final_off;
+	u32 used;
+
+	phys = le64_to_cpu(rec->phys_block);
+	ino = le64_to_cpu(rec->ino);
+	used = le32_to_cpu(rec->used_size);
+	if (used == 0 || used > BRIEFS_XATTR_MAX_USED)
+		return 0;
+
+	/*
+	 * Only restore a block the owning inode still references.  final_off==0
+	 * means the xattr was removed (or the inode freed) after this record was
+	 * logged, so the block has been freed and may be reused -- restoring the
+	 * stale content would clobber the new owner.
+	 */
+	final_off = bsi->journal ? replay_xattr_final_get(bsi->journal, ino) : 0;
+	if (final_off != phys)
+		return 0;
+
+	bh = sb_bread(sb, phys);
+	if (!bh) {
+		pr_warn("briefs: xattr replay can't read block %llu (skip)\n", phys);
+		return 0;
+	}
+
+	memcpy(bh->b_data, rec->data, used);
+	memset(bh->b_data + used, 0, BRIEFS_BLOCK_SIZE - used);
+	/* Recompute the CRC at offset 4080 over [0, 4080). */
+	*(__le64 *)(bh->b_data + BRIEFS_BLOCK_SIZE - 2 * sizeof(__u64)) =
+		cpu_to_le64(briefs_chain_checksum(bh->b_data));
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+
+	pr_debug("briefs: replay restored xattr block ino=%llu phys=%llu used=%u\n",
+		 ino, phys, used);
+	return 0;
+}
+
+/*
  * Mount/recovery: replay journal from last checkpoint.
  *
  * Apply one journal record.
@@ -923,14 +1018,57 @@ static int apply_record(struct super_block *sb, u32 rec_type, void *rec_data,
 		 */
 		ret = replay_trie_alloc(sb, rec_data, reserve_only);
 		break;
-	case JRN_INODE_FULL:
-		if (!reserve_only)
+	case JRN_INODE_FULL: {
+		/*
+		 * Pass-1 records the inode's xattr_offset (last-wins) so pass-2's
+		 * replay_xattr_data() can skip stale content records for freed
+		 * xattr blocks (generic/547 deferred-free/reuse family).  Pass-2
+		 * applies the full inode snapshot as before.
+		 */
+		struct jrn_inode_full *ifull = rec_data;
+		u64 ino = le64_to_cpu(ifull->ino);
+		const struct briefs_disk_inode *di =
+			(const struct briefs_disk_inode *)ifull->inode_data;
+		u64 xo = le64_to_cpu(di->xattr_offset);
+
+		if (reserve_only) {
+			if (bsi->journal)
+				replay_xattr_final_set(bsi->journal, ino, xo);
+		} else {
 			ret = replay_inode_full(sb, rec_data);
+		}
 		break;
+	}
 	case JRN_SYMLINK_DATA:
 		if (!reserve_only)
 			ret = replay_symlink_data(sb, rec_data);
 		break;
+	case JRN_XATTR_DATA: {
+		/*
+		 * Pass-1 reserves the xattr block (idempotent) so a later
+		 * extent-alloc or trie re-derivation can't reuse it while it is
+		 * still referenced.  Pass-2 restores the block content, but ONLY
+		 * if the owning inode's final xattr_offset (from the pass-1
+		 * last-INODE_FULL map) still points here -- otherwise the block
+		 * was freed (JRN_EXTENT_FREE) and may be reused, and restoring the
+		 * stale content would clobber the new owner (generic/547
+		 * deferred-free/reuse family; file data blocks carry no replayed
+		 * content record, but xattr blocks uniquely do).  The block is
+		 * implied-allocated by this record (no separate alloc record);
+		 * freeing rides JRN_EXTENT_FREE's pass-1 dispatch.
+		 */
+		struct jrn_xattr_data *xd = rec_data;
+		u64 phys = le64_to_cpu(xd->phys_block);
+
+		if (reserve_only && phys != 0) {
+			u64 rel = abs_to_data(bsi->sb, phys);
+
+			briefs_reserve_block(&bsi->alloc, rel);
+		}
+		if (!reserve_only)
+			ret = replay_xattr_data(sb, xd);
+		break;
+	}
 	default:
 		pr_debug("briefs: replay skipping unhandled record type=%u\n", rec_type);
 		break;
@@ -1132,6 +1270,7 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	 * writable, so the pool needs no locking.
 	 */
 	INIT_LIST_HEAD(&j->replay_trie_blocks);
+	hash_init(j->replay_xattr_final);
 	j->in_replay = true;
 
 	/* Pass 1: reserve/free all allocator blocks before re-derivation. */
@@ -1236,6 +1375,17 @@ replay_done:
 					 struct briefs_replay_trie_block, list);
 		list_del(&rb->list);
 		kfree(rb);
+	}
+	/* Free the pass-1 xattr-final map entries (blocks stay as pass-1 left them). */
+	{
+		struct briefs_replay_xattr_final *e;
+		struct hlist_node *tmp;
+		int bkt;
+
+		hash_for_each_safe(j->replay_xattr_final, bkt, tmp, e, node) {
+			hash_del(&e->node);
+			kfree(e);
+		}
 	}
 	return ret;
 }
@@ -1673,6 +1823,48 @@ int briefs_journal_symlink_data(struct briefs_journal *j, u64 ino,
 	memcpy(rec->target, target, target_len);
 
 	ret = briefs_journal_write_record(j, JRN_SYMLINK_DATA, rec, rec_size);
+	kfree(rec);
+	return ret;
+}
+
+/*
+ * Log the content of an inode's xattr block so a crash can restore it.
+ * Unlike directory-trie pages, an xattr block holds user data that cannot be
+ * re-derived from other journal records, so its full content is carried here.
+ * Pass-1 reserves phys_block; pass-2 writes @used_size bytes back to the block
+ * and recomputes the block CRC (which lives at offset 4080, beyond used_size).
+ *
+ * The record must fit in one journal block, so @used_size is capped at
+ * BRIEFS_XATTR_MAX_USED; callers enforce the cap before building the block.
+ */
+int briefs_journal_xattr_data(struct briefs_journal *j, u64 ino,
+			      u64 phys_block, u32 used_size,
+			      const void *block_data)
+{
+	struct jrn_xattr_data *rec;
+	size_t rec_size;
+	int ret;
+
+	if (!j || !block_data)
+		return -EINVAL;
+	if (used_size == 0 || used_size > BRIEFS_XATTR_MAX_USED)
+		return -EINVAL;
+
+	/*
+	 * offsetof(data) (==20), NOT sizeof (==24 due to __le64 alignment): the
+	 * flex array sits right after used_size with no padding before it.
+	 */
+	rec_size = offsetof(struct jrn_xattr_data, data) + used_size;
+	rec = kmalloc(rec_size, GFP_KERNEL);
+	if (!rec)
+		return -ENOMEM;
+
+	rec->ino = cpu_to_le64(ino);
+	rec->phys_block = cpu_to_le64(phys_block);
+	rec->used_size = cpu_to_le32(used_size);
+	memcpy(rec->data, block_data, used_size);
+
+	ret = briefs_journal_write_record(j, JRN_XATTR_DATA, rec, rec_size);
 	kfree(rec);
 	return ret;
 }

@@ -358,6 +358,9 @@ JRN_INODE_FULL \- complete 512-byte disk-inode snapshot
 JRN_SYMLINK_DATA
 .TP
 .B 11
+JRN_XATTR_DATA \- content of an inode's xattr block (crash-restore)
+.TP
+.B 12
 JRN_END
 .PP
 A checkpoint record (JRN_CHECKPOINT) stores the checkpoint sequence, the
@@ -371,6 +374,87 @@ block carries magic
 .RB ( CHECKPOINT_MAGIC ),
 rather than the JNLZ journal-block magic.  The journal ring skips this last
 block (the checkpoint block) to avoid wrapping ambiguity.
+.SH EXTENDED ATTRIBUTES
+BrieFS supports three extended-attribute namespaces:
+.BR user.* ,
+.BR trusted.*
+(requires
+.BR CAP_SYS_ADMIN ),
+and
+.BR security.*
+(for LSM labels).  POSIX ACLs
+.RB ( system.posix_acl_access / system.posix_acl_default )
+are not supported.
+.PP
+Each inode may own at most one external 4096-byte xattr block, allocated from
+the data block pool (the same allocator that backs directory-trie pages and
+B+ tree nodes) and referenced by the inode's
+.B xattr_offset
+(absolute block number; 0 means no block) and
+.B xattr_size
+(bytes of the block actually in use).  There is no inline xattr storage in
+the inode.
+.PP
+The block is a flat BrieFS-native layout (not ext2's bidirectional fill):
+.PP
+.nf
+    Offset  Size   Field
+      0       4    magic          0x58415454 ("XATT")
+      4       4    version        1
+      8       4    used_size      header + entries + name/value bytes
+     12       4    entry_count
+     16     8*N    briefs_xattr_entry[entry_count]
+   ...           name/value bytes (4-byte aligned)
+   4080      8    CRC32C over [0,4080)
+   4088      8    slack
+.fi
+.PP
+Each 8-byte entry is
+.RB ( struct briefs_xattr_entry ):
+.PP
+.nf
+    Offset  Size  Field
+      0       2   name_len      full name incl. prefix, no NUL
+      2       2   value_len     0 means no value
+      4       2   name_offset   from block start
+      6       2   value_offset  from block start, 0 if value_len==0
+.fi
+.PP
+Names are stored with their namespace prefix
+(e.g.
+.BR user.foo ,
+.BR trusted.bar ,
+.BR security.baz ).
+Empty values use
+.B value_len
+\== 0 and
+.BR value_offset \= 0 .
+.PP
+A journal record (JRN_XATTR_DATA) carries the block content for
+crash-recovery: xattr blocks are user data that cannot be re-derived from
+other journal records (unlike directory tries), so each block write logs its
+content before the JRN_INODE_FULL that publishes
+.BR xattr_offset .
+On replay, pass 1 reserves the named block in the allocator and pass 2
+restores the content, zeroes the tail, and recomputes the CRC.
+Because a journal record must fit in one 4096-byte journal block (4064 bytes
+of payload after the 16-byte block and record headers), the fixed 20-byte
+record prefix caps
+.B used_size
+at 4044 bytes
+.RB ( BRIEFS_XATTR_MAX_USED ).
+.PP
+A single name+value that cannot fit in the block returns
+.B ERANGE
+to
+.BR setxattr (2);
+an assembled set that exceeds 4044 bytes returns
+.BR ENOSPC .
+.B XATTR_CREATE
+and
+.B XATTR_REPLACE
+are enforced
+.RB ( EEXIST / ENODATA ).
 .SH CHECKSUMS
 BrieFS uses CRC32C for metadata integrity:
 .IP \(bu 2
@@ -381,6 +465,9 @@ Journal block payloads are checksummed as part of their records.
 B+ tree extent-index nodes carry a CRC32C at byte 4080 covering bytes 0\-4079.
 .IP \(bu 2
 Directory-trie pages have their own checksum field in the page header.
+.IP \(bu 2
+Xattr blocks carry a CRC32C at byte 4080 covering bytes 0\-4079 (a zero
+stored CRC is treated as legacy/valid).
 .SH LIMITS
 The on-disk fields are wide, so the binding limits are mostly VFS ceilings or
 allocator/encoding widths rather than the disk types themselves.

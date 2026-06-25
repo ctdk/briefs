@@ -13,6 +13,7 @@
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
+#include "briefs_xattr.h"
 
 /*
  * Data region start: the allocator trie uses data-relative block numbers
@@ -301,6 +302,14 @@ void briefs_free_inode_data(struct inode *inode)
 	struct briefs_inode_info *binfo = briefs_i(inode);
 	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
 	struct briefs_disk_inode disk_di;
+
+	/*
+	 * Free the xattr block (if any) before extents/trie -- clear the
+	 * pointer first so replay never sees an inode pointing at a freed
+	 * block, same invariant as the dir-trie free below.  No-op (and
+	 * lock-free) when the inode has no xattrs.
+	 */
+	briefs_xattr_free(inode);
 
 	/* For directories, free the trie instead of file extents */
 	if (S_ISDIR(inode->i_mode)) {
