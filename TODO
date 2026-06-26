@@ -8,10 +8,8 @@
 - Make list of relevant mount options to honor, whether fs independent or
   unique to briefs.
 - Revise briefs(5) man page.
-- support xattrs
 - Quotas
 - POSIX ACLs
-- direct I/O
 - online resize (or any resize)
 - extend inode map/add inodes to existing volume
 
