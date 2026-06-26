@@ -280,7 +280,27 @@ ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		return ret;
 	}
 
-	return generic_file_read_iter(iocb, to);
+	/*
+	 * Buffered reads go through the page cache.  Take the inode lock shared
+	 * to exclude concurrent writers, which hold it exclusive
+	 * (briefs_dio_write and briefs_iomap_buffered_write): without this a
+	 * buffered read can race a DIO write to the same range, readahead a
+	 * folio into the write range after the iomap core's best-effort
+	 * post-write invalidate, and later serve pre-write bytes (generic/209:
+	 * aio-dio-invalidate-readahead).  The iomap core's post-write invalidate
+	 * is explicitly best-effort ("if it fails, tough"), so coherence with a
+	 * racing DIO write rests on this lock, not on that invalidation.  This
+	 * mirrors the direct-read branch above and completes BrieFS's
+	 * writers-exclusive / readers-shared inode_lock model.
+	 */
+	{
+		ssize_t ret;
+
+		inode_lock_shared(inode);
+		ret = generic_file_read_iter(iocb, to);
+		inode_unlock_shared(inode);
+		return ret;
+	}
 }
 
 /*
@@ -391,6 +411,14 @@ static ssize_t briefs_dio_write(struct kiocb *iocb, struct iov_iter *from)
 	ret = file_update_time(iocb->ki_filp);
 	if (ret)
 		goto out_unlock;
+	/*
+	 * DIO write coherence with concurrent buffered reads is handled on the
+	 * read side: briefs_read_iter takes inode_lock shared, so a buffered
+	 * read (and its readahead) cannot run against this range while we hold
+	 * inode_lock exclusive here.  The iomap core's own pre/post-write
+	 * pagecache invalidate is best-effort by design, so the lock -- not that
+	 * invalidation -- is what makes generic/209 deterministic.
+	 */
 	ret = iomap_dio_rw(iocb, from, &briefs_write_iomap_ops,
 			   &briefs_dio_write_ops, 0, NULL, 0);
 out_unlock:
