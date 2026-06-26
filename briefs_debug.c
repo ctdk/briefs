@@ -130,6 +130,11 @@ static int briefs_df_superblock_show(struct seq_file *m, void *v)
 	seq_printf(m, "magic=0x%016llx\n", le64_to_cpu(s->magic));
 	seq_printf(m, "version=%llu.%llu.%llu\n", le64_to_cpu(s->major_version),
 		   le64_to_cpu(s->minor_version), le64_to_cpu(s->patch_version));
+#ifdef BRIEFS_BUILD_VERSION
+	seq_printf(m, "build=%s\n", BRIEFS_BUILD_VERSION);
+#else
+	seq_puts(m, "build=unknown\n");
+#endif
 	seq_printf(m, "total_blocks=%llu\n", le64_to_cpu(s->total_blocks));
 	seq_printf(m, "data_blocks=%llu\n", le64_to_cpu(s->data_blocks));
 	seq_printf(m, "block_size=%llu\n", le64_to_cpu(s->block_size));

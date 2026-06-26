@@ -92,6 +92,9 @@ module_exit(briefs_exit);
 MODULE_AUTHOR("Jeremy Bingham");
 MODULE_DESCRIPTION("BrieFS - extent-only, trie-based filesystem.");
 MODULE_LICENSE("Dual MIT/GPL");
+#ifdef BRIEFS_BUILD_VERSION
+MODULE_VERSION(BRIEFS_BUILD_VERSION);
+#endif
 
 /* Let `mount -t briefs` (and `modprobe fs-briefs`) auto-load this module via
  * depmod. Without this alias, the module must be insmod'd manually before the

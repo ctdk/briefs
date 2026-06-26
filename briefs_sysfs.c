@@ -94,6 +94,22 @@ static ssize_t version_show(struct kobject *kobj, struct kobj_attribute *attr,
 		       le64_to_cpu(s->minor_version), le64_to_cpu(s->patch_version));
 }
 
+/*
+ * Code build identifier (git revision of the source the module was built
+ * from), distinct from the on-disk format "version" above.  Surfaced so the
+ * running module can be matched to its source; "unknown" when built outside a
+ * git tree (BRIEFS_BUILD_VERSION undefined).
+ */
+static ssize_t build_show(struct kobject *kobj, struct kobj_attribute *attr,
+			  char *buf)
+{
+#ifdef BRIEFS_BUILD_VERSION
+	return sprintf(buf, "%s\n", BRIEFS_BUILD_VERSION);
+#else
+	return sprintf(buf, "unknown\n");
+#endif
+}
+
 static ssize_t block_size_show(struct kobject *kobj, struct kobj_attribute *attr,
 			       char *buf)
 {
@@ -178,6 +194,7 @@ static ssize_t mount_time_show(struct kobject *kobj,
 static struct kobj_attribute label_attr = __ATTR_RO(label);
 static struct kobj_attribute uuid_attr = __ATTR_RO(uuid);
 static struct kobj_attribute version_attr = __ATTR_RO(version);
+static struct kobj_attribute build_attr = __ATTR_RO(build);
 static struct kobj_attribute block_size_attr = __ATTR_RO(block_size);
 static struct kobj_attribute total_blocks_attr = __ATTR_RO(total_blocks);
 static struct kobj_attribute free_blocks_attr = __ATTR_RO(free_blocks);
@@ -190,6 +207,7 @@ static struct attribute *briefs_sb_attrs[] = {
 	&label_attr.attr,
 	&uuid_attr.attr,
 	&version_attr.attr,
+	&build_attr.attr,
 	&block_size_attr.attr,
 	&total_blocks_attr.attr,
 	&free_blocks_attr.attr,
