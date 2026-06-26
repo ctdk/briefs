@@ -543,7 +543,9 @@ The following are intentionally not implemented in v0.9.3:
 No data journaling: buffered writes require an explicit flush or fsync to be
 durable.
 .IP \(bu 2
-No extended attributes, POSIX ACLs, quotas, direct I/O, or online resize.
+No POSIX ACLs, quotas, reflink/COW, fscrypt, fsverity, or online resize
+(extended attributes and direct I/O are supported; see the EXTENDED
+ATTRIBUTES section above).
 .IP \(bu 2
 B+ tree node splits are not themselves journaled; crash recovery relies on
 ordered writeback and, if necessary, offline repair with
