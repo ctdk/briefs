@@ -714,11 +714,6 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 	if (TRIE_REF_IS_NULL(node_ref))
 		return;
 
-	st = briefs_trie_get_state(sb);
-	if (!st)
-		return;
-	pages = &st->pages;
-
 	block = TRIE_REF_BLOCK(node_ref);
 	slot = TRIE_REF_SLOT(node_ref);
 
@@ -726,7 +721,26 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 	if (IS_ERR(bh))
 		return;
 
-	mutex_lock(&pages->lock);
+	/*
+	 * The per-superblock partial-page pool is built lazily by live trie
+	 * mutations (create_root / alloc_node / free).  A directory whose trie
+	 * was created on a previous mount and read back from disk by iget() is
+	 * NOT in this mount's pool: nothing re-seeds the pool for it, and if the
+	 * dir is only removed (not otherwise modified) on this mount the pool
+	 * may not even exist yet.  Freeing a trie node must not depend on the
+	 * pool -- the live_count and free-slots bitmap live in the on-disk page
+	 * header, and the block must be returned to the allocator when the page
+	 * empties or it leaks as an fsck orphan ("allocated but not referenced").
+	 * The pool is consulted only for the allocation-cache bookkeeping below,
+	 * which is skipped when no pool exists.  briefs_trie_free_all() already
+	 * validated this page's magic via trie_read_node() before calling here,
+	 * so a stale ref pointing at non-trie data never reaches this point.
+	 */
+	st = briefs_trie_get_state(sb);
+	pages = st ? &st->pages : NULL;
+
+	if (pages)
+		mutex_lock(&pages->lock);
 
 	if (!(trie_page_free_slots(page) & (1ULL << slot))) {
 		trie_page_set_free_slots(page, trie_page_free_slots(page) | (1ULL << slot));
@@ -737,22 +751,24 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 
 	page_empty = (trie_page_live_count(page) == 0);
 
-	if (!page_empty && trie_page_free_slots(page) != 0)
-		__trie_page_add_partial_locked(pages, block);
+	if (pages) {
+		if (!page_empty && trie_page_free_slots(page) != 0)
+			__trie_page_add_partial_locked(pages, block);
 
-	if (page_empty) {
-		list_for_each_entry_safe(entry, tmp, &pages->partial, list) {
-			if (entry->block == block) {
-				list_del(&entry->list);
-				kfree(entry);
-				break;
+		if (page_empty) {
+			list_for_each_entry_safe(entry, tmp, &pages->partial, list) {
+				if (entry->block == block) {
+					list_del(&entry->list);
+					kfree(entry);
+					break;
+				}
 			}
+			if (pages->hot_block == block)
+				pages->hot_block = 0;
 		}
-		if (pages->hot_block == block)
-			pages->hot_block = 0;
-	}
 
-	mutex_unlock(&pages->lock);
+		mutex_unlock(&pages->lock);
+	}
 
 	if (page_empty) {
 		struct briefs_sb_info *bsi = sb->s_fs_info;
