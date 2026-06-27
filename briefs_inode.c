@@ -56,6 +56,25 @@ struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
 		return ERR_PTR(-EIO);
 	}
 
+	/*
+	 * sb_bread() returns a cached buffer WITHOUT waiting when it is already
+	 * uptodate, so a block whose previous writeback is still in flight can be
+	 * handed back locked and (apparently) uptodate.  Wait for that writeback
+	 * to finish first.  If it failed, end_buffer_async_write() cleared
+	 * BH_Uptodate and set BH_Write_EIO; reading b_data or re-dirtying such a
+	 * buffer races that failed write and trips the
+	 * WARN_ON_ONCE(!buffer_uptodate) in mark_buffer_dirty() (generic/753
+	 * dm-error, where two inodes sharing a 4K inode block race writeback).
+	 * Quiesce the buffer and surface -EIO so callers propagate the error
+	 * instead of persisting into / re-dirtying a stale buffer; writeback
+	 * retries once the device is healthy again.
+	 */
+	wait_on_buffer(bh);
+	if (briefs_check_meta_write_error(bh)) {
+		brelse(bh);
+		return ERR_PTR(-EIO);
+	}
+
 	*di = (struct briefs_disk_inode *)(bh->b_data + inodeOffset);
 	return bh;
 }
@@ -100,7 +119,23 @@ int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
 		return PTR_ERR(bh);
 
 	briefs_cpu_inode_to_disk(src, di);
+
+	/*
+	 * Same shared-block writeback race as briefs_write_inode(): a concurrent
+	 * writeback of this inode block may fail on a dying device and clear
+	 * BH_Uptodate before we mark dirty.  Lock the buffer, wait for any in-flight
+	 * write, and propagate -EIO rather than re-dirtying a broken buffer.
+	 */
+	lock_buffer(bh);
+	if (!buffer_uptodate(bh)) {
+		unlock_buffer(bh);
+		briefs_check_meta_write_error(bh);
+		brelse(bh);
+		return -EIO;
+	}
 	mark_buffer_dirty(bh);
+	unlock_buffer(bh);
+
 	if (sync)
 		sync_dirty_buffer(bh);
 	brelse(bh);
@@ -490,7 +525,28 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	 */
 	briefs_journal_inode_full(bsi->journal, inode->i_ino, disk_inode);
 
+	/*
+	 * A concurrent writeback of this shared 4K inode block may have been
+	 * submitted while we prepared this update (the buffer can carry several
+	 * inodes).  On a failing device (dm-error sudden death, generic/753) that
+	 * writeback completes EIO and end_buffer_async_write() clears BH_Uptodate.
+	 * Re-dirtying the now-!uptodate buffer would trip
+	 * WARN_ON_ONCE(!buffer_uptodate) in mark_buffer_dirty().  Take the buffer
+	 * lock so no new writeback can be submitted, wait for any write already
+	 * in flight, and if it failed propagate -EIO instead of re-dirtying a
+	 * broken buffer.  The journal record above preserves the change for
+	 * replay; writeback retries once the device recovers.
+	 */
+	lock_buffer(bh);
+	if (!buffer_uptodate(bh)) {
+		unlock_buffer(bh);
+		briefs_check_meta_write_error(bh);
+		mapping_set_error(inode->i_mapping, -EIO);
+		brelse(bh);
+		return -EIO;
+	}
 	mark_buffer_dirty(bh);
+	unlock_buffer(bh);
 	brelse(bh);
 
 	return 0;
