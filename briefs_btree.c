@@ -1473,8 +1473,19 @@ int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
 						modified);
 
 	if (root_empty) {
-		/* Every extent was removed: free the root (already freed by the
-		 * subtree walk) and clear the tree-backed state. */
+		/* Every extent was removed from the tree: free the root (already
+		 * freed by the subtree walk) and clear the tree-backed state so the
+		 * freed root block is not dereferenced below.
+		 *
+		 * A right straddler that extended past @end was extracted to @right
+		 * BEFORE its leaf was freed, so its data blocks survive but are now
+		 * unreferenced. When nright > 0 we must NOT return here: that would
+		 * orphan the straddler's blocks (allocated but in no extent, read
+		 * back as a hole). Instead continue past this block to re-insert
+		 * the straddlers into the cleared (now inline-only) inode, which
+		 * promotes back to indexed if it spills, then recompute the tail
+		 * cache and count.
+		 */
 		*modified = true;
 		write_seqcount_begin(&binfo->extent_seq);
 		di->flags &= ~InodeFlagIndexed;
@@ -1484,7 +1495,9 @@ int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
 		memset(di->inline_extents, 0, sizeof(di->inline_extents));
 		binfo->cached_max_end = 0;
 		write_seqcount_end(&binfo->extent_seq);
-		return 0;
+
+		if (nright == 0)
+			return 0;
 	}
 
 	/* Re-insert right-straddler tails (extents that extended past @end). */
