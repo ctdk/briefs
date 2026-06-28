@@ -691,10 +691,6 @@ static int briefs_read_and_fill_inode(struct inode *inode)
 		inode->i_op = &briefs_file_inode_ops;
 	}
 
-	pr_info("briefs: inode %llu: mode=0o%06o, uid=%u, gid=%u, size=%llu, nlink=%u\n",
-		ino, inode->i_mode, from_kuid(&init_user_ns, inode->i_uid),
-		from_kgid(&init_user_ns, inode->i_gid), inode->i_size, inode->i_nlink);
-
 	brelse(bh);
 	return 0;
 }
