@@ -1043,23 +1043,35 @@ static int trie_iter_grow(struct trie_iter *iter, int need)
 	if (new_cap == iter->cap)
 		return 0;
 
+	/*
+	 * Grow both arrays atomically: allocate the two replacements first, copy,
+	 * then free the olds and swap.  krealloc() cannot do this safely in a pair
+	 * -- on failure it returns NULL but leaves the old block intact, while on
+	 * success it may free the old block and move.  Calling krealloc() twice and
+	 * freeing on partial failure therefore double-frees whichever succeeded
+	 * (its old block was already freed by the move) and leaves the iterator
+	 * holding a dangling pointer that briefs_trie_iter_free() then kfree()s
+	 * again -- a cross-slab double-free / use-after-free.  The all-or-nothing
+	 * kmalloc_array + copy + free-old sequence below never touches the live
+	 * arrays until both replacements exist, so on -ENOMEM the iterator is left
+	 * exactly as the caller found it (no dangling pointer, no double-free).
+	 */
 	{
 		u64 *new_stack;
 		u8 *new_emitted;
 
-		new_stack = krealloc(iter->stack, new_cap * sizeof(u64), GFP_KERNEL);
-		new_emitted = krealloc(iter->leaf_emitted, new_cap * sizeof(u8), GFP_KERNEL);
-		if (!new_stack || !new_emitted) {
+		new_stack = kmalloc_array(new_cap, sizeof(u64), GFP_KERNEL);
+		if (!new_stack)
+			return -ENOMEM;
+		new_emitted = kmalloc_array(new_cap, sizeof(u8), GFP_KERNEL);
+		if (!new_emitted) {
 			kfree(new_stack);
-			kfree(new_emitted);
 			return -ENOMEM;
 		}
-		/*
-		 * On success, krealloc may have freed the old arrays already. Update
-		 * both pointers and the capacity atomically so an allocation failure
-		 * in the second krealloc cannot leave the iterator with a dangling
-		 * pointer. (Both succeeded above.)
-		 */
+		memcpy(new_stack, iter->stack, iter->cap * sizeof(u64));
+		memcpy(new_emitted, iter->leaf_emitted, iter->cap * sizeof(u8));
+		kfree(iter->stack);
+		kfree(iter->leaf_emitted);
 		iter->stack = new_stack;
 		iter->leaf_emitted = new_emitted;
 		iter->cap = new_cap;
