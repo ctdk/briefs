@@ -455,6 +455,20 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	inode_lock(inode);
 
+	/* The inline-data path bypasses briefs_iomap_buffered_write (which
+	 * calls file_remove_privs for the extent-backed path), so strip
+	 * suid/sgid and clear security.capability here.  Without this an
+	 * append to a small inline file carrying capabilities leaves the cap
+	 * xattr in place (generic/093: append must clear capabilities).
+	 * Under inode_lock, as file_remove_privs' notify_change requires;
+	 * the promote/extent path below re-calls it as a harmless no-op.
+	 */
+	ret = file_remove_privs(iocb->ki_filp);
+	if (ret) {
+		inode_unlock(inode);
+		return ret;
+	}
+
 	if ((binfo->disk_inode.flags & InodeFlagInlineData) || inode->i_size == 0) {
 		if (total_size <= BRIEFS_INODE_INLINE_DATA_SIZE) {
 			u8 tmp[BRIEFS_INODE_INLINE_DATA_SIZE];
@@ -680,6 +694,26 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		if (binfo->disk_inode.num_extents_total == 0 ||
 		    binfo->cached_max_end <= trunc_block)
 			goto out_copy;
+	}
+
+	/* notify_change() translates the ATTR_KILL_SUID / ATTR_KILL_SGID bits
+	 * that do_truncate() adds (via dentry_needs_remove_privs) into ATTR_MODE
+	 * with the setid bits cleared before calling ->setattr.  The size-change
+	 * paths below all return directly and never reach the out_copy
+	 * setattr_copy() epilogue, so apply the stripped mode here and mirror it
+	 * into the disk inode -- every truncate path persists/journals
+	 * &binfo->disk_inode, so they all pick up the new mode.  Without this a
+	 * truncate of a setid file by an unprivileged (non-CAP_FSETID) caller
+	 * leaves the setid bits set (generic/193).  For a privileged caller
+	 * dentry_needs_remove_privs() returns 0, ATTR_MODE is absent, and the
+	 * mode is untouched.  Capability clearing on truncate is handled earlier
+	 * by notify_change()'s security_inode_killpriv() (ATTR_KILL_PRIV), not
+	 * here.  The equal-size no-op case above jumped to out_copy, whose
+	 * setattr_copy() applies ATTR_MODE itself.
+	 */
+	if (attr->ia_valid & ATTR_MODE) {
+		inode->i_mode = attr->ia_mode;
+		binfo->disk_inode.filemode = inode->i_mode;
 	}
 
 	/* A size change updates mtime and ctime.  notify_change() populates
@@ -1614,6 +1648,20 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 		return -EINVAL;
 
 	inode_lock(inode);
+
+	/*
+	 * The VFS fallocate path (vfs_fallocate) does not strip suid/sgid or
+	 * clear security.capability, so -- as ext4_fallocate does -- do it
+	 * here before any allocation or punch.  An unprivileged
+	 * (non-CAP_FSETID) caller's fallocate/punch of a setid file must
+	 * clear the setid bits (generic/683/684), and any fallocate of a
+	 * file carrying capabilities must clear them regardless of caller
+	 * (generic/688).  Under inode_lock, as file_remove_privs' notify_change
+	 * requires.
+	 */
+	ret = file_remove_privs(file);
+	if (ret)
+		goto out_unlock;
 
 	/*
 	 * Enforce RLIMIT_FSIZE on an allocation that grows i_size.  The VFS
