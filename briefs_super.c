@@ -201,6 +201,20 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 	sb->s_xattr = briefs_xattr_handlers;
 	sb->s_flags |= SB_ACTIVE;
 
+	/* Enable cgroup-aware writeback.  inode_cgwb_enabled() (which gates
+	 * per-cgroup writeback ownership and thus io.stat write accounting)
+	 * requires SB_I_CGROUPWB on the superblock; neither mount_bdev nor
+	 * get_tree_bdev sets it -- every block filesystem (ext2/ext4/xfs/
+	 * btrfs/f2fs) sets it by hand in fill_super.  Without it, writeback
+	 * is charged to the task running fsync rather than the cgroup that
+	 * dirtied the pages, so cross-cgroup scenarios see write=0 for the
+	 * dirtier (generic/563).  The iomap writeback path already calls
+	 * wbc_init_bio()/wbc_account_cgroup_owner(); this flag is the only
+	 * missing piece.  Harmless on a bdi without BDI_CAP_WRITEBACK
+	 * (inode_cgwb_enabled's own capability check then short-circuits).
+	 */
+	sb->s_iflags |= SB_I_CGROUPWB;
+
 	/* Replay journal on mount (if not clean) */
 	ret = briefs_journal_replay(bsi->journal);
 	if (ret) {
