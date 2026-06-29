@@ -905,6 +905,85 @@ static u64 replay_xattr_final_get(struct briefs_journal *j, u64 ino)
 }
 
 /*
+ * Nlink-reconciliation helpers (generic/475). These run only during journal
+ * replay, single-threaded at mount before the filesystem is writable.
+ */
+
+/* Return true if inode @ino is marked allocated in the replayed inode bitmap. */
+static bool replay_inode_allocated(struct briefs_sb_info *bsi, u64 ino)
+{
+	struct briefs_alloc *alloc = &bsi->inode_alloc;
+	u64 rel = ino - 1;
+	u64 w2, b2;
+
+	if (ino == 0 || !alloc->l2 || rel >= alloc->block_count)
+		return false;
+
+	w2 = rel / 64;
+	b2 = rel % 64;
+	return (alloc->l2[w2] & (1ULL << b2)) == 0; /* bit clear = allocated */
+}
+
+static struct briefs_replay_nlink *replay_nlink_find(struct briefs_journal *j, u64 ino)
+{
+	struct briefs_replay_nlink *e;
+
+	hash_for_each_possible(j->replay_nlink_hash, e, node, ino)
+		if (e->ino == ino)
+			return e;
+	return NULL;
+}
+
+static struct briefs_replay_nlink *replay_nlink_get(struct briefs_journal *j, u64 ino)
+{
+	struct briefs_replay_nlink *e = replay_nlink_find(j, ino);
+
+	if (e)
+		return e;
+
+	e = kmalloc(sizeof(*e), GFP_KERNEL);
+	if (!e)
+		return NULL;
+	e->ino = ino;
+	e->link_count = 0;
+	e->subdir_count = 0;
+	hash_add(j->replay_nlink_hash, &e->node, ino);
+	return e;
+}
+
+static int replay_nlink_inc_link(struct briefs_journal *j, u64 ino)
+{
+	struct briefs_replay_nlink *e = replay_nlink_get(j, ino);
+
+	if (!e)
+		return -ENOMEM;
+	e->link_count++;
+	return 0;
+}
+
+static int replay_nlink_inc_subdir(struct briefs_journal *j, u64 ino)
+{
+	struct briefs_replay_nlink *e = replay_nlink_get(j, ino);
+
+	if (!e)
+		return -ENOMEM;
+	e->subdir_count++;
+	return 0;
+}
+
+static void replay_nlink_free_all(struct briefs_journal *j)
+{
+	struct briefs_replay_nlink *e;
+	struct hlist_node *tmp;
+	int bkt;
+
+	hash_for_each_safe(j->replay_nlink_hash, bkt, tmp, e, node) {
+		hash_del(&e->node);
+		kfree(e);
+	}
+}
+
+/*
  * Replay a JRN_XATTR_DATA record.
  * Restores @used_size bytes of an inode's xattr block content at phys_block,
  * zeroes the tail [used_size, 4080), and recomputes the block CRC at offset
@@ -1227,19 +1306,181 @@ int briefs_journal_replay_pop_trie_block(struct briefs_journal *j, u64 *rel)
 }
 
 /*
+ * Replay pass-3: reconcile on-disk inode nlinks with the re-derived tries.
+ *
+ * Crash replay derives directory tries from JRN_DIR_UPDATE records but applies
+ * inode nlink snapshots from JRN_INODE_FULL / JRN_INODE_UPDATE independently. A
+ * sudden-death crash can leave a partial journal tail containing an
+ * INODE_UPDATE that decremented nlinks without the matching DIR_DEL, so the
+ * recovered filesystem has an inode with nlink == 0 while a directory entry still
+ * names it. The next unlink of that name calls drop_nlink() on an already-zero
+ * link count and trips the kernel WARNING that _check_dmesg catches
+ * (generic/475).
+ *
+ * After pass-2 has re-derived all directory tries, walk every directory trie to
+ * count, per inode, how many directory entries reference it (link_count) and
+ * how many child-directory entries each directory contains (subdir_count).
+ * Then patch every on-disk inode's nlinks to match:
+ *   - directories: nlinks = 2 + subdir_count
+ *   - non-directories: nlinks = link_count
+ *
+ * This is a pure recovery-time fix: no on-disk format change, no mkfs/fsck
+ * updates.
+ */
+static int replay_reconcile_nlinks(struct super_block *sb)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct briefs_journal *j = bsi ? bsi->journal : NULL;
+	u64 ino, max_ino;
+	u32 patched = 0;
+
+	if (!bsi || !j)
+		return -EINVAL;
+
+	max_ino = bsi->inode_alloc.block_count;
+	if (max_ino == 0)
+		return 0;
+
+	hash_init(j->replay_nlink_hash);
+
+	/* Pass 3a: count entries and subdirectories from the re-derived tries. */
+	for (ino = 1; ino <= max_ino; ino++) {
+		struct briefs_disk_inode *di;
+		struct buffer_head *bh;
+		struct briefs_inode dir_di;
+		struct trie_iter *iter;
+		u64 child_ino;
+		u8 ftype;
+		char name_buf[BRIEFS_NAME_LEN + 1];
+		int name_len;
+
+		if (!replay_inode_allocated(bsi, ino))
+			continue;
+
+		bh = briefs_read_inode_block(sb, ino, &di);
+		if (IS_ERR(bh)) {
+			pr_warn("briefs: nlink reconcile: can't read inode %llu (skip)\n",
+			        ino);
+			continue;
+		}
+
+		if (le64_to_cpu(di->magic) != _BRIEFS_INODE_MAGIC ||
+		    !BRIEFS_S_ISDIR(le32_to_cpu(di->filemode))) {
+			brelse(bh);
+			continue;
+		}
+
+		briefs_disk_inode_to_cpu(di, &dir_di);
+
+		iter = briefs_trie_iter_alloc();
+		if (!iter) {
+			brelse(bh);
+			replay_nlink_free_all(j);
+			return -ENOMEM;
+		}
+
+		briefs_trie_iter_init(iter, &dir_di, 0);
+		while (briefs_trie_iter_next(sb, iter, 0, &child_ino, &ftype,
+		                             name_buf, &name_len) == 0) {
+			int ret;
+
+			if (child_ino != 0 && replay_inode_allocated(bsi, child_ino)) {
+				ret = replay_nlink_inc_link(j, child_ino);
+				if (ret) {
+					briefs_trie_iter_free(iter);
+					brelse(bh);
+					replay_nlink_free_all(j);
+					return ret;
+				}
+			}
+
+			if (ftype == (S_IFDIR >> 12)) {
+				ret = replay_nlink_inc_subdir(j, ino);
+				if (ret) {
+					briefs_trie_iter_free(iter);
+					brelse(bh);
+					replay_nlink_free_all(j);
+					return ret;
+				}
+			}
+		}
+
+		briefs_trie_iter_free(iter);
+		brelse(bh);
+
+		if ((ino & 4095) == 0)
+			cond_resched();
+	}
+
+	/* Pass 3b: patch on-disk nlinks where they disagree with the counts. */
+	for (ino = 1; ino <= max_ino; ino++) {
+		struct briefs_disk_inode *di;
+		struct buffer_head *bh;
+		struct briefs_replay_nlink *e;
+		u32 expected, old;
+
+		if (!replay_inode_allocated(bsi, ino))
+			continue;
+
+		bh = briefs_read_inode_block(sb, ino, &di);
+		if (IS_ERR(bh))
+			continue;
+
+		if (le64_to_cpu(di->magic) != _BRIEFS_INODE_MAGIC) {
+			brelse(bh);
+			continue;
+		}
+
+		e = replay_nlink_find(j, ino);
+		if (BRIEFS_S_ISDIR(le32_to_cpu(di->filemode))) {
+			u32 subdirs = e ? e->subdir_count : 0;
+
+			expected = 2 + subdirs;
+		} else {
+			expected = e ? e->link_count : 0;
+		}
+
+		old = le32_to_cpu(di->nlinks);
+		if (old != expected) {
+			di->nlinks = cpu_to_le32(expected);
+			mark_buffer_dirty(bh);
+			sync_dirty_buffer(bh);
+			patched++;
+			pr_debug("briefs: replay reconciled nlink ino=%llu %u -> %u\n",
+			         ino, old, expected);
+		}
+
+		brelse(bh);
+
+		if ((ino & 4095) == 0)
+			cond_resched();
+	}
+
+	replay_nlink_free_all(j);
+
+	pr_info("briefs: replay reconciled nlinks for %u inodes\n", patched);
+	return 0;
+}
+
+/*
  * Walks the journal from journal_log_start to journal_log_end and re-applies
  * each record.  After successful replay, the journal is marked clean.
  *
- * Two passes: (1) a reservation pre-scan that marks every block/inode claimed
- * by an ALLOC record (and frees every FREE record) so the in-memory allocators
- * reflect the full post-crash allocation state BEFORE any directory-trie
- * re-derivation runs; (2) the apply pass that writes inode/symlink blocks and
- * re-derives directory tries.  Without the pre-scan, re-derivation
- * (replay_dir_update -> briefs_trie_insert) could allocate a fresh trie page
- * out of a block that a later JRN_EXTENT_ALLOC record reserves for file data,
- * aliasing a trie page onto file data (generic/073 after the page_init sync).
- * briefs_reserve_block is idempotent, so re-reserving in the apply pass is
- * harmless.
+ * Three passes:
+ *   (1) reservation pre-scan: marks every block/inode claimed by an ALLOC
+ *       record (and frees every FREE record) so the in-memory allocators
+ *       reflect the full post-crash allocation state BEFORE any directory-trie
+ *       re-derivation runs;
+ *   (2) apply pass: writes inode/symlink blocks and re-derives directory tries;
+ *   (3) nlink reconciliation: recomputes on-disk nlinks from the re-derived
+ *       tries so a partial-tail crash cannot leave an inode with nlink == 0
+ *       while a directory entry still names it (generic/475).
+ *
+ * Without the pre-scan, re-derivation (replay_dir_update -> briefs_trie_insert)
+ * could allocate a fresh trie page out of a block that a later JRN_EXTENT_ALLOC
+ * record reserves for file data, aliasing a trie page onto file data
+ * (generic/073 after the page_init sync).  briefs_reserve_block is idempotent,
+ * so re-reserving in the apply pass is harmless.
  */
 int briefs_journal_replay(struct briefs_journal *j) {
 	if (!j) return -EINVAL;
@@ -1271,6 +1512,7 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	 */
 	INIT_LIST_HEAD(&j->replay_trie_blocks);
 	hash_init(j->replay_xattr_final);
+	hash_init(j->replay_nlink_hash);
 	j->in_replay = true;
 
 	/* Pass 1: reserve/free all allocator blocks before re-derivation. */
@@ -1287,6 +1529,18 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	ret = walk_journal(j, sb, false, &records_replayed, &blocks_read, &errors);
 	if (ret)
 		goto replay_done;
+
+	/*
+	 * Pass 3: nlink reconciliation. The re-derived tries are now authoritative
+	 * for which directory entries exist; make on-disk nlinks agree with them so
+	 * a partial-tail crash cannot leave an inode with nlink == 0 while a name
+	 * still points to it (generic/475 drop_nlink underflow).
+	 */
+	ret = replay_reconcile_nlinks(sb);
+	if (ret) {
+		pr_err("briefs: nlink reconciliation failed: %d\n", ret);
+		goto replay_done;
+	}
 
 	pr_info("briefs: journal replay complete (blocks=%u, records=%u, errors=%u)\n",
 		blocks_read, records_replayed, errors);
@@ -1386,6 +1640,9 @@ replay_done:
 			hash_del(&e->node);
 			kfree(e);
 		}
+
+		/* Free the pass-3 nlink-reconciliation map entries. */
+		replay_nlink_free_all(j);
 	}
 	return ret;
 }

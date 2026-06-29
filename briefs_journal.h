@@ -92,6 +92,14 @@ struct briefs_journal {
 	 * blocks uniquely do).  Populated/valid only while in_replay is set.
 	 */
 	DECLARE_HASHTABLE(replay_xattr_final, 8);
+
+	/*
+	 * Replay pass-3 map: ino -> accumulated link/subdir counts derived from
+	 * the re-derived directory tries. Used by replay_reconcile_nlinks() to
+	 * patch on-disk inode nlinks so they agree with the actual directory
+	 * entries after a partial-tail crash (generic/475).
+	 */
+	DECLARE_HASHTABLE(replay_nlink_hash, 16);
 };
 
 /*
@@ -109,6 +117,19 @@ struct briefs_replay_xattr_final {
 struct briefs_replay_trie_block {
 	struct list_head list;
 	u64 rel;		/* data-relative block number */
+};
+
+/*
+ * One entry in the replay nlink-reconciliation map (above).  Lives only
+ * during replay.  link_count counts directory entries across all dirs pointing
+ * to ino; subdir_count counts how many child-directory entries exist inside
+ * ino.
+ */
+struct briefs_replay_nlink {
+	struct hlist_node node;
+	u64 ino;
+	u32 link_count;
+	u32 subdir_count;
 };
 
 /*
