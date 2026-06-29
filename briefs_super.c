@@ -26,6 +26,33 @@ int briefs_sync_fs(struct super_block *sb, int wait)
 		return briefs_journal_sync(bsi->journal);
 	return 0;
 }
+
+/*
+ * briefs_freeze_fs / briefs_thaw_fs - VFS freeze/thaw hooks.
+ *
+ * The VFS generic freeze_super() does the writer-freeze dance
+ * (SB_FREEZE_WRITE -> SB_FREEZE_TRANS -> SB_FREEZE_COMPLETE, blocking new
+ * writers and waiting on in-flight ones) and calls ->freeze_fs once writers
+ * are quiesced; thaw_super() calls ->thaw_fs before unblocking writers.
+ * FIFREEZE/FITHAW return -EOPNOTSUPP up front unless the superblock provides
+ * at least one of ->freeze_fs / ->freeze_super (fs/ioctl.c), so a hook must
+ * exist for the ioctls to be accepted at all.
+ *
+ * The only BrieFS-specific work at freeze time is flushing the journal so the
+ * on-disk crash-recovery state is current while the fs is frozen -- exactly
+ * what briefs_sync_fs(sb, 1) does. Nothing BrieFS-specific is needed on thaw
+ * (the journal is not suspended and writers simply resume), so unfreeze_fs
+ * mirrors sync_fs for symmetry and as a forward-looking hook.
+ */
+int briefs_freeze_fs(struct super_block *sb)
+{
+	return briefs_sync_fs(sb, 1);
+}
+
+int briefs_unfreeze_fs(struct super_block *sb)
+{
+	return briefs_sync_fs(sb, 1);
+}
 /* briefs_fill_super - entry point for mount */
 /* Keeping things simple, at least at first. Cribbing off of xiafs_fill_super
  * since it's reasonably simple but gets the job done. */

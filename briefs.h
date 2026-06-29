@@ -1194,6 +1194,8 @@ int briefs_remove_dir_entry(struct inode *dir, const char *name, size_t name_len
 void briefs_evict_inode(struct inode *inode);
 void briefs_umount_begin(struct super_block *sb);
 int briefs_sync_fs(struct super_block *sb, int wait);
+int briefs_freeze_fs(struct super_block *sb);
+int briefs_unfreeze_fs(struct super_block *sb);
 int briefs_dir_open(struct inode *inode, struct file *file);
 int briefs_dir_release(struct inode *inode, struct file *file);
 
