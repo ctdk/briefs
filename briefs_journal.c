@@ -1458,7 +1458,7 @@ static int replay_reconcile_nlinks(struct super_block *sb)
 
 	replay_nlink_free_all(j);
 
-	pr_info("briefs: replay reconciled nlinks for %u inodes\n", patched);
+	pr_debug("briefs: replay reconciled nlinks for %u inodes\n", patched);
 	return 0;
 }
 

@@ -1070,7 +1070,6 @@ int briefs_getattr(struct mnt_idmap *idmap, const struct path *path,
 	}
 	inode->i_blocks = i_blocks;
 	stat->blocks = i_blocks;
-	pr_debug("briefs: getattr ino=%lu i_blocks=%llu\n", inode->i_ino, i_blocks);
 	return 0;
 }
 

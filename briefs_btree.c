@@ -1531,21 +1531,21 @@ static void btree_drain_subtree(struct super_block *sb, u64 block, u64 *cap)
 	(*cap)--;
 
 	if (block >= (bdev_nr_bytes(sb->s_bdev) >> sb->s_blocksize_bits)) {
-		pr_warn("briefs: btree drain: node %llu out of range\n", block);
+		pr_debug("briefs: btree drain: node %llu out of range\n", block);
 		return;
 	}
 
 	bh = sb_bread(sb, block);
 	if (!bh) {
-		pr_warn("briefs: btree drain: sb_bread node %llu failed\n",
-			block);
+		pr_debug("briefs: btree drain: sb_bread node %llu failed\n",
+			 block);
 		return;
 	}
 	if (buffer_dirty(bh)) {
 		sync_dirty_buffer(bh);
 		if (briefs_check_meta_write_error(bh))
-			pr_warn("briefs: btree drain: node %llu write failed\n",
-				block);
+			pr_err("briefs: btree drain: node %llu write failed\n",
+			       block);
 	}
 
 	node = (struct briefs_extent_btree_node *)bh->b_data;

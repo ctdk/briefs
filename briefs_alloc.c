@@ -77,9 +77,9 @@ int briefs_alloc_init_at(struct briefs_alloc *alloc, struct super_block *sb,
 
 	brelse(bh);
 
-	pr_info("briefs: allocator at block %llu: l0=%llu words, l1=%llu words, l2=%llu words, entries=%llu, free=%llu\n",
-		pool_block, alloc->l0_words, alloc->l1_words, alloc->l2_words,
-		alloc->block_count, alloc->free_count);
+	pr_debug("briefs: allocator at block %llu: l0=%llu words, l1=%llu words, l2=%llu words, entries=%llu, free=%llu\n",
+		 pool_block, alloc->l0_words, alloc->l1_words, alloc->l2_words,
+		 alloc->block_count, alloc->free_count);
 
 	/* Allocate arrays */
 	alloc->l0 = __vmalloc(alloc->l0_words * sizeof(u64), GFP_KERNEL);
@@ -167,8 +167,8 @@ int briefs_alloc_init_at(struct briefs_alloc *alloc, struct super_block *sb,
 		w += n;
 	}
 
-	pr_info("briefs: allocator at block %llu initialized from disk (%llu entries, %llu free)\n",
-		pool_block, alloc->block_count, alloc->free_count);
+	pr_debug("briefs: allocator at block %llu initialized from disk (%llu entries, %llu free)\n",
+		 pool_block, alloc->block_count, alloc->free_count);
 
 	return 0;
 }

@@ -556,14 +556,14 @@ static int briefs_unlink_common(struct inode *dir, struct dentry *dentry) {
 	/* Remove the directory entry from the parent first. */
 	ret = briefs_remove_dir_entry(dir, dentry->d_name.name, dentry->d_name.len);
 	if (ret) {
-		pr_debug("removing %pd failed\n", dentry);
+		pr_debug("briefs: removing %pd failed\n", dentry);
 		return ret;
 	}
 
 	/* Log directory entry deletion only after the trie is changed. */
 	ret = briefs_journal_dir_del(bsi->journal, dir->i_ino, dentry);
 	if (ret) {
-		pr_debug("journaling %pd failed\n", dentry);
+		pr_debug("briefs: journaling %pd failed\n", dentry);
 		goto restore_entry;
 	}
 

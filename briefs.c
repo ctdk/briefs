@@ -31,8 +31,8 @@ static int __init briefs_init(void) {
 	int ret;
 
 	pr_info("briefs: loading filesystem module\n");
-	pr_info("briefs: magic=0x%016llx, block_size=%d, inode_size=%d\n",
-		(unsigned long long)_BRIEFS_SUPER_MAGIC, BRIEFS_BLOCK_SIZE, BRIEFS_INODE_SIZE);
+	pr_debug("briefs: magic=0x%016llx, block_size=%d, inode_size=%d\n",
+		 (unsigned long long)_BRIEFS_SUPER_MAGIC, BRIEFS_BLOCK_SIZE, BRIEFS_INODE_SIZE);
 
 	/* Catch on-disk structure size drift vs. Go briefs-utils layout */
 	briefs_build_bug_on_sizes();
@@ -67,13 +67,13 @@ static int __init briefs_init(void) {
 	if (ret)
 		pr_warn("briefs: proc_init failed: %d (continuing)\n", ret);
 
-	pr_info("briefs: filesystem registered successfully\n");
+	pr_debug("briefs: filesystem registered successfully\n");
 	return 0;
 }
 
 /* Module exit */
 static void __exit briefs_exit(void) {
-	pr_info("briefs: unregistering filesystem\n");
+	pr_debug("briefs: unregistering filesystem\n");
 	unregister_filesystem(&briefs_fs_type);
 
 	/* Tear down the module-level surfaces in reverse init order. Per-sb
@@ -83,7 +83,7 @@ static void __exit briefs_exit(void) {
 	briefs_debugfs_exit();
 
 	kmem_cache_destroy(briefs_inode_cachep);
-	pr_info("briefs: unloading filesystem module\n");
+	pr_debug("briefs: unloading filesystem module\n");
 }
 
 module_init(briefs_init);

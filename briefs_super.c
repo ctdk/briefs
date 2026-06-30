@@ -76,7 +76,7 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 	struct briefs_sb_info *bsi;
 	int ret = -EINVAL;
 
-	pr_info("briefs: fill_super enter\n");
+	pr_debug("briefs: fill_super enter\n");
 
 	bsi = kzalloc(sizeof(struct briefs_sb_info), GFP_KERNEL);
 	if (!bsi)
@@ -103,12 +103,10 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 
 	bsb = (struct briefs_superblock *) bh->b_data;
 
-	pr_info("briefs: superblock magic=0x%016llx, inode_table_offset=%llu\n",
-	        le64_to_cpu(bsb->magic), le64_to_cpu(bsb->inode_table_offset));
+	pr_debug("briefs: superblock magic=0x%016llx, inode_table_offset=%llu\n",
+		 le64_to_cpu(bsb->magic), le64_to_cpu(bsb->inode_table_offset));
 
 	sb->s_magic = le64_to_cpu(bsb->magic);
-
-	pr_info("briefs: magic=0x%08lx\n", sb->s_magic);
 
 	if (sb->s_magic != _BRIEFS_SUPER_MAGIC) {
 		pr_err("briefs: invalid magic\n");
@@ -358,7 +356,7 @@ out:
 	}
 	sb->s_fs_info = NULL;
 	kfree(bsi);
-	pr_info("briefs: fill_super returning %d\n", ret);
+	pr_debug("briefs: fill_super returning %d\n", ret);
 	return ret;
 }
 
@@ -366,7 +364,7 @@ out:
 void briefs_put_super(struct super_block *sb) {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
 
-	pr_info("briefs: put_super enter\n");
+	pr_debug("briefs: put_super enter\n");
 
 	if (bsi) {
 		/* Quiesce observability surfaces before tearing bsi down so no
@@ -417,7 +415,7 @@ void briefs_put_super(struct super_block *sb) {
 
 		/* Sync allocation trie to disk */
 		if (!sb_rdonly(sb)) {
-			pr_info("briefs: syncing allocation trie\n");
+			pr_debug("briefs: syncing allocation trie\n");
 			briefs_alloc_sync(&bsi->alloc);
 
 			/*
@@ -428,20 +426,20 @@ void briefs_put_super(struct super_block *sb) {
 				briefs_journal_sync_superblock(bsi->journal);
 		}
 
-		pr_info("briefs: cleaning up journal\n");
+		pr_debug("briefs: cleaning up journal\n");
 		if (bsi->journal) {
 			briefs_journal_cleanup(bsi->journal);
 			kfree(bsi->journal);
 			bsi->journal = NULL;
 		}
 
-		pr_info("briefs: syncing inode allocator\n");
+		pr_debug("briefs: syncing inode allocator\n");
 		briefs_alloc_sync(&bsi->inode_alloc);
 
-		pr_info("briefs: calling alloc_cleanup\n");
+		pr_debug("briefs: calling alloc_cleanup\n");
 		briefs_alloc_cleanup(&bsi->alloc);
 		briefs_alloc_cleanup(&bsi->inode_alloc);
-		pr_info("briefs: alloc_cleanup done\n");
+		pr_debug("briefs: alloc_cleanup done\n");
 
 		if (bsi->sb_bh) {
 			brelse(bsi->sb_bh);
@@ -452,7 +450,7 @@ void briefs_put_super(struct super_block *sb) {
 
 	briefs_trie_cleanup_state(sb);
 
-	pr_info("briefs: put_super\n");
+	pr_debug("briefs: put_super\n");
 }
 /* shamelessly yoinking from xiafs - incomplete */
 int briefs_statfs(struct dentry *dentry, struct kstatfs *buf) {
@@ -477,19 +475,16 @@ int briefs_statfs(struct dentry *dentry, struct kstatfs *buf) {
 }
 /* briefs_umount_begin - called before unmount */
 void briefs_umount_begin(struct super_block *sb) {
-	pr_info("briefs: umount_begin\n");
+	pr_debug("briefs: umount_begin\n");
 }
 /* briefs_kill_sb - called when sb is being destroyed */
 void briefs_kill_sb(struct super_block *sb) {
-	pr_info("briefs: kill_sb\n");
-	if (sb) {
-		pr_info("briefs: killing sb %p\n", sb);
-	}
+	pr_debug("briefs: kill_sb\n");
 	kill_block_super(sb);
 }
 /* briefs_mount - mount callback */
 struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
                            const char *dev_name, void *data) {
-	pr_info("briefs: mount callback\n");
+	pr_debug("briefs: mount callback\n");
 	return mount_bdev(fs_type, flags, dev_name, data, briefs_fill_super);
 }
