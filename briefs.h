@@ -865,6 +865,17 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter, u64 cu
 /* Per-mount flags set from mount options (briefs_super.c fs_context parser). */
 #define BRIEFS_MF_DEBUG      0x1   /* -o debug: create the debugfs tree + count stats */
 #define BRIEFS_MF_NORECOVERY 0x2   /* -o norecovery: skip journal replay; requires ro mount */
+#define BRIEFS_MF_ERRORS_CONT  0x4   /* -o errors=continue */
+#define BRIEFS_MF_ERRORS_PANIC 0x8   /* -o errors=panic */
+#define BRIEFS_MF_ERROR_FS     0x10  /* filesystem has seen a metadata write error */
+#define BRIEFS_MF_SHUTDOWN     0x20  /* filesystem is being/has been shut down due to error */
+
+/* Values for the errors= mount option. Default (0) is remount-ro. */
+enum briefs_errors_policy {
+	BRIEFS_ERRORS_RO,
+	BRIEFS_ERRORS_CONTINUE,
+	BRIEFS_ERRORS_PANIC,
+};
 
 /*
  * Best-effort per-superblock operation counters. Only incremented when
@@ -1153,6 +1164,9 @@ int briefs_btree_clear_unwritten(struct super_block *sb, struct briefs_inode *di
 struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
                                              struct briefs_disk_inode **di);
 bool briefs_check_meta_write_error(struct buffer_head *bh);
+void briefs_handle_meta_write_error(struct super_block *sb, const char *ctx);
+bool briefs_sb_shutdown(struct super_block *sb);
+const char *briefs_error_policy_name(struct super_block *sb);
 int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
                                const struct briefs_inode *src, bool sync);
 struct buffer_head *briefs_get_zero_block(struct super_block *sb, u64 block);

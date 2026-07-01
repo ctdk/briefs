@@ -56,6 +56,7 @@ int briefs_show_options(struct seq_file *seq, struct dentry *root)
 		seq_show_option(seq, "debug", NULL);
 	if (bsi->mount_flags & BRIEFS_MF_NORECOVERY)
 		seq_show_option(seq, "norecovery", NULL);
+	seq_show_option(seq, "errors", briefs_error_policy_name(root->d_sb));
 	return 0;
 }
 
@@ -82,6 +83,8 @@ static int briefs_df_mount_info_show(struct seq_file *m, void *v)
 	seq_printf(m, "read_only=%d\n", sb_rdonly(sb) ? 1 : 0);
 	seq_printf(m, "debug=%d\n", (bsi->mount_flags & BRIEFS_MF_DEBUG) ? 1 : 0);
 	seq_printf(m, "norecovery=%d\n", (bsi->mount_flags & BRIEFS_MF_NORECOVERY) ? 1 : 0);
+	seq_printf(m, "errors=%s\n", briefs_error_policy_name(sb));
+	seq_printf(m, "error_fs=%d\n", (bsi->mount_flags & BRIEFS_MF_ERROR_FS) ? 1 : 0);
 	seq_printf(m, "mount_jiffies=%llu\n", msecs);
 	seq_printf(m, "mount_secs_since_boot=%llu\n", msecs / HZ);
 	return 0;

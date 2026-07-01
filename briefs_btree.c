@@ -1544,8 +1544,7 @@ static void btree_drain_subtree(struct super_block *sb, u64 block, u64 *cap)
 	if (buffer_dirty(bh)) {
 		sync_dirty_buffer(bh);
 		if (briefs_check_meta_write_error(bh))
-			pr_err("briefs: btree drain: node %llu write failed\n",
-			       block);
+			briefs_handle_meta_write_error(sb, "btree drain");
 	}
 
 	node = (struct briefs_extent_btree_node *)bh->b_data;

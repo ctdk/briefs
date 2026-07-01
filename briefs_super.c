@@ -83,13 +83,36 @@ struct briefs_fs_context {
 enum {
 	Opt_debug,
 	Opt_norecovery,
+	Opt_errors,
+};
+
+static const struct constant_table briefs_param_errors[] = {
+	{"continue",   BRIEFS_ERRORS_CONTINUE},
+	{"remount-ro", BRIEFS_ERRORS_RO},
+	{"panic",      BRIEFS_ERRORS_PANIC},
+	{}
 };
 
 const struct fs_parameter_spec briefs_param_spec[] = {
 	fsparam_flag_no("debug", Opt_debug),
 	fsparam_flag_no("norecovery", Opt_norecovery),
+	fsparam_enum("errors", Opt_errors, briefs_param_errors),
 	{}
 };
+
+/*
+ * briefs_error_policy_name - return the current errors= value for show_options.
+ */
+const char *briefs_error_policy_name(struct super_block *sb)
+{
+	struct briefs_sb_info *bsi = briefs_sb(sb);
+
+	if (bsi->mount_flags & BRIEFS_MF_ERRORS_PANIC)
+		return "panic";
+	if (bsi->mount_flags & BRIEFS_MF_ERRORS_CONT)
+		return "continue";
+	return "remount-ro";
+}
 
 static void briefs_free_fc(struct fs_context *fc)
 {
@@ -131,6 +154,21 @@ static int briefs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 			ctx->mount_flags &= ~BRIEFS_MF_NORECOVERY;
 		else
 			ctx->mount_flags |= BRIEFS_MF_NORECOVERY;
+		break;
+	case Opt_errors:
+		ctx->mount_flags &= ~(BRIEFS_MF_ERRORS_CONT | BRIEFS_MF_ERRORS_PANIC);
+		switch (result.uint_32) {
+		case BRIEFS_ERRORS_CONTINUE:
+			ctx->mount_flags |= BRIEFS_MF_ERRORS_CONT;
+			break;
+		case BRIEFS_ERRORS_PANIC:
+			ctx->mount_flags |= BRIEFS_MF_ERRORS_PANIC;
+			break;
+		case BRIEFS_ERRORS_RO:
+		default:
+			/* default is remount-ro; leave both bits clear */
+			break;
+		}
 		break;
 	default:
 		/* fs_parse only returns known opts; unreachable */

@@ -451,7 +451,7 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	int ret = briefs_journal_write_block(j, j->checkpoint_block, cp_buf);
 	kfree(cp_buf);
 	if (ret) {
-		pr_err("briefs: checkpoint write failed (err=%d)\n", ret);
+		briefs_handle_meta_write_error(j->vfs_sb, "checkpoint write");
 		return ret;
 	}
 
@@ -467,9 +467,9 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 			if (buffer_dirty(cpbh)) {
 				sync_dirty_buffer(cpbh);
 				if (briefs_check_meta_write_error(cpbh)) {
-					pr_err("briefs: checkpoint block %llu write failed\n",
-					       j->checkpoint_block);
 					brelse(cpbh);
+					briefs_handle_meta_write_error(j->vfs_sb,
+						"checkpoint block sync");
 					return -EIO;
 				}
 			}
@@ -776,7 +776,7 @@ int briefs_journal_sync_superblock(struct briefs_journal *j)
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
 	if (briefs_check_meta_write_error(bh)) {
-		pr_err("briefs: superblock write failed\n");
+		briefs_handle_meta_write_error(vfs_sb, "superblock sync");
 		brelse(bh);
 		return -EIO;
 	}
@@ -1908,19 +1908,20 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j) {
 		if (bh) {
 			if (buffer_dirty(bh)) {
 				sync_dirty_buffer(bh);
-				if (briefs_check_meta_write_error(bh)) {
-					pr_err("briefs: journal block %llu write failed\n",
-					       pos);
+				if (briefs_check_meta_write_error(bh))
 					io_err = true;
-				}
 			}
 			brelse(bh);
 		}
 		if (pos == sync_end)
 			break;
 	}
-	if (io_err)
+	if (io_err) {
+		j->dirty = false;
+		j->synced_pos = j->write_pos;
+		briefs_handle_meta_write_error(j->vfs_sb, "journal sync");
 		return -EIO;
+	}
 	j->synced_pos = j->write_pos;
 
 	pr_debug("briefs: journal synced, write_pos=%llu\n", j->write_pos);

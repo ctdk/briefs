@@ -637,8 +637,7 @@ static int briefs_alloc_sync_level(struct briefs_alloc *alloc, u64 *array,
 			mark_buffer_dirty(bh);
 			sync_dirty_buffer(bh);
 			if (briefs_check_meta_write_error(bh)) {
-				pr_err("briefs: alloc bitmap L%d block %llu write failed\n",
-				       level, offset);
+				briefs_handle_meta_write_error(alloc->sb, "alloc bitmap sync");
 				brelse(bh);
 				return -EIO;
 			}
@@ -705,8 +704,7 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 			mark_buffer_dirty(bh);
 			sync_dirty_buffer(bh);
 			if (briefs_check_meta_write_error(bh)) {
-				pr_err("briefs: alloc header block %llu write failed\n",
-				       alloc->alloc_pool_start);
+				briefs_handle_meta_write_error(alloc->sb, "alloc header sync");
 				brelse(bh);
 				mutex_unlock(&alloc->lock);
 				return -EIO;

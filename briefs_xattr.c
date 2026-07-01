@@ -491,6 +491,7 @@ int briefs_xattr_set(struct inode *inode, const char *name,
 		 */
 		sync_dirty_buffer(bh);
 		if (briefs_check_meta_write_error(bh)) {
+			briefs_handle_meta_write_error(inode->i_sb, "xattr block sync");
 			if (newly_allocated)
 				briefs_free_block(&bsi->alloc, rel);
 			brelse(bh);

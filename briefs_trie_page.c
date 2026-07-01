@@ -327,6 +327,7 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 	 * pointing at the zeroed page).
 	 */
 	if (briefs_check_meta_write_error(bh)) {
+		briefs_handle_meta_write_error(sb, "trie page init");
 		briefs_free_block(&bsi->alloc, rel);
 		brelse(bh);
 		return -EIO;
@@ -785,8 +786,7 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 		 */
 		sync_dirty_buffer(bh);
 		if (briefs_check_meta_write_error(bh))
-			pr_warn("briefs: trie free: page %llu header write failed\n",
-				block);
+			briefs_handle_meta_write_error(sb, "trie free");
 		brelse(bh);
 		/* Journal the trie page free so recovery does not leave it allocated. */
 		briefs_journal_trie_free(bsi->journal, block);

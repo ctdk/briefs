@@ -52,6 +52,10 @@ BrieFS recognizes the following filesystem-specific mount options:
 * `norecovery` — skip journal replay on mount. This is useful for read-only
   inspection or repair of a dirty volume, but it requires a read-only mount
   (`-o ro,norecovery`). A read-write mount with `norecovery` is rejected.
+* `errors=continue|remount-ro|panic` — behaviour on a metadata write error.
+  `remount-ro` (the default) remounts the filesystem read-only. `continue`
+  logs the error and keeps running read-write. `panic` triggers a kernel
+  panic. The active policy is visible in `/proc/mounts` and debugfs.
 
 RELATED
 -------

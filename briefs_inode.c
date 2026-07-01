@@ -104,6 +104,72 @@ bool briefs_check_meta_write_error(struct buffer_head *bh)
 }
 
 /*
+ * briefs_sb_shutdown - true if the filesystem has been shut down by a metadata
+ * write error under an errors=remount-ro policy.
+ */
+bool briefs_sb_shutdown(struct super_block *sb)
+{
+	struct briefs_sb_info *bsi = briefs_sb(sb);
+
+	return bsi && (bsi->mount_flags & BRIEFS_MF_SHUTDOWN);
+}
+
+/*
+ * briefs_handle_meta_write_error - react to a detected metadata write error.
+ *
+ * This is the central chokepoint for the errors= mount option. Callers that
+ * detect a write error via briefs_check_meta_write_error() pass their context
+ * string here. We log the error, mark the filesystem as having seen an error,
+ * and then either continue, remount read-only, or panic, depending on the
+ * mount option.
+ *
+ * For errors=remount-ro, we prefer to force the superblock read-only now when
+ * called from process context outside the journal write_lock. Some callers
+ * (journal sync/checkpoint) hold j->write_lock and cannot safely take VFS
+ * locks; they set BRIEFS_MF_SHUTDOWN and return -EIO, and a later process
+ * context path will perform the VFS transition.
+ *
+ * Note: this helper intentionally does not take or release @bh; callers have
+ * already cleared its dirty/EIO state via briefs_check_meta_write_error().
+ */
+void briefs_handle_meta_write_error(struct super_block *sb, const char *ctx)
+{
+	struct briefs_sb_info *bsi = briefs_sb(sb);
+	unsigned long flags;
+
+	if (!bsi)
+		return;
+
+	flags = bsi->mount_flags;
+	bsi->mount_flags |= BRIEFS_MF_ERROR_FS;
+
+	pr_err("briefs: metadata write error (%s)\n", ctx);
+
+	if (flags & BRIEFS_MF_ERRORS_PANIC) {
+		panic("BrieFS (device %s): panic forced after %s error\n",
+		      sb->s_id, ctx);
+	}
+
+	if (flags & BRIEFS_MF_ERRORS_CONT)
+		return;
+
+	/* Default and explicit errors=remount-ro: set shutdown flag. If we are
+	 * already read-only there is nothing more to do.
+	 */
+	if (sb_rdonly(sb))
+		return;
+
+	bsi->mount_flags |= BRIEFS_MF_SHUTDOWN;
+	pr_crit("briefs: Remounting filesystem read-only due to %s error\n", ctx);
+	/*
+	 * Setting SB_RDONLY directly is the same emergency transition ext4 uses
+	 * in ext4_handle_error(). It does not run the full remount procedure,
+	 * but it blocks all future modifying VFS operations on this superblock.
+	 */
+	sb->s_flags |= SB_RDONLY;
+}
+
+/*
  * Persist a complete struct briefs_inode to disk for the given inode number.
  * If sync is true, also sync the buffer to ensure durability (used during
  * journal replay).  Returns 0 on success, negative errno on error.
@@ -138,6 +204,11 @@ int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
 
 	if (sync)
 		sync_dirty_buffer(bh);
+	if (briefs_check_meta_write_error(bh)) {
+		briefs_handle_meta_write_error(sb, "persist disk inode");
+		brelse(bh);
+		return -EIO;
+	}
 	brelse(bh);
 	return 0;
 }
@@ -541,6 +612,7 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	if (!buffer_uptodate(bh)) {
 		unlock_buffer(bh);
 		briefs_check_meta_write_error(bh);
+		briefs_handle_meta_write_error(inode->i_sb, "write inode");
 		mapping_set_error(inode->i_mapping, -EIO);
 		brelse(bh);
 		return -EIO;
