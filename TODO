@@ -4,9 +4,11 @@
 - Move away from any deprecated kernel functions BrieFS may be using. Likely to
   come naturally as it's updated to work with newer kernels, but still needs
   calling out.
-- Start honoring mount options.
-- Make list of relevant mount options to honor, whether fs independent or
-  unique to briefs.
+- [Phase 1 done] Migrate mount path to fs_context so remount works; honor
+  the existing "debug" flag (and "nodebug") and checkpoint the journal on
+  read-only remount.
+- Make list of additional relevant mount options to honor, whether fs
+  independent or unique to briefs.
 - Revise briefs(5) man page.
 - Quotas
 - POSIX ACLs
