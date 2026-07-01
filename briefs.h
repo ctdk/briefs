@@ -862,8 +862,9 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter, u64 cu
 
 /* VFS structures */
 
-/* Per-mount flags set from mount options (briefs_debug.c parse_options). */
-#define BRIEFS_MF_DEBUG 0x1   /* -o debug: create the debugfs tree + count stats */
+/* Per-mount flags set from mount options (briefs_super.c fs_context parser). */
+#define BRIEFS_MF_DEBUG      0x1   /* -o debug: create the debugfs tree + count stats */
+#define BRIEFS_MF_NORECOVERY 0x2   /* -o norecovery: skip journal replay; requires ro mount */
 
 /*
  * Best-effort per-superblock operation counters. Only incremented when

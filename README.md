@@ -43,6 +43,16 @@ $ sudo mount -t briefs /dev/xvdb1 /mnt # or whatever
 
 and you're on your way. If your BrieFS volume gets messed up, `fsck.briefs` is there to help you. It works the way you would expect an fsck program to work, but refer to the `briefs-utils` documentation for specific options.
 
+### Mount options
+
+BrieFS recognizes the following filesystem-specific mount options:
+
+* `debug` / `nodebug` — create (or remove) the per-superblock debugfs tree and
+  enable runtime stat counters. `nodebug` is the default.
+* `norecovery` — skip journal replay on mount. This is useful for read-only
+  inspection or repair of a dirty volume, but it requires a read-only mount
+  (`-o ro,norecovery`). A read-write mount with `norecovery` is rejected.
+
 RELATED
 -------
 

@@ -75,17 +75,19 @@ static void briefs_cleanup_bsi_journal(struct briefs_sb_info *bsi)
 /* ---- fs_context-based mount option handling ----------------------------- */
 
 /* Per-mount parsed options carried through fs_context (initial mount and
- * reconfigure). Today only the "debug" token is recognized. */
+ * reconfigure). */
 struct briefs_fs_context {
 	unsigned long mount_flags;	/* BRIEFS_MF_* */
 };
 
 enum {
 	Opt_debug,
+	Opt_norecovery,
 };
 
 const struct fs_parameter_spec briefs_param_spec[] = {
 	fsparam_flag_no("debug", Opt_debug),
+	fsparam_flag_no("norecovery", Opt_norecovery),
 	{}
 };
 
@@ -123,6 +125,12 @@ static int briefs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 			ctx->mount_flags &= ~BRIEFS_MF_DEBUG;
 		else
 			ctx->mount_flags |= BRIEFS_MF_DEBUG;
+		break;
+	case Opt_norecovery:
+		if (result.negated)
+			ctx->mount_flags &= ~BRIEFS_MF_NORECOVERY;
+		else
+			ctx->mount_flags |= BRIEFS_MF_NORECOVERY;
 		break;
 	default:
 		/* fs_parse only returns known opts; unreachable */
@@ -175,6 +183,14 @@ static int briefs_reconfigure(struct fs_context *fc)
 	old_flags = bsi->mount_flags;
 	new_flags = ctx->mount_flags;
 	bsi->mount_flags = new_flags;
+
+	/* norecovery only affects mount-time replay; do not allow toggling it
+	 * on remount because it cannot be applied after the superblock is live. */
+	if ((old_flags ^ new_flags) & BRIEFS_MF_NORECOVERY) {
+		pr_warn("briefs: norecovery cannot be changed via remount\n");
+		bsi->mount_flags = old_flags;
+		return -EINVAL;
+	}
 
 	/* Toggle the debugfs tree if the debug option changed. */
 	if ((old_flags ^ new_flags) & BRIEFS_MF_DEBUG) {
@@ -359,11 +375,20 @@ int briefs_fill_super(struct super_block *sb, struct fs_context *fc) {
 	 */
 	sb->s_iflags |= SB_I_CGROUPWB;
 
-	/* Replay journal on mount (if not clean) */
-	ret = briefs_journal_replay(bsi->journal);
-	if (ret) {
-		pr_err("briefs: journal replay failed: %d\n", ret);
-		goto out_no_journal;
+	/* Replay journal on mount (unless the user asked to skip it). */
+	if (bsi->mount_flags & BRIEFS_MF_NORECOVERY) {
+		if (!sb_rdonly(sb)) {
+			pr_err("briefs: norecovery requires a read-only mount\n");
+			ret = -EINVAL;
+			goto out_no_journal;
+		}
+		pr_info("briefs: norecovery requested; skipping journal replay\n");
+	} else {
+		ret = briefs_journal_replay(bsi->journal);
+		if (ret) {
+			pr_err("briefs: journal replay failed: %d\n", ret);
+			goto out_no_journal;
+		}
 	}
 
 	/* BrieFS tracks file size, extent offsets/lengths, and extent counts in
