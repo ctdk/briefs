@@ -42,10 +42,10 @@ SSH ?= ssh vagrant@192.168.121.234 -p 22 \
 	-i $(VAGRANT_KEY)
 
 all:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
 
 # Default: build in VM, run tests there
 .PHONY: test test-only
