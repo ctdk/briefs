@@ -4,6 +4,8 @@
 - Move away from any deprecated kernel functions BrieFS may be using. Likely to
   come naturally as it's updated to work with newer kernels, but still needs
   calling out.
+- [Done] Support large extended-attribute values via chained 4 KiB
+  continuation blocks, with crash-safe journal replay and fsck validation.
 - [Phase 1 done] Migrate mount path to fs_context so remount works; honor
   the existing "debug" flag (and "nodebug") and checkpoint the journal on
   read-only remount.

@@ -893,14 +893,117 @@ static int replay_xattr_final_set(struct briefs_journal *j, u64 ino,
 	return 0;
 }
 
-/* Pass-2 helper: look up @ino's final xattr_offset, or 0 if none recorded. */
-static u64 replay_xattr_final_get(struct briefs_journal *j, u64 ino)
+/*
+ * Extract the next_block pointer from a JRN_XATTR_DATA content record.
+ * v1 blocks have no next pointer; v2 blocks carry it when the record is
+ * large enough to include the full v2 header.
+ */
+static u64 xattr_rec_next_block(const void *data, u32 used_size)
 {
-	struct briefs_replay_xattr_final *e;
+	const struct briefs_xattr_header *hdr = data;
+	u32 version;
 
-	hash_for_each_possible(j->replay_xattr_final, e, node, ino)
-		if (e->ino == ino)
-			return e->xattr_offset;
+	if (used_size < sizeof(struct briefs_xattr_header))
+		return 0;
+	version = le32_to_cpu(hdr->version);
+	if (version == 1)
+		return 0;
+	return le64_to_cpu(hdr->next_block);
+}
+
+static int replay_xattr_next_set(struct briefs_journal *j, u64 phys,
+				 u64 next_block)
+{
+	struct briefs_replay_xattr_next *e;
+
+	hash_for_each_possible(j->replay_xattr_next, e, node, phys)
+		if (e->phys == phys) {
+			e->next_block = next_block;
+			return 0;
+		}
+
+	e = kmalloc(sizeof(*e), GFP_KERNEL);
+	if (!e)
+		return -ENOMEM;
+	e->phys = phys;
+	e->next_block = next_block;
+	hash_add(j->replay_xattr_next, &e->node, phys);
+	return 0;
+}
+
+static u64 replay_xattr_next_get(struct briefs_journal *j, u64 phys)
+{
+	struct briefs_replay_xattr_next *e;
+
+	hash_for_each_possible(j->replay_xattr_next, e, node, phys)
+		if (e->phys == phys)
+			return e->next_block;
+	return 0;
+}
+
+static int replay_xattr_live_add(struct briefs_journal *j, u64 phys)
+{
+	struct briefs_replay_xattr_live *e;
+
+	hash_for_each_possible(j->replay_xattr_live, e, node, phys)
+		if (e->phys == phys)
+			return 0;
+
+	e = kmalloc(sizeof(*e), GFP_KERNEL);
+	if (!e)
+		return -ENOMEM;
+	e->phys = phys;
+	hash_add(j->replay_xattr_live, &e->node, phys);
+	return 0;
+}
+
+static bool replay_xattr_live_get(struct briefs_journal *j, u64 phys)
+{
+	struct briefs_replay_xattr_live *e;
+
+	hash_for_each_possible(j->replay_xattr_live, e, node, phys)
+		if (e->phys == phys)
+			return true;
+	return false;
+}
+
+/*
+ * After pass-1 has recorded each inode's final xattr head and captured the
+ * next_block links from every JRN_XATTR_DATA record, walk the chains and
+ * mark every block that the final on-disk inode will reference as live.
+ * Pass-2 uses this set to decide which content records to restore.
+ */
+static int replay_build_xattr_live_set(struct super_block *sb)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct briefs_journal *j = bsi ? bsi->journal : NULL;
+	struct briefs_replay_xattr_final *f;
+	struct hlist_node *tmp;
+	int bkt;
+
+	if (!j)
+		return 0;
+
+	hash_init(j->replay_xattr_live);
+
+	hash_for_each_safe(j->replay_xattr_final, bkt, tmp, f, node) {
+		u64 block = f->xattr_offset;
+		u32 visited = 0;
+
+		while (block != 0) {
+			int ret;
+
+			if (++visited > BRIEFS_XATTR_MAX_CHAIN) {
+				pr_warn("briefs: xattr live chain loop ino=%llu\n",
+					f->ino);
+				break;
+			}
+			ret = replay_xattr_live_add(j, block);
+			if (ret)
+				return ret;
+			block = replay_xattr_next_get(j, block);
+		}
+	}
 	return 0;
 }
 
@@ -1002,7 +1105,7 @@ static int replay_xattr_data(struct super_block *sb, struct jrn_xattr_data *rec)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
 	struct buffer_head *bh;
-	u64 phys, ino, final_off;
+	u64 phys, ino;
 	u32 used;
 
 	phys = le64_to_cpu(rec->phys_block);
@@ -1012,13 +1115,12 @@ static int replay_xattr_data(struct super_block *sb, struct jrn_xattr_data *rec)
 		return 0;
 
 	/*
-	 * Only restore a block the owning inode still references.  final_off==0
-	 * means the xattr was removed (or the inode freed) after this record was
-	 * logged, so the block has been freed and may be reused -- restoring the
+	 * Only restore a block that belongs to the owning inode's final xattr
+	 * chain.  Blocks that were freed (xattr removed or chain rewritten) are
+	 * no longer in the live set and may have been reused; restoring their
 	 * stale content would clobber the new owner.
 	 */
-	final_off = bsi->journal ? replay_xattr_final_get(bsi->journal, ino) : 0;
-	if (final_off != phys)
+	if (!bsi->journal || !replay_xattr_live_get(bsi->journal, phys))
 		return 0;
 
 	bh = sb_bread(sb, phys);
@@ -1126,23 +1228,25 @@ static int apply_record(struct super_block *sb, u32 rec_type, void *rec_data,
 		/*
 		 * Pass-1 reserves the xattr block (idempotent) so a later
 		 * extent-alloc or trie re-derivation can't reuse it while it is
-		 * still referenced.  Pass-2 restores the block content, but ONLY
-		 * if the owning inode's final xattr_offset (from the pass-1
-		 * last-INODE_FULL map) still points here -- otherwise the block
-		 * was freed (JRN_EXTENT_FREE) and may be reused, and restoring the
-		 * stale content would clobber the new owner (generic/547
-		 * deferred-free/reuse family; file data blocks carry no replayed
-		 * content record, but xattr blocks uniquely do).  The block is
-		 * implied-allocated by this record (no separate alloc record);
-		 * freeing rides JRN_EXTENT_FREE's pass-1 dispatch.
+		 * still referenced.  It also records the block's next_block link so
+		 * the live-chain set can be built before pass-2.  Pass-2 restores
+		 * the block content only when the owning inode's final chain still
+		 * contains it; otherwise the block was freed (JRN_EXTENT_FREE) and
+		 * may be reused, and restoring the stale content would clobber the
+		 * new owner (generic/547 deferred-free/reuse family).
 		 */
 		struct jrn_xattr_data *xd = rec_data;
 		u64 phys = le64_to_cpu(xd->phys_block);
+		u32 used = le32_to_cpu(xd->used_size);
 
 		if (reserve_only && phys != 0) {
 			u64 rel = abs_to_data(bsi->sb, phys);
 
 			briefs_reserve_block(&bsi->alloc, rel);
+			if (bsi->journal)
+				ret = replay_xattr_next_set(bsi->journal, phys,
+							    xattr_rec_next_block(xd->data,
+										 used));
 		}
 		if (!reserve_only)
 			ret = replay_xattr_data(sb, xd);
@@ -1512,6 +1616,7 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	 */
 	INIT_LIST_HEAD(&j->replay_trie_blocks);
 	hash_init(j->replay_xattr_final);
+	hash_init(j->replay_xattr_next);
 	hash_init(j->replay_nlink_hash);
 	j->in_replay = true;
 
@@ -1522,6 +1627,17 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	if (pre_errors) {
 		pr_err("briefs: journal reservation pre-scan reported %u errors\n", pre_errors);
 		ret = -EIO;
+		goto replay_done;
+	}
+
+	/*
+	 * Build the set of xattr blocks that are still referenced by each
+	 * inode's final chain, so pass-2 can skip stale content records for
+	 * blocks that were freed and reused.
+	 */
+	ret = replay_build_xattr_live_set(sb);
+	if (ret) {
+		pr_err("briefs: journal replay failed to build xattr live set: %d\n", ret);
 		goto replay_done;
 	}
 
@@ -1630,15 +1746,27 @@ replay_done:
 		list_del(&rb->list);
 		kfree(rb);
 	}
-	/* Free the pass-1 xattr-final map entries (blocks stay as pass-1 left them). */
+	/* Free the pass-1 xattr replay maps (blocks stay as pass-1 left them). */
 	{
-		struct briefs_replay_xattr_final *e;
+		struct briefs_replay_xattr_final *f;
+		struct briefs_replay_xattr_next *n;
+		struct briefs_replay_xattr_live *l;
 		struct hlist_node *tmp;
 		int bkt;
 
-		hash_for_each_safe(j->replay_xattr_final, bkt, tmp, e, node) {
-			hash_del(&e->node);
-			kfree(e);
+		hash_for_each_safe(j->replay_xattr_final, bkt, tmp, f, node) {
+			hash_del(&f->node);
+			kfree(f);
+		}
+
+		hash_for_each_safe(j->replay_xattr_next, bkt, tmp, n, node) {
+			hash_del(&n->node);
+			kfree(n);
+		}
+
+		hash_for_each_safe(j->replay_xattr_live, bkt, tmp, l, node) {
+			hash_del(&l->node);
+			kfree(l);
 		}
 
 		/* Free the pass-3 nlink-reconciliation map entries. */

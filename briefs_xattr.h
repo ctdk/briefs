@@ -6,12 +6,14 @@ struct dentry;
 struct inode;
 
 /*
- * BrieFS extended attributes.  Each inode may own one external 4096-byte xattr
- * block (see briefs.h: briefs_xattr_header / briefs_xattr_entry) referenced by
- * the inode's xattr_offset / xattr_size fields.  The three namespace handlers
- * (user / trusted / security) are published via sb->s_xattr; the VFS resolves
- * get/set by prefix and auto-sets IOP_XATTR on every inode.  listxattr(2) uses
- * the .listxattr inode op (briefs_xattr_list) which reads the on-disk block.
+ * BrieFS extended attributes.  Each inode may own one or more chained external
+ * 4096-byte xattr blocks (see briefs.h: briefs_xattr_header /
+ * briefs_xattr_entry) referenced by the inode's xattr_offset / xattr_size
+ * fields.  Large values are split across continuation blocks linked by
+ * briefs_xattr_header.next_block.  The three namespace handlers (user /
+ * trusted / security) are published via sb->s_xattr; the VFS resolves get/set
+ * by prefix and auto-sets IOP_XATTR on every inode.  listxattr(2) uses the
+ * .listxattr inode op (briefs_xattr_list) which reads the on-disk chain.
  */
 
 /* Handlers array (NULL-terminated) for sb->s_xattr. */

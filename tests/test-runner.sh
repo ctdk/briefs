@@ -269,6 +269,115 @@ mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount after symlin
 [ "$(readlink "$MNT_POINT/slink" 2>/dev/null || true)" = "hello-briefs-symlink" ] && pass "small inline symlink after replay" || fail "symlink after replay"
 [ "$(readlink "$MNT_POINT/slink_max" 2>/dev/null || true)" = "$MAX_INLINE_TARGET" ] && pass "max inline symlink after replay" || fail "max inline symlink after replay"
 
+# Phase 6c: Extended attributes (small inline and large chained values)
+echo ""
+echo "=== Phase 6c: Extended Attributes ==="
+
+set_xattr() {
+  local path="$1" size="$2" name="$3"
+  python3 - "$path" "$size" "$name" <<'PY'
+import sys, os
+path = sys.argv[1]
+size = int(sys.argv[2])
+name = sys.argv[3].encode()
+value = os.urandom(size)
+os.setxattr(path, name, value)
+ref = path + "." + name.decode().replace(".", "_") + ".xattr_ref"
+with open(ref, "wb") as f:
+    f.write(value)
+PY
+}
+
+check_xattr() {
+  local path="$1" name="$2"
+  python3 - "$path" "$name" <<'PY'
+import sys, os
+path = sys.argv[1]
+name = sys.argv[2].encode()
+ref = path + "." + name.decode().replace(".", "_") + ".xattr_ref"
+with open(ref, "rb") as f:
+    expected = f.read()
+got = os.getxattr(path, name)
+sys.exit(0 if got == expected else 1)
+PY
+}
+
+remove_xattr() {
+  local path="$1" name="$2"
+  python3 - "$path" "$name" <<'PY'
+import sys, os
+path = sys.argv[1]
+name = sys.argv[2].encode()
+os.removexattr(path, name)
+ref = path + "." + name.decode().replace(".", "_") + ".xattr_ref"
+try:
+    os.remove(ref)
+except FileNotFoundError:
+    pass
+PY
+}
+
+touch "$MNT_POINT/xattr_file" 2>/dev/null || true
+if set_xattr "$MNT_POINT/xattr_file" 64 "user.small"; then
+  pass "set small inline xattr"
+else
+  fail "set small inline xattr"
+fi
+if check_xattr "$MNT_POINT/xattr_file" "user.small"; then
+  pass "read small inline xattr"
+else
+  fail "read small inline xattr"
+fi
+
+if set_xattr "$MNT_POINT/xattr_file" 60000 "user.big"; then
+  pass "set large chained xattr"
+else
+  fail "set large chained xattr"
+fi
+if check_xattr "$MNT_POINT/xattr_file" "user.big"; then
+  pass "read large chained xattr"
+else
+  fail "read large chained xattr"
+fi
+
+sync
+umount "$MNT_POINT" 2>/dev/null || true
+if mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null; then
+  pass "remount after xattr"
+else
+  fail "remount after xattr"
+fi
+if check_xattr "$MNT_POINT/xattr_file" "user.small"; then
+  pass "small xattr survives replay"
+else
+  fail "small xattr after replay"
+fi
+if check_xattr "$MNT_POINT/xattr_file" "user.big"; then
+  pass "large xattr survives replay"
+else
+  fail "large xattr after replay"
+fi
+
+if remove_xattr "$MNT_POINT/xattr_file" "user.big"; then
+  pass "remove large xattr"
+else
+  fail "remove large xattr"
+fi
+if remove_xattr "$MNT_POINT/xattr_file" "user.small"; then
+  pass "remove small xattr"
+else
+  fail "remove small xattr"
+fi
+attrs_removed() {
+  python3 - "$MNT_POINT/xattr_file" <<'PY'
+import sys, os
+path = sys.argv[1]
+attrs = os.listxattr(path)
+sys.exit(1 if 'user.small' in attrs or 'user.big' in attrs else 0)
+PY
+}
+if attrs_removed; then pass "xattrs removed"; else fail "xattrs removed"; fi
+
 # Phase 7: Executables
 echo ""
 echo "=== Phase 7: Executables ==="

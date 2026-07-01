@@ -120,7 +120,8 @@ WORKS
 * CRC32C checksum verification for journal records and B+ tree extent index nodes
 * Files larger than 2 GiB
 * Nanosecond-precision timestamps
-* Extended attributes (user, trusted, and security namespaces; no POSIX ACLs)
+* Extended attributes (user, trusted, and security namespaces; large values may
+  span chained 4 KiB continuation blocks; no POSIX ACLs)
 * Direct I/O (O_DIRECT)
 
 DEFINITELY MISSING OR BROKEN
@@ -144,6 +145,10 @@ Where the on-disk fields are wide enough that they aren't the binding constraint
 * **Directories** have no per-directory entry cap (no ext2-style 32000 limit). A trie page holds 64 nodes per 4 KiB and chains on demand, bounded only by free space. Entry names are limited to `NAME_MAX` (255 bytes).
 * **Hard links**: the on-disk link count is a 32-bit field (~4.29×10^9), well beyond the VFS `LINK_MAX` (65000). A directory's link count is 2 plus its subdirectory count.
 * **Symbolic links**: targets up to 256 bytes are stored inline in the inode; longer targets use ordinary data extents, up to the file-size limit.
+* **Extended attributes**: each inode owns a singly-linked chain of 4 KiB xattr
+  blocks.  A single attribute value may be split across continuation blocks,
+  so the practical per-value limit is the VFS `XATTR_SIZE_MAX` ceiling
+  (65536 bytes on Linux).
 * **Inodes**: the inode number is a 64-bit field. `mkfs.briefs` provisions one inode per `inode-ratio` blocks (default 8, minimum 100), so a freshly made filesystem has `totalBlocks / inode-ratio` inodes available.
 * **Timestamps**: on disk, 64-bit seconds plus 64-bit nanoseconds, at 1 ns granularity (`s_time_gran = 1`). BrieFS does not set `s_time_min`/`s_time_max`, so the VFS defaults apply (`TIME64_MIN` … `TIME64_MAX`, ±(2^63−1) seconds from the epoch, ~±292 billion years). BrieFS never clamps timestamps, so values outside the representable range are rejected by the VFS rather than silently wrapped.
 * **Journal**: a fixed-size metadata-only ring, 64 blocks by default (`mkfs.briefs -j`), with a separate checkpoint block. There is no data journaling.

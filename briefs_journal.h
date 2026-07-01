@@ -94,6 +94,17 @@ struct briefs_journal {
 	DECLARE_HASHTABLE(replay_xattr_final, 8);
 
 	/*
+	 * Replay pass-1 maps for chained xattr blocks.  JRN_XATTR_DATA records
+	 * capture each block's next_block pointer; after pass-1 we walk from each
+	 * inode's final xattr_offset head and mark every block in its chain as
+	 * live.  Pass-2 only restores blocks in this set, so stale content records
+	 * for freed/reused blocks are ignored (generic/547 deferred-free/reuse
+	 * family, now extended to multi-block chains).
+	 */
+	DECLARE_HASHTABLE(replay_xattr_next, 8);
+	DECLARE_HASHTABLE(replay_xattr_live, 8);
+
+	/*
 	 * Replay pass-3 map: ino -> accumulated link/subdir counts derived from
 	 * the re-derived directory tries. Used by replay_reconcile_nlinks() to
 	 * patch on-disk inode nlinks so they agree with the actual directory
@@ -109,6 +120,25 @@ struct briefs_replay_xattr_final {
 	struct hlist_node node;
 	u64 ino;
 	u64 xattr_offset;
+};
+
+/*
+ * Replay-only map from a phys_block logged by JRN_XATTR_DATA to the
+ * briefs_xattr_header.next_block recorded in that content record.
+ */
+struct briefs_replay_xattr_next {
+	struct hlist_node node;
+	u64 phys;
+	u64 next_block;
+};
+
+/*
+ * Replay-only set of physical xattr blocks that belong to an inode's final
+ * chain (walked from replay_xattr_final via replay_xattr_next).
+ */
+struct briefs_replay_xattr_live {
+	struct hlist_node node;
+	u64 phys;
 };
 
 /*
