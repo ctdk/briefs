@@ -10,6 +10,9 @@
 #include <linux/mpage.h>
 #include <linux/seqlock.h>
 #include <linux/pagemap.h>
+#include <linux/fs_context.h>
+#include <linux/fs_parser.h>
+#include <linux/string.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
@@ -69,7 +72,151 @@ static void briefs_cleanup_bsi_journal(struct briefs_sb_info *bsi)
 	bsi->journal = NULL;
 }
 
-int briefs_fill_super(struct super_block *sb, void *data, int flags) {
+/* ---- fs_context-based mount option handling ----------------------------- */
+
+/* Per-mount parsed options carried through fs_context (initial mount and
+ * reconfigure). Today only the "debug" token is recognized. */
+struct briefs_fs_context {
+	unsigned long mount_flags;	/* BRIEFS_MF_* */
+};
+
+enum {
+	Opt_debug,
+};
+
+const struct fs_parameter_spec briefs_param_spec[] = {
+	fsparam_flag_no("debug", Opt_debug),
+	{}
+};
+
+static void briefs_free_fc(struct fs_context *fc)
+{
+	kfree(fc->fs_private);
+}
+
+/*
+ * Parse one mount option. Unknown tokens are rejected during remount so users
+ * get feedback on typos, but warned-and-ignored during initial mount so future
+ * or VFS-injected options do not break mounting.
+ */
+static int briefs_parse_param(struct fs_context *fc, struct fs_parameter *param)
+{
+	struct briefs_fs_context *ctx = fc->fs_private;
+	struct fs_parse_result result;
+	int opt;
+
+	opt = fs_parse(fc, briefs_param_spec, param, &result);
+	if (opt < 0) {
+		/* The VFS passes the source device as a parameter named "source";
+		 * let it handle that before we decide whether to reject unknowns. */
+		if (strcmp(param->key, "source") == 0)
+			return -ENOPARAM;
+		if (fc->purpose == FS_CONTEXT_FOR_RECONFIGURE)
+			return opt;
+		pr_warn("briefs: unknown mount option \"%s\" ignored\n", param->key);
+		return 0;
+	}
+
+	switch (opt) {
+	case Opt_debug:
+		if (result.negated)
+			ctx->mount_flags &= ~BRIEFS_MF_DEBUG;
+		else
+			ctx->mount_flags |= BRIEFS_MF_DEBUG;
+		break;
+	default:
+		/* fs_parse only returns known opts; unreachable */
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int briefs_get_tree(struct fs_context *fc)
+{
+	return get_tree_bdev(fc, briefs_fill_super);
+}
+
+/*
+ * briefs_reconfigure - apply option changes on mount -o remount,...
+ *
+ * The VFS has already frozen writers and will apply sb_flags (e.g. SB_RDONLY)
+ * after this returns. We must flush the journal before a read-only transition:
+ * otherwise a subsequent crash sees an uncheckpointed journal and replay can
+ * clobber live data blocks (the same failure mode as the clean-unmount replay
+ * family fixed by f8ef293).
+ */
+static int briefs_reconfigure(struct fs_context *fc)
+{
+	struct super_block *sb = fc->root->d_sb;
+	struct briefs_sb_info *bsi = briefs_sb(sb);
+	struct briefs_fs_context *ctx = fc->fs_private;
+	unsigned long old_flags, new_flags;
+	bool going_ro;
+	int ret;
+
+	going_ro = (fc->sb_flags & SB_RDONLY) && !sb_rdonly(sb);
+
+	/* Flush everything before changing state. */
+	ret = sync_filesystem(sb);
+	if (ret)
+		return ret;
+
+	/* On a read-only transition, checkpoint the journal so log_start catches
+	 * up to log_end and the on-disk crash-recovery tail is clean. */
+	if (going_ro && bsi->journal) {
+		ret = briefs_journal_checkpoint(bsi->journal);
+		if (ret) {
+			pr_err("briefs: remount-ro checkpoint failed (err=%d); aborting remount\n",
+			       ret);
+			return ret;
+		}
+	}
+
+	old_flags = bsi->mount_flags;
+	new_flags = ctx->mount_flags;
+	bsi->mount_flags = new_flags;
+
+	/* Toggle the debugfs tree if the debug option changed. */
+	if ((old_flags ^ new_flags) & BRIEFS_MF_DEBUG) {
+		if (new_flags & BRIEFS_MF_DEBUG)
+			briefs_debugfs_add_sb(sb);
+		else
+			briefs_debugfs_remove_sb(sb);
+	}
+
+	return 0;
+}
+
+static const struct fs_context_operations briefs_context_ops = {
+	.free		= briefs_free_fc,
+	.parse_param	= briefs_parse_param,
+	.get_tree	= briefs_get_tree,
+	.reconfigure	= briefs_reconfigure,
+};
+
+int briefs_init_fs_context(struct fs_context *fc)
+{
+	struct briefs_fs_context *ctx;
+
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+
+	/* Seed remount context from the live superblock so unset options keep
+	 * their current values and explicit toggles can clear them. */
+	if (fc->purpose == FS_CONTEXT_FOR_RECONFIGURE) {
+		struct super_block *sb = fc->root->d_sb;
+		struct briefs_sb_info *bsi = briefs_sb(sb);
+
+		ctx->mount_flags = bsi->mount_flags;
+	}
+
+	fc->fs_private = ctx;
+	fc->ops = &briefs_context_ops;
+	return 0;
+}
+
+int briefs_fill_super(struct super_block *sb, struct fs_context *fc) {
 	struct buffer_head *bh;
 	struct briefs_superblock *bsb;
 	struct inode *root_inode;
@@ -83,13 +230,12 @@ int briefs_fill_super(struct super_block *sb, void *data, int flags) {
 		return -ENOMEM;
 	sb->s_fs_info = bsi;
 
-	/* Parse mount options (legacy mount API forwards the raw options string
-	 * in @data). Only "debug" is recognized today; unknown tokens are warned
-	 * about and ignored so future/VFS-injected options don't break mounting. */
+	/* Mount options were parsed by the fs_context layer before fill_super. */
 	bsi->mount_jiffies = get_jiffies_64();
-	ret = briefs_parse_options(data, bsi);
-	if (ret)
-		goto out;
+	if (fc && fc->fs_private) {
+		struct briefs_fs_context *ctx = fc->fs_private;
+		bsi->mount_flags = ctx->mount_flags;
+	}
 
 	if (!sb_set_blocksize(sb, 4096)) {
 		pr_err("briefs: blocksize too small\n");
@@ -481,10 +627,4 @@ void briefs_umount_begin(struct super_block *sb) {
 void briefs_kill_sb(struct super_block *sb) {
 	pr_debug("briefs: kill_sb\n");
 	kill_block_super(sb);
-}
-/* briefs_mount - mount callback */
-struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
-                           const char *dev_name, void *data) {
-	pr_debug("briefs: mount callback\n");
-	return mount_bdev(fs_type, flags, dev_name, data, briefs_fill_super);
 }

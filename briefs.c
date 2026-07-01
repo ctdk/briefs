@@ -15,8 +15,9 @@ static struct file_system_type briefs_fs_type = {
 	.owner = THIS_MODULE,
 	.name = "briefs",
 	.fs_flags = FS_REQUIRES_DEV,
-	.mount = briefs_mount,
+	.init_fs_context = briefs_init_fs_context,
 	.kill_sb = briefs_kill_sb,
+	.parameters = briefs_param_spec,
 };
 
 /* Inode slab constructor - called for each new slab allocation */

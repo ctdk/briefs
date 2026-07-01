@@ -1,23 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 /*
- * BrieFS observability: per-superblock debugfs tree, mount-option parsing,
- * the global per-sb list, and the stat-counter helper backing the debugfs
- * "stats" file. The per-sb list is also consumed by briefs_sysfs.c and
- * briefs_proc.c.
+ * BrieFS observability: per-superblock debugfs tree, the global per-sb list,
+ * and the stat-counter helper backing the debugfs "stats" file. The per-sb
+ * list is also consumed by briefs_sysfs.c and briefs_proc.c.
  *
  * debugfs is gated to mounts that pass -o debug (BRIEFS_MF_DEBUG): only those
  * mounts get a per-sb directory under /sys/kernel/debug/briefs/<s_id>/ and
  * only they pay for the stat-counter increments (briefs_stat_inc is a skipped
- * branch otherwise).
+ * branch otherwise). Mount-option parsing lives in briefs_super.c; this file
+ * only reports the active options via briefs_show_options().
  */
 
 #include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
-#include <linux/string.h>
-#include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
 #include <linux/jiffies.h>
@@ -46,38 +44,7 @@ void briefs_sb_list_del(struct briefs_sb_info *bsi)
 	spin_unlock(&briefs_sb_list_lock);
 }
 
-/* ---- mount-option parsing (legacy mount API) -------------------------- */
-
-/*
- * Parse the raw mount options string forwarded by mount_bdev. The only token
- * today is "debug" (gate the debugfs tree + stat counters). Unknown tokens are
- * warned about and ignored so the module stays forward-compatible with tokens
- * the VFS may inject and with future options.
- */
-int briefs_parse_options(char *data, struct briefs_sb_info *bsi)
-{
-	char *opts, *token;
-
-	if (!data || !*data)
-		return 0;
-
-	opts = kstrdup(data, GFP_KERNEL);
-	if (!opts)
-		return -ENOMEM;
-
-	while ((token = strsep(&opts, ",")) != NULL) {
-		if (!*token)
-			continue;
-		if (strcmp(token, "debug") == 0) {
-			bsi->mount_flags |= BRIEFS_MF_DEBUG;
-		} else {
-			pr_warn("briefs: unknown mount option \"%s\" ignored\n", token);
-		}
-	}
-
-	kfree(opts);
-	return 0;
-}
+/* ---- show active mount options ---------------------------------------- */
 
 int briefs_show_options(struct seq_file *seq, struct dentry *root)
 {

@@ -4,6 +4,7 @@
 #define _BRIEFS_H
 
 #include <linux/fs.h>
+#include <linux/fs_parser.h>
 #include <linux/types.h>
 #include <linux/stddef.h>
 #include <linux/blk_types.h>
@@ -990,10 +991,18 @@ int briefs_file_mmap(struct file *file, struct vm_area_struct *vma);
 extern const struct super_operations briefs_super_ops;
 extern const struct export_operations briefs_export_ops;
 
+/* Forward declarations for fs_context API. */
+struct fs_context;
+struct fs_parameter;
+struct fs_parameter_spec;
+
+extern const struct fs_parameter_spec briefs_param_spec[];
+
 /* Fill superblock - entry point for mount */
-int briefs_fill_super(struct super_block *sb, void *data, int flags);
-struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
-                          const char *dev_name, void *data);
+int briefs_fill_super(struct super_block *sb, struct fs_context *fc);
+
+/* fs_context lifecycle helpers (briefs_super.c). */
+int briefs_init_fs_context(struct fs_context *fc);
 
 /*
  * Observability surfaces (briefs_debug.c / briefs_sysfs.c / briefs_proc.c).
@@ -1001,11 +1010,10 @@ struct dentry *briefs_mount(struct file_system_type *fs_type, int flags,
  * debugfs: per-sb tree under /sys/kernel/debug/briefs/<s_id>/, gated to -o debug.
  * sysfs:   per-sb attrs under /sys/fs/briefs/<s_id>/, always on.
  * /proc:   /proc/fs/briefs/mounts index, always on.
- * Mount-option parsing (briefs_parse_options) populates bsi->mount_flags;
- * briefs_show_options emits them. The per-sb list (briefs_sb_list) lets /proc
- * and the module enumerate live mounts.
+ * Mount-option parsing (briefs_parse_param / briefs_init_fs_context) populates
+ * bsi->mount_flags; briefs_show_options emits them. The per-sb list
+ * (briefs_sb_list) lets /proc and the module enumerate live mounts.
  */
-int briefs_parse_options(char *data, struct briefs_sb_info *bsi);
 int briefs_show_options(struct seq_file *seq, struct dentry *root);
 
 int briefs_debugfs_init(void);          /* module init: create /sys/kernel/debug/briefs */
