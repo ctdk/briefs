@@ -11,9 +11,9 @@ set -euo pipefail
 SSH_CMD="${1:-}"
 TEST_IMG="${TMPDIR:-/tmp}/briefs-test-$$.img"
 MNT_POINT="/tmp/briefs-mnt-$$"
-KERNEL_MODULE="${BRIEFS_MODULE:-/home/jeremy/src/briefs/briefs_fs.ko}"
-MKBRIEFS="${BRIEFS_MKFS:-/home/jeremy/go/bin/mkfs.briefs}"
-FSCKBRIEFS="${BRIEFS_FSCK:-/home/jeremy/go/bin/fsck.briefs}"
+KERNEL_MODULE="${BRIEFS_MODULE:-./briefs_fs.ko}"
+MKBRIEFS="${BRIEFS_MKFS:-$(command -v mkfs.briefs 2>/dev/null || echo /home/jeremy/go/bin/mkfs.briefs)}"
+FSCKBRIEFS="${BRIEFS_FSCK:-$(command -v fsck.briefs 2>/dev/null || echo /home/jeremy/go/bin/fsck.briefs)}"
 LOSETUP="${BRIEFS_LOSETUP:-$(command -v losetup || echo /sbin/losetup)}"
 LOSETUP_DISCOVER="${BRIEFS_LOSETUP_DISCOVER:-true}"
 
@@ -93,7 +93,17 @@ fi
 $LOSETUP -D 2>/dev/null || true
 sleep 1
 rmmod briefs_fs 2>/dev/null || true
-insmod "$KERNEL_MODULE" && pass "briefs_fs module loaded" || fail "module load failed"
+if [ ! -f "$KERNEL_MODULE" ]; then
+  echo "  ERROR: module not found: $KERNEL_MODULE"
+  echo "  Set BRIEFS_MODULE or build briefs_fs.ko in the current directory."
+  exit 1
+fi
+if insmod "$KERNEL_MODULE"; then
+  pass "briefs_fs module loaded"
+else
+  echo "  ERROR: insmod $KERNEL_MODULE failed"
+  exit 1
+fi
 
 # Phase 1: mkfs
 echo ""
@@ -106,7 +116,7 @@ SIZE=8192
 echo ""
 echo "=== Phase 2: Mount ==="
 mkdir -p "$MNT_POINT"
-mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "mount succeeded" || fail "mount failed"
+mount -o loop -t briefs "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "mount succeeded" || fail "mount failed"
 
 # Phase 3: Basic file operations
 echo ""
@@ -156,7 +166,7 @@ FSIZE=$(stat -c%s "$CHAIN_TEST" 2>/dev/null || echo 0)
 [ "$FSIZE" = 69642 ] && pass "chain-block append size" || fail "chain-block append size" "(expected 69642, got $FSIZE)"
 sync
 umount "$MNT_POINT" 2>/dev/null || true
-mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for chain-block replay" || fail "remount for chain-block replay"
+mount -o loop -t briefs "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for chain-block replay" || fail "remount for chain-block replay"
 FSIZE=$(stat -c%s "$CHAIN_TEST" 2>/dev/null || echo 0)
 [ "$FSIZE" = 69642 ] && pass "chain-block file survives replay" || fail "chain-block file survives replay" "(got $FSIZE)"
 
@@ -204,7 +214,7 @@ cmp "$MNT_POINT/expected_trunc" "$MNT_POINT/inline_trunc_promote" && pass "trunc
 
 sync
 umount "$MNT_POINT" 2>/dev/null || true
-mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for inline replay" || fail "remount for inline replay"
+mount -o loop -t briefs "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for inline replay" || fail "remount for inline replay"
 check_file "inline file after replay" "$MNT_POINT/inline_small" "reborn"
 check_file "promoted inline file after replay" "$MNT_POINT/inline_promote" "$LONGER"
 check_file "append-promote file after replay" "$MNT_POINT/inline_append_promote" "$(printf 'z%.0s' $(seq 1 300))"
@@ -244,12 +254,12 @@ rm "$MNT_POINT/goodbye" 2>/dev/null && pass "unlink file" || fail "unlink"
 mkdir "$MNT_POINT/rmdir_test" && mkdir "$MNT_POINT/rmdir_test/nested" && echo -n "x" > "$MNT_POINT/rmdir_test/nested/file"
 sync
 umount "$MNT_POINT" 2>/dev/null || true
-mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for rmdir replay" || fail "remount for rmdir"
+mount -o loop -t briefs "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for rmdir replay" || fail "remount for rmdir"
 rm -rf "$MNT_POINT/rmdir_test" 2>/dev/null && pass "rmdir nested directory" || fail "rmdir"
 [ ! -d "$MNT_POINT/rmdir_test" ] && pass "rmdir target gone" || fail "rmdir target still exists"
 sync
 umount "$MNT_POINT" 2>/dev/null || true
-mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount after rmdir" || fail "remount after rmdir"
+mount -o loop -t briefs "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount after rmdir" || fail "remount after rmdir"
 [ ! -d "$MNT_POINT/rmdir_test" ] && pass "rmdir target still gone after remount" || fail "rmdir target resurrected"
 
 # Phase 6b: Symlink content survives replay
@@ -265,7 +275,7 @@ ln -s "$MAX_INLINE_TARGET" "$MNT_POINT/slink_max" 2>/dev/null && pass "create ma
 
 sync
 umount "$MNT_POINT" 2>/dev/null || true
-mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount after symlink" || fail "remount after symlink"
+mount -o loop -t briefs "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount after symlink" || fail "remount after symlink"
 [ "$(readlink "$MNT_POINT/slink" 2>/dev/null || true)" = "hello-briefs-symlink" ] && pass "small inline symlink after replay" || fail "symlink after replay"
 [ "$(readlink "$MNT_POINT/slink_max" 2>/dev/null || true)" = "$MAX_INLINE_TARGET" ] && pass "max inline symlink after replay" || fail "max inline symlink after replay"
 
@@ -342,7 +352,7 @@ fi
 
 sync
 umount "$MNT_POINT" 2>/dev/null || true
-if mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null; then
+if mount -o loop -t briefs "$TEST_IMG" "$MNT_POINT" 2>/dev/null; then
   pass "remount after xattr"
 else
   fail "remount after xattr"
@@ -398,7 +408,7 @@ cp /bin/uname "$MNT_POINT/uname_test"
 # Check that the ELF binary we copied in is still runnable after umount/remount
 sync
 umount "$MNT_POINT"
-mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null
+mount -o loop -t briefs "$TEST_IMG" "$MNT_POINT" 2>/dev/null
 check_cmd "exec after remount" 0 "$MNT_POINT/true_test"
 echo "  (also tests journal replay on mount)"
 
@@ -424,7 +434,7 @@ done
 rm $(seq 1 10 | sed "s|^|$MNT_POINT/alloc_test/file_|") 2>/dev/null || true
 sync
 umount "$MNT_POINT" 2>/dev/null || true
-mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for allocator replay" || fail "remount for allocator replay"
+mount -o loop -t briefs "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for allocator replay" || fail "remount for allocator replay"
 for i in $(seq 31 50); do
   echo -n "y" > "$MNT_POINT/alloc_test/file_$i" 2>/dev/null || true
 done
@@ -456,7 +466,7 @@ done
 rm "$MNT_POINT"/statfs_test_* 2>/dev/null || true
 sync
 umount "$MNT_POINT" 2>/dev/null || true
-mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for statfs replay" || fail "remount for statfs"
+mount -o loop -t briefs "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount for statfs replay" || fail "remount for statfs"
 FREE_AFTER=$(stat -f "$MNT_POINT" 2>/dev/null | grep -o 'Free: [0-9]*' | awk '{print $2}' || echo "")
 [ "$FREE_BEFORE" = "$FREE_AFTER" ] && pass "free counts consistent after replay" || fail "free counts inconsistent after replay" "(before=$FREE_BEFORE after=$FREE_AFTER)"
 
@@ -507,7 +517,7 @@ INLINE_HEX=$(od -An -tx1 -N10 "$PUNCH_INLINE" | tr -d ' \n')
 
 sync
 umount "$MNT_POINT" 2>/dev/null || true
-mount -o loop "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount after punch hole" || fail "remount after punch hole"
+mount -o loop -t briefs "$TEST_IMG" "$MNT_POINT" 2>/dev/null && pass "remount after punch hole" || fail "remount after punch hole"
 [ -z "$(dd if="$PUNCH_FILE" bs=4096 skip=1 count=1 2>/dev/null | tr -d '\0')" ] && pass "aligned punch survives replay" || fail "aligned punch survives replay"
 [ -z "$(dd if="$PUNCH_FILE2" bs=1 skip=100 count=200 2>/dev/null | tr -d '\0')" ] && pass "unaligned punch survives replay" || fail "unaligned punch survives replay"
 [ -z "$(dd if="$PUNCH_WHOLE" bs=4096 count=1 2>/dev/null | tr -d '\0')" ] && pass "whole-block punch survives replay" || fail "whole-block punch survives replay"
@@ -640,7 +650,7 @@ OPT_IMG="${TMPDIR:-/tmp}/briefs-opt-$$.img"
 OPT_MNT="/tmp/briefs-opt-mnt-$$"
 "$MKBRIEFS" -s 5000 "$OPT_IMG" 2>/dev/null && pass "optimize: mkfs image" || fail "optimize: mkfs"
 mkdir -p "$OPT_MNT"
-mount -o loop "$OPT_IMG" "$OPT_MNT" 2>/dev/null && pass "optimize: mount" || fail "optimize: mount"
+mount -o loop -t briefs "$OPT_IMG" "$OPT_MNT" 2>/dev/null && pass "optimize: mount" || fail "optimize: mount"
 
 # A multi-extent file: 200 full 4 KiB writes at every-other 8 KiB offset forces
 # the kernel to build a multi-leaf B+ tree extent index (>126 extents), which
@@ -678,7 +688,7 @@ fi
 # name and content. The kernel resolves trie names itself, so a name_len field
 # bug surfaces here as missing/garbled entries — exactly where fsck's own
 # re-verify would have reported clean.
-mount -o loop "$OPT_IMG" "$OPT_MNT" 2>/dev/null && pass "optimize: remount" || fail "optimize: remount"
+mount -o loop -t briefs "$OPT_IMG" "$OPT_MNT" 2>/dev/null && pass "optimize: remount" || fail "optimize: remount"
 OPT_ENTRY_COUNT=$(ls "$OPT_MNT" 2>/dev/null | wc -l)
 [ "$OPT_ENTRY_COUNT" = "$ENTRY_COUNT" ] && pass "optimize: entry count preserved" || fail "optimize: entry count" "(before $ENTRY_COUNT after $OPT_ENTRY_COUNT)"
 ALL_NAMES_OK=1
