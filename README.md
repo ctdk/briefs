@@ -121,7 +121,8 @@ WORKS
 * Files larger than 2 GiB
 * Nanosecond-precision timestamps
 * Extended attributes (user, trusted, and security namespaces; large values may
-  span chained 4 KiB continuation blocks; no POSIX ACLs)
+  span chained 4 KiB continuation blocks; crash-safe journal replay and fsck
+  validation; no POSIX ACLs)
 * Direct I/O (O_DIRECT)
 
 DEFINITELY MISSING OR BROKEN

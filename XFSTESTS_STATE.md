@@ -10,6 +10,10 @@ measured by a fresh full-suite run on the VM.
 from the working tree and loaded with all fixes through `55023ac`/`a1eb7e0`/
 `0cd7062` deployed).
 
+**Latest xattr cluster run:** 2026-07-02, `generic/020 037 062 066 070 097 103
+117 337 377 403 454 631`, all 13 passed (commit `29121e6` on
+`even-more-xfstests`).
+
 | Bucket        | Count | Notes                                                     |
 |---------------|------:|-----------------------------------------------------------|
 | Selected      |   783 | auto-group tests the suite considered                      |
@@ -200,6 +204,11 @@ feature or an environment gap — not a stale declaration. Grouped by reason bel
 784  785  789  790  792
 ```
 
+### xfstests xattr cluster (13/13, 2026-07-02)
+
+All xattr-gated tests pass with the chained-xattr fix in `29121e6`:
+020, 037, 062, 066, 070, 097, 103, 117, 337, 377, 403, 454, 631.
+
 ### Recent fix highlights (this campaign)
 
 A large cluster of previously-failing tests now passes. Notable fixes:
@@ -213,6 +222,7 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | 074                           | fb649e8  | orphan dir-trie-page leak (trie_free_node)                    |
 | 753                           | 73a0d1d  | dm-error writeback WARN (lock_buffer across mark_buffer_dirty)|
 | 679                           | 05cb297  | unwritten extents                                             |
+| 020 037 062 066 070 097 103 117 337 377 403 454 631 | 29121e6  | chained xattr buffer-head accounting + release bugs             |
 | 547                           | 86fa48b  | fsync-ordered trie durability                                 |
 | 640                           | 2d66610  | rename trie-root journal ordering                             |
 | 620                           | 97a50e7  | mkfs huge-disk EIO (stop pre-zeroing inode table)             |
@@ -254,6 +264,9 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 - Fresh `./check -s briefs -g auto` on the VM (2026-06-29), kernel
   `6.12.94+deb13-amd64`, branch `bh-to-iomap`, module built on the VM and
   loaded with fixes through `55023ac`/`a1eb7e0`/`0cd7062` deployed.
+- Xattr cluster re-run 2026-07-02 on branch `even-more-xfstests`, kernel
+  `6.12.94+deb13-amd64`, module built from commit `29121e6` (loaded via
+  `insmod briefs_fs.ko`), loop devices on `/var/tmp`. 13/13 pass.
 - Pass/Fail/Not-run lists derived from the run's `Ran:` / `Not run:` / failure
   lines in `/tmp/fullsuite.log` on the VM.
 - Not-run reasons read from each test's `.notrun` artifact and grouped.

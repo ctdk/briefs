@@ -6,14 +6,17 @@
   calling out.
 - [Done] Support large extended-attribute values via chained 4 KiB
   continuation blocks, with crash-safe journal replay and fsck validation.
-- [Phase 1 done] Migrate mount path to fs_context so remount works; honor
-  the existing "debug" flag (and "nodebug") and checkpoint the journal on
+  (Kernel commit `29121e6`, briefs-utils `042d09b`. xfstests xattr cluster
+  020/037/062/066/070/097/103/117/337/377/403/454/631 passes 13/13.)
+- [Done] Migrate mount path to fs_context so remount works; honor the
+  existing "debug" flag (and "nodebug") and checkpoint the journal on
   read-only remount.
 - Make list of additional relevant mount options to honor, whether fs
-  independent or unique to briefs. (Started: norecovery added.)
+  independent or unique to briefs. (Started: norecovery, errors=, debug/nodebug.)
 - [Done] Add norecovery mount option: skip journal replay, require ro mount.
 - [Done] Add errors=continue|remount-ro|panic mount option and central metadata
   write-error handler.
+- [Done] fs_context-based mount/remount, debugfs toggle on remount.
 - Revise briefs(5) man page.
 - Quotas
 - POSIX ACLs
