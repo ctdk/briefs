@@ -365,14 +365,16 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	 * was checkpointed away and that background writeback hadn't yet reached
 	 * disk before the drop_writes+unmount reverts to stale data on remount.
 	 *
-	 * sync_blockdev() flushes sb->s_bdev's mapping, which holds the
-	 * sb_bread()-read inode and trie buffers.  File DATA lives in the
-	 * per-inode address_space and is flushed separately by
-	 * file_write_and_wait_range() at fsync time, so it is not touched here.
-	 * We hold j->write_lock; no BrieFS metadata-writeback path takes it
-	 * (buffer I/O submission/completion is lock-free, and briefs_write_inode
-	 * acquires write_lock only when *creating* a record, not when its dirty
-	 * buffer is written back), so this wait cannot self-deadlock.
+	 * sync_blockdev() writes out sb->s_bdev's page-cache mapping, which holds
+	 * the sb_bread()-read inode and trie buffers.  Note that since Linux 6.12
+	 * sync_blockdev() does NOT issue a drive-level REQ_PREFLUSH; callers that
+	 * need cache flush ordering (fsync(2), unmount) must also call
+	 * blkdev_issue_flush().  File DATA lives in the per-inode address_space and
+	 * is flushed separately by file_write_and_wait_range() at fsync time, so it
+	 * is not touched here.  We hold j->write_lock; no BrieFS metadata-writeback
+	 * path takes it (buffer I/O submission/completion is lock-free, and
+	 * briefs_write_inode acquires write_lock only when *creating* a record, not
+	 * when its dirty buffer is written back), so this wait cannot self-deadlock.
 	 */
 	{
 		int ret = sync_blockdev(j->vfs_sb->s_bdev);
@@ -381,7 +383,7 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	}
 
 	/*
-	 * Persist the allocator bitmaps alongside the inode/trie buffers flushed
+	 * Persist the allocator bitmaps alongside the inode/trie buffers written
 	 * above.  briefs_alloc_sync() is the ONLY path that marks the bitmap
 	 * buffer_heads dirty -- the alloc/free hot paths mutate only the in-memory
 	 * l0/l1/l2 arrays and never dirty the backing buffers -- so sync_blockdev()
@@ -1977,7 +1979,7 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j) {
 	j->dirty = false;
 
 	/*
-	 * Flush the trie/inode metadata buffers the just-written journal records
+	 * Write out the trie/inode metadata buffers the just-written journal records
 	 * reference BEFORE those journal blocks reach disk.  Dir-entry insertion
 	 * (briefs_trie_insert -> briefs_trie_page_init) and inode mutation
 	 * (briefs_write_inode) only mark_buffer_dirty() the trie page / inode
@@ -1998,26 +2000,28 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j) {
 	 * (see __briefs_journal_checkpoint_locked()); fsync(2) was the gap.
 	 *
 	 * The journal commit point is journal_log_end, advanced (with the
-	 * superblock sync) only AFTER this flush and the journal-block loop below,
-	 * so the on-disk ordering is metadata-before-commit: a crash before
+	 * superblock sync) only AFTER this write-out and the journal-block loop
+	 * below, so the on-disk ordering is metadata-before-commit: a crash before
 	 * log_end is advanced leaves these records beyond the committed tail and
 	 * they are not replayed; a crash after leaves the trie already durable, so
 	 * replay is a no-op.  sync_blockdev() waits on every dirty buffer on
 	 * s_bdev (trie, inode, and the just-dirtied journal block at write_pos),
-	 * so by the time it returns all of them are on disk.  The per-block
-	 * sync_dirty_buffer() loop below then re-reads those journal buffers and
-	 * no-ops on the now-clean ones.  Same self-deadlock argument as the
-	 * checkpoint path holds: no BrieFS metadata-writeback path takes
-	 * j->write_lock during buffer I/O.
+	 * so by the time it returns all of them are on disk.  Note, however, that
+	 * since Linux 6.12 sync_blockdev() no longer issues a REQ_PREFLUSH bio;
+	 * callers that need a drive-level flush (fsync(2), unmount) must also call
+	 * blkdev_issue_flush().  The per-block sync_dirty_buffer() loop below then
+	 * re-reads those journal buffers and no-ops on the now-clean ones.  Same
+	 * self-deadlock argument as the checkpoint path holds: no BrieFS
+	 * metadata-writeback path takes j->write_lock during buffer I/O.
 	 *
-	 * This is a full-device flush on every fsync -- heavier than ideal.  A
-	 * targeted flush of only the dirtied trie/inode buffers is the natural
-	 * refinement once BrieFS moves off buffer_heads to iomap.
+	 * This writes out every dirty buffer on s_bdev on every fsync -- heavier
+	 * than ideal.  A targeted flush of only the dirtied trie/inode buffers is the
+	 * natural refinement once BrieFS moves off buffer_heads to iomap.
 	 */
 	{
 		int err = sync_blockdev(j->vfs_sb->s_bdev);
 		if (err) {
-			pr_err("briefs: fsync metadata buffer flush failed: %d\n", err);
+			pr_err("briefs: fsync metadata buffer write-out failed: %d\n", err);
 			return err;
 		}
 	}

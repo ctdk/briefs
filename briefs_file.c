@@ -94,9 +94,24 @@ int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
 	/* Flush journal to disk on explicit fsync */
 	if (bsi->journal && bsi->journal->dirty) {
 		ret = briefs_journal_sync(bsi->journal);
+		if (ret)
+			return ret;
 	}
 
-	return ret;
+	/*
+	 * Issue a drive-level flush.  In older kernels sync_blockdev() also did
+	 * this, but since Linux 6.12 it only flushes the block device's page-cache
+	 * mapping and no longer submits a REQ_PREFLUSH bio.  Without this explicit
+	 * flush, volatile-cache devices (and the dm-log-writes test target, which
+	 * only logs writes once a flush/FUA moves them out of its unflushed queue)
+	 * can reorder or omit the data/metadata writes that fsync(2) is supposed
+	 * to make durable, causing generic/455 crash-replay md5 mismatches.
+	 */
+	ret = blkdev_issue_flush(inode->i_sb->s_bdev);
+	if (ret)
+		return ret;
+
+	return 0;
 }
 /* Open file */
 int briefs_open(struct inode *inode, struct file *file) {

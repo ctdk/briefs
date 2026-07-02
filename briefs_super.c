@@ -645,6 +645,23 @@ void briefs_put_super(struct super_block *sb) {
 		pr_debug("briefs: syncing inode allocator\n");
 		briefs_alloc_sync(&bsi->inode_alloc);
 
+		/*
+		 * Issue a drive-level flush so all metadata written during unmount
+		 * is durable on the underlying block device.  In Linux 6.12
+		 * sync_blockdev() no longer submits a REQ_PREFLUSH bio; without this
+		 * explicit flush, volatile-cache devices and the dm-log-writes
+		 * target used by generic/455 can leave the final unmount writes in
+		 * their unflushed queue.  Those writes are then logged after the
+		 * post-umount "end" mark, so replaying up to "end" omits them and
+		 * the crash-replay md5 check fails.
+		 */
+		if (!sb_rdonly(sb)) {
+			int flush_ret = blkdev_issue_flush(sb->s_bdev);
+			if (flush_ret)
+				pr_err("briefs: unmount flush failed (err=%d)\n",
+				       flush_ret);
+		}
+
 		pr_debug("briefs: calling alloc_cleanup\n");
 		briefs_alloc_cleanup(&bsi->alloc);
 		briefs_alloc_cleanup(&bsi->inode_alloc);
