@@ -21,9 +21,12 @@ BRIEFS_SRC="/vagrant"
 IMG_DIR="/var/lib/xfstests-briefs"
 TEST_IMG="$IMG_DIR/test.img"
 SCRATCH_IMG="$IMG_DIR/scratch.img"
+LOGWRITES_IMG="$IMG_DIR/logwrites.img"
 TEST_MNT="/mnt/briefs-test"
 SCRATCH_MNT="/mnt/briefs-scratch"
-IMG_SIZE_MB=4096
+# 16 GiB gives plenty of headroom for tests that create thin pools, snapshots,
+# log-writes devices and large fsx images on top of the scratch/test devices.
+IMG_SIZE_MB=16384
 
 if [ "$(id -u)" -ne 0 ]; then
 	echo "must run as root (try: sudo bash $0)" >&2
@@ -61,17 +64,22 @@ done
 echo "=== creating loop-backed test/scratch devices ==="
 mkdir -p "$IMG_DIR" "$TEST_MNT" "$SCRATCH_MNT"
 # Detach any old loops pointing at our images.
-for img in "$TEST_IMG" "$SCRATCH_IMG"; do
+for img in "$TEST_IMG" "$SCRATCH_IMG" "$LOGWRITES_IMG"; do
 	lo="$(losetup -j "$img" 2>/dev/null | cut -d: -f1 || true)"
 	[ -n "$lo" ] && losetup -d "$lo" 2>/dev/null || true
 done
 # (Re)create sparse images.
 truncate -s "${IMG_SIZE_MB}M" "$TEST_IMG"
 truncate -s "${IMG_SIZE_MB}M" "$SCRATCH_IMG"
+# Log-writes device needs to record every write to the scratch device.
+# Size it at twice the scratch device size to avoid running out of log space.
+truncate -s "$((IMG_SIZE_MB * 2))M" "$LOGWRITES_IMG"
 TEST_LOOP="$(losetup -f --show "$TEST_IMG")"
 SCRATCH_LOOP="$(losetup -f --show "$SCRATCH_IMG")"
+LOGWRITES_LOOP="$(losetup -f --show "$LOGWRITES_IMG")"
 echo "  TEST_DEV=$TEST_LOOP  (-> $TEST_IMG)"
 echo "  SCRATCH_DEV=$SCRATCH_LOOP  (-> $SCRATCH_IMG)"
+echo "  LOGWRITES_DEV=$LOGWRITES_LOOP  (-> $LOGWRITES_IMG)"
 
 echo "=== writing resolved config to $XFSTESTS_DIR/configs/briefs.config ==="
 if [ -d "$XFSTESTS_DIR/configs" ]; then
@@ -83,6 +91,7 @@ export TEST_DIR=$TEST_MNT
 export SCRATCH_MNT=$SCRATCH_MNT
 export TEST_DEV=$TEST_LOOP
 export SCRATCH_DEV=$SCRATCH_LOOP
+export LOGWRITES_DEV=$LOGWRITES_LOOP
 export MKFS_PROG=/go/bin/mkfs.briefs
 # Dedicated prog var (mirrors MKFS_BTRFS_PROG / MKFS_BCACHEFS_PROG, etc.).
 # common/config unconditionally resets MKFS_PROG="$(type -P mkfs)" (the generic
@@ -128,4 +137,6 @@ echo
 echo "=== setup complete ==="
 echo "Next: from $XFSTESTS_DIR run:"
 echo "  HOST_OPTIONS=configs/briefs.config ./check -s briefs -g generic"
-echo "(xfstests deps must be installed: apt-get install xfsprogs attr acl ...)"
+echo "(xfstests deps must be installed: apt-get install xfsprogs attr acl lvm2 thin-provisioning-tools ...)"
+echo "NOTE: generic/704/730/731 (scsi_debug) may need 'sudo rmmod scsi_debug' before each run so the"
+echo "      xfstests helper can load/unload the module itself."
