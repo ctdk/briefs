@@ -261,24 +261,33 @@ static int xattr_copy_value(struct super_block *sb, struct buffer_head *first_bh
 		} else {
 			/* A non-continuation block in the middle of a value is corrupt. */
 			ret = -EIO;
+			brelse(bh);
+			bh = NULL;
 			break;
 		}
 
 		if (payload_start > used) {
 			ret = -EIO;
+			brelse(bh);
+			bh = NULL;
 			break;
 		}
 		avail = used - payload_start;
 		take = min(avail, value_len - copied);
 		if (take == 0) {
 			ret = -EIO;
+			brelse(bh);
+			bh = NULL;
 			break;
 		}
 		memcpy(value + copied, bh->b_data + payload_start, take);
 		copied += take;
 
-		if (copied >= value_len)
+		if (copied >= value_len) {
+			brelse(bh);
+			bh = NULL;
 			break;
+		}
 
 		{
 			struct buffer_head *next = briefs_xattr_chain_next(sb, bh);
@@ -297,8 +306,6 @@ static int xattr_copy_value(struct super_block *sb, struct buffer_head *first_bh
 		}
 	}
 
-	if (bh)
-		brelse(bh);
 	return ret;
 }
 
@@ -339,10 +346,13 @@ int briefs_xattr_get(struct inode *inode, const char *name,
 			ret = xattr_copy_value(inode->i_sb, bh, e, value, ret);
 			if (ret == 0)
 				ret = le16_to_cpu(e->value_len);
+			/* xattr_copy_value consumed the chain; prevent double-brelse. */
+			bh = NULL;
 		}
 	}
 
-	brelse(bh);
+	if (bh)
+		brelse(bh);
 out:
 	up_read(&binfo->xattr_sem);
 	return ret;
@@ -534,8 +544,10 @@ static void xattr_chain_release(struct xattr_chain *chain)
 
 	if (!chain)
 		return;
-	for (i = 0; i < chain->count; i++)
-		brelse(chain->bhs[i]);
+	for (i = 0; i < chain->count; i++) {
+		if (chain->bhs[i])
+			brelse(chain->bhs[i]);
+	}
 	kfree(chain->bhs);
 	chain->bhs = NULL;
 	chain->count = 0;
@@ -558,6 +570,8 @@ static int xattr_chain_load(struct inode *inode, struct xattr_chain *chain)
 		return PTR_ERR(bh);
 
 	while (bh) {
+		u64 next;
+
 		if (chain->count >= BRIEFS_XATTR_MAX_CHAIN) {
 			pr_warn("briefs: xattr chain too long at ino=%lu\n", inode->i_ino);
 			brelse(bh);
@@ -575,7 +589,12 @@ static int xattr_chain_load(struct inode *inode, struct xattr_chain *chain)
 		chain->bhs = grown;
 		chain->bhs[chain->count++] = bh;
 
-		bh = briefs_xattr_chain_next(sb, bh);
+		xattr_header_load(bh->b_data, NULL, NULL, NULL, &next, NULL);
+		if (next == 0) {
+			bh = NULL;
+			break;
+		}
+		bh = briefs_xattr_block_read_abs(sb, next);
 		if (IS_ERR(bh)) {
 			xattr_chain_release(chain);
 			return PTR_ERR(bh);
@@ -837,14 +856,14 @@ static int xattr_build_chain(struct xattr_kv *kvs, u32 n,
 		u32 inline_len, max_payload, remaining;
 
 again:
-		max_payload = BRIEFS_XATTR_MAX_USED - hdr_size -
-			      descs[cur_eb]->e.n *
-			      sizeof(struct briefs_xattr_entry);
+		/* Total payload space available after the on-disk header. */
+		max_payload = BRIEFS_XATTR_MAX_USED - hdr_size;
 
 		/*
 		 * Not enough payload capacity for even this entry's name/record
 		 * (or the entry array is full): close the current entry block and
-		 * start a fresh one.
+		 * start a fresh one.  payload_used already includes the existing
+		 * entry records, so max_payload must not subtract them again.
 		 */
 		if (need_entry > max_payload - descs[cur_eb]->payload_used ||
 		    descs[cur_eb]->e.n >= XATTR_BLOCK_MAX_ENTRIES) {
@@ -1169,11 +1188,6 @@ out_chain:
 					brelse(bhs[i]);
 				}
 			}
-		}
-	} else {
-		if (bhs) {
-			for (i = 0; i < nblocks; i++)
-				brelse(bhs[i]);
 		}
 	}
 	kfree(rel_blocks);
