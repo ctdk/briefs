@@ -36,7 +36,7 @@
 /* Semantic versioning, yo */
 #define _BRIEFS_MAJOR_VER 0
 #define _BRIEFS_MINOR_VER 9
-#define _BRIEFS_PATCH_VER 3
+#define _BRIEFS_PATCH_VER 4
 
 /* Journal magic */
 #define JOURNAL_MAGIC 0x4A4E4C5A  /* "JNLZ" */
