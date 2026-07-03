@@ -375,6 +375,18 @@ struct inode *briefs_new_inode(struct mnt_idmap *idmap, struct inode *dir,
 	inode->i_atime_sec = inode->i_mtime_sec = inode->i_ctime_sec = now.tv_sec;
 	inode->i_atime_nsec = inode->i_mtime_nsec = inode->i_ctime_nsec = now.tv_nsec;
 
+	/* Inherit parent flags that traditionally propagate to children. */
+	if (dir) {
+		struct briefs_inode_info *pbinfo = briefs_i(dir);
+		u32 inherit = BRIEFS_USER_FLAG_NODUMP | BRIEFS_USER_FLAG_NOATIME;
+
+		binfo->disk_inode.user_flags |=
+			pbinfo->disk_inode.user_flags & inherit;
+	}
+
+	/* Apply user-visible chattr flags to VFS inode flags. */
+	briefs_apply_inode_flags(inode);
+
 	/* Set up briefs_inode fields */
 	binfo->disk_inode.inode_number = ino;
 	binfo->disk_inode.magic = _BRIEFS_INODE_MAGIC;
@@ -745,6 +757,10 @@ static int briefs_read_and_fill_inode(struct inode *inode)
 	inode->i_mtime_nsec = cpu_di.mtime_nsec;
 	inode->i_ctime_sec = cpu_di.ctime_sec;
 	inode->i_ctime_nsec = cpu_di.ctime_nsec;
+
+	/* Birth time for statx STATX_BTIME. */
+	/* Apply user-visible chattr flags to VFS inode flags. */
+	briefs_apply_inode_flags(inode);
 
 	/* Set VFS operations based on inode type */
 	if (S_ISDIR(inode->i_mode)) {

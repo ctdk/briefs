@@ -15,6 +15,17 @@
 #include "briefs_journal.h"
 #include "briefs_debug.h"
 
+/*
+ * briefs_dir_sync - make a directory mutation durable for DIRSYNC.
+ *
+ * Caller must have already journaled/persisted the change and must not hold
+ * any lock that conflicts with writing the inode buffer.
+ */
+static int briefs_dir_sync(struct inode *dir)
+{
+	return briefs_inode_sync(dir);
+}
+
 /* briefs_readdir - enumerate directory contents
  *
  * Offset scheme (mirrors libfs simple_offset so telldir/seekdir round-trip):
@@ -359,7 +370,8 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	d_instantiate(dentry, inode);
 
 	pr_debug("briefs: created inode %lu, added to dir\n", inode->i_ino);
-	return 0;
+	ret = briefs_dir_sync(dir);
+	return ret;
 }
 
 /* briefs_mkdir - create a new directory */
@@ -476,7 +488,8 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 	d_instantiate(new_dentry, inode);
 
 	pr_debug("briefs: link inode %lu now has %u links\n", inode->i_ino, inode->i_nlink);
-	return 0;
+	ret = briefs_dir_sync(dir);
+	return ret;
 }
 
 
@@ -644,7 +657,8 @@ int briefs_unlink(struct inode *dir, struct dentry *dentry) {
 	ret = briefs_unlink_common(dir, dentry);
 
 	pr_debug("briefs: unlinked %pd\n", dentry);
-
+	if (ret == 0)
+		ret = briefs_dir_sync(dir);
 	return ret;
 }
 
@@ -669,7 +683,8 @@ int briefs_rmdir(struct inode *dir, struct dentry *dentry) {
 	ret = briefs_unlink_common(dir, dentry);
 
 	pr_debug("briefs: rmdir'd %pd\n", dentry);
-
+	if (ret == 0)
+		ret = briefs_dir_sync(dir);
 	return ret;
 }
 
@@ -785,7 +800,10 @@ static int briefs_rename_exchange(struct inode *old_dir, struct dentry *old_dent
 		if (ret) goto fail;
 	}
 
-	return 0;
+	ret = briefs_dir_sync(old_dir);
+	if (ret == 0 && cross)
+		ret = briefs_dir_sync(new_dir);
+	return ret;
 
 fail:
 	/* Restore the pre-swap entries (idempotent: remove whatever sits at each
@@ -1047,7 +1065,10 @@ static int briefs_rename_whiteout(struct mnt_idmap *idmap,
 	}
 
 	pr_debug("briefs: renamed (whiteout) %pd -> %pd\n", old_dentry, new_dentry);
-	return 0;
+	ret = briefs_dir_sync(old_dir);
+	if (ret == 0 && old_dir != new_dir)
+		ret = briefs_dir_sync(new_dir);
+	return ret;
 
 fail:
 	/* Undo in reverse order.  Restore the old entry to the source IN PLACE
@@ -1302,7 +1323,10 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 	}
 
 	pr_debug("briefs: renamed %pd -> %pd\n", old_dentry, new_dentry);
-	return 0;
+	ret = briefs_dir_sync(old_dir);
+	if (ret == 0 && old_dir != new_dir)
+		ret = briefs_dir_sync(new_dir);
+	return ret;
 
 fail:
 	/* Restore cross-directory nlink and parent_inode state. */

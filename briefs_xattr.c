@@ -1200,6 +1200,8 @@ out:
 	if (dirtied)
 		mark_inode_dirty(inode);
 	up_write(&binfo->xattr_sem);
+	if (ret == 0)
+		ret = briefs_inode_sync(inode);
 	return ret;
 }
 

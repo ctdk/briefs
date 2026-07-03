@@ -28,6 +28,8 @@ const struct inode_operations briefs_dir_inode_ops = {
 	.rmdir = briefs_rmdir,
 	.rename = briefs_rename,
 	.listxattr = briefs_xattr_list,
+	.fileattr_get = briefs_fileattr_get,
+	.fileattr_set = briefs_fileattr_set,
 };
 
 /* Inode operations for files */
@@ -36,6 +38,8 @@ const struct inode_operations briefs_file_inode_ops = {
 	.getattr = briefs_getattr,
 	.fiemap = briefs_fiemap,
 	.listxattr = briefs_xattr_list,
+	.fileattr_get = briefs_fileattr_get,
+	.fileattr_set = briefs_fileattr_set,
 };
 
 /* Inode operations for symlinks */

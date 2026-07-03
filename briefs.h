@@ -291,11 +291,64 @@ struct briefs_disk_extent {
 	__le32 pad;
 };
 
-/* Inode flags */
+/* Inode flags (internal state; not visible to chattr/lsattr) */
 #define InodeFlagReserved    0x00000001
 #define InodeFlagCompressed  0x00000002
 #define InodeFlagIndexed     0x00000004
 #define InodeFlagInlineData  0x00000008
+
+/* User-visible inode flags stored in disk_inode.user_flags.  These match the
+ * standard FS_*_FL values from include/uapi/linux/fs.h so chattr/lsattr work
+ * without translation at the UAPI boundary. */
+#define BRIEFS_USER_FLAG_SYNC      FS_SYNC_FL      /* 0x00000008 */
+#define BRIEFS_USER_FLAG_IMMUTABLE FS_IMMUTABLE_FL /* 0x00000010 */
+#define BRIEFS_USER_FLAG_APPEND    FS_APPEND_FL    /* 0x00000020 */
+#define BRIEFS_USER_FLAG_NODUMP    FS_NODUMP_FL    /* 0x00000040 */
+#define BRIEFS_USER_FLAG_NOATIME   FS_NOATIME_FL   /* 0x00000080 */
+#define BRIEFS_USER_FLAG_DIRSYNC   FS_DIRSYNC_FL   /* 0x00010000 */
+
+#define BRIEFS_USER_FLAG_ALL \
+	(BRIEFS_USER_FLAG_SYNC | BRIEFS_USER_FLAG_IMMUTABLE | \
+	 BRIEFS_USER_FLAG_APPEND | BRIEFS_USER_FLAG_NODUMP | \
+	 BRIEFS_USER_FLAG_NOATIME | BRIEFS_USER_FLAG_DIRSYNC)
+
+#define BRIEFS_XFLAG_SUPPORTED \
+	(FS_XFLAG_SYNC | FS_XFLAG_IMMUTABLE | FS_XFLAG_APPEND | \
+	 FS_XFLAG_NODUMP | FS_XFLAG_NOATIME)
+
+static inline u32 briefs_user_flags_to_xflags(u32 user_flags)
+{
+	u32 xflags = 0;
+
+	if (user_flags & BRIEFS_USER_FLAG_SYNC)
+		xflags |= FS_XFLAG_SYNC;
+	if (user_flags & BRIEFS_USER_FLAG_IMMUTABLE)
+		xflags |= FS_XFLAG_IMMUTABLE;
+	if (user_flags & BRIEFS_USER_FLAG_APPEND)
+		xflags |= FS_XFLAG_APPEND;
+	if (user_flags & BRIEFS_USER_FLAG_NODUMP)
+		xflags |= FS_XFLAG_NODUMP;
+	if (user_flags & BRIEFS_USER_FLAG_NOATIME)
+		xflags |= FS_XFLAG_NOATIME;
+	return xflags;
+}
+
+static inline u32 briefs_xflags_to_user_flags(u32 xflags)
+{
+	u32 user_flags = 0;
+
+	if (xflags & FS_XFLAG_SYNC)
+		user_flags |= BRIEFS_USER_FLAG_SYNC;
+	if (xflags & FS_XFLAG_IMMUTABLE)
+		user_flags |= BRIEFS_USER_FLAG_IMMUTABLE;
+	if (xflags & FS_XFLAG_APPEND)
+		user_flags |= BRIEFS_USER_FLAG_APPEND;
+	if (xflags & FS_XFLAG_NODUMP)
+		user_flags |= BRIEFS_USER_FLAG_NODUMP;
+	if (xflags & FS_XFLAG_NOATIME)
+		user_flags |= BRIEFS_USER_FLAG_NOATIME;
+	return user_flags;
+}
 
 /* briefs_extent / briefs_disk_extent .flags bits.  Currently only one is
  * defined: an extent allocated by fallocate() that has not yet been written
@@ -338,7 +391,8 @@ struct briefs_inode {
 	__u64 dir_trie_root;       /* packed trie node reference: (block << 6) | slot (dirs only) */
 	__u64 rdev;                /* device number (block/char special files) */
 	__u64 generation;         /* inode generation for stable NFS file handles */
-	__u8 reserved[72]; /* zero padded to 512 bytes */
+	__u32 user_flags;         /* FS_*_FL bits visible to chattr/lsattr */
+	__u8 reserved[68];        /* zero padded to 512 bytes */
 };
 
 /* On-disk inode - 512 bytes (little endian) */
@@ -374,7 +428,8 @@ struct briefs_disk_inode {
 	__le64 dir_trie_root;
 	__le64 rdev;
 	__le64 generation;
-	__u8 reserved[72];
+	__le32 user_flags;       /* FS_*_FL bits visible to chattr/lsattr */
+	__u8 reserved[68];
 };
 
 static inline void briefs_disk_extent_to_cpu(const struct briefs_disk_extent *src,
@@ -434,6 +489,7 @@ static inline void briefs_disk_inode_to_cpu(const struct briefs_disk_inode *src,
 	dst->dir_trie_root = le64_to_cpu(src->dir_trie_root);
 	dst->rdev = le64_to_cpu(src->rdev);
 	dst->generation = le64_to_cpu(src->generation);
+	dst->user_flags = le32_to_cpu(src->user_flags);
 	memcpy(dst->reserved, src->reserved, sizeof(dst->reserved));
 }
 
@@ -474,6 +530,7 @@ static inline void briefs_cpu_inode_to_disk(const struct briefs_inode *src,
 	dst->dir_trie_root = cpu_to_le64(src->dir_trie_root);
 	dst->rdev = cpu_to_le64(src->rdev);
 	dst->generation = cpu_to_le64(src->generation);
+	dst->user_flags = cpu_to_le32(src->user_flags);
 	memcpy(dst->reserved, src->reserved, sizeof(dst->reserved));
 }
 
@@ -1098,6 +1155,7 @@ int briefs_append_extent_nojournal(struct super_block *sb, struct briefs_inode *
                                     struct briefs_extent *ext);
 void briefs_free_blocks_range(struct briefs_sb_info *bsi, u64 phys_start, u64 len);
 int briefs_write_inode(struct inode *inode, struct writeback_control *wbc);
+int briefs_inode_sync(struct inode *inode);
 
 /*
  * Offset-keyed B+ tree extent index (briefs_btree.c).
@@ -1187,6 +1245,52 @@ int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
                                const struct briefs_inode *src, bool sync);
 struct buffer_head *briefs_get_zero_block(struct super_block *sb, u64 block);
 
+/* Map on-disk user_flags to VFS inode flags. */
+static inline unsigned int briefs_user_flags_to_iflags(u32 user_flags)
+{
+	unsigned int iflags = 0;
+
+	if (user_flags & BRIEFS_USER_FLAG_SYNC)
+		iflags |= S_SYNC;
+	if (user_flags & BRIEFS_USER_FLAG_IMMUTABLE)
+		iflags |= S_IMMUTABLE;
+	if (user_flags & BRIEFS_USER_FLAG_APPEND)
+		iflags |= S_APPEND;
+	if (user_flags & BRIEFS_USER_FLAG_NOATIME)
+		iflags |= S_NOATIME;
+	if (user_flags & BRIEFS_USER_FLAG_DIRSYNC)
+		iflags |= S_DIRSYNC;
+	return iflags;
+}
+
+/* Map VFS inode flags back to on-disk user_flags. */
+static inline u32 briefs_iflags_to_user_flags(unsigned int iflags)
+{
+	u32 user_flags = 0;
+
+	if (iflags & S_SYNC)
+		user_flags |= BRIEFS_USER_FLAG_SYNC;
+	if (iflags & S_IMMUTABLE)
+		user_flags |= BRIEFS_USER_FLAG_IMMUTABLE;
+	if (iflags & S_APPEND)
+		user_flags |= BRIEFS_USER_FLAG_APPEND;
+	if (iflags & S_NOATIME)
+		user_flags |= BRIEFS_USER_FLAG_NOATIME;
+	if (iflags & S_DIRSYNC)
+		user_flags |= BRIEFS_USER_FLAG_DIRSYNC;
+	return user_flags;
+}
+
+/* Apply binfo->disk_inode.user_flags to inode->i_flags. */
+static inline void briefs_apply_inode_flags(struct inode *inode)
+{
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	unsigned int iflags = briefs_user_flags_to_iflags(binfo->disk_inode.user_flags);
+
+	inode_set_flags(inode, iflags,
+			S_SYNC | S_APPEND | S_IMMUTABLE | S_NOATIME | S_DIRSYNC);
+}
+
 /* Mirror VFS timestamps into a disk inode */
 static inline void briefs_sync_inode_times(struct inode *inode,
                                             struct briefs_inode *di)
@@ -1253,6 +1357,12 @@ const char *briefs_get_link(struct dentry *dentry, struct inode *inode, struct d
 
 /* File operations */
 long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len);
+
+/* chattr / lsattr inode flags */
+struct fileattr;
+int briefs_fileattr_get(struct dentry *dentry, struct fileattr *fa);
+int briefs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
+                        struct fileattr *fa);
 
 /* File operations */
 ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to);

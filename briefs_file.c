@@ -17,11 +17,15 @@
 #include <linux/mm.h>
 #include <linux/uaccess.h>
 #include <linux/migrate.h>
+#include <linux/fileattr.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
 #include "briefs_debug.h"
 #include "briefs_iomap.h"
+
+/* Not declared in the headers on 6.12. */
+extern void generic_fill_statx_attr(struct inode *inode, struct kstat *stat);
 
 /* address_space_operations wrappers (kernel 6.12 folio-based APIs). */
 
@@ -144,25 +148,130 @@ int briefs_release(struct inode *inode, struct file *file) {
  * fails tests whose data is otherwise correct.  Return a zeroed fsxattr so
  * xfs_io prints the (stdout, filtered) fsx fields and emits no error line.
  *
- * FS_IOC_FSSETXATTR and every other cmd fall through to -ENOTTY, preserving
- * the prior behavior (no handler existed, so the VFS returned -ENOTTY for all
- * ioctls): xflag/chattr-style tests that expect the feature unsupported keep
- * failing/notrun cleanly rather than silently no-op'ing.
+ * FS_IOC_{GET,SET}FLAGS and FS_IOC_FS{GET,SET}XATTR are now handled by the VFS
+ * through inode_operations::fileattr_get / fileattr_set, so this stub only
+ * needs to reject everything else with -ENOTTY.
  */
 long briefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	switch (cmd) {
-	case FS_IOC_FSGETXATTR: {
-		struct fsxattr fsx;
-
-		memset(&fsx, 0, sizeof(fsx));
-		if (copy_to_user((void __user *)arg, &fsx, sizeof(fsx)))
-			return -EFAULT;
-		return 0;
-	}
-	}
-
 	return -ENOTTY;
+}
+
+/*
+ * briefs_fileattr_get - get user-visible inode flags (chattr/lsattr/statx).
+ */
+int briefs_fileattr_get(struct dentry *dentry, struct fileattr *fa)
+{
+	struct inode *inode = d_inode(dentry);
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	u32 flags = binfo->disk_inode.user_flags & FS_COMMON_FL;
+
+	if (!S_ISDIR(inode->i_mode))
+		flags &= ~FS_DIRSYNC_FL;
+
+	fileattr_fill_flags(fa, flags);
+	fileattr_fill_xflags(fa, briefs_user_flags_to_xflags(flags));
+	fa->fsx_extsize = 0;
+	fa->fsx_nextents = binfo->disk_inode.num_extents_total;
+	fa->fsx_projid = 0;
+	fa->fsx_cowextsize = 0;
+	return 0;
+}
+
+/*
+ * briefs_fileattr_set - set user-visible inode flags (chattr/lsattr/statx).
+ */
+int briefs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
+                        struct fileattr *fa)
+{
+	struct inode *inode = d_inode(dentry);
+	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct briefs_disk_inode disk_di;
+	u32 old_flags, new_flags, changed;
+	unsigned int new_iflags;
+	int ret;
+
+	old_flags = binfo->disk_inode.user_flags;
+
+	if (fa->flags_valid) {
+		if (fa->flags & ~FS_COMMON_FL)
+			return -EOPNOTSUPP;
+		new_flags = (old_flags & ~FS_COMMON_FL) | (fa->flags & FS_COMMON_FL);
+	} else if (fa->fsx_valid) {
+		if (fa->fsx_xflags & ~BRIEFS_XFLAG_SUPPORTED)
+			return -EOPNOTSUPP;
+		if (fa->fsx_extsize != 0 || fa->fsx_projid != 0 ||
+		    fa->fsx_cowextsize != 0)
+			return -EOPNOTSUPP;
+		new_flags = (old_flags & ~FS_COMMON_FL) |
+			    briefs_xflags_to_user_flags(fa->fsx_xflags);
+	} else {
+		return -EOPNOTSUPP;
+	}
+
+	/* DIRSYNC only valid on directories. */
+	if ((new_flags & FS_DIRSYNC_FL) && !S_ISDIR(inode->i_mode))
+		return -EINVAL;
+
+	/* When setting immutable on a regular file, flush dirty data and DIO
+	 * first so mmap pages become readonly and cannot be written around the
+	 * flag. */
+	if (S_ISREG(inode->i_mode) && !(old_flags & FS_IMMUTABLE_FL) &&
+	    (new_flags & FS_IMMUTABLE_FL)) {
+		inode_dio_wait(inode);
+		ret = filemap_write_and_wait(inode->i_mapping);
+		if (ret)
+			return ret;
+	}
+
+	changed = old_flags ^ new_flags;
+	if (!changed)
+		return 0;
+
+	binfo->disk_inode.user_flags = new_flags;
+
+	new_iflags = briefs_user_flags_to_iflags(new_flags);
+	inode_set_flags(inode, new_iflags,
+			S_SYNC | S_APPEND | S_IMMUTABLE | S_NOATIME | S_DIRSYNC);
+
+	inode_set_ctime_to_ts(inode, current_time(inode));
+	mark_inode_dirty(inode);
+
+	/* Journal a full snapshot so the change survives crash+replay. */
+	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
+	ret = briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+	if (ret) {
+		/* Roll back on journal failure so in-memory and on-disk match. */
+		binfo->disk_inode.user_flags = old_flags;
+		briefs_apply_inode_flags(inode);
+		return ret;
+	}
+
+	ret = briefs_inode_sync(inode);
+	return ret;
+}
+
+/*
+ * briefs_inode_sync - flush metadata + journal + drive for IS_SYNC inodes.
+ */
+int briefs_inode_sync(struct inode *inode)
+{
+	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
+	int ret;
+
+	ret = sync_inode_metadata(inode, 1);
+	if (ret)
+		return ret;
+
+	if (!IS_SYNC(inode) && !IS_DIRSYNC(inode))
+		return 0;
+
+	ret = briefs_journal_sync(bsi->journal);
+	if (ret)
+		return ret;
+
+	return blkdev_issue_flush(inode->i_sb->s_bdev);
 }
 
 /*
@@ -520,7 +629,7 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 			iocb->ki_pos += count;
 			inode_unlock(inode);
-			return count;
+			return generic_write_sync(iocb, count);
 		}
 
 		/* Write exceeds inline capacity: promote the inode first. */
@@ -862,7 +971,8 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			}
 		}
 		mutex_unlock(&binfo->extent_lock);
-		return 0;
+		ret = briefs_inode_sync(inode);
+		return ret;
 	}
 
 	/* Extending an extent-backed file: the new range [old_size, new_size) is
@@ -893,7 +1003,8 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		}
 		mutex_unlock(&binfo->extent_lock);
 		mark_inode_dirty(inode);
-		return 0;
+		ret = briefs_inode_sync(inode);
+		return ret;
 	}
 
 	pr_debug("briefs: setattr truncate ino=%lu %llu -> %llu\n",
@@ -923,7 +1034,8 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
 		}
 		mutex_unlock(&binfo->extent_lock);
-		return 0;
+		ret = briefs_inode_sync(inode);
+		return ret;
 	}
 
 	trunc_block = (new_size + BRIEFS_BLOCK_SIZE - 1) / BRIEFS_BLOCK_SIZE;
@@ -1040,7 +1152,8 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	}
 
 	mutex_unlock(&binfo->extent_lock);
-	return 0;
+	ret = briefs_inode_sync(inode);
+	return ret;
 
 out_unlock:
 	mutex_unlock(&binfo->extent_lock);
@@ -1063,7 +1176,8 @@ out_copy:
 	binfo->disk_inode.nlinks = inode->i_nlink;
 	briefs_sync_inode_times(inode, &binfo->disk_inode);
 	mark_inode_dirty(inode);
-	return 0;
+	ret = briefs_inode_sync(inode);
+	return ret;
 }
 /* briefs_getattr - get file attributes */
 int briefs_getattr(struct mnt_idmap *idmap, const struct path *path,
@@ -1075,6 +1189,15 @@ int briefs_getattr(struct mnt_idmap *idmap, const struct path *path,
 	u64 i_blocks;
 
 	generic_fillattr(idmap, request_mask, inode, stat);
+	generic_fill_statx_attr(inode, stat);
+
+	if (binfo->disk_inode.user_flags & BRIEFS_USER_FLAG_NODUMP)
+		stat->attributes |= STATX_ATTR_NODUMP;
+	stat->attributes_mask |= STATX_ATTR_NODUMP;
+
+	stat->btime.tv_sec = binfo->disk_inode.creation_time_sec;
+	stat->btime.tv_nsec = binfo->disk_inode.creation_time_nsec;
+	stat->result_mask |= STATX_BTIME;
 
 	/* Inline-data files consume no data blocks. */
 	if (binfo->disk_inode.flags & InodeFlagInlineData) {
@@ -1623,6 +1746,8 @@ out_free:
 	kvfree(old_exts);
 	kvfree(new_exts);
 	inode_unlock(inode);
+	if (ret == 0)
+		ret = briefs_inode_sync(inode);
 	return ret;
 }
 
@@ -1892,6 +2017,8 @@ out_update:
 
 out_unlock:
 	inode_unlock(inode);
+	if (ret == 0)
+		ret = briefs_inode_sync(inode);
 	return ret;
 }
 
@@ -1999,7 +2126,8 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	d_instantiate(dentry, inode);
 
 	pr_debug("briefs: symlink inode %lu -> %s added to dir\n", inode->i_ino, symname);
-	return 0;
+	ret = briefs_inode_sync(dir);
+	return ret;
 }
 /*
  * briefs_mknod - create a special file (block, char, fifo, socket).
@@ -2024,7 +2152,8 @@ int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	d_instantiate(dentry, inode);
 
 	pr_debug("briefs: mknod inode %lu (mode=%o) added to dir\n", inode->i_ino, mode);
-	return 0;
+	ret = briefs_inode_sync(dir);
+	return ret;
 }
 /*
  * briefs_get_link - read the symlink target path.
