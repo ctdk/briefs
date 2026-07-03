@@ -413,7 +413,26 @@ int briefs_fill_super(struct super_block *sb, struct fs_context *fc) {
 	 */
 	sb->s_iflags |= SB_I_CGROUPWB;
 
-	/* Replay journal on mount (unless the user asked to skip it). */
+	/*
+	 * Replay journal on mount (unless the user asked to skip it).
+	 *
+	 * If the underlying block device is read-only and the journal has records
+	 * that need replay, refuse the mount.  A read-only device cannot durably
+	 * write back the metadata buffers that replay mutates, so allowing replay
+	 * would risk inconsistent state.  The caller can use -o norecovery,ro if
+	 * they explicitly want to inspect the filesystem without replay.
+	 */
+	if (!(bsi->mount_flags & BRIEFS_MF_NORECOVERY)) {
+		u64 log_start = le64_to_cpu(bsb->journal_log_start);
+		u64 log_end = le64_to_cpu(bsb->journal_log_end);
+
+		if (log_start != log_end && bdev_read_only(sb->s_bdev)) {
+			pr_err("briefs: cannot mount dirty filesystem on read-only device\n");
+			ret = -EROFS;
+			goto out_no_journal;
+		}
+	}
+
 	if (bsi->mount_flags & BRIEFS_MF_NORECOVERY) {
 		if (!sb_rdonly(sb)) {
 			pr_err("briefs: norecovery requires a read-only mount\n");

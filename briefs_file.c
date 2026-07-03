@@ -149,12 +149,35 @@ int briefs_release(struct inode *inode, struct file *file) {
  * xfs_io prints the (stdout, filtered) fsx fields and emits no error line.
  *
  * FS_IOC_{GET,SET}FLAGS and FS_IOC_FS{GET,SET}XATTR are now handled by the VFS
- * through inode_operations::fileattr_get / fileattr_set, so this stub only
- * needs to reject everything else with -ENOTTY.
+ * through inode_operations::fileattr_get / fileattr_set, so this handler only
+ * needs to answer BRIEFS_IOC_GOINGDOWN and reject everything else with -ENOTTY.
  */
 long briefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	return -ENOTTY;
+	struct inode *inode = file_inode(file);
+	u32 flags;
+	int ret;
+
+	switch (cmd) {
+	case BRIEFS_IOC_GOINGDOWN:
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		if (get_user(flags, (__u32 __user *)arg))
+			return -EFAULT;
+		ret = mnt_want_write_file(file);
+		if (ret) {
+			if (ret != -EROFS)
+				return ret;
+			/* allow idempotent shutdown on already-read-only fs */
+		}
+		ret = briefs_shutdown(inode->i_sb, flags);
+		if (ret != -EROFS)
+			mnt_drop_write_file(file);
+		return ret;
+
+	default:
+		return -ENOTTY;
+	}
 }
 
 /*

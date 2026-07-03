@@ -5,9 +5,17 @@ measured by fresh full-suite and targeted runs on the VM.
 
 ## Overview
 
-**Latest full-suite run:** not yet re-run after the chattr/lsattr implementation
-in commit `38d57d0`; previous run 2026-07-03 (`./check -s briefs -g auto`)
+**Latest full-suite run:** not yet re-run after the shutdown ioctl
+implementation; previous run 2026-07-03 (`./check -s briefs -g auto`)
 recorded 347 pass / 434 not-run / 2 fail.
+
+**Latest targeted shutdown run:** 2026-07-03, core shutdown cluster
+`043 044 045 046 047 048 049 050 051` all passed; extended godown-based
+cluster `388 392 468 474 505 530 536 622 635 646 705` passed. New failures
+in this group are unrelated to the ioctl itself: `417` (xattr EA size issue),
+`599` (dmesg noise), `623` (VM `xfs_io` lacks the `shutdown` command),
+`730`/`737` (other post-shutdown consistency issues, `737` hits a pre-existing
+`fsck.briefs` OOM spin).
 
 **Latest targeted chattr run:** 2026-07-03, `generic/079 277 424 545 553 555
 596 629`, all 8 passed, using the module built from commit `38d57d0` on
@@ -90,14 +98,14 @@ feature or an environment gap — not a stale declaration. Grouped by reason bel
 |-----------------------------------------------------------|----|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Reflink not supported (scratch)                           | 138| 161 164 165 166 167 168 170 171 172 173 174 175 176 183 185 186 187 188 189 190 191 194 195 196 197 199 200 201 202 203 205 206 216 217 218 220 222 227 229 238 242 243 253 254 259 261 262 264 265 266 267 268 271 272 276 278 279 281 282 283 284 287 289 290 291 292 293 295 296 297 298 301 302 305 326 327 328 329 330 331 332 333 334 352 353 356 357 358 359 370 372 373 387 414 415 447 457 458 501 513 514 515 518 540 541 542 543 544 546 562 588 628 648 651 652 653 654 655 657 658 659 660 661 662 663 664 665 666 667 668 669 670 671 672 673 675 702 733 |
 | Reflink not supported (test)                              | 38 | 110 111 115 116 118 119 134 137 138 139 140 142 143 144 145 146 147 148 149 150 151 152 153 154 155 156 157 178 179 180 181 303 407 463 578 612 649 734 |
-| disk quotas not supported                                 | 31 | 082 219 230 231 232 233 234 235 244 270 280 379 380 381 382 383 384 385 386 400 506 566 587 594 600 601 603 681 682 691 762 |
-| briefs does not support shutdown                          | 30 | 042 043 044 045 046 047 048 049 050 051 052 054 055 388 392 417 461 468 474 505 530 536 599 622 635 646 705 730 737 766 |
+| disk quotas not supported                                 | 32 | 055 082 219 230 231 232 233 234 235 244 270 280 379 380 381 382 383 384 385 386 400 506 566 587 594 600 601 603 681 682 691 762 |
+| log state probing not supported                           | 2  | 052 054 |
 | No encryption support (fscrypt)                           | 28 | 368 369 395 396 397 398 399 419 421 429 435 440 548 549 550 580 581 582 583 584 592 593 595 602 613 621 693 739 |
 | xfs_io exchangerange not supported                       | 18 | 709 710 712 713 714 715 716 717 718 719 720 722 723 724 725 726 727 752 |
 | ACLs not supported                                        | 14 | 026 053 077 099 105 237 307 318 319 375 444 449 529 697 |
 | xfs_io fcollapse failed (no COLLAPSE_RANGE)              | 12 | 012 016 017 021 022 031 072 497 499 503 641 687 |
 | fsverity utility required (no fsverity)                   | 11 | 572 573 574 575 576 577 579 624 625 692 788 |
-| xfs_io fzero failed (no ZERO_RANGE)                      | 10 | 008 009 033 096 456 469 511 610 685 758 |
+| xfs_io fzero failed (no ZERO_RANGE)                      | 11 | 008 009 033 042 096 456 469 511 610 685 758 |
 | xfs_io finsert failed (no INSERT_RANGE)                   | 9  | 058 060 061 063 064 404 485 686 735 |
 | Dedupe not supported (test)                              | 8  | 121 122 136 158 182 304 408 516 |
 | Dedupe not supported (scratch)                           | 7  | 162 163 374 493 517 630 674 |
@@ -115,7 +123,8 @@ feature or an environment gap — not a stale declaration. Grouped by reason bel
 | xfs_io fiemap -a failed (no attr-fork fiemap)            | 1  | 425 |
 | xfs_io label failed (no label ioctl)                     | 1  | 492 |
 | cross-device copy_file_range not supported                | 1  | 565 |
-| xfs_io shutdown failed                                   | 1  | 623 |
+| xfs_io shutdown command missing in VM xfs_io             | 1  | 623 | rebuild or install xfsprogs with shutdown support |
+| post-shutdown consistency / fsck stress                  | 4  | 417 599 730 737 | 417=xattr EA issue, 599=dmesg, 730/737=other (737 OOMs fsck.briefs) |
 | requires delayed allocation buffered writes              | 1  | 614 |
 | xfs_io swapext not supported                             | 1  | 711 |
 | xfs_io startupdate not supported                         | 1  | 721 |
@@ -140,7 +149,7 @@ feature or an environment gap — not a stale declaration. Grouped by reason bel
 |-----------------------------------------------------------|----|------------------|----------------------------------------------------------------|
 | lvm utility required                                      | 3  | 081 108 459      | `apt install lvm2` (config-heavy)                             |
 | requires $LOGWRITES_DEV                                   | 4  | 455 470 482 757  | dm-logwrites scratch config                                    |
-| requires $SCRATCH_LOGDEV                                  | 1  | 487              | dm-logwrites config                                            |
+| requires $SCRATCH_LOGDEV                                  | 2  | 487 766          | dm-logwrites config                                            |
 | scratch device too small (<16G)                           | 2  | 781 793          | bigger SCRATCH_DEV loop (≥16G)                                 |
 | requires ≥10GB free on scratch                            | 1  | 038              | bigger scratch                                                 |
 | requires ≥4GB free on test                                | 1  | 694              | bigger TEST_DEV loop (≥8G)                                     |
@@ -211,10 +220,19 @@ feature or an environment gap — not a stale declaration. Grouped by reason bel
 All xattr-gated tests pass with the chained-xattr fix in `29121e6`:
 020, 037, 062, 066, 070, 097, 103, 117, 337, 377, 403, 454, 631.
 
-### xfstests chattr/lsattr cluster (8/8, 2026-07-03)
+### xfstests shutdown cluster (2026-07-03)
 
-All chattr-gated tests pass with the inode-flag implementation in `38d57d0`:
-079, 277, 424, 545, 553, 555, 596, 629.
+The `XFS_IOC_GOINGDOWN` ioctl is now implemented, so `godown`-based shutdown
+tests run. Core cluster `043 044 045 046 047 048 049 050 051` passes.
+Extended godown cluster `388 392 461 468 474 505 530 536 622 635 646 705`
+passes. `050` required a read-only-dirty-journal mount rejection in
+`briefs_fill_super`.
+
+Still gated by other missing features: `042` (fzero), `052 054` (log state),
+`055` (quota), `766` (scratch logdev). Newly-exposed failures: `417` (xattr
+EA size in `multi_open_unlink`), `599` (dmesg noise), `623` (VM `xfs_io`
+lacks the `shutdown` command), `730` (post-shutdown I/O error expectation),
+`737` (fsck.briefs OOM spin after shutdown, pre-existing Go tool issue).
 
 ### Recent fix highlights (this campaign)
 

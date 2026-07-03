@@ -26,7 +26,7 @@
 static int __briefs_journal_write_record_locked(struct briefs_journal *j,
 	enum journal_record_type type, void *data, u32 data_len);
 static int __briefs_journal_checkpoint_locked(struct briefs_journal *j);
-static int __briefs_journal_sync_locked(struct briefs_journal *j);
+static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoint);
 /*
  * Initialize journal from superblock
  */
@@ -326,7 +326,13 @@ int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_ty
                                  void *data, u32 data_len) {
 	int ret;
 	if (!j) return -EINVAL;
+	if (briefs_sb_shutdown(j->vfs_sb))
+		return -EROFS;
 	mutex_lock(&j->write_lock);
+	if (briefs_sb_shutdown(j->vfs_sb)) {
+		mutex_unlock(&j->write_lock);
+		return -EROFS;
+	}
 	ret = __briefs_journal_write_record_locked(j, type, data, data_len);
 	mutex_unlock(&j->write_lock);
 	return ret;
@@ -344,7 +350,7 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 
 	/* Flush any pending records first */
 	if (j->dirty) {
-		int ret = __briefs_journal_sync_locked(j);
+		int ret = __briefs_journal_sync_locked(j, true);
 		if (ret) return ret;
 	}
 
@@ -1932,8 +1938,12 @@ void briefs_journal_cleanup(struct briefs_journal *j) {
 /*
  * Sync dirty journal block to disk
  * Flushes the current block, advances write_pos.
+ *
+ * @checkpoint: when true, a periodic checkpoint may be emitted after the
+ * sync; when false (shutdown LOGFLUSH path), the journal tail is advanced but
+ * log_start is left untouched so replay still runs on the next mount.
  */
-static int __briefs_journal_sync_locked(struct briefs_journal *j) {
+static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoint) {
 	u64 sync_start, sync_end, pos;
 	int ret;
 	bool io_err = false;
@@ -2086,7 +2096,7 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j) {
 	 * the last checkpoint, flush one now.  This prevents the journal
 	 * from growing unbounded between unmounts and limits replay time.
 	 */
-	if (j->records_since_checkpoint >= JRN_CHECKPOINT_INTERVAL) {
+	if (checkpoint && j->records_since_checkpoint >= JRN_CHECKPOINT_INTERVAL) {
 		ret = __briefs_journal_checkpoint_locked(j);
 		if (ret)
 			pr_warn("briefs: periodic checkpoint failed: %d\n", ret);
@@ -2106,7 +2116,22 @@ int briefs_journal_sync(struct briefs_journal *j) {
 	int ret;
 	if (!j) return 0;
 	mutex_lock(&j->write_lock);
-	ret = __briefs_journal_sync_locked(j);
+	ret = __briefs_journal_sync_locked(j, true);
+	mutex_unlock(&j->write_lock);
+	return ret;
+}
+
+/*
+ * Public entry: flush pending journal records to disk without checkpointing.
+ * Used by the shutdown ioctl's LOGFLUSH path so that replay still runs on the
+ * next mount (log_start < log_end) while all pending records are durable.
+ */
+int briefs_journal_sync_no_checkpoint(struct briefs_journal *j)
+{
+	int ret;
+	if (!j) return 0;
+	mutex_lock(&j->write_lock);
+	ret = __briefs_journal_sync_locked(j, false);
 	mutex_unlock(&j->write_lock);
 	return ret;
 }

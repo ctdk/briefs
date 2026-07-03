@@ -941,7 +941,19 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter, u64 cu
 #define BRIEFS_MF_ERRORS_CONT  0x4   /* -o errors=continue */
 #define BRIEFS_MF_ERRORS_PANIC 0x8   /* -o errors=panic */
 #define BRIEFS_MF_ERROR_FS     0x10  /* filesystem has seen a metadata write error */
-#define BRIEFS_MF_SHUTDOWN     0x20  /* filesystem is being/has been shut down due to error */
+#define BRIEFS_MF_SHUTDOWN     0x20  /* filesystem is being/has been shut down */
+
+/* Shutdown ioctl (XFS_IOC_GOINGDOWN / F2FS_IOC_SHUTDOWN) flags. */
+#define BRIEFS_IOC_GOINGDOWN _IOR('X', 125, __u32)
+#ifndef XFS_FSOP_GOING_FLAGS_DEFAULT
+#define XFS_FSOP_GOING_FLAGS_DEFAULT    0x0
+#endif
+#ifndef XFS_FSOP_GOING_FLAGS_LOGFLUSH
+#define XFS_FSOP_GOING_FLAGS_LOGFLUSH 0x1
+#endif
+#ifndef XFS_FSOP_GOING_FLAGS_NOLOGFLUSH
+#define XFS_FSOP_GOING_FLAGS_NOLOGFLUSH 0x2
+#endif
 
 /* Values for the errors= mount option. Default (0) is remount-ro. */
 enum briefs_errors_policy {
@@ -1240,6 +1252,7 @@ struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
 bool briefs_check_meta_write_error(struct buffer_head *bh);
 void briefs_handle_meta_write_error(struct super_block *sb, const char *ctx);
 bool briefs_sb_shutdown(struct super_block *sb);
+int briefs_shutdown(struct super_block *sb, u32 flags);
 const char *briefs_error_policy_name(struct super_block *sb);
 int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
                                const struct briefs_inode *src, bool sync);
@@ -1377,6 +1390,9 @@ int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync);
 int briefs_open(struct inode *inode, struct file *file);
 int briefs_release(struct inode *inode, struct file *file);
 long briefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+
+/* Journal helpers */
+int briefs_journal_sync_no_checkpoint(struct briefs_journal *j);
 
 /* Directory operations */
 int briefs_readdir(struct file *file, struct dir_context *ctx);

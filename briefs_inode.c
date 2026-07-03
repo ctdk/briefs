@@ -104,14 +104,99 @@ bool briefs_check_meta_write_error(struct buffer_head *bh)
 }
 
 /*
- * briefs_sb_shutdown - true if the filesystem has been shut down by a metadata
- * write error under an errors=remount-ro policy.
+ * briefs_sb_shutdown - true if the filesystem has been shut down (by error
+ * path or by an explicit XFS_IOC_GOINGDOWN ioctl).
  */
 bool briefs_sb_shutdown(struct super_block *sb)
 {
 	struct briefs_sb_info *bsi = briefs_sb(sb);
 
 	return bsi && (bsi->mount_flags & BRIEFS_MF_SHUTDOWN);
+}
+
+/*
+ * briefs_force_shutdown - common shutdown transition.
+ *
+ * Sets the shutdown flag and makes the superblock read-only. Idempotent.
+ * Caller must ensure it is safe to touch sb->s_flags (process context, not
+ * inside a transaction-spinlock region).
+ */
+static void briefs_force_shutdown(struct super_block *sb, const char *why)
+{
+	struct briefs_sb_info *bsi = briefs_sb(sb);
+
+	if (!bsi)
+		return;
+
+	if (bsi->mount_flags & BRIEFS_MF_SHUTDOWN)
+		return;
+
+	if (sb_rdonly(sb))
+		goto set_flag;
+
+	bsi->mount_flags |= BRIEFS_MF_SHUTDOWN;
+	pr_crit("briefs: Remounting filesystem read-only due to %s\n", why);
+	sb->s_flags |= SB_RDONLY;
+	return;
+
+set_flag:
+	bsi->mount_flags |= BRIEFS_MF_SHUTDOWN;
+}
+
+/*
+ * briefs_shutdown - handle an explicit XFS_IOC_GOINGDOWN ioctl.
+ *
+ * Implements the three XFS shutdown flags:
+ *   XFS_FSOP_GOING_FLAGS_DEFAULT    (0): freeze bdev, shutdown, thaw
+ *   XFS_FSOP_GOING_FLAGS_LOGFLUSH   (1): flush journal records, then shutdown
+ *   XFS_FSOP_GOING_FLAGS_NOLOGFLUSH (2): shutdown immediately
+ *
+ * LOGFLUSH must flush pending journal records *without* checkpointing, so
+ * tests that expect replay (generic/052) still see log_start < log_end on the
+ * next mount. NOLOGFLUSH/DEFAULT leave the journal as-is and simply stop new
+ * metadata writes.
+ */
+int briefs_shutdown(struct super_block *sb, u32 flags)
+{
+	struct briefs_sb_info *bsi = briefs_sb(sb);
+	int ret = 0;
+
+	if (!bsi)
+		return -EINVAL;
+
+	if (bsi->mount_flags & BRIEFS_MF_SHUTDOWN)
+		return 0;
+
+	switch (flags) {
+	case XFS_FSOP_GOING_FLAGS_DEFAULT:
+		ret = bdev_freeze(sb->s_bdev);
+		if (ret)
+			return ret;
+		briefs_force_shutdown(sb, "explicit shutdown ioctl");
+		bdev_thaw(sb->s_bdev);
+		break;
+
+	case XFS_FSOP_GOING_FLAGS_LOGFLUSH:
+		if (bsi->journal) {
+			ret = briefs_journal_sync_no_checkpoint(bsi->journal);
+			if (ret)
+				return ret;
+			ret = blkdev_issue_flush(sb->s_bdev);
+			if (ret)
+				return ret;
+		}
+		briefs_force_shutdown(sb, "explicit shutdown ioctl (log flush)");
+		break;
+
+	case XFS_FSOP_GOING_FLAGS_NOLOGFLUSH:
+		briefs_force_shutdown(sb, "explicit shutdown ioctl (no log flush)");
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
 }
 
 /*
@@ -159,14 +244,7 @@ void briefs_handle_meta_write_error(struct super_block *sb, const char *ctx)
 	if (sb_rdonly(sb))
 		return;
 
-	bsi->mount_flags |= BRIEFS_MF_SHUTDOWN;
-	pr_crit("briefs: Remounting filesystem read-only due to %s error\n", ctx);
-	/*
-	 * Setting SB_RDONLY directly is the same emergency transition ext4 uses
-	 * in ext4_handle_error(). It does not run the full remount procedure,
-	 * but it blocks all future modifying VFS operations on this superblock.
-	 */
-	sb->s_flags |= SB_RDONLY;
+	briefs_force_shutdown(sb, ctx);
 }
 
 /*
