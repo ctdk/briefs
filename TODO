@@ -11,6 +11,11 @@
 - [Done] Migrate mount path to fs_context so remount works; honor the
   existing "debug" flag (and "nodebug") and checkpoint the journal on
   read-only remount.
+- [Done] chattr/lsattr inode flags (+S/+D/+i/+a/+d/+A), wired through
+  `fileattr_get/set` so both `FS_IOC_{GET,SET}FLAGS` and
+  `FS_IOC_FS{GET,SET}XATTR` work, with +S/+D flushing inode, journal and
+  drive for metadata durability. (Kernel commit `38d57d0`; closes xfstests
+  `generic/079 277 424 545 553 555 596 629`.)
 - Make list of additional relevant mount options to honor, whether fs
   independent or unique to briefs. (Started: norecovery, errors=, debug/nodebug.)
 - [Done] Add norecovery mount option: skip journal replay, require ro mount.
