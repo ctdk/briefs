@@ -58,6 +58,7 @@ Vagrant.configure(2) do |config|
     libvirt.storage_pool_name = 'images'
     libvirt.memory = '4096'
     libvirt.cpus = 2
+    libvirt.cpu_mode = 'host-passthrough'
     libvirt.storage :file, :size => '20G'
     libvirt.storage :file, :size => '30G'
   end
