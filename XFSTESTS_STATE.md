@@ -14,36 +14,43 @@ failing-test notes).
 | Bucket           | Count | Notes                                                    |
 |------------------|------:|----------------------------------------------------------|
 | Selected         |   782 | auto-group tests the suite considered (388 excluded)     |
-| Not run          |   408 | skipped by a `_require_*` gate (verified below)            |
-| Executed         |   374 | selected − not-run                                        |
-| **Pass**         |   363 | executed and matched golden output                       |
-| **Fail**         |    11 | see below; several are env/closable, a few are real bugs |
+| Not run          |   410 | skipped by a `_require_*` gate (verified below)            |
+| Executed         |   372 | selected − not-run                                        |
+| **Pass**         |   365 | executed and matched golden output                       |
+| **Fail**         |     7 | see below                                                |
 | Wedges / oops    |     0 | suite completed, no hangs                                  |
 
-**Tally reading.** xfstests reports "Failed 11 of 782 tests"; the 782 is the
-*selected* count. Executed = 782 − 408 = 374; pass = 374 − 11 = 363.
+**Tally reading.** xfstests reports "Failed 7 of 782 tests"; the 782 is the
+*selected* count. Executed = 782 − 410 = 372; pass = 372 − 7 = 365.
 
-**Of the 11 failures:**
+**Of the 7 failures:**
 
 - `generic/311` — pre-existing baseline flake (dm-flakey/fsync timing).
 - `generic/417` — real BrieFS bug: `multi_open_unlink` fails to create a 512-byte
   EA on a file that has just been unlinked (`ENOENT`), indicating a race/ordering
   issue between xattr creation and unlink in BrieFS.
-- `generic/455`, `generic/482`, `generic/757` — environment: `$LOGWRITES_DEV` /
-  dm-log-writes device is not configured, so log-mark lookups fail.
-- `generic/465`, `generic/133` — environment: scratch/test device too small,
-  test hits `ENOSPC`.
-- `generic/599` — VFS `cleanup_mnt` WARN after a shutdown ioctl, triggered by
-  BrieFS shutdown; dmesg check fails. Needs investigation.
+- `generic/455` — real BrieFS log-writes/replay bug: log-writes device now
+  configured, but replaying to `mark9` produces an md5sum mismatch.
+- `generic/599` — real BrieFS bug: VFS `cleanup_mnt` WARN after a shutdown ioctl,
+  triggered by BrieFS shutdown; dmesg check fails. Needs investigation.
 - `generic/623` — real BrieFS shutdown bug: fsync after shutdown does not
   return `EIO` as the test expects.
-- `generic/730` — environment: `scsi_debug` cleanup/umount issue.
+- `generic/730` — real BrieFS shutdown bug: read after the `scsi_debug` block
+  device is deleted should return `EIO`, but `cat` exits cleanly with no error.
+  Same error-propagation gap as 623.
 - `generic/737` — real BrieFS shutdown/replay bug: a 1 MiB file created with
   `O_SYNC`+`O_DIRECT` is lost after shutdown/remount (`No such file or directory`).
 
-`generic/475`, previously the lone known open bug, **passed** in this run (still
-inherently flaky; log-writes infrastructure now exercises it reliably when
-configured).
+Environment issues resolved after the re-run:
+
+- `generic/133` — passed after `TEST_DEV` image was enlarged to 4 GiB.
+- `generic/465` — passed after `SCRATCH_DEV` image was enlarged to 20 GiB.
+- `generic/482`, `generic/757` — now correctly not-run (`could not locate any FUA
+  write`) after `LOGWRITES_DEV` was configured; BrieFS does not issue FUA writes.
+
+`generic/475`, previously the lone known open bug, **passed** in the original
+full-suite run (still inherently flaky; log-writes infrastructure exercises it
+reliably when configured).
 
 ---
 
@@ -99,34 +106,27 @@ of size 512 ... No such file or directory`. The test opens files, sets EAs, and
 - **Action:** real shutdown/replay bug; investigate direct-I/O + shutdown
   durability.
 
-### generic/133 — ENOSPC on small device
-- **Status:** fail (all pwrite paths return `No space left on device`).
-- **Nature:** test device too small for the aio-dio workload.
-- **Action:** environment; enlarge TEST_DEV or mark as expected not-run.
+### generic/455 — log-writes replay md5 mismatch
+- **Status:** fail (output mismatch); `testfile0.mark9 md5sum mismatched`.
+- **Nature:** with `LOGWRITES_DEV` properly configured (20 GiB backing image),
+  the test runs but replaying the logged writes up to `mark9` does not reproduce
+  the expected file contents. This is the same log-writes / crash-replay
+  consistency family as `generic/475`.
+- **Action:** real BrieFS bug; investigate ordering/durability of journal + data
+  writes under dm-log-writes replay.
 
-### generic/465 — ENOSPC on small scratch device
-- **Status:** fail (`write file failed: No space left on device`).
-- **Nature:** scratch device too small for the aio-dio append-write/read-race
-  test.
-- **Action:** environment; enlarge SCRATCH_DEV.
-
-### generic/455 / generic/482 / generic/757 — LOGWRITES_DEV not configured
-- **Status:** fail (`failed to locate entry mark 'mkfs' / 'last'`).
-- **Nature:** these tests require a dm-log-writes device (`$LOGWRITES_DEV`); the
-  VM run did not set one up.
-- **Action:** environment; configure `LOGWRITES_DEV` to run them. Once
-  configured, 757 is a log-writes stress test and 455/482 exercise the
-  crash-replay infrastructure.
-
-### generic/730 — scsi_debug cleanup issue
-- **Status:** fail (test output empty / umount errors).
-- **Nature:** test uses `scsi_debug`; cleanup leaves mount/umount in a bad state.
-- **Action:** environment / transient; re-run in isolation after ensuring
-  `scsi_debug` is not already loaded.
+### generic/730 — read after device deletion missing EIO
+- **Status:** fail (output mismatch); expected `cat: -: Input/output error`, got
+  no error.
+- **Root cause:** after deleting the `scsi_debug` device under a mounted BrieFS
+  filesystem with an open read fd, BrieFS does not propagate `EIO` to the read.
+  Same shutdown/error-propagation gap as `generic/623`.
+- **Action:** real BrieFS bug; wire device-error/shutdown error propagation into
+  read path.
 
 ---
 
-## Not-run tests (408)
+## Not-run tests (410)
 
 Every not-run is gated by a `_require_*` probe that actually exercises the
 filesystem or the VM environment, so a not-run is a genuine unimplemented
@@ -187,6 +187,7 @@ from the run were read and grouped; all gates are legitimate.
 | fanotify ioerrors not supported                           | 1 | 791 |
 | FSTRIM not supported                                      | 1 | 537 |
 | file_getattr not supported for regular files on briefs    | 1 | 772 |
+| could not locate any FUA write                            | 2 | 482 757 |
 
 > **Note on chattr/lsattr.** `generic/079 277 424 545 553 555 596 629` are now
 > passing after the inode-flag implementation. The remaining chattr-related
@@ -200,7 +201,8 @@ from the run were read and grouped; all gates are legitimate.
 
 | Reason (gate text)                                        | N  | Tests            | Fix                                                            |
 |-----------------------------------------------------------|----:|------------------|----------------------------------------------------------------|
-| requires $LOGWRITES_DEV / dm-log-writes                   | 4  | 455 470 482 757  | configure dm-log-writes scratch device                         |
+| requires $LOGWRITES_DEV / dm-log-writes                   | 1  | 470              | configure dm-log-writes scratch device; 455 now runs and fails |
+| BrieFS issues no FUA writes                               | 2  | 482 757          | genuine missing feature; cannot run these log-writes tests     |
 | requires $SCRATCH_LOGDEV                                  | 2  | 487 766          | configure dm-log-writes config                                  |
 | scratch device too small (<16G / <4G)                       | 3  | 620 781 793      | bigger SCRATCH_DEV loop (≥16G)                                  |
 | Scratch device too small / Test device too small            | 9  | 256 273 274 275 312 320 747 213 256 | resize loops |
@@ -220,7 +222,7 @@ from the run were read and grouped; all gates are legitimate.
 
 ---
 
-## Passing tests (363)
+## Passing tests (365)
 
 ```
 001  002  003  005  006  007  011  013
@@ -234,41 +236,41 @@ from the run were read and grouped; all gates are legitimate.
 094  095  097  098  100  101  102  103
 104  106  107  108  109  112  113  114
 117  120  123  124  125  126  127  128
-129  130  131  132  135  141  169  177
-184  192  193  198  204  207  208  209
-210  211  212  214  215  221  224  225
-226  228  236  239  240  241  245  246
-247  248  249  250  252  255  257  258
-263  269  277  285  286  294  299  300
-306  308  309  310  313  314  315  316
-317  321  322  323  325  335  336  337
-338  339  340  341  342  343  344  345
-346  347  348  354  355  360  361  362
-363  364  366  371  376  377  378  390
-391  392  393  394  401  403  405  406
-409  410  411  412  416  418  420  422
-423  424  426  427  428  430  431  432
-433  434  436  437  438  439  441  443
-445  446  448  450  451  452  453  454
-459  461  464  466  467  468  471  472
-474  475  476  477  478  479  480  481
-483  484  486  488  489  490  491  494
-495  496  498  502  504  505  507  508
-510  512  519  520  523  524  525  526
-527  528  530  532  533  534  535  536
-538  539  545  547  551  552  553  554
-555  557  558  563  564  567  568  569
-571  585  586  589  591  596  597  598
-604  609  611  615  616  617  618  619
-622  626  627  629  631  632  633  634
-635  636  637  638  639  640  642  643
-646  647  650  676  677  678  679  680
-683  684  688  690  695  696  703  704
-705  706  707  708  728  729  731  732
-736  738  740  741  742  743  748  749
-750  751  753  754  755  756  759  760
-761  763  764  771  779  782  784  785
-789  790  792
+129  130  131  132  133  135  141  169
+177  184  192  193  198  204  207  208
+209  210  211  212  214  215  221  224
+225  226  228  236  239  240  241  245
+246  247  248  249  250  252  255  257
+258  263  269  277  285  286  294  299
+300  306  308  309  310  313  314  315
+316  317  321  322  323  325  335  336
+337  338  339  340  341  342  343  344
+345  346  347  348  354  355  360  361
+362  363  364  366  371  376  377  378
+390  391  392  393  394  401  403  405
+406  409  410  411  412  416  418  420
+422  423  424  426  427  428  430  431
+432  433  434  436  437  438  439  441
+443  445  446  448  450  451  452  453
+454  459  461  464  465  466  467  468
+471  472  474  475  476  477  478  479
+480  481  483  484  486  488  489  490
+491  494  495  496  498  502  504  505
+507  508  510  512  519  520  523  524
+525  526  527  528  530  532  533  534
+535  536  538  539  545  547  551  552
+553  554  555  557  558  563  564  567
+568  569  571  585  586  589  591  596
+597  598  604  609  611  615  616  617
+618  619  622  626  627  629  631  632
+633  634  635  636  637  638  639  640
+642  643  646  647  650  676  677  678
+679  680  683  684  688  690  695  696
+703  704  705  706  707  708  728  729
+731  732  736  738  740  741  742  743
+748  749  750  751  753  754  755  756
+759  760  761  763  764  771  779  782
+784  785  789  790  792
 ```
 
 ### xfstests xattr cluster (13/13, 2026-07-02)
@@ -285,9 +287,11 @@ Extended godown cluster `392 461 468 474 505 530 536 622 635 646 705` passes.
 
 `generic/388` is excluded from the full suite because it wedges. Newly-exposed
 shutdown-related failures: `417` (xattr EA race), `599` (VFS cleanup_mnt WARN),
-`623` (fsync after shutdown missing EIO), `730` (scsi_debug env), `737`
-(file lost after O_DIRECT+shutdown). Environment failures: `455 482 757`
-(LOGWRITES_DEV not set), `133 465` (ENOSPC).
+`623` (fsync after shutdown missing EIO), `730` (read after device delete
+missing EIO), `737` (file lost after O_DIRECT+shutdown). With `LOGWRITES_DEV`
+now configured, `455` reveals a real log-writes replay md5 mismatch; `482` and
+`757` are correctly not-run because BrieFS does not issue FUA writes. Size
+failures `133` and `465` passed after enlarging the loop images.
 
 ### Recent fix highlights (this campaign)
 
@@ -333,10 +337,12 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | 079 277 424 545 553 555 596 629 | 38d57d0  | chattr/lsattr inode flags (+S/+D/+i/+a/+d/+A)                |
 | 475                           | —        | dm-error crash-replay: passed this run, still flaky/deferred   |
 
-> Open BrieFS code bugs after this run: `417` (xattr/unlink race), `599`
-> (shutdown VFS cleanup WARN), `623` (fsync after shutdown missing EIO), `737`
-> (O_DIRECT file lost after shutdown), and the excluded `388` shutdown/replay
-> wedge. `generic/475` passed in this run but remains a known deferred bug.
+> Open BrieFS code bugs after this run: `417` (xattr/unlink race), `455`
+> (log-writes replay md5 mismatch), `599` (shutdown VFS cleanup WARN), `623`
+> (fsync after shutdown missing EIO), `730` (read after device delete missing
+> EIO), `737` (O_DIRECT file lost after shutdown), and the excluded `388`
+> shutdown/replay wedge. `generic/475` passed in the original run but remains a
+> known deferred bug in the same crash-replay family.
 
 ---
 
@@ -345,8 +351,16 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 - Full suite `./check -g auto -X .exclude` on the VM (2026-07-04), kernel
   `6.12.94+deb13-amd64`, branch `even-more-xfstests`. `generic/388` excluded
   via `/xfstests/tests/generic/.exclude`.
+- Post-run fixes applied on the VM: `TEST_DEV` (`/var/tmp/test.img`) enlarged to
+  4 GiB, `SCRATCH_DEV` (`/var/tmp/scratch.img`) and `LOGWRITES_DEV`
+  (`/var/tmp/logwrites.img`) enlarged to 20 GiB. `LOGWRITES_DEV` is a raw loop
+  device; logwrites tests create their own `/dev/mapper/logwrites-test` dm target
+  on top of `SCRATCH_DEV`.
+- Re-run results: `generic/133` and `generic/465` pass; `generic/482` and
+  `generic/757` become correctly not-run (`could not locate any FUA write`);
+  `generic/455` runs and fails with a log-writes replay md5 mismatch.
 - Pass/Fail/Not-run lists derived from the final `Ran:` / `Not run:` / `Failures:`
-  block in `/xfstests/results/check.log`.
+  block in `/xfstests/results/check.log` plus the targeted re-runs.
 - Not-run reasons read from each test's `.notrun` artifact in
   `/xfstests/results/generic/` and grouped.
 - Failing-test details inspected from `.out.bad`, `.full`, and `.dmesg` files.
