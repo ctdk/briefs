@@ -338,6 +338,13 @@ int briefs_fill_super(struct super_block *sb, struct fs_context *fc) {
 	bsi->sb_bh = bh;
 	bsi->sb = bsb;
 
+	/* Initialize per-inode-block RMW locks before any inode mutation. */
+	{
+		int i;
+		for (i = 0; i < BRIEFS_INODE_BLOCK_LOCKS; i++)
+			mutex_init(&bsi->inode_block_locks[i]);
+	}
+
 	/* Initialize data block allocator */
 	ret = briefs_alloc_init(&bsi->alloc, sb, bsb);
 	if (ret) {

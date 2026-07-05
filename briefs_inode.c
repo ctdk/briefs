@@ -257,10 +257,21 @@ int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
 {
 	struct briefs_disk_inode *di;
 	struct buffer_head *bh;
+	struct mutex *block_lock = briefs_inode_block_lock(sb, ino);
+	int ret = 0;
+
+	/*
+	 * Serialize with write_inode() and other persist_disk_inode() callers on
+	 * the same shared 4K inode block.  briefs_write_inode() snapshots and copies
+	 * back a private inode copy; overlapping RMW cycles must not interleave.
+	 */
+	mutex_lock(block_lock);
 
 	bh = briefs_read_inode_block(sb, ino, &di);
-	if (IS_ERR(bh))
-		return PTR_ERR(bh);
+	if (IS_ERR(bh)) {
+		ret = PTR_ERR(bh);
+		goto out_unlock;
+	}
 
 	/*
 	 * Hold the buffer lock across the modify+mark so a concurrent writeback
@@ -273,8 +284,8 @@ int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
 	if (!buffer_uptodate(bh)) {
 		unlock_buffer(bh);
 		briefs_check_meta_write_error(bh);
-		brelse(bh);
-		return -EIO;
+		ret = -EIO;
+		goto out_release;
 	}
 	briefs_cpu_inode_to_disk(src, di);
 	mark_buffer_dirty(bh);
@@ -284,11 +295,15 @@ int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
 		sync_dirty_buffer(bh);
 	if (briefs_check_meta_write_error(bh)) {
 		briefs_handle_meta_write_error(sb, "persist disk inode");
-		brelse(bh);
-		return -EIO;
+		ret = -EIO;
+		goto out_release;
 	}
+
+out_release:
 	brelse(bh);
-	return 0;
+out_unlock:
+	mutex_unlock(block_lock);
+	return ret;
 }
 
 /*
@@ -630,27 +645,42 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	struct briefs_inode_info *binfo;
 	struct briefs_disk_inode *disk_inode, local_di;
 	struct buffer_head *bh;
+	struct mutex *block_lock;
 	unsigned seq;
+	int ret = 0;
 
 	if (!inode)
 		return -EINVAL;
 
 	bsi = inode->i_sb->s_fs_info;
 	binfo = briefs_i(inode);
+	block_lock = briefs_inode_block_lock(inode->i_sb, inode->i_ino);
 
 	pr_debug("briefs: write_inode %lu\n", inode->i_ino);
 
+	/*
+	 * Serialize read-modify-write cycles on the shared 4K inode block.
+	 * BrieFS packs 8 inodes per block; without this serialization a writer
+	 * that copies back its private snapshot between another writer's snapshot
+	 * and copy-back can overwrite that sibling inode's slot, losing its size
+	 * or extent updates (generic/048 sync+shutdown size bug).  The buffer
+	 * lock alone cannot cover the whole RMW because journaling may trigger a
+	 * checkpoint that calls sync_blockdev() and would deadlock waiting on
+	 * the locked buffer.
+	 */
+	mutex_lock(block_lock);
+
 	bh = briefs_read_inode_block(inode->i_sb, inode->i_ino, &disk_inode);
-	if (IS_ERR(bh))
-		return PTR_ERR(bh);
+	if (IS_ERR(bh)) {
+		ret = PTR_ERR(bh);
+		goto out_unlock;
+	}
 
 	/*
 	 * Snapshot the current on-disk inode slot under the buffer lock.  The
-	 * 4K inode block is shared by multiple inodes, and writeback of the block
-	 * can be submitted while we are preparing our update.  Working on a
-	 * private copy prevents a concurrent writeback from capturing a
-	 * partially-modified buffer (generic/048 sync+shutdown size bug) and also
-	 * protects the other inodes' slots from being overwritten by a stale view.
+	 * shared block can have writeback submitted while we prepare our update;
+	 * working on a private copy prevents a concurrent writeback from capturing
+	 * a partially-modified buffer.
 	 */
 	lock_buffer(bh);
 	if (!buffer_uptodate(bh)) {
@@ -658,8 +688,8 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 		briefs_check_meta_write_error(bh);
 		briefs_handle_meta_write_error(inode->i_sb, "write inode");
 		mapping_set_error(inode->i_mapping, -EIO);
-		brelse(bh);
-		return -EIO;
+		ret = -EIO;
+		goto out_release;
 	}
 	memcpy(&local_di, disk_inode, sizeof(local_di));
 	unlock_buffer(bh);
@@ -722,15 +752,18 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 		briefs_check_meta_write_error(bh);
 		briefs_handle_meta_write_error(inode->i_sb, "write inode");
 		mapping_set_error(inode->i_mapping, -EIO);
-		brelse(bh);
-		return -EIO;
+		ret = -EIO;
+		goto out_release;
 	}
 	memcpy(disk_inode, &local_di, sizeof(local_di));
 	mark_buffer_dirty(bh);
 	unlock_buffer(bh);
-	brelse(bh);
 
-	return 0;
+out_release:
+	brelse(bh);
+out_unlock:
+	mutex_unlock(block_lock);
+	return ret;
 }
 /* briefs_alloc_inode - allocate a VFS inode (called by VFS inode cache) */
 struct inode *briefs_alloc_vfs_inode(struct super_block *sb) {

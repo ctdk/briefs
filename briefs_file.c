@@ -468,6 +468,7 @@ static ssize_t briefs_iomap_buffered_write(struct kiocb *iocb,
 					    struct iov_iter *from)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
+	loff_t old_size;
 	ssize_t ret;
 
 	inode_lock(inode);
@@ -496,8 +497,18 @@ static ssize_t briefs_iomap_buffered_write(struct kiocb *iocb,
 	ret = file_update_time(iocb->ki_filp);
 	if (ret)
 		goto out_unlock;
+	old_size = i_size_read(inode);
 	ret = iomap_file_buffered_write(iocb, from, &briefs_write_iomap_ops,
 					 NULL);
+	/*
+	 * iomap_file_buffered_write grows i_size but does not always mark the
+	 * inode dirty (e.g., when the write lands in an already-allocated run and
+	 * file_update_time decided no cmtime update was needed).  If the write
+	 * extended the file, force a dirty so briefs_write_inode() will persist
+	 * the new size for sync+shutdown durability (generic/048).
+	 */
+	if (ret > 0 && i_size_read(inode) > old_size)
+		mark_inode_dirty(inode);
 out_unlock:
 	inode_unlock(inode);
 	if (ret > 0)

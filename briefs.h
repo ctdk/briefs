@@ -32,6 +32,7 @@
 #define BRIEFS_INODE_INLINE_DATA_SIZE 256
 #define BRIEFS_NAME_LEN 255
 #define BRIEFS_DELALLOC_RUN_MAX 256	/* max blocks per coalesced write run */
+#define BRIEFS_INODE_BLOCK_LOCKS 64	/* hash buckets for inode-block RMW locks */
 
 /* Semantic versioning, yo */
 #define _BRIEFS_MAJOR_VER 0
@@ -1002,6 +1003,7 @@ struct briefs_sb_info {
 	struct dentry *debugfs_dir;     /* per-sb debugfs dir, NULL unless -o debug */
 	struct kobject s_kobj;          /* per-sb sysfs kobject, embedded in bsi */
 	u64 mount_jiffies;              /* time of mount, for debugfs/sysfs/proc */
+	struct mutex inode_block_locks[BRIEFS_INODE_BLOCK_LOCKS]; /* serialize RMW on shared inode blocks */
 };
 
 /* briefs_inode_info - our inode info */
@@ -1039,6 +1041,20 @@ static inline struct briefs_sb_info *briefs_sb(struct super_block *sb) {
 
 static inline struct briefs_inode_info *briefs_i(struct inode *inode) {
 	return container_of(inode, struct briefs_inode_info, vfs_inode);
+}
+
+/*
+ * Return the mutex that serializes read-modify-write cycles on the inode block
+ * holding @ino.  BrieFS packs 8 inodes per 4K block; concurrent writeback of
+ * different inodes in the same block must not interleave or the copy-back can
+ * overwrite a sibling inode's slot (generic/048 sync+shutdown size bug).
+ */
+static inline struct mutex *briefs_inode_block_lock(struct super_block *sb,
+                                                    u64 ino)
+{
+	struct briefs_sb_info *bsi = briefs_sb(sb);
+	u64 block = (ino - 1) / (sb->s_blocksize / BRIEFS_INODE_SIZE);
+	return &bsi->inode_block_locks[block % BRIEFS_INODE_BLOCK_LOCKS];
 }
 
 /* Convert data-relative block to absolute block number */
