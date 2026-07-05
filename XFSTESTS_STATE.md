@@ -16,19 +16,16 @@ failing-test notes).
 | Selected         |   782 | auto-group tests the suite considered (388 excluded)     |
 | Not run          |   398 | skipped by a `_require_*` gate (verified below)            |
 | Executed         |   384 | selected − not-run                                        |
-| **Pass**         |   375 | executed and matched golden output                       |
-| **Fail**         |     9 | see below                                                |
+| **Pass**         |   376 | executed and matched golden output                       |
+| **Fail**         |     8 | see below                                                |
 | Wedges / oops    |     0 | suite completed; `generic/127` had to be killed manually   |
 
-**Tally reading.** xfstests reports "Failed 9 of 782 tests"; the 782 is the
-*selected* count. Executed = 782 − 398 = 384; pass = 384 − 9 = 375.
+**Tally reading.** xfstests reports "Failed 8 of 782 tests"; the 782 is the
+*selected* count. Executed = 782 − 398 = 384; pass = 384 − 8 = 376.
 
-**Of the 9 failures:**
+**Of the 8 failures:**
 
 - `generic/311` — pre-existing baseline flake (dm-flakey/fsync timing).
-- `generic/048` — real BrieFS bug: after sync+shutdown, files 919 and 922 have
-  incorrect size (10 MB not persisted); first-time failure in this run now that
-  scratch device is large enough for the test to execute.
 - `generic/127` — real BrieFS hang: mmap+fsx children enter D-state for >20 min;
   the test was manually killed so the suite could continue. Same mmap/writeback
   deadlock family as earlier observations.
@@ -51,8 +48,8 @@ failing-test notes).
 Environment issues resolved after the re-run:
 
 - `generic/038` — now runs and passes after `SCRATCH_DEV` was enlarged to 20 GiB.
-- `generic/048` — now runs (was gated by ≥10 GB free space) and fails with the
-  sync/shutdown size bug above.
+- `generic/048` — now runs (was gated by ≥10 GB free space) and passes after the
+  sync/shutdown size fix.
 - `generic/133` — passed after `TEST_DEV` image was enlarged to 4 GiB.
 - `generic/256`, `273`, `274`, `275`, `312`, `320`, `620`, `747` — now run and
   pass with the enlarged scratch/test loop devices.
@@ -80,16 +77,23 @@ reliably when configured).
 
 ---
 
-## Failing tests (9)
+## Failing tests (8)
 
 ### generic/048 — file size not persisted after sync+shutdown
-- **Status:** fail (output mismatch), newly exposed now that scratch is large enough.
-- **Root cause:** the test creates 999 files of 10 MiB, calls `_scratch_sync`,
-  then `_scratch_shutdown`, remounts, and checks every file. Files 919 and 922
-  report `has incorrect size - sync failed`. Either `sync(2)` is not flushing
-  BrieFS dirty data/sizes to disk, or the shutdown path is discarding buffered
-  state that should have been written.
-- **Action:** real BrieFS bug; investigate sync → writeback → shutdown ordering.
+- **Status:** **fixed** (`62167fa`); was fail (output mismatch), newly exposed now
+  that scratch is large enough.
+- **Root cause:** `iomap_file_buffered_write()` updates `i_size` itself but does
+  not always dirty the inode, so `sync_inodes_sb()` did not write the final
+  size before `XFS_IOC_GOINGDOWN` made the FS read-only. A second, smaller race
+  was concurrent read-modify-write of the same inode-table block from sibling
+  inodes; the copy-back could overwrite another slot that had been updated in
+  the meantime.
+- **Fix:** unconditionally `mark_inode_dirty()` in `briefs_iomap_buffered_write()`
+  when `i_size` grew, and add per-inode-block mutex serialization around the
+  snapshot/prepare/journal/copy-back in `briefs_write_inode()` and
+  `briefs_persist_disk_inode()`.
+- **Verification:** 30/30 standalone passes and 20/20 `dd` reproducer passes;
+  `generic/030–099` shutdown cluster clean.
 
 ### generic/127 — mmap+fsx D-state hang
 - **Status:** fail (suite killed the fsx children after they hung >20 min).
@@ -259,7 +263,7 @@ from the run were read and grouped; all gates are legitimate.
 001  002  003  005  006  007  011  013
 014  015  020  023  024  025  027  028
 029  030  032  034  035  036  037  039
-040  041  043  044  045  046  047  049
+040  041  043  044  045  046  047  048  049
 050  051  056  057  059  062  065  066
 067  068  069  070  071  073  074  075
 076  078  079  080  081  083  084  085
@@ -322,9 +326,8 @@ Extended godown cluster `392 461 468 474 505 530 536 622 635 646 705` passes.
 Newly-exposed shutdown-related failures:
 `417` (xattr EA race), `599` (VFS cleanup_mnt WARN), `623` (fsync after shutdown
 missing EIO), `730` (read after device delete missing EIO), `737` (file lost
-after O_DIRECT+shutdown), plus `048` (sync+shutdown size bug) and `127`
-(mmap+fsx D-state hang). `generic/388` is excluded from the full suite because
-it wedges.
+after O_DIRECT+shutdown), and `127` (mmap+fsx D-state hang). `generic/388` is
+excluded from the full suite because it wedges.
 
 With `LOGWRITES_DEV` now configured, `455` reveals a real log-writes replay md5
 mismatch; `482` and `757` are correctly not-run because BrieFS does not issue FUA
@@ -373,12 +376,13 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | 177                           | —        | env (gawk installed)                                          |
 | 079 277 424 545 553 555 596 629 | 38d57d0  | chattr/lsattr inode flags (+S/+D/+i/+a/+d/+A)                |
 | 475                           | —        | dm-error crash-replay: passed this run, still flaky/deferred   |
+| 048                           | 62167fa  | sync+shutdown file size bug (inode dirty on i_size growth + inode-block RMW lock) |
 
-> Open BrieFS code bugs after this run: `048` (sync+shutdown size bug), `127`
-> (mmap+fsx D-state hang), `417` (xattr/unlink race), `455` (log-writes replay
-> md5 mismatch), `599` (shutdown VFS cleanup WARN), `623` (fsync after shutdown
-> missing EIO), `730` (read after device delete missing EIO), `737` (O_DIRECT
-> file lost after shutdown), and the excluded `388` shutdown/replay wedge.
+> Open BrieFS code bugs after this run: `127` (mmap+fsx D-state hang), `417`
+> (xattr/unlink race), `455` (log-writes replay md5 mismatch), `599` (shutdown
+> VFS cleanup WARN), `623` (fsync after shutdown missing EIO), `730` (read after
+> device delete missing EIO), `737` (O_DIRECT file lost after shutdown), and the
+> excluded `388` shutdown/replay wedge.
 > `generic/311` is a pre-existing baseline flake. `generic/475` passed in this run
 > but remains a known deferred bug in the same crash-replay family.
 
@@ -394,11 +398,10 @@ A large cluster of previously-failing tests now passes. Notable fixes:
   (`/var/tmp/logwrites.img`) enlarged to 20 GiB. `LOGWRITES_DEV` is a raw loop
   device; logwrites tests create their own `/dev/mapper/logwrites-test` dm target
   on top of `SCRATCH_DEV`.
-- Results: `generic/038`, `256`, `273–275`, `312`, `320`, `620`, `747` now run
-  and pass; `generic/048` now runs and fails; `generic/133` and `generic/465`
-  pass; `generic/482` and `generic/757` become correctly not-run (`could not
-  locate any FUA write`); `generic/455` runs and fails with a log-writes replay
-  md5 mismatch.
+- Results: `generic/038`, `048`, `256`, `273–275`, `312`, `320`, `620`, `747`
+  now run and pass; `generic/133` and `generic/465` pass; `generic/482` and
+  `generic/757` become correctly not-run (`could not locate any FUA write`);
+  `generic/455` runs and fails with a log-writes replay md5 mismatch.
 - Pass/Fail/Not-run lists derived from the final `Ran:` / `Not run:` / `Failures:`
   block in `/xfstests/results/check.log` plus the targeted re-runs.
 - Not-run reasons read from each test's `.notrun` artifact in
