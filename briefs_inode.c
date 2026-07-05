@@ -262,13 +262,12 @@ int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
 	if (IS_ERR(bh))
 		return PTR_ERR(bh);
 
-	briefs_cpu_inode_to_disk(src, di);
-
 	/*
-	 * Same shared-block writeback race as briefs_write_inode(): a concurrent
-	 * writeback of this inode block may fail on a dying device and clear
-	 * BH_Uptodate before we mark dirty.  Lock the buffer, wait for any in-flight
-	 * write, and propagate -EIO rather than re-dirtying a broken buffer.
+	 * Hold the buffer lock across the modify+mark so a concurrent writeback
+	 * of this shared 4K inode block cannot submit the buffer with partially
+	 * modified contents.  Also catches a failed in-flight writeback
+	 * (BH_Uptodate cleared, e.g. generic/753) and propagates -EIO instead of
+	 * re-dirtying a broken buffer.
 	 */
 	lock_buffer(bh);
 	if (!buffer_uptodate(bh)) {
@@ -277,6 +276,7 @@ int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
 		brelse(bh);
 		return -EIO;
 	}
+	briefs_cpu_inode_to_disk(src, di);
 	mark_buffer_dirty(bh);
 	unlock_buffer(bh);
 
@@ -628,7 +628,7 @@ int briefs_finish_create(struct inode *dir, struct dentry *dentry,
 int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	struct briefs_sb_info *bsi;
 	struct briefs_inode_info *binfo;
-	struct briefs_disk_inode *disk_inode;
+	struct briefs_disk_inode *disk_inode, local_di;
 	struct buffer_head *bh;
 	unsigned seq;
 
@@ -644,25 +644,45 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	if (IS_ERR(bh))
 		return PTR_ERR(bh);
 
+	/*
+	 * Snapshot the current on-disk inode slot under the buffer lock.  The
+	 * 4K inode block is shared by multiple inodes, and writeback of the block
+	 * can be submitted while we are preparing our update.  Working on a
+	 * private copy prevents a concurrent writeback from capturing a
+	 * partially-modified buffer (generic/048 sync+shutdown size bug) and also
+	 * protects the other inodes' slots from being overwritten by a stale view.
+	 */
+	lock_buffer(bh);
+	if (!buffer_uptodate(bh)) {
+		unlock_buffer(bh);
+		briefs_check_meta_write_error(bh);
+		briefs_handle_meta_write_error(inode->i_sb, "write inode");
+		mapping_set_error(inode->i_mapping, -EIO);
+		brelse(bh);
+		return -EIO;
+	}
+	memcpy(&local_di, disk_inode, sizeof(local_di));
+	unlock_buffer(bh);
+
 	/* Sync VFS timestamp and size fields into in-memory copy first */
 	briefs_sync_inode_times(inode, &binfo->disk_inode);
 	binfo->disk_inode.filesize = inode->i_size;
 
 	/*
-	 * Copy in-memory disk_inode to the on-disk buffer, converting to
+	 * Copy in-memory disk_inode to the local on-disk copy, converting to
 	 * little endian. Use a seqcount retry loop to ensure we don't persist
 	 * a partially-updated extent list if briefs_append_extent or another
 	 * extent writer is in progress concurrently.
 	 */
 	do {
 		seq = read_seqcount_begin(&binfo->extent_seq);
-		briefs_cpu_inode_to_disk(&binfo->disk_inode, disk_inode);
+		briefs_cpu_inode_to_disk(&binfo->disk_inode, &local_di);
 		/* Update VFS-derived fields after the copy */
-		disk_inode->filemode = cpu_to_le32(inode->i_mode);
-		disk_inode->uid = cpu_to_le32(from_kuid(&init_user_ns, inode->i_uid));
-		disk_inode->gid = cpu_to_le32(from_kgid(&init_user_ns, inode->i_gid));
-		disk_inode->filesize = cpu_to_le64(inode->i_size);
-		disk_inode->nlinks = cpu_to_le32(inode->i_nlink);
+		local_di.filemode = cpu_to_le32(inode->i_mode);
+		local_di.uid = cpu_to_le32(from_kuid(&init_user_ns, inode->i_uid));
+		local_di.gid = cpu_to_le32(from_kgid(&init_user_ns, inode->i_gid));
+		local_di.filesize = cpu_to_le64(inode->i_size);
+		local_di.nlinks = cpu_to_le32(inode->i_nlink);
 	} while (read_seqcount_retry(&binfo->extent_seq, seq));
 
 	/* Mirror the VFS-derived fields back into the in-memory disk inode so
@@ -684,19 +704,17 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	 * This captures extent metadata, timestamps, mode, nlink, and the
 	 * trie root in a single record.
 	 */
-	briefs_journal_inode_full(bsi->journal, inode->i_ino, disk_inode);
+	briefs_journal_inode_full(bsi->journal, inode->i_ino, &local_di);
 
 	/*
-	 * A concurrent writeback of this shared 4K inode block may have been
-	 * submitted while we prepared this update (the buffer can carry several
-	 * inodes).  On a failing device (dm-error sudden death, generic/753) that
-	 * writeback completes EIO and end_buffer_async_write() clears BH_Uptodate.
-	 * Re-dirtying the now-!uptodate buffer would trip
-	 * WARN_ON_ONCE(!buffer_uptodate) in mark_buffer_dirty().  Take the buffer
-	 * lock so no new writeback can be submitted, wait for any write already
-	 * in flight, and if it failed propagate -EIO instead of re-dirtying a
-	 * broken buffer.  The journal record above preserves the change for
-	 * replay; writeback retries once the device recovers.
+	 * Copy the finalized local snapshot into the shared buffer and re-dirty
+	 * it.  Re-take the buffer lock so no new writeback of the block can be
+	 * submitted between the copy and mark_buffer_dirty(), and so we can detect
+	 * a concurrent failed writeback (end_buffer_async_write() cleared
+	 * BH_Uptodate, e.g. generic/753 dm-error sudden death).  If the buffer is
+	 * !uptodate, propagate -EIO instead of re-dirtying a broken buffer; the
+	 * journal record above preserves the change for replay, and writeback
+	 * retries once the device recovers.
 	 */
 	lock_buffer(bh);
 	if (!buffer_uptodate(bh)) {
@@ -707,6 +725,7 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 		brelse(bh);
 		return -EIO;
 	}
+	memcpy(disk_inode, &local_di, sizeof(local_di));
 	mark_buffer_dirty(bh);
 	unlock_buffer(bh);
 	brelse(bh);
