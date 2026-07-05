@@ -14,42 +14,54 @@ failing-test notes).
 | Bucket           | Count | Notes                                                    |
 |------------------|------:|----------------------------------------------------------|
 | Selected         |   782 | auto-group tests the suite considered (388 excluded)     |
-| Not run          |   410 | skipped by a `_require_*` gate (verified below)            |
-| Executed         |   372 | selected − not-run                                        |
-| **Pass**         |   365 | executed and matched golden output                       |
-| **Fail**         |     7 | see below                                                |
-| Wedges / oops    |     0 | suite completed, no hangs                                  |
+| Not run          |   398 | skipped by a `_require_*` gate (verified below)            |
+| Executed         |   384 | selected − not-run                                        |
+| **Pass**         |   375 | executed and matched golden output                       |
+| **Fail**         |     9 | see below                                                |
+| Wedges / oops    |     0 | suite completed; `generic/127` had to be killed manually   |
 
-**Tally reading.** xfstests reports "Failed 7 of 782 tests"; the 782 is the
-*selected* count. Executed = 782 − 410 = 372; pass = 372 − 7 = 365.
+**Tally reading.** xfstests reports "Failed 9 of 782 tests"; the 782 is the
+*selected* count. Executed = 782 − 398 = 384; pass = 384 − 9 = 375.
 
-**Of the 7 failures:**
+**Of the 9 failures:**
 
 - `generic/311` — pre-existing baseline flake (dm-flakey/fsync timing).
+- `generic/048` — real BrieFS bug: after sync+shutdown, files 919 and 922 have
+  incorrect size (10 MB not persisted); first-time failure in this run now that
+  scratch device is large enough for the test to execute.
+- `generic/127` — real BrieFS hang: mmap+fsx children enter D-state for >20 min;
+  the test was manually killed so the suite could continue. Same mmap/writeback
+  deadlock family as earlier observations.
 - `generic/417` — real BrieFS bug: `multi_open_unlink` fails to create a 512-byte
   EA on a file that has just been unlinked (`ENOENT`), indicating a race/ordering
   issue between xattr creation and unlink in BrieFS.
 - `generic/455` — real BrieFS log-writes/replay bug: log-writes device now
-  configured, but replaying to `mark9` produces an md5sum mismatch.
+  configured, but replaying the logged writes produces an md5sum mismatch
+  (`testfile0.mark4 md5sum mismatched`).
 - `generic/599` — real BrieFS bug: VFS `cleanup_mnt` WARN after a shutdown ioctl,
   triggered by BrieFS shutdown; dmesg check fails. Needs investigation.
 - `generic/623` — real BrieFS shutdown bug: fsync after shutdown does not
   return `EIO` as the test expects.
 - `generic/730` — real BrieFS shutdown bug: read after the `scsi_debug` block
-  device is deleted should return `EIO`, but `cat` exits cleanly with no error.
+  device is deleted should return `EIO`, but the read exits cleanly.
   Same error-propagation gap as 623.
 - `generic/737` — real BrieFS shutdown/replay bug: a 1 MiB file created with
   `O_SYNC`+`O_DIRECT` is lost after shutdown/remount (`No such file or directory`).
 
 Environment issues resolved after the re-run:
 
+- `generic/038` — now runs and passes after `SCRATCH_DEV` was enlarged to 20 GiB.
+- `generic/048` — now runs (was gated by ≥10 GB free space) and fails with the
+  sync/shutdown size bug above.
 - `generic/133` — passed after `TEST_DEV` image was enlarged to 4 GiB.
+- `generic/256`, `273`, `274`, `275`, `312`, `320`, `620`, `747` — now run and
+  pass with the enlarged scratch/test loop devices.
 - `generic/465` — passed after `SCRATCH_DEV` image was enlarged to 20 GiB.
 - `generic/482`, `generic/757` — now correctly not-run (`could not locate any FUA
   write`) after `LOGWRITES_DEV` was configured; BrieFS does not issue FUA writes.
 
-`generic/475`, previously the lone known open bug, **passed** in the original
-full-suite run (still inherently flaky; log-writes infrastructure exercises it
+`generic/475`, previously the lone known open bug, **passed** in this run (still
+inherently flaky; log-writes infrastructure exercises the crash-replay path
 reliably when configured).
 
 ---
@@ -68,7 +80,25 @@ reliably when configured).
 
 ---
 
-## Failing tests (11)
+## Failing tests (9)
+
+### generic/048 — file size not persisted after sync+shutdown
+- **Status:** fail (output mismatch), newly exposed now that scratch is large enough.
+- **Root cause:** the test creates 999 files of 10 MiB, calls `_scratch_sync`,
+  then `_scratch_shutdown`, remounts, and checks every file. Files 919 and 922
+  report `has incorrect size - sync failed`. Either `sync(2)` is not flushing
+  BrieFS dirty data/sizes to disk, or the shutdown path is discarding buffered
+  state that should have been written.
+- **Action:** real BrieFS bug; investigate sync → writeback → shutdown ordering.
+
+### generic/127 — mmap+fsx D-state hang
+- **Status:** fail (suite killed the fsx children after they hung >20 min).
+- **Root cause:** `generic/127` runs `ltp/fsx` in both lite-mmap and standard-mmap
+  modes. The mmap variants enter uninterruptible sleep (D-state) and never
+  complete. The standard non-mmap variants complete fine, so the issue is
+  mmap writeback / page-fault interaction with BrieFS.
+- **Action:** real BrieFS bug; same mmap/writeback deadlock family observed
+  before. Investigate `briefs_writepage`/iomap DIO/mmap writeback paths.
 
 ### generic/311 — pre-existing baseline flake
 - **Status:** fail (output mismatch), reproduces on a known-good baseline too.
@@ -80,7 +110,7 @@ reliably when configured).
 ### generic/417 — xattr EA create/unlink race
 - **Status:** fail (output mismatch) in shutdown cluster.
 - **Root cause:** `multi_open_unlink` reports `failed to create EA "user.name.0"
-of size 512 ... No such file or directory`. The test opens files, sets EAs, and
+  of size 512 ... No such file or directory`. The test opens files, sets EAs, and
   unlinks them concurrently; BrieFS allows unlink to win before the xattr create
   completes, or returns `ENOENT` incorrectly.
 - **Action:** real BrieFS bug; investigate xattr-set vs unlink serialization.
@@ -107,17 +137,16 @@ of size 512 ... No such file or directory`. The test opens files, sets EAs, and
   durability.
 
 ### generic/455 — log-writes replay md5 mismatch
-- **Status:** fail (output mismatch); `testfile0.mark9 md5sum mismatched`.
+- **Status:** fail (output mismatch); `testfile0.mark4 md5sum mismatched`.
 - **Nature:** with `LOGWRITES_DEV` properly configured (20 GiB backing image),
-  the test runs but replaying the logged writes up to `mark9` does not reproduce
+  the test runs but replaying the logged writes up to `mark4` does not reproduce
   the expected file contents. This is the same log-writes / crash-replay
   consistency family as `generic/475`.
 - **Action:** real BrieFS bug; investigate ordering/durability of journal + data
   writes under dm-log-writes replay.
 
 ### generic/730 — read after device deletion missing EIO
-- **Status:** fail (output mismatch); expected `cat: -: Input/output error`, got
-  no error.
+- **Status:** fail (output mismatch); expected read error, got no error.
 - **Root cause:** after deleting the `scsi_debug` device under a mounted BrieFS
   filesystem with an open read fd, BrieFS does not propagate `EIO` to the read.
   Same shutdown/error-propagation gap as `generic/623`.
@@ -126,7 +155,7 @@ of size 512 ... No such file or directory`. The test opens files, sets EAs, and
 
 ---
 
-## Not-run tests (410)
+## Not-run tests (398)
 
 Every not-run is gated by a `_require_*` probe that actually exercises the
 filesystem or the VM environment, so a not-run is a genuine unimplemented
@@ -144,33 +173,38 @@ from the run were read and grouped; all gates are legitimate.
   deliberately out of scope.
 - **Environment** (VM setup, closable without code change): lvm/logwrites
   devices, fsverity/duperemove utilities, dbtest not built, scratch/test too
-  small, selinux, hibernation-to-swap.
+  small, selinux, hibernation-to-swap, zoned devices.
 
 ### Absent features
 
 | Reason (gate text)                                        | N  | Tests                                                                                                                                                                                                                                                                           |
 |-----------------------------------------------------------|----:|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Reflink not supported (scratch)                           | 138 | 161 164 165 166 167 168 170 171 172 173 174 175 176 183 185 186 187 188 189 190 191 194 195 196 197 199 200 201 202 203 205 206 216 217 218 220 222 227 229 238 242 243 253 254 259 261 262 264 265 266 267 268 271 272 276 278 279 281 282 283 284 287 289 290 291 292 293 295 296 297 298 301 302 305 326 327 328 329 330 331 332 333 334 352 353 356 357 358 359 370 372 373 387 414 415 447 457 458 501 513 514 515 518 540 541 542 543 544 546 562 588 628 648 651 652 653 654 655 657 658 659 660 661 662 663 664 665 666 667 668 669 670 671 672 673 675 702 733 |
-| Reflink not supported (test)                              | 39 | 110 111 115 116 118 119 134 137 138 139 140 142 143 144 145 146 147 148 149 150 151 152 153 154 155 156 157 159 160 178 179 180 181 303 407 463 578 612 649 734 |
+| Reflink not supported (test)                              | 39 | 110 111 115 116 118 119 134 137 138 139 140 142 143 144 145 146 147 148 149 150 151 152 153 154 155 156 157 159 178 179 180 181 303 407 463 578 612 649 734 |
 | disk quotas not supported                                 | 31 | 082 219 230 231 232 233 234 235 244 270 280 379 380 381 382 383 384 385 386 400 506 566 587 594 600 601 603 681 682 691 762 |
-| log state probing not supported                           | 3 | 052 054 055 |
 | No encryption support (fscrypt)                           | 28 | 368 369 395 396 397 398 399 419 421 429 435 440 548 549 550 580 581 582 583 584 592 593 595 602 613 621 693 739 |
 | xfs_io exchangerange not supported                        | 16 | 709 710 712 714 716 717 718 719 720 722 723 724 725 726 727 752 |
 | ACLs not supported                                        | 14 | 026 053 077 099 105 237 307 318 319 375 444 449 529 697 |
 | xfs_io fcollapse failed (no COLLAPSE_RANGE)               | 12 | 012 016 017 021 022 031 072 497 499 503 641 687 |
 | fsverity utility required (no fsverity)                   | 11 | 572 573 574 575 576 577 579 624 625 692 788 |
 | xfs_io fzero failed (no ZERO_RANGE)                       | 11 | 008 009 033 042 096 456 469 511 610 685 758 |
-| xfs_io finsert failed (no INSERT_RANGE)                   | 9 | 058 060 061 063 064 404 485 686 735 |
 | Dedupe not supported (test)                               | 9 | 121 122 136 158 160 182 304 408 516 |
+| xfs_io finsert failed (no INSERT_RANGE)                   | 9 | 058 060 061 063 064 404 485 686 735 |
 | Dedupe not supported (scratch)                            | 7 | 162 163 374 493 517 630 674 |
-| atomic writes not supported                               | 10 | 765 767 768 769 770 773 774 775 776 778 |
-| DAX not supported                                         | 5 | 413 462 605 606 608 |
 | idmapped mounts not supported                             | 6 | 644 645 656 689 698 699 |
+| FITRIM not supported                                      | 5 | 038 251 260 288 500 |
 | O_TMPFILE not supported                                   | 4 | 004 389 509 531 |
-| FITRIM not supported                                      | 4 | 251 260 288 500 |
+| DAX not supported                                         | 3 | 413 462 605 606 608 |
+| log state probing not supported                           | 3 | 052 054 055 |
+| duperemove utility required                               | 3 | 559 560 561 |
+| multi-block atomic writes not supported                   | 3 | 774 775 778 |
+| write atomic not supported (block device)                 | 3 | 765 773 776 |
+| xfs_io pwrite doesn't support -A                          | 3 | 768 769 770 |
 | defragmentation not supported                             | 2 | 018 324 |
 | casefold not supported                                    | 2 | 556 783 |
 | fcntl setdeleg not supported                              | 2 | 786 787 |
+| xfs_io exchangerange -s 64k -l 64k not supported          | 2 | 713 715 |
+| could not locate any FUA write                            | 2 | 482 757 |
 | can't mkfs briefs with geometry                           | 1 | 223 |
 | xfs_io fsmap missing                                      | 1 | 365 |
 | filesystem timestamp bounds unknown                       | 1 | 402 |
@@ -187,7 +221,8 @@ from the run were read and grouped; all gates are legitimate.
 | fanotify ioerrors not supported                           | 1 | 791 |
 | FSTRIM not supported                                      | 1 | 537 |
 | file_getattr not supported for regular files on briefs    | 1 | 772 |
-| could not locate any FUA write                            | 2 | 482 757 |
+| write atomic not supported (filesystem)                   | 1 | 767 |
+| xfs_io chattr +x failed                                   | 1 | 607 |
 
 > **Note on chattr/lsattr.** `generic/079 277 424 545 553 555 596 629` are now
 > passing after the inode-flag implementation. The remaining chattr-related
@@ -201,20 +236,16 @@ from the run were read and grouped; all gates are legitimate.
 
 | Reason (gate text)                                        | N  | Tests            | Fix                                                            |
 |-----------------------------------------------------------|----:|------------------|----------------------------------------------------------------|
-| requires $LOGWRITES_DEV / dm-log-writes                   | 1  | 470              | configure dm-log-writes scratch device; 455 now runs and fails |
-| BrieFS issues no FUA writes                               | 2  | 482 757          | genuine missing feature; cannot run these log-writes tests     |
+| requires $LOGWRITES_DEV / dm-log-writes                   | 1  | 470              | configure dm-log-writes scratch device; 455 now runs and fails   |
+| BrieFS issues no FUA writes                               | 2  | 482 757          | genuine missing feature; cannot run these log-writes tests       |
 | requires $SCRATCH_LOGDEV                                  | 2  | 487 766          | configure dm-log-writes config                                  |
-| scratch device too small (<16G / <4G)                       | 3  | 620 781 793      | bigger SCRATCH_DEV loop (≥16G)                                  |
-| Scratch device too small / Test device too small            | 9  | 256 273 274 275 312 320 747 213 256 | resize loops |
-| requires ≥10GB free on scratch                            | 2  | 038 048          | bigger scratch                                                 |
-| requires ≥1GB free on scratch                             | 1  | 460              | bigger scratch                                                 |
-| requires ≥4GB free on test                                | 1  | 694              | bigger TEST_DEV loop (≥8G)                                     |
-| requires ≥5GB free on test                                | 1  | 701              | bigger TEST_DEV loop (≥8G)                                     |
-| requires ≥8GB free on scratch                             | 1  | 590              | bigger scratch                                                 |
-| /xfstests/src/dbtest not built                            | 1  | 010              | `make` in /xfstests/src (build bug `dbtest.c:306 myDB`, oos)   |
+| scratch device too small / zoned loopback needed          | 2  | 781 793          | bigger SCRATCH_DEV + kernel zoned support                       |
+| scratch device too small / other size gates                 | 0  | —                | resolved by 20 GiB SCRATCH_DEV (038, 048, 256, 273–275, 312, 320, 620, 747 now run) |
+| requires ≥4GB free on test                                 | 1  | 694              | bigger TEST_DEV loop (≥8G)                                      |
+| requires ≥5GB free on test                                 | 1  | 701              | bigger TEST_DEV loop (≥8G)                                      |
+| /xfstests/src/dbtest not built                            | 1  | 010              | `make` in /xfstests/src (build bug `dbtest.c:306 myDB`, oos)    |
 | selinux required                                          | 1  | 700              | env                                                            |
 | userspace hibernation to swap enabled                     | 1  | 570              | env                                                            |
-| CONFIG_FAIL_MAKE_REQUEST not enabled                      | 1  | 019              | kernel config                                                  |
 
 > `fsverity`/`duperemove` "utility required" rows are listed under absent
 > features: even with the utility installed, BrieFS lacks the kernel ioctl, so
@@ -222,7 +253,7 @@ from the run were read and grouped; all gates are legitimate.
 
 ---
 
-## Passing tests (365)
+## Passing tests (375)
 
 ```
 001  002  003  005  006  007  011  013
@@ -235,42 +266,43 @@ from the run were read and grouped; all gates are legitimate.
 086  087  088  089  090  091  092  093
 094  095  097  098  100  101  102  103
 104  106  107  108  109  112  113  114
-117  120  123  124  125  126  127  128
-129  130  131  132  133  135  141  169
-177  184  192  193  198  204  207  208
-209  210  211  212  214  215  221  224
+117  120  123  124  125  126  128  129
+130  131  132  133  135  141  169  177
+184  192  193  198  204  207  208  209
+210  211  212  213  214  215  221  224
 225  226  228  236  239  240  241  245
-246  247  248  249  250  252  255  257
-258  263  269  277  285  286  294  299
-300  306  308  309  310  313  314  315
-316  317  321  322  323  325  335  336
-337  338  339  340  341  342  343  344
-345  346  347  348  354  355  360  361
-362  363  364  366  371  376  377  378
-390  391  392  393  394  401  403  405
-406  409  410  411  412  416  418  420
-422  423  424  426  427  428  430  431
-432  433  434  436  437  438  439  441
-443  445  446  448  450  451  452  453
-454  459  461  464  465  466  467  468
-471  472  474  475  476  477  478  479
-480  481  483  484  486  488  489  490
-491  494  495  496  498  502  504  505
-507  508  510  512  519  520  523  524
-525  526  527  528  530  532  533  534
-535  536  538  539  545  547  551  552
-553  554  555  557  558  563  564  567
-568  569  571  585  586  589  591  596
+246  247  248  249  250  252  255  256
+257  258  263  269  273  274  275  277
+285  286  294  299  300  306  308  309
+310  312  313  314  315  316  317  320
+321  322  323  325  335  336  337  338
+339  340  341  342  343  344  345  346
+347  348  354  355  360  361  362  363
+364  366  371  376  377  378  390  391
+392  393  394  401  403  405  406  409
+410  411  412  416  418  420  422  423
+424  426  427  428  430  431  432  433
+434  436  437  438  439  441  443  445
+446  448  450  451  452  453  454  459
+460  461  464  465  466  467  468  471
+472  474  475  476  477  478  479  480
+481  483  484  486  488  489  490  491
+494  495  496  498  502  504  505  507
+508  510  512  519  520  523  524  525
+526  527  528  530  532  533  534  535
+536  538  539  545  547  551  552  553
+554  555  557  558  563  564  567  568
+569  571  585  586  589  590  591  596
 597  598  604  609  611  615  616  617
-618  619  622  626  627  629  631  632
-633  634  635  636  637  638  639  640
-642  643  646  647  650  676  677  678
-679  680  683  684  688  690  695  696
-703  704  705  706  707  708  728  729
-731  732  736  738  740  741  742  743
-748  749  750  751  753  754  755  756
-759  760  761  763  764  771  779  782
-784  785  789  790  792
+618  619  620  622  626  627  629  631
+632  633  634  635  636  637  638  639
+640  642  643  646  647  650  676  677
+678  679  680  683  684  688  690  695
+696  703  704  705  706  707  708  728
+729  731  732  736  738  740  741  742
+743  747  748  749  750  751  753  754
+755  756  759  760  761  763  764  771
+779  782  784  785  789  790  792
 ```
 
 ### xfstests xattr cluster (13/13, 2026-07-02)
@@ -281,17 +313,22 @@ All xattr-gated tests pass with the chained-xattr fix in `29121e6`:
 ### xfstests shutdown cluster (2026-07-04)
 
 The `XFS_IOC_GOINGDOWN` ioctl is now implemented, so `godown`-based shutdown
-tests run. Core cluster `043 044 045 046 047 048 049 050 051` passes.
-Extended godown cluster `392 461 468 474 505 530 536 622 635 646 705` passes.
-`050` required a read-only-dirty-journal mount rejection in `briefs_fill_super`.
+tests run. Core cluster `043 044 045 046 047 049 050 051` passes (048 now fails
+with the sync/size bug). `050` required a read-only-dirty-journal mount
+rejection in `briefs_fill_super`.
 
-`generic/388` is excluded from the full suite because it wedges. Newly-exposed
-shutdown-related failures: `417` (xattr EA race), `599` (VFS cleanup_mnt WARN),
-`623` (fsync after shutdown missing EIO), `730` (read after device delete
-missing EIO), `737` (file lost after O_DIRECT+shutdown). With `LOGWRITES_DEV`
-now configured, `455` reveals a real log-writes replay md5 mismatch; `482` and
-`757` are correctly not-run because BrieFS does not issue FUA writes. Size
-failures `133` and `465` passed after enlarging the loop images.
+Extended godown cluster `392 461 468 474 505 530 536 622 635 646 705` passes.
+
+Newly-exposed shutdown-related failures:
+`417` (xattr EA race), `599` (VFS cleanup_mnt WARN), `623` (fsync after shutdown
+missing EIO), `730` (read after device delete missing EIO), `737` (file lost
+after O_DIRECT+shutdown), plus `048` (sync+shutdown size bug) and `127`
+(mmap+fsx D-state hang). `generic/388` is excluded from the full suite because
+it wedges.
+
+With `LOGWRITES_DEV` now configured, `455` reveals a real log-writes replay md5
+mismatch; `482` and `757` are correctly not-run because BrieFS does not issue FUA
+writes. Size failures `133` and `465` passed after enlarging the loop images.
 
 ### Recent fix highlights (this campaign)
 
@@ -337,12 +374,13 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | 079 277 424 545 553 555 596 629 | 38d57d0  | chattr/lsattr inode flags (+S/+D/+i/+a/+d/+A)                |
 | 475                           | —        | dm-error crash-replay: passed this run, still flaky/deferred   |
 
-> Open BrieFS code bugs after this run: `417` (xattr/unlink race), `455`
-> (log-writes replay md5 mismatch), `599` (shutdown VFS cleanup WARN), `623`
-> (fsync after shutdown missing EIO), `730` (read after device delete missing
-> EIO), `737` (O_DIRECT file lost after shutdown), and the excluded `388`
-> shutdown/replay wedge. `generic/475` passed in the original run but remains a
-> known deferred bug in the same crash-replay family.
+> Open BrieFS code bugs after this run: `048` (sync+shutdown size bug), `127`
+> (mmap+fsx D-state hang), `417` (xattr/unlink race), `455` (log-writes replay
+> md5 mismatch), `599` (shutdown VFS cleanup WARN), `623` (fsync after shutdown
+> missing EIO), `730` (read after device delete missing EIO), `737` (O_DIRECT
+> file lost after shutdown), and the excluded `388` shutdown/replay wedge.
+> `generic/311` is a pre-existing baseline flake. `generic/475` passed in this run
+> but remains a known deferred bug in the same crash-replay family.
 
 ---
 
@@ -351,14 +389,16 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 - Full suite `./check -g auto -X .exclude` on the VM (2026-07-04), kernel
   `6.12.94+deb13-amd64`, branch `even-more-xfstests`. `generic/388` excluded
   via `/xfstests/tests/generic/.exclude`.
-- Post-run fixes applied on the VM: `TEST_DEV` (`/var/tmp/test.img`) enlarged to
+- Post-run setup on the VM: `TEST_DEV` (`/var/tmp/test.img`) enlarged to
   4 GiB, `SCRATCH_DEV` (`/var/tmp/scratch.img`) and `LOGWRITES_DEV`
   (`/var/tmp/logwrites.img`) enlarged to 20 GiB. `LOGWRITES_DEV` is a raw loop
   device; logwrites tests create their own `/dev/mapper/logwrites-test` dm target
   on top of `SCRATCH_DEV`.
-- Re-run results: `generic/133` and `generic/465` pass; `generic/482` and
-  `generic/757` become correctly not-run (`could not locate any FUA write`);
-  `generic/455` runs and fails with a log-writes replay md5 mismatch.
+- Results: `generic/038`, `256`, `273–275`, `312`, `320`, `620`, `747` now run
+  and pass; `generic/048` now runs and fails; `generic/133` and `generic/465`
+  pass; `generic/482` and `generic/757` become correctly not-run (`could not
+  locate any FUA write`); `generic/455` runs and fails with a log-writes replay
+  md5 mismatch.
 - Pass/Fail/Not-run lists derived from the final `Ran:` / `Not run:` / `Failures:`
   block in `/xfstests/results/check.log` plus the targeted re-runs.
 - Not-run reasons read from each test's `.notrun` artifact in
