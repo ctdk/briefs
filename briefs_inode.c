@@ -382,6 +382,15 @@ int briefs_update_parent_dir(struct inode *dir, struct briefs_sb_info *bsi,
 		briefs_sync_inode_times(dir, &pbinfo->disk_inode);
 	}
 
+	/*
+	 * Persist the directory inode into the bdev buffer cache.  The dirty
+	 * buffer is written back by sync_blockdev() in the shutdown/umount path
+	 * before the journal is checkpointed clean, so a NOLOGFLUSH shutdown sees
+	 * the trie root on disk even though the journal records are not replayed
+	 * (generic/417).  Synchronous writes here would make every create/unlink
+	 * wait for disk, so leave the buffer dirty and let the normal metadata
+	 * flush paths batch it.
+	 */
 	ret = briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
 	if (ret) {
 		pbinfo->disk_inode.filesize = old_size;

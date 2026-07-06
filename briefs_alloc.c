@@ -170,6 +170,17 @@ int briefs_alloc_init_at(struct briefs_alloc *alloc, struct super_block *sb,
 	pr_debug("briefs: allocator at block %llu initialized from disk (%llu entries, %llu free)\n",
 		 pool_block, alloc->block_count, alloc->free_count);
 
+	/*
+	 * Reserve relative block 0.  The allocator API uses 0 as the ENOSPC
+	 * sentinel: callers compare the returned block to 0 and treat it as
+	 * "no space".  Make sure the bitmap never hands out block 0, so a
+	 * genuine allocation of the first data block does not collide with that
+	 * sentinel (generic/417: after freeing the trie root, the next create
+	 * allocated data block 0 and trie_page_init returned -ENOSPC).
+	 */
+	if (alloc->block_count > 0)
+		briefs_reserve_block(alloc, 0);
+
 	return 0;
 }
 
@@ -193,6 +204,23 @@ u64 briefs_alloc_block(struct briefs_alloc *alloc)
 	if (!alloc || alloc->free_count == 0 || !alloc->l0) {
 		mutex_unlock(&alloc->lock);
 		return 0;
+	}
+
+	/*
+	 * Block 0 is the API's ENOSPC sentinel; never hand it out.  It may be
+	 * left free by mkfs (which starts the bitmap at the first data block)
+	 * or re-exposed by briefs_alloc_recompute_summaries after journal
+	 * replay.  If it is free, reserve it now and continue searching for a
+	 * real block.
+	 */
+	if (alloc->l2[0] & 1ULL) {
+		alloc->l2[0] &= ~1ULL;
+		alloc->free_count--;
+		if (alloc->l2[0] == 0) {
+			alloc->l1[0] &= ~1ULL;
+			if (alloc->l1[0] == 0)
+				alloc->l0[0] &= ~1ULL;
+		}
 	}
 
 	/* Next-fit: start the L0 scan at the rover and wrap around, so a
@@ -308,6 +336,18 @@ u64 briefs_alloc_blocks(struct briefs_alloc *alloc, u64 n)
 	if (n > alloc->free_count || n > alloc->block_count) {
 		mutex_unlock(&alloc->lock);
 		return 0;
+	}
+
+	/* Reserve the data-relative block-0 sentinel so a contiguous run never
+	 * starts there.  See briefs_alloc_block for the full rationale. */
+	if (alloc->l2[0] & 1ULL) {
+		alloc->l2[0] &= ~1ULL;
+		alloc->free_count--;
+		if (alloc->l2[0] == 0) {
+			alloc->l1[0] &= ~1ULL;
+			if (alloc->l1[0] == 0)
+				alloc->l0[0] &= ~1ULL;
+		}
 	}
 
 	for (w2 = 0; w2 < alloc->l2_words; w2++) {
@@ -748,6 +788,20 @@ void briefs_alloc_recompute_summaries(struct briefs_alloc *alloc)
 	if (alloc->l2_words > 0) {
 		u64 mask = (l2_valid_bits == 64) ? ~0ULL : ((1ULL << l2_valid_bits) - 1);
 		alloc->l2[alloc->l2_words - 1] &= mask;
+	}
+
+	/*
+	 * Block 0 is the API's ENOSPC sentinel; it must never be considered
+	 * free even if the on-disk bitmap (or a freshly formatted filesystem)
+	 * leaves L2 bit 0 set.  Reserve it now and skip it when counting.
+	 */
+	if (alloc->l2_words > 0 && (alloc->l2[0] & 1ULL)) {
+		alloc->l2[0] &= ~1ULL;
+		if (alloc->l2[0] == 0) {
+			alloc->l1[0] &= ~1ULL;
+			if (alloc->l1[0] == 0)
+				alloc->l0[0] &= ~1ULL;
+		}
 	}
 
 	alloc->free_count = 0;

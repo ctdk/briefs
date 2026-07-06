@@ -613,6 +613,19 @@ void briefs_put_super(struct super_block *sb) {
 		briefs_sysfs_remove_sb(sb);
 
 		/*
+		 * Write back all dirty metadata buffers before checkpointing the
+		 * journal.  BrieFS metadata lives in the bdev buffer cache and is
+		 * dirtied by briefs_persist_disk_inode() / mark_buffer_dirty(); a
+		 * journal record that references a metadata block is not truly
+		 * durable until that block is also on disk.  If we checkpoint a
+		 * clean journal while inode/trie buffers are still dirty, a later
+		 * clean mount sees stale on-disk metadata and has no journal records
+		 * left to replay (generic/417: directory root stale after a
+		 * NOLOGFLUSH shutdown/umount/remount cycle).
+		 */
+		sync_blockdev(sb->s_bdev);
+
+		/*
 		 * Always checkpoint the journal before unmount.
 		 *
 		 * briefs_journal_sync() (called by sync(2)/syncfs(2) via
@@ -641,7 +654,7 @@ void briefs_put_super(struct super_block *sb) {
 		 * (generic/547 #2, dm-thin drop-writes) is separate and still
 		 * needs defer-trie-free-until-checkpoint.
 		 */
-		if (bsi->journal && !sb_rdonly(sb)) {
+		if (bsi->journal) {
 			int ckret = briefs_journal_checkpoint(bsi->journal);
 			if (ckret)
 				pr_err("briefs: unmount checkpoint failed (err=%d); journal may replay on next mount\n",
@@ -649,17 +662,15 @@ void briefs_put_super(struct super_block *sb) {
 		}
 
 		/* Sync allocation trie to disk */
-		if (!sb_rdonly(sb)) {
-			pr_debug("briefs: syncing allocation trie\n");
-			briefs_alloc_sync(&bsi->alloc);
+		pr_debug("briefs: syncing allocation trie\n");
+		briefs_alloc_sync(&bsi->alloc);
 
-			/*
-			 * Persist superblock free counts. briefs_journal_sync_superblock
-			 * refreshes them from the allocator state first.
-			 */
-			if (bsi->journal)
-				briefs_journal_sync_superblock(bsi->journal);
-		}
+		/*
+		 * Persist superblock free counts. briefs_journal_sync_superblock
+		 * refreshes them from the allocator state first.
+		 */
+		if (bsi->journal)
+			briefs_journal_sync_superblock(bsi->journal);
 
 		pr_debug("briefs: cleaning up journal\n");
 		if (bsi->journal) {
@@ -681,7 +692,7 @@ void briefs_put_super(struct super_block *sb) {
 		 * post-umount "end" mark, so replaying up to "end" omits them and
 		 * the crash-replay md5 check fails.
 		 */
-		if (!sb_rdonly(sb)) {
+		{
 			int flush_ret = blkdev_issue_flush(sb->s_bdev);
 			if (flush_ret)
 				pr_err("briefs: unmount flush failed (err=%d)\n",

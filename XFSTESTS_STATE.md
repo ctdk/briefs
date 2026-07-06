@@ -26,9 +26,9 @@ failing-test notes).
 **Of the 6 failures:**
 
 - `generic/311` — pre-existing baseline flake (dm-flakey/fsync timing).
-- `generic/417` — real BrieFS bug: `multi_open_unlink` fails to create a 512-byte
-  EA on a file that has just been unlinked (`ENOENT`), indicating a race/ordering
-  issue between xattr creation and unlink in BrieFS.
+- `generic/417` — **fixed** on 2026-07-06: directory trie root persisted before
+  shutdown, trie collapse frees empty root, allocator reserves block 0, and
+  `put_super()` flushes metadata before checkpointing the journal.
 - `generic/599` — real BrieFS bug: VFS `cleanup_mnt` WARN after a shutdown ioctl,
   triggered by BrieFS shutdown; dmesg check fails. Needs investigation.
 - `generic/623` — real BrieFS shutdown bug: fsync after shutdown does not
@@ -130,12 +130,38 @@ continued.
 - **Action:** none (baseline; track only for regressions in neighbouring tests).
 
 ### generic/417 — xattr EA create/unlink race
-- **Status:** fail (output mismatch) in shutdown cluster.
-- **Root cause:** `multi_open_unlink` reports `failed to create EA "user.name.0"
-  of size 512 ... No such file or directory`. The test opens files, sets EAs, and
-  unlinks them concurrently; BrieFS allows unlink to win before the xattr create
-  completes, or returns `ENOENT` incorrectly.
-- **Action:** real BrieFS bug; investigate xattr-set vs unlink serialization.
+- **Status:** **fixed** (repro passes, fsck clean) on 2026-07-06.
+- **Root cause:** A create+setxattr+unlink+`NOLOGFLUSH` shutdown cycle left two
+  inconsistencies across umount/remount:
+  1. The parent directory's on-disk inode still pointed at a stale trie root
+     because `briefs_update_parent_dir()` persisted the directory inode with
+     `sync=false`; the updated `dir_trie_root` was not on disk before the
+     journal was checkpointed clean, so the next mount read stale metadata and
+     had no replay records to correct it.
+  2. `briefs_trie_remove()` stopped its collapse loop at `anc - 2`, missing the
+     leaf's immediate parent, and never freed an empty root. The orphan trie
+     page was then reused by the next xattr block, so later trie allocations
+     saw a bad magic and fell back to fresh pages until the allocator handed
+     out data block 0, which every caller treats as the ENOSPC sentinel.
+  3. The allocator itself allowed block 0 to be handed out successfully, even
+     though its API uses 0 as the failure sentinel.
+- **Fix:**
+  - Update the parent directory inode in `briefs_update_parent_dir()` and leave
+    the buffer dirty; `sync_blockdev()` in `briefs_put_super()` flushes it before
+    the journal is checkpointed clean, so a NOLOGFLUSH shutdown/umount cycle
+    still sees the trie root on disk without paying a synchronous write on every
+    create/unlink.
+  - Collapse the leaf's immediate parent in `briefs_trie_remove()` and free an
+    empty root afterwards.
+  - Treat data-relative block 0 as the ENOSPC sentinel everywhere in the
+    allocator: reserve it at init, at allocation time, in multi-block
+    allocation, and in `briefs_alloc_recompute_summaries()`.
+  - Only force a journal sync + drive flush in `briefs_dir_sync()` for DIRSYNC or
+    IS_SYNC inodes; normal directory operations are batched by the periodic
+    journal checkpoint or the shutdown/umount path.
+- **Verification:** local `repro417.sh` (create, 512-byte EA, unlink,
+  `XFS_IOC_GOINGDOWN NOLOGFLUSH`, umount/remount, recreate, EA) passes,
+  `fsck.briefs` reports a clean filesystem, and `generic/417` passes on the VM.
 
 ### generic/599 — VFS cleanup_mnt WARN after shutdown
 - **Status:** fail (`_check_dmesg` catches a kernel warning).
@@ -345,11 +371,11 @@ rejection in `briefs_fill_super`.
 Extended godown cluster `392 461 468 474 505 530 536 622 635 646 705` passes.
 
 Newly-exposed shutdown-related failures:
-`417` (xattr EA race), `599` (VFS cleanup_mnt WARN), `623` (fsync after shutdown
-missing EIO), `730` (read after device delete missing EIO), `753` (dm-error
-metadata-sync WARN), and historically `127` (mmap+fsx D-state hang — passed in
-this run). `generic/737` (file lost after O_DIRECT+shutdown) is now fixed.
-`generic/388` is excluded from the full suite because it wedges.
+`599` (VFS cleanup_mnt WARN), `623` (fsync after shutdown missing EIO), `730`
+(read after device delete missing EIO), `753` (dm-error metadata-sync WARN), and
+historically `127` (mmap+fsx D-state hang — passed in this run). `generic/417`
+(xattr EA race) and `generic/737` (file lost after O_DIRECT+shutdown) are now
+fixed. `generic/388` is excluded from the full suite because it wedges.
 
 With `LOGWRITES_DEV` now configured, `455` passes (was an md5 mismatch in the
 previous run). `482` and `757` are correctly not-run because BrieFS does not
@@ -375,6 +401,7 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | 620                           | 97a50e7  | mkfs huge-disk EIO (stop pre-zeroing inode table)             |
 | 169 420                       | 8321fc6  | FS_IOC_FSGETXATTR ioctl                                       |
 | 029 030 032                   | f8ef293  | always-checkpoint at unmount (clean-unmount replay clobber)   |
+| 417                           | —        | xattr/unlink NOLOGFLUSH durability (dir inode sync, trie collapse, block-0 sentinel) |
 | 464                           | 4ef6ccb  | trie_iter_grow double-free (suite wedge)                      |
 | 023 025 078                   | —        | renameat2 EXCHANGE/WHITEOUT + emptiness check                 |
 | 257 637 676                   | —        | readdir seek/resume (simple_offset)                           |
