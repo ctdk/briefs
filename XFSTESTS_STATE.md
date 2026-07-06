@@ -5,7 +5,7 @@ measured by fresh full-suite and targeted runs on the VM.
 
 ## Overview
 
-**Latest full-suite run:** 2026-07-04, `./check -g auto -X .exclude` on the VM,
+**Latest full-suite run:** 2026-07-06, `./check -g auto -X .exclude` on the VM,
 kernel `6.12.94+deb13-amd64`, branch `even-more-xfstests`. `generic/388` was
 expunged from the run via `/xfstests/tests/generic/.exclude` because it wedges
 the suite (shutdown/replay corruption leaves `godown` stuck in D-state; see
@@ -16,25 +16,19 @@ failing-test notes).
 | Selected         |   782 | auto-group tests the suite considered (388 excluded)     |
 | Not run          |   398 | skipped by a `_require_*` gate (verified below)            |
 | Executed         |   384 | selected − not-run                                        |
-| **Pass**         |   376 | executed and matched golden output                       |
-| **Fail**         |     8 | see below                                                |
-| Wedges / oops    |     0 | suite completed; `generic/127` had to be killed manually   |
+| **Pass**         |   377 | executed and matched golden output                       |
+| **Fail**         |     7 | see below                                                |
+| Wedges / oops    |     0 | suite completed without manual intervention              |
 
-**Tally reading.** xfstests reports "Failed 8 of 782 tests"; the 782 is the
-*selected* count. Executed = 782 − 398 = 384; pass = 384 − 8 = 376.
+**Tally reading.** xfstests reports "Failed 7 of 782 tests"; the 782 is the
+*selected* count. Executed = 782 − 398 = 384; pass = 384 − 7 = 377.
 
-**Of the 8 failures:**
+**Of the 7 failures:**
 
 - `generic/311` — pre-existing baseline flake (dm-flakey/fsync timing).
-- `generic/127` — real BrieFS hang: mmap+fsx children enter D-state for >20 min;
-  the test was manually killed so the suite could continue. Same mmap/writeback
-  deadlock family as earlier observations.
 - `generic/417` — real BrieFS bug: `multi_open_unlink` fails to create a 512-byte
   EA on a file that has just been unlinked (`ENOENT`), indicating a race/ordering
   issue between xattr creation and unlink in BrieFS.
-- `generic/455` — real BrieFS log-writes/replay bug: log-writes device now
-  configured, but replaying the logged writes produces an md5sum mismatch
-  (`testfile0.mark4 md5sum mismatched`).
 - `generic/599` — real BrieFS bug: VFS `cleanup_mnt` WARN after a shutdown ioctl,
   triggered by BrieFS shutdown; dmesg check fails. Needs investigation.
 - `generic/623` — real BrieFS shutdown bug: fsync after shutdown does not
@@ -44,6 +38,12 @@ failing-test notes).
   Same error-propagation gap as 623.
 - `generic/737` — real BrieFS shutdown/replay bug: a 1 MiB file created with
   `O_SYNC`+`O_DIRECT` is lost after shutdown/remount (`No such file or directory`).
+- `generic/753` — real BrieFS dm-error metadata-sync bug: dmesg reports
+  `journal back-pressure checkpoint failed: -5` and `metadata write error`
+  (xattr chain + alloc header) under a failing dm-error device, then fsck
+  reports an inconsistent filesystem. Same metadata-sync error-propagation
+  family as the earlier `73a0d1d` fix, but hitting sync sites beyond inode
+  table blocks.
 
 Environment issues resolved after the re-run:
 
@@ -57,9 +57,12 @@ Environment issues resolved after the re-run:
 - `generic/482`, `generic/757` — now correctly not-run (`could not locate any FUA
   write`) after `LOGWRITES_DEV` was configured; BrieFS does not issue FUA writes.
 
-`generic/475`, previously the lone known open bug, **passed** in this run (still
-inherently flaky; log-writes infrastructure exercises the crash-replay path
-reliably when configured).
+`generic/455` (log-writes replay) and `generic/475` (dm-error crash-replay)
+both passed in this run. `generic/455` was previously failing with an md5
+mismatch and is now green with the configured log-writes infrastructure.
+`generic/127` also passed, though it has historically hung in the mmap+fsx
+children; xfstests' own fsx timeout killed the children and the suite
+continued.
 
 ---
 
@@ -77,7 +80,7 @@ reliably when configured).
 
 ---
 
-## Failing tests (8)
+## Failing tests (7)
 
 ### generic/048 — file size not persisted after sync+shutdown
 - **Status:** **fixed** (`62167fa`); was fail (output mismatch), newly exposed now
@@ -96,13 +99,12 @@ reliably when configured).
   `generic/030–099` shutdown cluster clean.
 
 ### generic/127 — mmap+fsx D-state hang
-- **Status:** fail (suite killed the fsx children after they hung >20 min).
-- **Root cause:** `generic/127` runs `ltp/fsx` in both lite-mmap and standard-mmap
-  modes. The mmap variants enter uninterruptible sleep (D-state) and never
-  complete. The standard non-mmap variants complete fine, so the issue is
-  mmap writeback / page-fault interaction with BrieFS.
-- **Action:** real BrieFS bug; same mmap/writeback deadlock family observed
-  before. Investigate `briefs_writepage`/iomap DIO/mmap writeback paths.
+- **Status:** **passed** in the 2026-07-06 run; historically a hang where the
+  mmap fsx children enter D-state for >20 min and have to be killed.
+- **Nature:** flaky deadlock between mmap writeback / page-fault interaction
+  and BrieFS writeback. The non-mmap fsx variants complete fine.
+- **Action:** monitor; if it re-hangs, investigate `briefs_writepage`/iomap
+  DIO/mmap writeback paths.
 
 ### generic/311 — pre-existing baseline flake
 - **Status:** fail (output mismatch), reproduces on a known-good baseline too.
@@ -141,13 +143,12 @@ reliably when configured).
   durability.
 
 ### generic/455 — log-writes replay md5 mismatch
-- **Status:** fail (output mismatch); `testfile0.mark4 md5sum mismatched`.
+- **Status:** **fixed/passing** in the 2026-07-06 run; was fail (output mismatch)
+  with `testfile0.mark4 md5sum mismatched`.
 - **Nature:** with `LOGWRITES_DEV` properly configured (20 GiB backing image),
-  the test runs but replaying the logged writes up to `mark4` does not reproduce
-  the expected file contents. This is the same log-writes / crash-replay
-  consistency family as `generic/475`.
-- **Action:** real BrieFS bug; investigate ordering/durability of journal + data
-  writes under dm-log-writes replay.
+  the test now replays logged writes correctly and matches the expected md5.
+- **Action:** none; remains in the crash-replay family and should be watched
+  for regressions.
 
 ### generic/730 — read after device deletion missing EIO
 - **Status:** fail (output mismatch); expected read error, got no error.
@@ -156,6 +157,18 @@ reliably when configured).
   Same shutdown/error-propagation gap as `generic/623`.
 - **Action:** real BrieFS bug; wire device-error/shutdown error propagation into
   read path.
+
+### generic/753 — dm-error metadata write-error WARN
+- **Status:** fail (`_check_dmesg` + fsck inconsistency).
+- **Root cause:** under a dm-error device that fails writes, BrieFS emits
+  `journal back-pressure checkpoint failed: -5`, `metadata write error (xattr
+  chain sync)`, and `metadata write error (alloc header sync)`, then the
+  post-test fsck reports an inconsistent filesystem. The earlier `73a0d1d` fix
+  hardened inode-table writes with `lock_buffer` across `mark_buffer_dirty`,
+  but other metadata sync paths (xattr chain, allocator headers) still propagate
+  errors only to dmesg without cleaning up or remounting read-only safely.
+- **Action:** extend the metadata-sync error-check pattern to xattr chain and
+  allocator sync sites; consider remounting read-only on metadata I/O errors.
 
 ---
 
@@ -257,7 +270,7 @@ from the run were read and grouped; all gates are legitimate.
 
 ---
 
-## Passing tests (375)
+## Passing tests (377)
 
 ```
 001  002  003  005  006  007  011  013
@@ -270,7 +283,7 @@ from the run were read and grouped; all gates are legitimate.
 086  087  088  089  090  091  092  093
 094  095  097  098  100  101  102  103
 104  106  107  108  109  112  113  114
-117  120  123  124  125  126  128  129
+117  120  123  124  125  126  127  128  129
 130  131  132  133  135  141  169  177
 184  192  193  198  204  207  208  209
 210  211  212  213  214  215  221  224
@@ -287,7 +300,7 @@ from the run were read and grouped; all gates are legitimate.
 410  411  412  416  418  420  422  423
 424  426  427  428  430  431  432  433
 434  436  437  438  439  441  443  445
-446  448  450  451  452  453  454  459
+446  448  450  451  452  453  454  455  459
 460  461  464  465  466  467  468  471
 472  474  475  476  477  478  479  480
 481  483  484  486  488  489  490  491
@@ -304,7 +317,7 @@ from the run were read and grouped; all gates are legitimate.
 678  679  680  683  684  688  690  695
 696  703  704  705  706  707  708  728
 729  731  732  736  738  740  741  742
-743  747  748  749  750  751  753  754
+743  747  748  749  750  751  754
 755  756  759  760  761  763  764  771
 779  782  784  785  789  790  792
 ```
@@ -326,12 +339,14 @@ Extended godown cluster `392 461 468 474 505 530 536 622 635 646 705` passes.
 Newly-exposed shutdown-related failures:
 `417` (xattr EA race), `599` (VFS cleanup_mnt WARN), `623` (fsync after shutdown
 missing EIO), `730` (read after device delete missing EIO), `737` (file lost
-after O_DIRECT+shutdown), and `127` (mmap+fsx D-state hang). `generic/388` is
-excluded from the full suite because it wedges.
+after O_DIRECT+shutdown), `753` (dm-error metadata-sync WARN), and historically
+`127` (mmap+fsx D-state hang — passed in this run). `generic/388` is excluded
+from the full suite because it wedges.
 
-With `LOGWRITES_DEV` now configured, `455` reveals a real log-writes replay md5
-mismatch; `482` and `757` are correctly not-run because BrieFS does not issue FUA
-writes. Size failures `133` and `465` passed after enlarging the loop images.
+With `LOGWRITES_DEV` now configured, `455` passes (was an md5 mismatch in the
+previous run). `482` and `757` are correctly not-run because BrieFS does not
+issue FUA writes. Size failures `133` and `465` passed after enlarging the loop
+images.
 
 ### Recent fix highlights (this campaign)
 
@@ -378,19 +393,20 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | 475                           | —        | dm-error crash-replay: passed this run, still flaky/deferred   |
 | 048                           | 62167fa  | sync+shutdown file size bug (inode dirty on i_size growth + inode-block RMW lock) |
 
-> Open BrieFS code bugs after this run: `127` (mmap+fsx D-state hang), `417`
-> (xattr/unlink race), `455` (log-writes replay md5 mismatch), `599` (shutdown
-> VFS cleanup WARN), `623` (fsync after shutdown missing EIO), `730` (read after
-> device delete missing EIO), `737` (O_DIRECT file lost after shutdown), and the
-> excluded `388` shutdown/replay wedge.
-> `generic/311` is a pre-existing baseline flake. `generic/475` passed in this run
-> but remains a known deferred bug in the same crash-replay family.
+> Open BrieFS code bugs after this run: `417` (xattr/unlink race), `599`
+> (shutdown VFS cleanup WARN), `623` (fsync after shutdown missing EIO), `730`
+> (read after device delete missing EIO), `737` (O_DIRECT file lost after
+> shutdown), `753` (dm-error metadata-sync WARN), and the excluded `388`
+> shutdown/replay wedge. `generic/127` passed in this run but remains a known
+> mmap+fsx D-state hang risk. `generic/311` is a pre-existing baseline flake.
+> `generic/455` and `generic/475` passed in this run; `475` remains a known flaky
+> deferred bug in the crash-replay family.
 
 ---
 
 ## How this was measured
 
-- Full suite `./check -g auto -X .exclude` on the VM (2026-07-04), kernel
+- Full suite `./check -g auto -X .exclude` on the VM (2026-07-06), kernel
   `6.12.94+deb13-amd64`, branch `even-more-xfstests`. `generic/388` excluded
   via `/xfstests/tests/generic/.exclude`.
 - Post-run setup on the VM: `TEST_DEV` (`/var/tmp/test.img`) enlarged to
@@ -399,11 +415,12 @@ A large cluster of previously-failing tests now passes. Notable fixes:
   device; logwrites tests create their own `/dev/mapper/logwrites-test` dm target
   on top of `SCRATCH_DEV`.
 - Results: `generic/038`, `048`, `256`, `273–275`, `312`, `320`, `620`, `747`
-  now run and pass; `generic/133` and `generic/465` pass; `generic/482` and
-  `generic/757` become correctly not-run (`could not locate any FUA write`);
-  `generic/455` runs and fails with a log-writes replay md5 mismatch.
+  run and pass; `generic/133` and `generic/465` pass; `generic/482` and
+  `generic/757` correctly not-run (`could not locate any FUA write`);
+  `generic/455` passes with configured log-writes; `generic/753` newly fails on
+  dm-error metadata-sync dmesg warnings.
 - Pass/Fail/Not-run lists derived from the final `Ran:` / `Not run:` / `Failures:`
-  block in `/xfstests/results/check.log` plus the targeted re-runs.
+  block in `/xfstests/results/check.log`.
 - Not-run reasons read from each test's `.notrun` artifact in
   `/xfstests/results/generic/` and grouped.
 - Failing-test details inspected from `.out.bad`, `.full`, and `.dmesg` files.
