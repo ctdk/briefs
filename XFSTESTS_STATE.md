@@ -97,7 +97,7 @@ continued.
   `generic/030–099` shutdown cluster clean.
 
 ### generic/737 — file lost after O_DIRECT+shutdown
-- **Status:** **fixed** (`d4cbd05`); was fail (output mismatch).
+- **Status:** **fixed** (`8f4a27b`); was fail (output mismatch).
 - **Root cause:** T-2 creates a 1 MiB file with `O_DIRECT & O_SYNC`, issues a
   sudden `XFS_IOC_GOINGDOWN NOLOGFLUSH` shutdown, and remounts; the file is gone.
   Two independent durability gaps combined: directory mutations were not flushed
@@ -400,7 +400,7 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | 079 277 424 545 553 555 596 629 | 38d57d0  | chattr/lsattr inode flags (+S/+D/+i/+a/+d/+A)                |
 | 475                           | —        | dm-error crash-replay: passed this run, still flaky/deferred   |
 | 048                           | 62167fa  | sync+shutdown file size bug (inode dirty on i_size growth + inode-block RMW lock) |
-| 737                           | —        | O_DIRECT+shutdown file lost (directory sync durability + journal ring back-pressure) |
+| 737                           | 8f4a27b  | O_DIRECT+shutdown file lost (directory sync durability + journal ring back-pressure) |
 
 > Open BrieFS code bugs after this run: `417` (xattr/unlink race), `599`
 > (shutdown VFS cleanup WARN), `623` (fsync after shutdown missing EIO), `730`
