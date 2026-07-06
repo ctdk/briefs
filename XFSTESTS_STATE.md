@@ -16,14 +16,14 @@ failing-test notes).
 | Selected         |   782 | auto-group tests the suite considered (388 excluded)     |
 | Not run          |   398 | skipped by a `_require_*` gate (verified below)            |
 | Executed         |   384 | selected − not-run                                        |
-| **Pass**         |   377 | executed and matched golden output                       |
-| **Fail**         |     7 | see below                                                |
+| **Pass**         |   378 | executed and matched golden output                       |
+| **Fail**         |     6 | see below                                                |
 | Wedges / oops    |     0 | suite completed without manual intervention              |
 
 **Tally reading.** xfstests reports "Failed 7 of 782 tests"; the 782 is the
 *selected* count. Executed = 782 − 398 = 384; pass = 384 − 7 = 377.
 
-**Of the 7 failures:**
+**Of the 6 failures:**
 
 - `generic/311` — pre-existing baseline flake (dm-flakey/fsync timing).
 - `generic/417` — real BrieFS bug: `multi_open_unlink` fails to create a 512-byte
@@ -36,8 +36,6 @@ failing-test notes).
 - `generic/730` — real BrieFS shutdown bug: read after the `scsi_debug` block
   device is deleted should return `EIO`, but the read exits cleanly.
   Same error-propagation gap as 623.
-- `generic/737` — real BrieFS shutdown/replay bug: a 1 MiB file created with
-  `O_SYNC`+`O_DIRECT` is lost after shutdown/remount (`No such file or directory`).
 - `generic/753` — real BrieFS dm-error metadata-sync bug: dmesg reports
   `journal back-pressure checkpoint failed: -5` and `metadata write error`
   (xattr chain + alloc header) under a failing dm-error device, then fsck
@@ -80,7 +78,7 @@ continued.
 
 ---
 
-## Failing tests (7)
+## Failing tests (6)
 
 ### generic/048 — file size not persisted after sync+shutdown
 - **Status:** **fixed** (`62167fa`); was fail (output mismatch), newly exposed now
@@ -97,6 +95,24 @@ continued.
   `briefs_persist_disk_inode()`.
 - **Verification:** 30/30 standalone passes and 20/20 `dd` reproducer passes;
   `generic/030–099` shutdown cluster clean.
+
+### generic/737 — file lost after O_DIRECT+shutdown
+- **Status:** **fixed** (`d4cbd05`); was fail (output mismatch).
+- **Root cause:** T-2 creates a 1 MiB file with `O_DIRECT & O_SYNC`, issues a
+  sudden `XFS_IOC_GOINGDOWN NOLOGFLUSH` shutdown, and remounts; the file is gone.
+  Two independent durability gaps combined: directory mutations were not flushed
+  by the create path because `briefs_dir_sync()` delegated to
+  `briefs_inode_sync()` and returned early for non-`IS_SYNC`/`DIRSYNC` inodes,
+  and the 64-block journal ring could wrap under a stream of fsyncs and
+  overwrite the still-needed create records because back-pressure was only
+  checked on block-full flushes.
+- **Fix:** rewrite `briefs_dir_sync()` to flush directory metadata, the journal,
+  and issue a drive flush unconditionally; add back-pressure checkpoints at the
+  top and bottom of `__briefs_journal_sync_locked()` to keep the ring from
+  wrapping during sync-driven single-block advances.
+- **Verification:** minimal `repro737.sh` 3/3, `generic/737` 3/3 standalone, and
+  a regression cluster of `generic/003 029 030 032 048 640 737` all pass with
+  clean `dmesg`; `generic/011` dirstress still passes.
 
 ### generic/127 — mmap+fsx D-state hang
 - **Status:** **passed** in the 2026-07-06 run; historically a hang where the
@@ -133,14 +149,6 @@ continued.
 - **Root cause:** expected output contains `fsync: Input/output error`; BrieFS
   does not return `EIO` on fsync after a shutdown ioctl.
 - **Action:** wire shutdown error propagation into fsync/writeback.
-
-### generic/737 — file lost after shutdown/remount
-- **Status:** fail (output mismatch).
-- **Root cause:** T-2 creates a 1 MiB file with `O_DIRECT & O_SYNC`, issues a
-  sudden shutdown, cycles mount, and the file is gone (`No such file or directory`).
-  Data for buffered and AIO-DIO paths survives; the O_DIRECT path loses the file.
-- **Action:** real shutdown/replay bug; investigate direct-I/O + shutdown
-  durability.
 
 ### generic/455 — log-writes replay md5 mismatch
 - **Status:** **fixed/passing** in the 2026-07-06 run; was fail (output mismatch)
@@ -316,7 +324,7 @@ from the run were read and grouped; all gates are legitimate.
 640  642  643  646  647  650  676  677
 678  679  680  683  684  688  690  695
 696  703  704  705  706  707  708  728
-729  731  732  736  738  740  741  742
+729  731  732  736  737  738  740  741  742
 743  747  748  749  750  751  754
 755  756  759  760  761  763  764  771
 779  782  784  785  789  790  792
@@ -338,10 +346,10 @@ Extended godown cluster `392 461 468 474 505 530 536 622 635 646 705` passes.
 
 Newly-exposed shutdown-related failures:
 `417` (xattr EA race), `599` (VFS cleanup_mnt WARN), `623` (fsync after shutdown
-missing EIO), `730` (read after device delete missing EIO), `737` (file lost
-after O_DIRECT+shutdown), `753` (dm-error metadata-sync WARN), and historically
-`127` (mmap+fsx D-state hang — passed in this run). `generic/388` is excluded
-from the full suite because it wedges.
+missing EIO), `730` (read after device delete missing EIO), `753` (dm-error
+metadata-sync WARN), and historically `127` (mmap+fsx D-state hang — passed in
+this run). `generic/737` (file lost after O_DIRECT+shutdown) is now fixed.
+`generic/388` is excluded from the full suite because it wedges.
 
 With `LOGWRITES_DEV` now configured, `455` passes (was an md5 mismatch in the
 previous run). `482` and `757` are correctly not-run because BrieFS does not
@@ -392,15 +400,15 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | 079 277 424 545 553 555 596 629 | 38d57d0  | chattr/lsattr inode flags (+S/+D/+i/+a/+d/+A)                |
 | 475                           | —        | dm-error crash-replay: passed this run, still flaky/deferred   |
 | 048                           | 62167fa  | sync+shutdown file size bug (inode dirty on i_size growth + inode-block RMW lock) |
+| 737                           | —        | O_DIRECT+shutdown file lost (directory sync durability + journal ring back-pressure) |
 
 > Open BrieFS code bugs after this run: `417` (xattr/unlink race), `599`
 > (shutdown VFS cleanup WARN), `623` (fsync after shutdown missing EIO), `730`
-> (read after device delete missing EIO), `737` (O_DIRECT file lost after
-> shutdown), `753` (dm-error metadata-sync WARN), and the excluded `388`
-> shutdown/replay wedge. `generic/127` passed in this run but remains a known
-> mmap+fsx D-state hang risk. `generic/311` is a pre-existing baseline flake.
-> `generic/455` and `generic/475` passed in this run; `475` remains a known flaky
-> deferred bug in the crash-replay family.
+> (read after device delete missing EIO), `753` (dm-error metadata-sync WARN),
+> and the excluded `388` shutdown/replay wedge. `generic/127` passed in this run
+> but remains a known mmap+fsx D-state hang risk. `generic/311` is a
+> pre-existing baseline flake. `generic/455` and `generic/475` passed in this
+> run; `475` remains a known flaky deferred bug in the crash-replay family.
 
 ---
 

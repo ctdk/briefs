@@ -44,6 +44,7 @@ int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb) 
 	j->write_pos = le64_to_cpu(sb->journal_log_start);
 	j->synced_pos = j->write_pos;   /* nothing written yet -> nothing to sync */
 	j->dirty = false;
+	j->in_checkpoint = false;
 
 	/* Validate journal geometry */
 	if (j->journal_end <= j->journal_start) {
@@ -223,6 +224,7 @@ static int __briefs_journal_write_record_locked(struct briefs_journal *j,
 	briefs_stat_inc(briefs_sb(j->vfs_sb), journal_records);
 
 	total_size = hdr_size + data_len;
+
 
 	/* Check if record fits in remaining block space */
 	if (j->write_offset + total_size > JOURNAL_BLOCK_SIZE) {
@@ -492,6 +494,7 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	j->sb->journal_log_start = cpu_to_le64(j->write_pos);
 	j->sb->journal_log_end = cpu_to_le64(j->write_pos);
 
+
 	j->dirty = false;
 	j->records_since_checkpoint = 0;
 
@@ -561,9 +564,13 @@ static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
 			if (!TRIE_REF_IS_NULL(binfo->disk_inode.dir_trie_root)) {
 				int sret = briefs_trie_seed_pool(sb,
 						binfo->disk_inode.dir_trie_root);
-				if (sret)
-					pr_warn("briefs: replay pool seed for ino %llu failed: %d\n",
+				if (sret) {
+					pr_err("briefs: replay pool seed for ino %llu failed: %d\n",
 						parent_ino, sret);
+					mutex_unlock(&binfo->trie_lock);
+					iput(parent);
+					return sret;
+				}
 			}
 			binfo->trie_pool_seeded = true;
 		}
@@ -591,6 +598,19 @@ static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
 		ret = briefs_trie_remove(sb, &binfo->disk_inode, rec->name, name_len);
 		if (ret == -ENOENT) {
 			ret = 0;
+		}
+	}
+
+	/* Persist the parent disk inode so the replayed directory trie root reaches
+	 * the inode block.  Otherwise the in-memory trie mutation is lost when the
+	 * inode is iput() after replay, leaving post-mount lookups unable to find the
+	 * entry (generic/737 O_DIRECT+NOLOGFLUSH shutdown loses a file). */
+	if (!ret) {
+		int pret = briefs_persist_disk_inode(sb, parent_ino, &binfo->disk_inode, false);
+		if (pret) {
+			pr_err("briefs: replay failed to persist parent inode %llu: %d\n",
+			       parent_ino, pret);
+			ret = pret;
 		}
 	}
 
@@ -1696,6 +1716,17 @@ int briefs_journal_replay(struct briefs_journal *j) {
 		}
 	}
 
+	/* Flush all replay-dirty metadata before marking the journal clean.  The
+	 * apply pass writes directory trie pages, inode blocks, and allocator
+	 * bitmaps; without a final flush those buffers can still be in the page
+	 * cache when we advance log_start/log_end, so a NOLOGFLUSH shutdown right
+	 * after replay would lose them. */
+	if (j->vfs_sb && j->vfs_sb->s_bdev) {
+		int flush_ret = sync_blockdev(j->vfs_sb->s_bdev);
+		if (flush_ret)
+			pr_err("briefs: failed to flush metadata after replay: %d\n", flush_ret);
+	}
+
 	/* Update superblock to mark journal clean */
 	j->sb->journal_log_start = j->sb->journal_log_end;
 	j->sb->checkpoint_seq = cpu_to_le64(le64_to_cpu(j->sb->checkpoint_seq) + 1);
@@ -1832,6 +1863,7 @@ int briefs_journal_dir_update(struct briefs_journal *j, u64 parent_ino, u64 chil
 	if (op > 1)
 		return -EINVAL;
 
+
 	memset(&rec, 0, sizeof(rec));
 	rec.parent_ino = cpu_to_le64(parent_ino);
 	rec.child_ino = cpu_to_le64(child_ino);
@@ -1952,6 +1984,26 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 		return 0;
 
 	/*
+	 * Back-pressure: a long stream of fsyncs can advance write_pos around
+	 * the ring while journal_log_start stays fixed.  If the current block
+	 * we are about to write is also the oldest uncheckpointed block, force
+	 * a checkpoint first to retire it; otherwise this sync would overwrite
+	 * live records before they were checkpointed away.
+	 */
+	if (!j->in_checkpoint &&
+	    j->write_pos == le64_to_cpu(j->sb->journal_log_start)) {
+		pr_debug("briefs: journal ring full at sync start, back-pressure checkpoint at write_pos=%llu\n",
+			 j->write_pos);
+		j->in_checkpoint = true;
+		ret = __briefs_journal_checkpoint_locked(j);
+		j->in_checkpoint = false;
+		if (ret)
+			return ret;
+		if (!j->dirty)
+			return 0;
+	}
+
+	/*
 	 * Capture the range of journal blocks dirtied since the last durable
 	 * sync: every filled block flushed by briefs_journal_write_record()
 	 * (from synced_pos up to write_pos) plus the partial block we are about
@@ -1966,12 +2018,14 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 	sync_start = j->synced_pos;
 	sync_end = j->write_pos;
 
+
 	/* Write current block to disk */
 	ret = briefs_journal_write_block(j, j->write_pos, j->cur_block);
 	if (ret) {
 		pr_err("briefs: journal sync failed (err=%d)\n", ret);
 		return ret;
 	}
+
 
 	/* Advance write position */
 	j->write_pos = briefs_journal_next_block(j, j->write_pos);
@@ -2100,6 +2154,25 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 		ret = __briefs_journal_checkpoint_locked(j);
 		if (ret)
 			pr_warn("briefs: periodic checkpoint failed: %d\n", ret);
+	}
+
+	/*
+	 * Back-pressure: if the next block to write would catch up to the
+	 * oldest uncheckpointed block, force a checkpoint now to retire the
+	 * tail before it is overwritten.  This protects records whose
+	 * on-disk metadata has not yet been checkpointed (directory creates
+	 * under a stream of O_SYNC writes -- generic/737).
+	 */
+	if (!j->in_checkpoint &&
+	    briefs_journal_next_block(j, j->write_pos) ==
+	    le64_to_cpu(j->sb->journal_log_start)) {
+		pr_debug("briefs: journal ring full, back-pressure checkpoint at write_pos=%llu\n",
+			 j->write_pos);
+		j->in_checkpoint = true;
+		ret = __briefs_journal_checkpoint_locked(j);
+		j->in_checkpoint = false;
+		if (ret)
+			pr_warn("briefs: back-pressure checkpoint failed: %d\n", ret);
 	}
 
 	return 0;

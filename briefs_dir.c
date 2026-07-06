@@ -16,14 +16,32 @@
 #include "briefs_debug.h"
 
 /*
- * briefs_dir_sync - make a directory mutation durable for DIRSYNC.
+ * briefs_dir_sync - make a directory mutation durable.
  *
- * Caller must have already journaled/persisted the change and must not hold
- * any lock that conflicts with writing the inode buffer.
+ * The VFS only guarantees directory durability for DIRSYNC directories, but
+ * BrieFS relies on the journaled directory mutation and the on-disk trie
+ * pages being flushed before later operations can overwrite the journal
+ * records that describe them.  Flush the parent inode, the journal, and the
+ * metadata buffers (trie pages) it references, then issue a drive-level
+ * flush so the change is ordered durably.  Callers must not hold locks that
+ * conflict with writing the inode/journal buffers.
  */
 static int briefs_dir_sync(struct inode *dir)
 {
-	return briefs_inode_sync(dir);
+	struct briefs_sb_info *bsi = briefs_sb(dir->i_sb);
+	int ret;
+
+	ret = sync_inode_metadata(dir, 1);
+	if (ret)
+		return ret;
+
+	if (bsi->journal && bsi->journal->dirty) {
+		ret = briefs_journal_sync(bsi->journal);
+		if (ret)
+			return ret;
+	}
+
+	return blkdev_issue_flush(dir->i_sb->s_bdev);
 }
 
 /* briefs_readdir - enumerate directory contents
