@@ -104,14 +104,99 @@ bool briefs_check_meta_write_error(struct buffer_head *bh)
 }
 
 /*
- * briefs_sb_shutdown - true if the filesystem has been shut down by a metadata
- * write error under an errors=remount-ro policy.
+ * briefs_sb_shutdown - true if the filesystem has been shut down (by error
+ * path or by an explicit XFS_IOC_GOINGDOWN ioctl).
  */
 bool briefs_sb_shutdown(struct super_block *sb)
 {
 	struct briefs_sb_info *bsi = briefs_sb(sb);
 
 	return bsi && (bsi->mount_flags & BRIEFS_MF_SHUTDOWN);
+}
+
+/*
+ * briefs_force_shutdown - common shutdown transition.
+ *
+ * Sets the shutdown flag and makes the superblock read-only. Idempotent.
+ * Caller must ensure it is safe to touch sb->s_flags (process context, not
+ * inside a transaction-spinlock region).
+ */
+static void briefs_force_shutdown(struct super_block *sb, const char *why)
+{
+	struct briefs_sb_info *bsi = briefs_sb(sb);
+
+	if (!bsi)
+		return;
+
+	if (bsi->mount_flags & BRIEFS_MF_SHUTDOWN)
+		return;
+
+	if (sb_rdonly(sb))
+		goto set_flag;
+
+	bsi->mount_flags |= BRIEFS_MF_SHUTDOWN;
+	pr_crit("briefs: Remounting filesystem read-only due to %s\n", why);
+	sb->s_flags |= SB_RDONLY;
+	return;
+
+set_flag:
+	bsi->mount_flags |= BRIEFS_MF_SHUTDOWN;
+}
+
+/*
+ * briefs_shutdown - handle an explicit XFS_IOC_GOINGDOWN ioctl.
+ *
+ * Implements the three XFS shutdown flags:
+ *   XFS_FSOP_GOING_FLAGS_DEFAULT    (0): freeze bdev, shutdown, thaw
+ *   XFS_FSOP_GOING_FLAGS_LOGFLUSH   (1): flush journal records, then shutdown
+ *   XFS_FSOP_GOING_FLAGS_NOLOGFLUSH (2): shutdown immediately
+ *
+ * LOGFLUSH must flush pending journal records *without* checkpointing, so
+ * tests that expect replay (generic/052) still see log_start < log_end on the
+ * next mount. NOLOGFLUSH/DEFAULT leave the journal as-is and simply stop new
+ * metadata writes.
+ */
+int briefs_shutdown(struct super_block *sb, u32 flags)
+{
+	struct briefs_sb_info *bsi = briefs_sb(sb);
+	int ret = 0;
+
+	if (!bsi)
+		return -EINVAL;
+
+	if (bsi->mount_flags & BRIEFS_MF_SHUTDOWN)
+		return 0;
+
+	switch (flags) {
+	case XFS_FSOP_GOING_FLAGS_DEFAULT:
+		ret = bdev_freeze(sb->s_bdev);
+		if (ret)
+			return ret;
+		briefs_force_shutdown(sb, "explicit shutdown ioctl");
+		bdev_thaw(sb->s_bdev);
+		break;
+
+	case XFS_FSOP_GOING_FLAGS_LOGFLUSH:
+		if (bsi->journal) {
+			ret = briefs_journal_sync_no_checkpoint(bsi->journal);
+			if (ret)
+				return ret;
+			ret = blkdev_issue_flush(sb->s_bdev);
+			if (ret)
+				return ret;
+		}
+		briefs_force_shutdown(sb, "explicit shutdown ioctl (log flush)");
+		break;
+
+	case XFS_FSOP_GOING_FLAGS_NOLOGFLUSH:
+		briefs_force_shutdown(sb, "explicit shutdown ioctl (no log flush)");
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
 }
 
 /*
@@ -159,14 +244,7 @@ void briefs_handle_meta_write_error(struct super_block *sb, const char *ctx)
 	if (sb_rdonly(sb))
 		return;
 
-	bsi->mount_flags |= BRIEFS_MF_SHUTDOWN;
-	pr_crit("briefs: Remounting filesystem read-only due to %s error\n", ctx);
-	/*
-	 * Setting SB_RDONLY directly is the same emergency transition ext4 uses
-	 * in ext4_handle_error(). It does not run the full remount procedure,
-	 * but it blocks all future modifying VFS operations on this superblock.
-	 */
-	sb->s_flags |= SB_RDONLY;
+	briefs_force_shutdown(sb, ctx);
 }
 
 /*
@@ -179,26 +257,37 @@ int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
 {
 	struct briefs_disk_inode *di;
 	struct buffer_head *bh;
-
-	bh = briefs_read_inode_block(sb, ino, &di);
-	if (IS_ERR(bh))
-		return PTR_ERR(bh);
-
-	briefs_cpu_inode_to_disk(src, di);
+	struct mutex *block_lock = briefs_inode_block_lock(sb, ino);
+	int ret = 0;
 
 	/*
-	 * Same shared-block writeback race as briefs_write_inode(): a concurrent
-	 * writeback of this inode block may fail on a dying device and clear
-	 * BH_Uptodate before we mark dirty.  Lock the buffer, wait for any in-flight
-	 * write, and propagate -EIO rather than re-dirtying a broken buffer.
+	 * Serialize with write_inode() and other persist_disk_inode() callers on
+	 * the same shared 4K inode block.  briefs_write_inode() snapshots and copies
+	 * back a private inode copy; overlapping RMW cycles must not interleave.
+	 */
+	mutex_lock(block_lock);
+
+	bh = briefs_read_inode_block(sb, ino, &di);
+	if (IS_ERR(bh)) {
+		ret = PTR_ERR(bh);
+		goto out_unlock;
+	}
+
+	/*
+	 * Hold the buffer lock across the modify+mark so a concurrent writeback
+	 * of this shared 4K inode block cannot submit the buffer with partially
+	 * modified contents.  Also catches a failed in-flight writeback
+	 * (BH_Uptodate cleared, e.g. generic/753) and propagates -EIO instead of
+	 * re-dirtying a broken buffer.
 	 */
 	lock_buffer(bh);
 	if (!buffer_uptodate(bh)) {
 		unlock_buffer(bh);
 		briefs_check_meta_write_error(bh);
-		brelse(bh);
-		return -EIO;
+		ret = -EIO;
+		goto out_release;
 	}
+	briefs_cpu_inode_to_disk(src, di);
 	mark_buffer_dirty(bh);
 	unlock_buffer(bh);
 
@@ -206,11 +295,15 @@ int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
 		sync_dirty_buffer(bh);
 	if (briefs_check_meta_write_error(bh)) {
 		briefs_handle_meta_write_error(sb, "persist disk inode");
-		brelse(bh);
-		return -EIO;
+		ret = -EIO;
+		goto out_release;
 	}
+
+out_release:
 	brelse(bh);
-	return 0;
+out_unlock:
+	mutex_unlock(block_lock);
+	return ret;
 }
 
 /*
@@ -289,6 +382,15 @@ int briefs_update_parent_dir(struct inode *dir, struct briefs_sb_info *bsi,
 		briefs_sync_inode_times(dir, &pbinfo->disk_inode);
 	}
 
+	/*
+	 * Persist the directory inode into the bdev buffer cache.  The dirty
+	 * buffer is written back by sync_blockdev() in the shutdown/umount path
+	 * before the journal is checkpointed clean, so a NOLOGFLUSH shutdown sees
+	 * the trie root on disk even though the journal records are not replayed
+	 * (generic/417).  Synchronous writes here would make every create/unlink
+	 * wait for disk, so leave the buffer dirty and let the normal metadata
+	 * flush paths batch it.
+	 */
 	ret = briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
 	if (ret) {
 		pbinfo->disk_inode.filesize = old_size;
@@ -550,41 +652,76 @@ int briefs_finish_create(struct inode *dir, struct dentry *dentry,
 int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	struct briefs_sb_info *bsi;
 	struct briefs_inode_info *binfo;
-	struct briefs_disk_inode *disk_inode;
+	struct briefs_disk_inode *disk_inode, local_di;
 	struct buffer_head *bh;
+	struct mutex *block_lock;
 	unsigned seq;
+	int ret = 0;
 
 	if (!inode)
 		return -EINVAL;
 
 	bsi = inode->i_sb->s_fs_info;
 	binfo = briefs_i(inode);
+	block_lock = briefs_inode_block_lock(inode->i_sb, inode->i_ino);
 
 	pr_debug("briefs: write_inode %lu\n", inode->i_ino);
 
+	/*
+	 * Serialize read-modify-write cycles on the shared 4K inode block.
+	 * BrieFS packs 8 inodes per block; without this serialization a writer
+	 * that copies back its private snapshot between another writer's snapshot
+	 * and copy-back can overwrite that sibling inode's slot, losing its size
+	 * or extent updates (generic/048 sync+shutdown size bug).  The buffer
+	 * lock alone cannot cover the whole RMW because journaling may trigger a
+	 * checkpoint that calls sync_blockdev() and would deadlock waiting on
+	 * the locked buffer.
+	 */
+	mutex_lock(block_lock);
+
 	bh = briefs_read_inode_block(inode->i_sb, inode->i_ino, &disk_inode);
-	if (IS_ERR(bh))
-		return PTR_ERR(bh);
+	if (IS_ERR(bh)) {
+		ret = PTR_ERR(bh);
+		goto out_unlock;
+	}
+
+	/*
+	 * Snapshot the current on-disk inode slot under the buffer lock.  The
+	 * shared block can have writeback submitted while we prepare our update;
+	 * working on a private copy prevents a concurrent writeback from capturing
+	 * a partially-modified buffer.
+	 */
+	lock_buffer(bh);
+	if (!buffer_uptodate(bh)) {
+		unlock_buffer(bh);
+		briefs_check_meta_write_error(bh);
+		briefs_handle_meta_write_error(inode->i_sb, "write inode");
+		mapping_set_error(inode->i_mapping, -EIO);
+		ret = -EIO;
+		goto out_release;
+	}
+	memcpy(&local_di, disk_inode, sizeof(local_di));
+	unlock_buffer(bh);
 
 	/* Sync VFS timestamp and size fields into in-memory copy first */
 	briefs_sync_inode_times(inode, &binfo->disk_inode);
 	binfo->disk_inode.filesize = inode->i_size;
 
 	/*
-	 * Copy in-memory disk_inode to the on-disk buffer, converting to
+	 * Copy in-memory disk_inode to the local on-disk copy, converting to
 	 * little endian. Use a seqcount retry loop to ensure we don't persist
 	 * a partially-updated extent list if briefs_append_extent or another
 	 * extent writer is in progress concurrently.
 	 */
 	do {
 		seq = read_seqcount_begin(&binfo->extent_seq);
-		briefs_cpu_inode_to_disk(&binfo->disk_inode, disk_inode);
+		briefs_cpu_inode_to_disk(&binfo->disk_inode, &local_di);
 		/* Update VFS-derived fields after the copy */
-		disk_inode->filemode = cpu_to_le32(inode->i_mode);
-		disk_inode->uid = cpu_to_le32(from_kuid(&init_user_ns, inode->i_uid));
-		disk_inode->gid = cpu_to_le32(from_kgid(&init_user_ns, inode->i_gid));
-		disk_inode->filesize = cpu_to_le64(inode->i_size);
-		disk_inode->nlinks = cpu_to_le32(inode->i_nlink);
+		local_di.filemode = cpu_to_le32(inode->i_mode);
+		local_di.uid = cpu_to_le32(from_kuid(&init_user_ns, inode->i_uid));
+		local_di.gid = cpu_to_le32(from_kgid(&init_user_ns, inode->i_gid));
+		local_di.filesize = cpu_to_le64(inode->i_size);
+		local_di.nlinks = cpu_to_le32(inode->i_nlink);
 	} while (read_seqcount_retry(&binfo->extent_seq, seq));
 
 	/* Mirror the VFS-derived fields back into the in-memory disk inode so
@@ -606,19 +743,17 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	 * This captures extent metadata, timestamps, mode, nlink, and the
 	 * trie root in a single record.
 	 */
-	briefs_journal_inode_full(bsi->journal, inode->i_ino, disk_inode);
+	briefs_journal_inode_full(bsi->journal, inode->i_ino, &local_di);
 
 	/*
-	 * A concurrent writeback of this shared 4K inode block may have been
-	 * submitted while we prepared this update (the buffer can carry several
-	 * inodes).  On a failing device (dm-error sudden death, generic/753) that
-	 * writeback completes EIO and end_buffer_async_write() clears BH_Uptodate.
-	 * Re-dirtying the now-!uptodate buffer would trip
-	 * WARN_ON_ONCE(!buffer_uptodate) in mark_buffer_dirty().  Take the buffer
-	 * lock so no new writeback can be submitted, wait for any write already
-	 * in flight, and if it failed propagate -EIO instead of re-dirtying a
-	 * broken buffer.  The journal record above preserves the change for
-	 * replay; writeback retries once the device recovers.
+	 * Copy the finalized local snapshot into the shared buffer and re-dirty
+	 * it.  Re-take the buffer lock so no new writeback of the block can be
+	 * submitted between the copy and mark_buffer_dirty(), and so we can detect
+	 * a concurrent failed writeback (end_buffer_async_write() cleared
+	 * BH_Uptodate, e.g. generic/753 dm-error sudden death).  If the buffer is
+	 * !uptodate, propagate -EIO instead of re-dirtying a broken buffer; the
+	 * journal record above preserves the change for replay, and writeback
+	 * retries once the device recovers.
 	 */
 	lock_buffer(bh);
 	if (!buffer_uptodate(bh)) {
@@ -626,14 +761,18 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 		briefs_check_meta_write_error(bh);
 		briefs_handle_meta_write_error(inode->i_sb, "write inode");
 		mapping_set_error(inode->i_mapping, -EIO);
-		brelse(bh);
-		return -EIO;
+		ret = -EIO;
+		goto out_release;
 	}
+	memcpy(disk_inode, &local_di, sizeof(local_di));
 	mark_buffer_dirty(bh);
 	unlock_buffer(bh);
-	brelse(bh);
 
-	return 0;
+out_release:
+	brelse(bh);
+out_unlock:
+	mutex_unlock(block_lock);
+	return ret;
 }
 /* briefs_alloc_inode - allocate a VFS inode (called by VFS inode cache) */
 struct inode *briefs_alloc_vfs_inode(struct super_block *sb) {

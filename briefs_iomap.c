@@ -367,6 +367,19 @@ static int briefs_write_iomap_end(struct inode *inode, loff_t pos, loff_t length
 {
 	if (written <= 0)
 		return written;
+
+	/*
+	 * iomap_file_buffered_write grows i_size itself and sets
+	 * IOMAP_F_SIZE_CHANGED, but it does not mark the inode dirty when no
+	 * new block was allocated in this iteration (a hit in an already-mapped
+	 * run).  file_update_time() only dirties when ctime/mtime change, so a
+	 * run of same-second writes can leave the inode clean with a stale
+	 * on-disk filesize.  Ensure any file-extending write dirties the inode
+	 * so briefs_write_inode() will persist the new size.
+	 */
+	if (flags & IOMAP_F_SIZE_CHANGED)
+		mark_inode_dirty(inode);
+
 	return 0;
 }
 

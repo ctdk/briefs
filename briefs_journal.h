@@ -26,6 +26,7 @@ struct briefs_journal {
 	u64 checkpoint_seq;               /* current checkpoint sequence */
 	u32 records_since_checkpoint;      /* records written since last checkpoint */
 	bool dirty;                       /* has uncommitted changes */
+	bool in_checkpoint;               /* recursion guard for sync back-pressure */
 	/*
 	 * Serializes all journal writers.  briefs_journal_write_record(),
 	 * _sync() and _checkpoint() mutate shared ring state (write_pos,

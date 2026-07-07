@@ -149,12 +149,35 @@ int briefs_release(struct inode *inode, struct file *file) {
  * xfs_io prints the (stdout, filtered) fsx fields and emits no error line.
  *
  * FS_IOC_{GET,SET}FLAGS and FS_IOC_FS{GET,SET}XATTR are now handled by the VFS
- * through inode_operations::fileattr_get / fileattr_set, so this stub only
- * needs to reject everything else with -ENOTTY.
+ * through inode_operations::fileattr_get / fileattr_set, so this handler only
+ * needs to answer BRIEFS_IOC_GOINGDOWN and reject everything else with -ENOTTY.
  */
 long briefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	return -ENOTTY;
+	struct inode *inode = file_inode(file);
+	u32 flags;
+	int ret;
+
+	switch (cmd) {
+	case BRIEFS_IOC_GOINGDOWN:
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		if (get_user(flags, (__u32 __user *)arg))
+			return -EFAULT;
+		ret = mnt_want_write_file(file);
+		if (ret) {
+			if (ret != -EROFS)
+				return ret;
+			/* allow idempotent shutdown on already-read-only fs */
+		}
+		ret = briefs_shutdown(inode->i_sb, flags);
+		if (ret != -EROFS)
+			mnt_drop_write_file(file);
+		return ret;
+
+	default:
+		return -ENOTTY;
+	}
 }
 
 /*
@@ -445,6 +468,7 @@ static ssize_t briefs_iomap_buffered_write(struct kiocb *iocb,
 					    struct iov_iter *from)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
+	loff_t old_size;
 	ssize_t ret;
 
 	inode_lock(inode);
@@ -473,8 +497,18 @@ static ssize_t briefs_iomap_buffered_write(struct kiocb *iocb,
 	ret = file_update_time(iocb->ki_filp);
 	if (ret)
 		goto out_unlock;
+	old_size = i_size_read(inode);
 	ret = iomap_file_buffered_write(iocb, from, &briefs_write_iomap_ops,
 					 NULL);
+	/*
+	 * iomap_file_buffered_write grows i_size but does not always mark the
+	 * inode dirty (e.g., when the write lands in an already-allocated run and
+	 * file_update_time decided no cmtime update was needed).  If the write
+	 * extended the file, force a dirty so briefs_write_inode() will persist
+	 * the new size for sync+shutdown durability (generic/048).
+	 */
+	if (ret > 0 && i_size_read(inode) > old_size)
+		mark_inode_dirty(inode);
 out_unlock:
 	inode_unlock(inode);
 	if (ret > 0)

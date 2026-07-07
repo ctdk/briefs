@@ -16,6 +16,10 @@
   `FS_IOC_FS{GET,SET}XATTR` work, with +S/+D flushing inode, journal and
   drive for metadata durability. (Kernel commit `38d57d0`; closes xfstests
   `generic/079 277 424 545 553 555 596 629`.)
+- [Done] XFS-style shutdown ioctl (`XFS_IOC_GOINGDOWN` / `F2FS_IOC_SHUTDOWN`)
+  so xfstests `godown`-based shutdown tests run. Core cluster
+  `043 044 045 046 047 048 049 050 051` passes; `050` needed a
+  dirty-journal-on-read-only-device mount rejection.
 - Make list of additional relevant mount options to honor, whether fs
   independent or unique to briefs. (Started: norecovery, errors=, debug/nodebug.)
 - [Done] Add norecovery mount option: skip journal replay, require ro mount.

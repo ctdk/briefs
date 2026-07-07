@@ -58,6 +58,7 @@ Vagrant.configure(2) do |config|
     libvirt.storage_pool_name = 'images'
     libvirt.memory = '4096'
     libvirt.cpus = 2
+    libvirt.cpu_mode = 'host-passthrough'
     libvirt.storage :file, :size => '20G'
     libvirt.storage :file, :size => '30G'
   end
@@ -77,5 +78,8 @@ Vagrant.configure(2) do |config|
     sudo DEBIAN_FRONTEND=noninteractive apt-get install git fakeroot linux-headers-amd64 hexedit hexer linux-source debhelper-compat libdw-dev zstd -y
     # xfstests build + runtime deps (for the BrieFS xfstests integration).
     sudo DEBIAN_FRONTEND=noninteractive apt-get install xfsprogs xfslibs-dev attr acl quota libgdbm-dev liburing-dev libcap-dev indent libaio-dev sqlite3 lvm2 -y
+    cd /usr/local && sudo tar -zxvf /go/targz/go1.26.3.linux-amd64.tar.gz
+    sudo ln -s /usr/local/go/bin/go /usr/local/bin/go
+    sudo ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt
   SHELL
 end

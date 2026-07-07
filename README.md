@@ -56,6 +56,10 @@ BrieFS recognizes the following filesystem-specific mount options:
   `remount-ro` (the default) remounts the filesystem read-only. `continue`
   logs the error and keeps running read-write. `panic` triggers a kernel
   panic. The active policy is visible in `/proc/mounts` and debugfs.
+* XFS-style forced shutdown via `XFS_IOC_GOINGDOWN` (also known as
+  `F2FS_IOC_SHUTDOWN`) is supported with `LOGFLUSH`, `NOLOGFLUSH`, and
+  `DEFAULT` flags. This is used by xfstests `src/godown` and by
+  `xfs_io -c shutdown` when available.
 
 RELATED
 -------

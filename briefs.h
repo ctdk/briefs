@@ -32,6 +32,7 @@
 #define BRIEFS_INODE_INLINE_DATA_SIZE 256
 #define BRIEFS_NAME_LEN 255
 #define BRIEFS_DELALLOC_RUN_MAX 256	/* max blocks per coalesced write run */
+#define BRIEFS_INODE_BLOCK_LOCKS 64	/* hash buckets for inode-block RMW locks */
 
 /* Semantic versioning, yo */
 #define _BRIEFS_MAJOR_VER 0
@@ -941,7 +942,19 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter, u64 cu
 #define BRIEFS_MF_ERRORS_CONT  0x4   /* -o errors=continue */
 #define BRIEFS_MF_ERRORS_PANIC 0x8   /* -o errors=panic */
 #define BRIEFS_MF_ERROR_FS     0x10  /* filesystem has seen a metadata write error */
-#define BRIEFS_MF_SHUTDOWN     0x20  /* filesystem is being/has been shut down due to error */
+#define BRIEFS_MF_SHUTDOWN     0x20  /* filesystem is being/has been shut down */
+
+/* Shutdown ioctl (XFS_IOC_GOINGDOWN / F2FS_IOC_SHUTDOWN) flags. */
+#define BRIEFS_IOC_GOINGDOWN _IOR('X', 125, __u32)
+#ifndef XFS_FSOP_GOING_FLAGS_DEFAULT
+#define XFS_FSOP_GOING_FLAGS_DEFAULT    0x0
+#endif
+#ifndef XFS_FSOP_GOING_FLAGS_LOGFLUSH
+#define XFS_FSOP_GOING_FLAGS_LOGFLUSH 0x1
+#endif
+#ifndef XFS_FSOP_GOING_FLAGS_NOLOGFLUSH
+#define XFS_FSOP_GOING_FLAGS_NOLOGFLUSH 0x2
+#endif
 
 /* Values for the errors= mount option. Default (0) is remount-ro. */
 enum briefs_errors_policy {
@@ -990,6 +1003,7 @@ struct briefs_sb_info {
 	struct dentry *debugfs_dir;     /* per-sb debugfs dir, NULL unless -o debug */
 	struct kobject s_kobj;          /* per-sb sysfs kobject, embedded in bsi */
 	u64 mount_jiffies;              /* time of mount, for debugfs/sysfs/proc */
+	struct mutex inode_block_locks[BRIEFS_INODE_BLOCK_LOCKS]; /* serialize RMW on shared inode blocks */
 };
 
 /* briefs_inode_info - our inode info */
@@ -1027,6 +1041,20 @@ static inline struct briefs_sb_info *briefs_sb(struct super_block *sb) {
 
 static inline struct briefs_inode_info *briefs_i(struct inode *inode) {
 	return container_of(inode, struct briefs_inode_info, vfs_inode);
+}
+
+/*
+ * Return the mutex that serializes read-modify-write cycles on the inode block
+ * holding @ino.  BrieFS packs 8 inodes per 4K block; concurrent writeback of
+ * different inodes in the same block must not interleave or the copy-back can
+ * overwrite a sibling inode's slot (generic/048 sync+shutdown size bug).
+ */
+static inline struct mutex *briefs_inode_block_lock(struct super_block *sb,
+                                                    u64 ino)
+{
+	struct briefs_sb_info *bsi = briefs_sb(sb);
+	u64 block = (ino - 1) / (sb->s_blocksize / BRIEFS_INODE_SIZE);
+	return &bsi->inode_block_locks[block % BRIEFS_INODE_BLOCK_LOCKS];
 }
 
 /* Convert data-relative block to absolute block number */
@@ -1240,6 +1268,7 @@ struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
 bool briefs_check_meta_write_error(struct buffer_head *bh);
 void briefs_handle_meta_write_error(struct super_block *sb, const char *ctx);
 bool briefs_sb_shutdown(struct super_block *sb);
+int briefs_shutdown(struct super_block *sb, u32 flags);
 const char *briefs_error_policy_name(struct super_block *sb);
 int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
                                const struct briefs_inode *src, bool sync);
@@ -1377,6 +1406,9 @@ int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync);
 int briefs_open(struct inode *inode, struct file *file);
 int briefs_release(struct inode *inode, struct file *file);
 long briefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+
+/* Journal helpers */
+int briefs_journal_sync_no_checkpoint(struct briefs_journal *j);
 
 /* Directory operations */
 int briefs_readdir(struct file *file, struct dir_context *ctx);

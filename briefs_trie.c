@@ -852,7 +852,12 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 collapse:
 	{
 		int i;
-		for (i = anc - 2; i >= 1; i--) {
+		/* Collapse empty intermediate nodes including the leaf's immediate
+			 * parent.  The ancestry array holds the path from root to leaf; the
+			 * leaf itself was already removed before this label, so start at the
+			 * parent of the removed leaf (anc - 1).
+			 */
+			for (i = anc - 1; i >= 1; i--) {
 			u64 check = ancestry[i];
 			struct buffer_head *cbh2, *pbh2;
 			struct briefs_trie_page *cpage2, *ppage2;
@@ -901,6 +906,29 @@ collapse:
 
 			briefs_trie_free_node(sb, check);
 			brelse(cbh2);
+		}
+
+		/*
+		 * If the collapse left the root as an empty intermediate node
+		 * (no children), free it too and clear the directory trie root.
+		 * Otherwise an unlinked sole entry leaves the directory pointing
+		 * at an empty trie page that is never referenced again.
+		 */
+		if (!TRIE_REF_IS_NULL(di->dir_trie_root)) {
+			struct buffer_head *rbh;
+			struct briefs_trie_page *rpage;
+			struct briefs_trie_node *rnode;
+
+			if (trie_read_node(sb, di->dir_trie_root, &rbh, &rpage, &rnode) == 0) {
+				if ((rnode->node_type & NODE_TYPE_INTERM) &&
+				    !(rnode->node_type & NODE_STATUS_LEAF) &&
+				    trie_node_child_count(rnode) == 0 &&
+				    TRIE_REF_IS_NULL(trie_node_first_child(rnode))) {
+					briefs_trie_free_node(sb, di->dir_trie_root);
+					di->dir_trie_root = 0;
+				}
+				brelse(rbh);
+			}
 		}
 	}
 
