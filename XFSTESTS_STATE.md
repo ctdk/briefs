@@ -62,6 +62,16 @@ mismatch and is now green with the configured log-writes infrastructure.
 children; xfstests' own fsx timeout killed the children and the suite
 continued.
 
+**Post-run fix (2026-07-07):** The 2026-07-06 full-suite run exposed a kernel
+BUG, not a BrieFS bug: a NULL pointer dereference at `iput+0xca` inside the
+`inode_switch_wbs_work_fn` kworker, triggered by `SB_I_CGROUPWB`.  The 6.12.y VM
+kernel has the known `cgroup_writeback_umount()` vs `inode_switch_wbs()` race
+and CVE-2026-31703, both unfixed in this stable branch.  Commit `9385fc8`
+temporarily disables cgroup writeback (removes `SB_I_CGROUPWB`) so the wb-switch
+path is never entered.  A targeted run `generic/001..030` passes cleanly;
+`generic/563` (which tests per-cgroup writeback accounting) regresses and will
+remain failed until the VM kernel is updated.
+
 ---
 
 ## Excluded test
@@ -389,7 +399,7 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | Tests                         | Commit   | Area                                                          |
 |-------------------------------|----------|---------------------------------------------------------------|
 | 093 193 683 684 688           | a1eb7e0  | killpriv-on-modify (file_remove_privs on inline write + fallocate, ATTR_MODE on truncate) |
-| 563                           | 55023ac  | cgroup writeback (SB_I_CGROUPWB)                              |
+| 563                           | 55023ac/9385fc8 | cgroup writeback (SB_I_CGROUPWB) temporarily disabled on 6.12 due to iput crash |
 | 617                           | 0cd7062  | punch-empty-tree straddler orphan                             |
 | 522 616                       | —        | punch-split-extent pagecache invalidation                     |
 | 074                           | fb649e8  | orphan dir-trie-page leak (trie_free_node)                    |
