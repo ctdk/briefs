@@ -406,19 +406,27 @@ int briefs_fill_super(struct super_block *sb, struct fs_context *fc) {
 	sb->s_xattr = briefs_xattr_handlers;
 	sb->s_flags |= SB_ACTIVE;
 
-	/* Enable cgroup-aware writeback.  inode_cgwb_enabled() (which gates
-	 * per-cgroup writeback ownership and thus io.stat write accounting)
-	 * requires SB_I_CGROUPWB on the superblock; neither mount_bdev nor
-	 * get_tree_bdev sets it -- every block filesystem (ext2/ext4/xfs/
-	 * btrfs/f2fs) sets it by hand in fill_super.  Without it, writeback
-	 * is charged to the task running fsync rather than the cgroup that
-	 * dirtied the pages, so cross-cgroup scenarios see write=0 for the
-	 * dirtier (generic/563).  The iomap writeback path already calls
-	 * wbc_init_bio()/wbc_account_cgroup_owner(); this flag is the only
-	 * missing piece.  Harmless on a bdi without BDI_CAP_WRITEBACK
-	 * (inode_cgwb_enabled's own capability check then short-circuits).
+	/*
+	 * Cgroup-aware writeback is deliberately disabled on this kernel.
+	 *
+	 * Setting SB_I_CGROUPWB enables per-cgroup writeback ownership (and
+	 * thus correct io.stat accounting for cross-cgroup writes, see
+	 * generic/563).  However, the 6.12.y kernel used in the test VM has a
+	 * known race between cgroup_writeback_umount() and
+	 * inode_switch_wbs_work_fn(): the work function calls iput() after the
+	 * switch, but the superblock can already be torn down and sb->s_op
+	 * nulled, leading to a NULL pointer dereference at iput+0xca
+	 * (op->drop_inode) and a dead kworker.  Until the VM kernel has the
+	 * upstream fix for the cgroup_writeback_umount race (and
+	 * CVE-2026-31703), keep BrieFS out of the inode wb-switch path by not
+	 * setting SB_I_CGROUPWB.  This makes generic/563 fail again, but it
+	 * allows the rest of the generic xfstests group to complete without
+	 * hanging the VM.
+	 *
+	 * Re-enable once the VM kernel is updated past the fixed stable
+	 * versions (7.0.2+, 6.18.25+, or a 6.12.y backport of the
+	 * cgroup_writeback_umount fix and CVE-2026-31703).
 	 */
-	sb->s_iflags |= SB_I_CGROUPWB;
 
 	/*
 	 * Replay journal on mount (unless the user asked to skip it).
