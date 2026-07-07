@@ -5,8 +5,8 @@ measured by fresh full-suite and targeted runs on the VM.
 
 ## Overview
 
-**Latest full-suite run:** 2026-07-06, `./check -g auto -X .exclude` on the VM,
-kernel `6.12.94+deb13-amd64`, branch `even-more-xfstests`. `generic/388` was
+**Latest valid full-suite run:** 2026-07-06, `./check -g auto -X .exclude` on the
+VM, kernel `6.12.94+deb13-amd64`, branch `even-more-xfstests`. `generic/388` was
 expunged from the run via `/xfstests/tests/generic/.exclude` because it wedges
 the suite (shutdown/replay corruption leaves `godown` stuck in D-state; see
 failing-test notes).
@@ -71,6 +71,18 @@ temporarily disables cgroup writeback (removes `SB_I_CGROUPWB`) so the wb-switch
 path is never entered.  A targeted run `generic/001..030` passes cleanly;
 `generic/563` (which tests per-cgroup writeback accounting) regresses and will
 remain failed until the VM kernel is updated.
+
+**Subsequent run (2026-07-07, invalid):** After the `9385fc8` workaround, a full
+`./check -g auto -X .exclude` run completed without hanging or kernel oops, but it
+reported **Failed 204 of 782 tests**.  Of the 203 `.out.bad` files, **168 are
+ENOSPC / "no space left on device" / "no free inodes" cascades** on `TEST_DEV`.
+`generic/001` creates enough files (200-chain copies across many base files over 5
+iterations) to exhaust the fixed inode table of the 16 GiB `TEST_DEV` image, and
+the leftover state poisons every later test that writes to `TEST_DIR`.  This is an
+environmental/setup issue, not a BrieFS regression caused by disabling
+`SB_I_CGROUPWB`.  The earlier 2026-07-06 run used a differently-sized test
+image and did not hit this cascade.  Re-running with a larger `TEST_DEV` (or
+reformatting between tests) is needed for a valid post-9385fc8 tally.
 
 ---
 
