@@ -80,9 +80,20 @@ ENOSPC / "no space left on device" / "no free inodes" cascades** on `TEST_DEV`.
 iterations) to exhaust the fixed inode table of the 16 GiB `TEST_DEV` image, and
 the leftover state poisons every later test that writes to `TEST_DIR`.  This is an
 environmental/setup issue, not a BrieFS regression caused by disabling
-`SB_I_CGROUPWB`.  The earlier 2026-07-06 run used a differently-sized test
-image and did not hit this cascade.  Re-running with a larger `TEST_DEV` (or
-reformatting between tests) is needed for a valid post-9385fc8 tally.
+`SB_I_CGROUPWB`.
+
+**Confirmed not an inode leak:** targeted create/delete, `generic/001`, `generic/027`,
+`generic/074`, and a cluster of those tests all return `FreeInodes` to 524,287 after
+cleanup.  The only persistent allocation is data-relative block 0, reserved by the
+allocator as the ENOSPC sentinel.
+
+**Standard procedure going forward:** xfstests mounts `TEST_DEV` once per
+`./check` invocation and does not clean it between tests, so a full
+`./check -g auto` run on BrieFS is unreliable.  Use the per-test runner
+`tests/xfstests/run-suite.sh`, which reformats both `TEST_DEV` and `SCRATCH_DEV`
+with `mkfs.briefs` before each test.  A valid post-9385fc8 tally must be taken
+with that runner (or with equivalent per-test reformatting), not with a single
+bulk `./check` invocation.
 
 ---
 
