@@ -24,9 +24,13 @@ SCRATCH_IMG="$IMG_DIR/scratch.img"
 LOGWRITES_IMG="$IMG_DIR/logwrites.img"
 TEST_MNT="/mnt/briefs-test"
 SCRATCH_MNT="/mnt/briefs-scratch"
-# 16 GiB gives plenty of headroom for tests that create thin pools, snapshots,
-# log-writes devices and large fsx images on top of the scratch/test devices.
-IMG_SIZE_MB=16384
+# TEST_DEV is mounted once per ./check invocation and accumulates files/inodes
+# across all tests.  Make it much larger than scratch so the fixed-size inode
+# table does not run out during a full generic run.
+TEST_IMG_SIZE_MB=65536	# 64 GiB
+SCRATCH_IMG_SIZE_MB=16384	# 16 GiB
+# Log-writes device needs to record every write to the scratch device.
+LOGWRITES_IMG_SIZE_MB=$((SCRATCH_IMG_SIZE_MB * 2))	# 32 GiB
 
 if [ "$(id -u)" -ne 0 ]; then
 	echo "must run as root (try: sudo bash $0)" >&2
@@ -69,11 +73,9 @@ for img in "$TEST_IMG" "$SCRATCH_IMG" "$LOGWRITES_IMG"; do
 	[ -n "$lo" ] && losetup -d "$lo" 2>/dev/null || true
 done
 # (Re)create sparse images.
-truncate -s "${IMG_SIZE_MB}M" "$TEST_IMG"
-truncate -s "${IMG_SIZE_MB}M" "$SCRATCH_IMG"
-# Log-writes device needs to record every write to the scratch device.
-# Size it at twice the scratch device size to avoid running out of log space.
-truncate -s "$((IMG_SIZE_MB * 2))M" "$LOGWRITES_IMG"
+truncate -s "${TEST_IMG_SIZE_MB}M" "$TEST_IMG"
+truncate -s "${SCRATCH_IMG_SIZE_MB}M" "$SCRATCH_IMG"
+truncate -s "${LOGWRITES_IMG_SIZE_MB}M" "$LOGWRITES_IMG"
 TEST_LOOP="$(losetup -f --show "$TEST_IMG")"
 SCRATCH_LOOP="$(losetup -f --show "$SCRATCH_IMG")"
 LOGWRITES_LOOP="$(losetup -f --show "$LOGWRITES_IMG")"
