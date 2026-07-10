@@ -112,16 +112,11 @@ export FSCK_PROG=/go/bin/fsck.briefs
 # device before every test, so every _scratch_mkfs/_test_mkfs must force.
 # common/config does not reset MKFS_OPTIONS for briefs, so this survives
 # into each test's child shell.
-# mkfs.briefs refuses to overwrite a device whose first block is non-zero
-# (i.e. one that already holds a filesystem -- its own or a foreign one;
-# see generic/740) unless given --force/-f.  xfstests reformats the scratch
-# device before every test, so every _scratch_mkfs/_test_mkfs must force.
-# common/config does not reset MKFS_OPTIONS for briefs, so this survives
-# into each test's child shell.
+export MKFS_OPTIONS="-f"
 # TEST_DEV is formatted once per ./check run, not between tests, and the full
 # generic group can exhaust the default inode table.  Use a higher inode ratio
-# so the fixed-size inode table does not run out.
-export MKFS_OPTIONS="--inode-ratio $TEST_IMG_INODE_RATIO -f"
+# there while keeping the default ratio on SCRATCH_DEV (reformatted per test).
+export TEST_MKFS_OPTIONS="--inode-ratio $TEST_IMG_INODE_RATIO -f"
 export MOUNT_OPTIONS=""
 export FSCK_OPTIONS="-n"
 EOF
