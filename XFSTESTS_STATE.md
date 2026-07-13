@@ -5,11 +5,31 @@ measured by fresh full-suite and targeted runs on the VM.
 
 ## Overview
 
-**Latest valid full-suite run:** 2026-07-06, `./check -g auto -X .exclude` on the
-VM, kernel `6.12.94+deb13-amd64`, branch `even-more-xfstests`. `generic/388` was
-expunged from the run via `/xfstests/tests/generic/.exclude` because it wedges
-the suite (shutdown/replay corruption leaves `godown` stuck in D-state; see
-failing-test notes).
+**Latest per-test full-suite run:** 2026-07-13, `tests/xfstests/run-suite.sh`
+over every generic test on the VM, kernel `6.12.95+deb13-amd64`, branch
+`even-more-xfstests`. `generic/388` was skipped because it wedges the suite.
+
+| Bucket           | Count | Notes                                                    |
+|------------------|------:|----------------------------------------------------------|
+| Selected         |   781 | all generic tests except 388                             |
+| Pass             |   368 | per-test runner reported PASS                            |
+| Fail             |    11 | see below                                                |
+| Not run          |   399 | `_require_*` gate or unsupported feature                 |
+| Hang             |     3 | timeout (300s) — 127, 521, 522                           |
+| Mount fail       |    11 | 313–323; see notes below                                 |
+
+**Mount-fail note:** The 11 `MOUNT FAIL` entries for `generic/313..323` are
+run-runner artifacts, not BrieFS bugs. Tests earlier in the suite (especially
+`generic/475`) create device-mapper targets on top of `SCRATCH_DEV`; if those
+targets are not torn down before the next test, `mount` on the underlying loop
+device fails with `EBUSY` / "Can't open blockdev". Re-running `313..323` in
+isolation with an improved runner that tears down leftover DM targets gave
+**9 PASS / 2 NOT RUN / 0 MOUNT FAIL**.
+
+**Previous full-suite run:** 2026-07-06, `./check -g auto -X .exclude` on the
+VM, kernel `6.12.94+deb13-amd64`. `generic/388` was expunged from the run via
+`/xfstests/tests/generic/.exclude` because it wedges the suite (shutdown/replay
+corruption leaves `godown` stuck in D-state; see failing-test notes).
 
 | Bucket           | Count | Notes                                                    |
 |------------------|------:|----------------------------------------------------------|
@@ -111,7 +131,41 @@ bulk `./check` invocation.
 
 ---
 
-## Failing tests (6)
+## Failing tests (2026-07-13 per-test run)
+
+The 2026-07-13 per-test run reported 11 outright failures, 3 hangs, and 11
+runner-induced mount failures (313–323, explained above). After correcting the
+mount failures, the effective failures are:
+
+- `generic/050` — read-only dirty-journal mount output differs; likely an
+  expected-error-string mismatch rather than a data bug.
+- `generic/089` — bulk fsx + many small files exhausts space on `TEST_DEV`
+  under the per-test runner (4 GiB test image); output mismatch because the
+  test runs out of inodes.
+- `generic/127` — mmap+fsx hang; times out after 300s (known mmap writeback
+  deadlock risk).
+- `generic/311` — pre-existing baseline flake (dm-flakey/fsync timing).
+- `generic/341` — duplicate directory entries after log replay (`x` and `y`
+  appear twice); real replay/idempotency bug.
+- `generic/475` — dm-error crash-replay; fsck killed / dmesg warning (deferred
+  crash-replay family).
+- `generic/510` — duplicate `B` directory after power failure; replay creates
+  a stale duplicate.
+- `generic/521` / `generic/522` — hang/timeouts (punch/pagecache tests).
+- `generic/563` — cgroup writeback accounting mismatch; expected after
+  `SB_I_CGROUPWB` was disabled on 6.12.
+- `generic/599` — VFS `cleanup_mnt` WARN after shutdown (same real bug as the
+  2026-07-06 run).
+- `generic/623` — fsync after shutdown does not return `EIO` (same as before).
+- `generic/730` — read after device delete missing `EIO` (same as before).
+- `generic/771` — duplicate `bar` after power failure; replay duplicate.
+
+Note: some of the 050/089/510/771 failures may still be influenced by prior
+test residue that the improved runner does not yet fully clean (e.g. leftover DM
+or snapshot targets). A clean reboot + full per-test re-run is needed for a
+fully trustworthy corrected tally.
+
+## Failing tests (6) (2026-07-06 `./check -g auto` run)
 
 ### generic/048 — file size not persisted after sync+shutdown
 - **Status:** **fixed** (`62167fa`); was fail (output mismatch), newly exposed now
@@ -492,3 +546,21 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 - Not-run reasons read from each test's `.notrun` artifact in
   `/xfstests/results/generic/` and grouped.
 - Failing-test details inspected from `.out.bad`, `.full`, and `.dmesg` files.
+
+### Per-test runner (2026-07-13)
+
+The 2026-07-13 run used `tests/xfstests/run-suite.sh` to invoke each generic
+xftest individually. The runner was hardened during this session to:
+
+- reformat both `TEST_DEV` and `SCRATCH_DEV` with `mkfs.briefs -f` before every
+  test;
+- unmount both mount points aggressively (`fuser -km`, normal/lazy/forced
+  `umount`) so daemon/background references do not leak between tests;
+- tear down leftover device-mapper targets that wrap `TEST_DEV` or
+  `SCRATCH_DEV` (tests such as `generic/475` create dm-error/dm-thin-pool stacks);
+- classify an interrupted `./check` (`Passed all 0 tests`) as a failure instead
+  of a pass;
+- report mount failures with the underlying error text.
+
+Full-suite log on the VM: `/tmp/run-suite-full.log`. Summary: PASS 368,
+FAIL 11, NOT RUN 399, HANG 3, MOUNT FAIL 11.
