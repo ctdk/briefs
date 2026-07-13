@@ -39,6 +39,34 @@ SCRATCH_MNT="${SCRATCH_MNT:-/mnt/briefs-scratch}"
 # Ensure module is loaded.
 modprobe briefs_fs 2>/dev/null || insmod "/lib/modules/$(uname -r)/extra/briefs/briefs_fs.ko" 2>/dev/null || true
 
+# Remove any device-mapper devices that wrap TEST_DEV or SCRATCH_DEV.  Tests
+# such as generic/475 create dm-error/dm-thin-pool/dm-log-writes stacks on top
+# of the scratch device; if the test is interrupted they stay behind and make
+# the underlying loop device busy (mount fails with EBUSY / "Can't open
+# blockdev").  Removing them restores the loop device for the next test.
+cleanup_dm_for_device() {
+    local dev="$1"
+    local real_dev
+    real_dev="$(realpath -e "$dev" 2>/dev/null)" || return 0
+
+     # Find DM devices that have $dev as a slave and remove them.
+    local slave
+    slave="$(basename "$real_dev")"
+    for slave_dir in /sys/block/dm-*/slaves; do
+        [ -d "$slave_dir" ] || continue
+        if [ -e "$slave_dir/$slave" ]; then
+            local dm_name dm_num
+            dm_num="$(basename "${slave_dir%/slaves}")"
+            dm_name="$(cat "/sys/block/$dm_num/dm/name" 2>/dev/null)" || continue
+            [ -n "$dm_name" ] || continue
+            # Best-effort unmount first, then remove the DM device.
+            umount "/dev/mapper/$dm_name" 2>/dev/null || true
+            umount "/dev/$dm_num" 2>/dev/null || true
+            dmsetup remove "$dm_name" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
 PASS=0
 FAIL=0
 NOTRUN=0
@@ -47,6 +75,34 @@ MKFS_FAIL=0
 MOUNT_FAIL=0
 TIMEOUT_SECS=300
 
+# Unmount a mount point aggressively.  Tests can leave daemons, lazy-unmount
+# the device themselves, or hold references in other ways; a plain umount is
+# not enough for a reliable per-test loop.
+force_umount() {
+    local mnt="$1"
+    local i
+
+    # Nothing to do if it is not currently mounted.
+    mountpoint -q "$mnt" 2>/dev/null || return 0
+
+    # Kill any userspace processes still using the mount.
+    if command -v fuser >/dev/null 2>&1; then
+        fuser -km "$mnt" >/dev/null 2>&1 || true
+        sleep 0.5
+    fi
+
+    # Normal, lazy, and forced unmount attempts.
+    for i in 1 2 3; do
+        umount "$mnt" 2>/dev/null && return 0
+        umount -l "$mnt" 2>/dev/null && return 0
+        umount -f "$mnt" 2>/dev/null && return 0
+        sleep 1
+    done
+
+    # If it is still mounted, give up; the caller will report the problem.
+    return 1
+}
+
 for testname in "$@"; do
     testbase="${testname##*/}"
     echo "========================================"
@@ -54,8 +110,11 @@ for testname in "$@"; do
     echo "========================================"
 
     # Clean slate for both devices.
-    umount "$TEST_MNT" 2>/dev/null || true
-    umount "$SCRATCH_MNT" 2>/dev/null || true
+    force_umount "$TEST_MNT" || true
+    force_umount "$SCRATCH_MNT" || true
+    cleanup_dm_for_device "$TEST_DEV"
+    cleanup_dm_for_device "$SCRATCH_DEV"
+    sync
 
     if ! "$MKFS_BRIEFS_PROG" -f "$TEST_DEV" >/dev/null 2>&1; then
         echo "  -> MKFS TEST FAIL"
@@ -69,9 +128,12 @@ for testname in "$@"; do
     fi
 
     # Mount TEST_DEV; SCRATCH_DEV is mounted by the test itself.
-    if ! mount -t briefs "$TEST_DEV" "$TEST_MNT" 2>/dev/null; then
-        echo "  -> MOUNT FAIL"
+    if ! mount -t briefs "$TEST_DEV" "$TEST_MNT" >/tmp/mount-err.log 2>&1; then
+        echo "  -> MOUNT FAIL: $(cat /tmp/mount-err.log)"
         MOUNT_FAIL=$((MOUNT_FAIL + 1))
+        # Try to leave things as clean as possible for the next test.
+        force_umount "$TEST_MNT" || true
+        force_umount "$SCRATCH_MNT" || true
         continue
     fi
 
@@ -82,8 +144,10 @@ for testname in "$@"; do
     cat /tmp/check_last.log
 
     # Clean up mounts before moving on, best effort.
-    umount "$TEST_MNT" 2>/dev/null || true
-    umount "$SCRATCH_MNT" 2>/dev/null || true
+    force_umount "$TEST_MNT" || true
+    force_umount "$SCRATCH_MNT" || true
+    cleanup_dm_for_device "$TEST_DEV"
+    cleanup_dm_for_device "$SCRATCH_DEV"
 
     if [ "$status" -eq 124 ]; then
         echo "  -> HANG (timeout)"
@@ -100,9 +164,14 @@ for testname in "$@"; do
     elif grep -qE "^Not run: (generic/)?${testbase}(\s|$)" /tmp/check_last.log; then
         echo "  -> NOT RUN"
         NOTRUN=$((NOTRUN + 1))
-    elif grep -qE "Passed all [0-9]+ tests" /tmp/check_last.log; then
+    elif grep -qE "Passed all [1-9][0-9]* tests" /tmp/check_last.log; then
         echo "  -> PASS"
         PASS=$((PASS + 1))
+    elif grep -qE "Passed all 0 tests" /tmp/check_last.log; then
+        # Test was interrupted or could not run (e.g. mount failure inside
+        # ./check itself); count it as a failure, not a pass.
+        echo "  -> FAIL (interrupted, 0 tests passed)"
+        FAIL=$((FAIL + 1))
     else
         # Ambiguous result (e.g. ./check aborted before printing a summary).
         echo "  -> UNKNOWN (exit $status)"
