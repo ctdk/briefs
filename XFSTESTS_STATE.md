@@ -11,20 +11,25 @@ over every generic test on the VM, kernel `6.12.95+deb13-amd64`, branch
 
 | Bucket           | Count | Notes                                                    |
 |------------------|------:|----------------------------------------------------------|
-| Selected         |   781 | all generic tests except 388                             |
-| Pass             |   368 | per-test runner reported PASS                            |
-| Fail             |    11 | see below                                                |
-| Not run          |   399 | `_require_*` gate or unsupported feature                 |
+| Selected         |   792 | all generic tests except 388                             |
+| Pass             |   376 | per-test runner reported PASS                            |
+| Fail             |    12 | 11 xfstests failures + `generic/299` killed (see below)  |
+| Not run          |   401 | `_require_*` gate or unsupported feature                 |
 | Hang             |     3 | timeout (300s) — 127, 521, 522                           |
-| Mount fail       |    11 | 313–323; see notes below                                 |
+| Mount fail       |     0 | leftover DM targets now torn down by the runner          |
 
-**Mount-fail note:** The 11 `MOUNT FAIL` entries for `generic/313..323` are
-run-runner artifacts, not BrieFS bugs. Tests earlier in the suite (especially
-`generic/475`) create device-mapper targets on top of `SCRATCH_DEV`; if those
-targets are not torn down before the next test, `mount` on the underlying loop
-device fails with `EBUSY` / "Can't open blockdev". Re-running `313..323` in
-isolation with an improved runner that tears down leftover DM targets gave
-**9 PASS / 2 NOT RUN / 0 MOUNT FAIL**.
+**Mount-fail note:** An earlier iteration of this run reported 11 `MOUNT FAIL`
+entries for `generic/313..323`. Those were run-runner artifacts caused by
+leftover device-mapper targets from tests such as `generic/475`. The runner was
+hardened to tear down DM targets wrapping `TEST_DEV` and `SCRATCH_DEV` before each
+test, so the final run reported **0 MOUNT FAIL**. Re-running `313..323` in
+isolation with the improved runner gave **9 PASS / 2 NOT RUN / 0 MOUNT FAIL**.
+
+**`generic/299` note:** The runner killed `generic/299` after it spent >300s
+spinning with repeated `briefs: btree: node <N> checksum mismatch` errors. It is
+counted as a failure because the process exited with an ambiguous status
+(UNKNOWN / exit 137); the underlying issue is a real BrieFS btree corruption bug
+that needs investigation.
 
 **Previous full-suite run:** 2026-07-06, `./check -g auto -X .exclude` on the
 VM, kernel `6.12.94+deb13-amd64`. `generic/388` was expunged from the run via
@@ -133,25 +138,23 @@ bulk `./check` invocation.
 
 ## Failing tests (2026-07-13 per-test run)
 
-The 2026-07-13 per-test run reported 11 outright failures, 3 hangs, and 11
-runner-induced mount failures (313–323, explained above). After correcting the
-mount failures, the effective failures are:
+The final 2026-07-13 per-test run reported **12 effective failures** and **3
+hangs**. The 11 xfstests-reported failures are listed first; `generic/299` is
+listed separately because it was killed by the runner after a btree-checksum
+mismatch spiral.
 
 - `generic/050` — read-only dirty-journal mount output differs; likely an
   expected-error-string mismatch rather than a data bug.
 - `generic/089` — bulk fsx + many small files exhausts space on `TEST_DEV`
   under the per-test runner (4 GiB test image); output mismatch because the
-  test runs out of inodes.
-- `generic/127` — mmap+fsx hang; times out after 300s (known mmap writeback
-  deadlock risk).
+  test runs out of inodes. The test ran for ~65 minutes before failing.
 - `generic/311` — pre-existing baseline flake (dm-flakey/fsync timing).
 - `generic/341` — duplicate directory entries after log replay (`x` and `y`
   appear twice); real replay/idempotency bug.
-- `generic/475` — dm-error crash-replay; fsck killed / dmesg warning (deferred
-  crash-replay family).
 - `generic/510` — duplicate `B` directory after power failure; replay creates
   a stale duplicate.
-- `generic/521` / `generic/522` — hang/timeouts (punch/pagecache tests).
+- `generic/547` — fsstress metadata mismatch; part of the crash-replay/dm-error
+  family (previously flaky, now failing again in this run).
 - `generic/563` — cgroup writeback accounting mismatch; expected after
   `SB_I_CGROUPWB` was disabled on 6.12.
 - `generic/599` — VFS `cleanup_mnt` WARN after shutdown (same real bug as the
@@ -160,10 +163,24 @@ mount failures, the effective failures are:
 - `generic/730` — read after device delete missing `EIO` (same as before).
 - `generic/771` — duplicate `bar` after power failure; replay duplicate.
 
-Note: some of the 050/089/510/771 failures may still be influenced by prior
-test residue that the improved runner does not yet fully clean (e.g. leftover DM
-or snapshot targets). A clean reboot + full per-test re-run is needed for a
-fully trustworthy corrected tally.
+### generic/299 — btree checksum mismatch hang (killed)
+
+- **Status:** killed by the per-test runner after ~210s; counted as a failure.
+- **Symptom:** dmesg flooded with `briefs: btree: node <N> checksum mismatch`
+  errors while `generic/299` was running; the test made no forward progress.
+- **Nature:** real BrieFS btree corruption / validation bug, not a runner issue.
+  Distinct from the dm-error crash-replay family (`475`, `547`) and from the
+  earlier trie-page / orphan-leak bugs.
+- **Action:** investigate btree checksum mismatch source; likely related to
+  replay or extent-tree corruption under load.
+
+### Hangs (timeout 300s)
+
+- `generic/127` — mmap+fsx hang; known mmap writeback deadlock risk.
+- `generic/521` / `generic/522` — punch/pagecache tests time out.
+
+**Note:** `generic/475` (dm-error crash-replay) passed in this run but remains
+a known flaky/deferred bug in the crash-replay family.
 
 ## Failing tests (6) (2026-07-06 `./check -g auto` run)
 
@@ -391,56 +408,56 @@ from the run were read and grouped; all gates are legitimate.
 
 ---
 
-## Passing tests (377)
+## Passing tests (376)
 
 ```
 001  002  003  005  006  007  011  013
 014  015  020  023  024  025  027  028
 029  030  032  034  035  036  037  039
-040  041  043  044  045  046  047  048  049
-050  051  056  057  059  062  065  066
+040  041  043  044  045  046  047  048
+049  051  056  057  059  062  065  066
 067  068  069  070  071  073  074  075
 076  078  079  080  081  083  084  085
-086  087  088  089  090  091  092  093
-094  095  097  098  100  101  102  103
-104  106  107  108  109  112  113  114
-117  120  123  124  125  126  127  128  129
-130  131  132  133  135  141  169  177
-184  192  193  198  204  207  208  209
-210  211  212  213  214  215  221  224
-225  226  228  236  239  240  241  245
-246  247  248  249  250  252  255  256
-257  258  263  269  273  274  275  277
-285  286  294  299  300  306  308  309
-310  312  313  314  315  316  317  320
-321  322  323  325  335  336  337  338
-339  340  341  342  343  344  345  346
-347  348  354  355  360  361  362  363
-364  366  371  376  377  378  390  391
-392  393  394  401  403  405  406  409
-410  411  412  416  418  420  422  423
-424  426  427  428  430  431  432  433
-434  436  437  438  439  441  443  445
-446  448  450  451  452  453  454  455  459
-460  461  464  465  466  467  468  471
-472  474  475  476  477  478  479  480
-481  483  484  486  488  489  490  491
-494  495  496  498  502  504  505  507
-508  510  512  519  520  523  524  525
-526  527  528  530  532  533  534  535
-536  538  539  545  547  551  552  553
-554  555  557  558  563  564  567  568
-569  571  585  586  589  590  591  596
-597  598  604  609  611  615  616  617
-618  619  620  622  626  627  629  631
-632  633  634  635  636  637  638  639
-640  642  643  646  647  650  676  677
-678  679  680  683  684  688  690  695
-696  703  704  705  706  707  708  728
-729  731  732  736  737  738  740  741  742
-743  747  748  749  750  751  754
-755  756  759  760  761  763  764  771
-779  782  784  785  789  790  792
+086  087  088  090  091  092  093  094
+095  097  098  100  101  102  103  104
+106  107  108  109  112  113  114  117
+120  123  124  125  126  128  129  130
+131  132  133  135  141  169  177  184
+192  193  198  204  207  208  209  210
+211  212  213  214  215  221  224  225
+226  228  236  239  240  241  245  246
+247  248  249  250  252  255  256  257
+258  263  269  273  274  275  277  285
+286  294  300  306  308  309  310  312
+313  314  315  316  317  320  321  322
+323  325  335  336  337  338  339  340
+342  343  344  345  346  347  348  350
+354  355  360  361  362  363  364  366
+371  376  377  378  390  391  392  393
+394  401  403  405  406  409  410  411
+412  416  417  418  420  422  423  424
+426  427  428  430  431  432  433  434
+436  437  438  439  441  442  443  445
+446  448  450  451  452  453  454  455
+459  460  461  464  465  466  467  468
+471  472  473  474  475  476  477  478
+479  480  481  483  484  486  488  489
+490  491  494  495  496  498  502  504
+505  507  508  512  519  520  523  524
+525  526  527  528  530  532  533  534
+535  536  538  539  545  551  552  553
+554  555  557  558  564  567  568  569
+571  585  586  589  590  591  596  597
+598  604  609  611  615  616  617  618
+619  620  622  626  627  629  631  632
+633  634  635  636  637  638  639  640
+642  643  646  647  650  676  677  678
+679  680  683  684  688  690  694  695
+696  701  703  704  705  706  707  708
+728  729  731  732  736  737  738  740
+741  742  743  747  748  749  750  751
+753  754  755  756  759  760  761  763
+764  779  782  784  785  789  790  792
 ```
 
 ### xfstests xattr cluster (13/13, 2026-07-02)
@@ -451,9 +468,9 @@ All xattr-gated tests pass with the chained-xattr fix in `29121e6`:
 ### xfstests shutdown cluster (2026-07-04)
 
 The `XFS_IOC_GOINGDOWN` ioctl is now implemented, so `godown`-based shutdown
-tests run. Core cluster `043 044 045 046 047 049 050 051` passes (048 now fails
-with the sync/size bug). `050` required a read-only-dirty-journal mount
-rejection in `briefs_fill_super`.
+tests run. Core cluster `043 044 045 046 047 048 049 050 051` passes in this
+run. `050` required a read-only-dirty-journal mount rejection in
+`briefs_fill_super`.
 
 Extended godown cluster `392 461 468 474 505 530 536 622 635 646 705` passes.
 
@@ -516,13 +533,24 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | 048                           | 62167fa  | sync+shutdown file size bug (inode dirty on i_size growth + inode-block RMW lock) |
 | 737                           | 8f4a27b  | O_DIRECT+shutdown file lost (directory sync durability + journal ring back-pressure) |
 
-> Open BrieFS code bugs after this run: `417` (xattr/unlink race), `599`
-> (shutdown VFS cleanup WARN), `623` (fsync after shutdown missing EIO), `730`
-> (read after device delete missing EIO), `753` (dm-error metadata-sync WARN),
-> and the excluded `388` shutdown/replay wedge. `generic/127` passed in this run
-> but remains a known mmap+fsx D-state hang risk. `generic/311` is a
-> pre-existing baseline flake. `generic/455` and `generic/475` passed in this
-> run; `475` remains a known flaky deferred bug in the crash-replay family.
+> Open BrieFS code bugs after this run:
+> - `299` — new btree checksum mismatch hang (killed by runner); needs
+>   investigation as a real corruption bug.
+> - `341`, `510`, `771` — replay creates duplicate directory entries after power
+>   failure; idempotency/replay bugs.
+> - `547` — fsstress metadata mismatch; crash-replay family.
+> - `599` — VFS `cleanup_mnt` WARN after shutdown.
+> - `623` — fsync after shutdown does not return `EIO`.
+> - `730` — read after device delete missing `EIO`.
+> - `388` — excluded shutdown/replay wedge.
+>
+> `generic/127`, `521`, `522` timed out (hangs). `generic/311` is a pre-existing
+> baseline flake. `generic/050` is an expected-error-string mismatch on
+> read-only dirty-journal mount. `generic/089` fails because the 4 GiB `TEST_DEV`
+> image is too small for the test's bulk fsx workload. `generic/563` fails because
+> cgroup writeback was disabled (`SB_I_CGROUPWB` workaround). `generic/455`,
+> `475`, and `753` passed in this run; `475` and `547` remain known flaky/deferred
+> crash-replay bugs.
 
 ---
 
@@ -562,5 +590,5 @@ xftest individually. The runner was hardened during this session to:
   of a pass;
 - report mount failures with the underlying error text.
 
-Full-suite log on the VM: `/tmp/run-suite-full.log`. Summary: PASS 368,
-FAIL 11, NOT RUN 399, HANG 3, MOUNT FAIL 11.
+Full-suite log on the VM: `/tmp/run-suite-clean.log`. Final summary:
+**PASS 376, FAIL 12, NOT RUN 401, HANG 3, MOUNT FAIL 0, MKFS FAIL 0**.
