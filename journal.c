@@ -558,6 +558,8 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
 
 /*
  * Replay a JRN_DIR_UPDATE record (op=0 = add, op=1 = delete).
+ * Returns 0 on success or if inode was freed (skippable).
+ * Returns -EIO on real I/O errors (caller should fail mount).
  */
 static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
 {
@@ -570,9 +572,17 @@ static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
 
 	parent = briefs_iget(sb, parent_ino);
 	if (IS_ERR(parent)) {
-		pr_warn("briefs: replay can't iget parent inode %llu (skip)\n",
-			parent_ino);
-		return 0; /* skip — might have been freed already */
+		ret = PTR_ERR(parent);
+		/* -EINVAL means inode magic was 0 (freed inode) - skippable.
+		 * -EIO or other errors mean real I/O failure - should fail mount. */
+		if (ret == -EINVAL) {
+			pr_debug("briefs: replay skipping freed parent inode %llu\n",
+				parent_ino);
+			return 0;
+		}
+		pr_err("briefs: replay failed to iget parent inode %llu (err=%d)\n",
+			parent_ino, ret);
+		return ret;
 	}
 
 	binfo = briefs_i(parent);
@@ -653,6 +663,7 @@ static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
 /*
  * Replay a JRN_INODE_UPDATE record.
  * Writes the recorded inode state back to the on-disk inode block.
+ * Returns 0 on success, -EIO on I/O error.
  */
 static int replay_inode_update(struct super_block *sb, struct jrn_inode_update *rec)
 {
@@ -674,8 +685,16 @@ static int replay_inode_update(struct super_block *sb, struct jrn_inode_update *
 
 	bh = briefs_read_inode_block(sb, ino, &di);
 	if (IS_ERR(bh)) {
-		pr_warn("briefs: replay can't read inode block for %llu (skip)\n", ino);
-		return 0;
+		int err = PTR_ERR(bh);
+		/* -EINVAL means inode magic was 0 (freed inode) - skippable.
+		 * -EIO means real I/O failure - should fail mount. */
+		if (err == -EINVAL) {
+			pr_debug("briefs: replay skipping freed inode %llu\n", ino);
+			return 0;
+		}
+		pr_err("briefs: replay failed to read inode block for %llu (err=%d)\n",
+			ino, err);
+		return err;
 	}
 
 	di->inode_number = cpu_to_le64(ino);
@@ -846,6 +865,7 @@ int briefs_journal_sync_superblock(struct briefs_journal *j)
 /*
  * Replay a JRN_INODE_FULL record.
  * Writes the embedded 512-byte on-disk inode back into the inode table.
+ * Returns 0 on success, -EIO on I/O error.
  */
 static int replay_inode_full(struct super_block *sb, struct jrn_inode_full *rec)
 {
@@ -855,8 +875,16 @@ static int replay_inode_full(struct super_block *sb, struct jrn_inode_full *rec)
 
 	bh = briefs_read_inode_block(sb, ino, &di);
 	if (IS_ERR(bh)) {
-		pr_warn("briefs: replay can't read inode block for %llu (skip)\n", ino);
-		return 0;
+		int err = PTR_ERR(bh);
+		/* -EINVAL means inode magic was 0 (freed inode) - skippable.
+		 * -EIO means real I/O failure - should fail mount. */
+		if (err == -EINVAL) {
+			pr_debug("briefs: replay skipping freed inode %llu\n", ino);
+			return 0;
+		}
+		pr_err("briefs: replay failed to read inode block for %llu (err=%d)\n",
+			ino, err);
+		return err;
 	}
 
 	memcpy(di, rec->inode_data, sizeof(struct briefs_disk_inode));
@@ -1413,9 +1441,15 @@ static int walk_journal(struct briefs_journal *j, struct super_block *sb,
 
 			int apply_ret = apply_record(sb, rec_type, rec_data, reserve_only);
 			if (apply_ret) {
-				pr_err("briefs: replay error for record type=%u: %d\n",
-				       rec_type, apply_ret);
-				errors++;
+				/* -EINVAL/-ENOENT means freed inode - skippable, don't count as error.
+				 * -EIO or other errors mean real I/O failure - should fail mount. */
+				if (apply_ret == -EINVAL || apply_ret == -ENOENT) {
+					/* Skippable - freed inode, already logged at debug level */
+				} else {
+					pr_err("briefs: replay FAILED for record type=%u: %d\n",
+					       rec_type, apply_ret);
+					errors++;
+				}
 			}
 			records++;
 			rec_off += sizeof(*rh) + rec_data_len;
