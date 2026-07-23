@@ -1907,13 +1907,22 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	 * mapped; for each maximal run of unmapped blocks, try to allocate the
 	 * whole run contiguously with one briefs_alloc_blocks() call and one
 	 * extent append (its merge logic handles len=k).  If no contiguous run
-	 * of that length fits (or run_len == 1), fall back to the original
-	 * per-block allocation so fragmented fallocate still succeeds and we
-	 * never regress on ENOSPC.  Free per-block (not briefs_free_blocks_range,
-	 * which 1M-caps) in error paths so large runs can't hit the cap.
+	 * of that length fits (or run_len == 1), fall back to per-block
+	 * allocation so fragmented fallocate still succeeds and we never
+	 * regress on ENOSPC.
+	 *
+	 * LOCK ORDER FIX (deadlock prevention): We must take extent_lock BEFORE
+	 * alloc->lock to match the global lock order (extent_lock -> alloc->lock
+	 * -> j->write_lock). The old code called briefs_alloc_blocks() (takes
+	 * alloc->lock) then briefs_append_extent_nojournal() (takes extent_lock),
+	 * inverting the order used by briefs_iomap_begin_common and
+	 * briefs_btree_insert_locked. Now we take extent_lock first, do an
+	 * unlocked alloc->lock section for allocation, then insert under the
+	 * held extent_lock.
 	 */
 	blk = start_blk;
 	while (blk < end_blk) {
+		/* Unlocked check for already-mapped blocks (fast path). */
 		if (briefs_block_mapped(inode, blk)) {
 			blk++;
 			continue;
@@ -1924,6 +1933,7 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 			run_len++;
 
 		if (run_len > 1) {
+			/* Allocate the run (takes alloc->lock). */
 			rel_run = briefs_alloc_blocks(&bsi->alloc, run_len);
 			if (rel_run != 0) {
 				phys_run = data_to_abs(bsi->sb, rel_run);
@@ -1937,13 +1947,15 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 						goto falloc_loop_done;
 					}
 				}
+				/* Take extent_lock BEFORE insert to maintain lock order. */
+				mutex_lock(&binfo->extent_lock);
 				ext.offset = blk;
 				ext.phys = phys_run;
 				ext.len = run_len;
 				ext.flags = BRIEFS_EXT_UNWRITTEN;
-				ret = briefs_append_extent_nojournal(inode->i_sb,
-								     &binfo->disk_inode,
-								     &ext);
+				ret = briefs_btree_insert_locked(inode->i_sb,
+								 &binfo->disk_inode, &ext);
+				mutex_unlock(&binfo->extent_lock);
 				if (ret == -EEXIST) {
 					/*
 					 * A concurrent writer mapped part of this
@@ -1973,6 +1985,7 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 
 		/* per-block fallback: run_len == 1, or no contiguous run fit */
 		for (i = 0; i < run_len; i++) {
+			/* Allocate single block (takes alloc->lock). */
 			rel = briefs_alloc_block(&bsi->alloc);
 			if (rel == 0) {
 				ret = -ENOSPC;
@@ -1986,14 +1999,15 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 				goto falloc_loop_done;
 			}
 
+			/* Take extent_lock BEFORE insert to maintain lock order. */
+			mutex_lock(&binfo->extent_lock);
 			ext.offset = blk + i;
 			ext.phys = phys;
 			ext.len = 1;
 			ext.flags = BRIEFS_EXT_UNWRITTEN;
-
-			ret = briefs_append_extent_nojournal(inode->i_sb,
-							     &binfo->disk_inode,
-							     &ext);
+			ret = briefs_btree_insert_locked(inode->i_sb,
+							 &binfo->disk_inode, &ext);
+			mutex_unlock(&binfo->extent_lock);
 			if (ret == -EEXIST) {
 				/* Block mapped by a concurrent writer after our
 				 * unlocked check; skip it (already allocated by

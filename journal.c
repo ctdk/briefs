@@ -272,9 +272,14 @@ static int __briefs_journal_write_record_locked(struct briefs_journal *j,
 		 * write_pos, so the condition above is never taken there.  Force a
 		 * checkpoint, which advances journal_log_start to write_pos and
 		 * frees the ring, instead of overwriting live records.  This
-		 * retires the same way the existing periodic checkpoint does; it
-		 * takes no BrieFS lock, so it is safe to call from within any
-		 * write_record caller (including under alloc->lock).
+		 * retires the same way the existing periodic checkpoint does.
+		 *
+		 * LOCK ORDER FIX: The checkpoint used to take alloc->lock (via
+		 * briefs_alloc_sync) while holding j->write_lock, creating an
+		 * AB-BA deadlock with callers holding alloc->lock. Now it
+		 * releases j->write_lock before calling briefs_alloc_sync(),
+		 * so it is safe to call from within any write_record caller
+		 * (including under alloc->lock).
 		 */
 		if (j->write_pos == le64_to_cpu(j->sb->journal_log_start)) {
 			pr_debug("briefs: journal ring full (back-pressure), checkpointing at write_pos=%llu\n",
@@ -391,6 +396,28 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	}
 
 	/*
+	 * LOCK ORDER FIX (deadlock prevention): We must NOT hold j->write_lock
+	 * while calling briefs_alloc_sync() because:
+	 *
+	 * 1. briefs_alloc_sync() takes alloc->lock
+	 * 2. Other paths (briefs_trie_alloc_node, briefs_xattr_set) take
+	 *    alloc->lock then emit journal records (taking j->write_lock)
+	 *
+	 * This creates an AB-BA deadlock:
+	 * - Thread A: holds alloc->lock, waiting for j->write_lock (back-pressure)
+	 * - Thread B: holds j->write_lock, waiting for alloc->lock (here)
+	 *
+	 * Safe to release j->write_lock here because:
+	 * - sync_blockdev() already flushed all dirty metadata (lines 388-391)
+	 * - The checkpoint state (write_pos, checkpoint_seq) is only modified
+	 *   by this function, and we haven't written the checkpoint block yet
+	 * - briefs_alloc_sync() is idempotent - calling it twice is harmless
+	 *
+	 * We re-acquire j->write_lock after the sync to complete the checkpoint.
+	 */
+	mutex_unlock(&j->write_lock);
+
+	/*
 	 * Persist the allocator bitmaps alongside the inode/trie buffers written
 	 * above.  briefs_alloc_sync() is the ONLY path that marks the bitmap
 	 * buffer_heads dirty -- the alloc/free hot paths mutate only the in-memory
@@ -405,20 +432,24 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	 * checkpointed-away-but-still-in-use blocks as FREE, hands one out to a
 	 * replayed allocation, and briefs_trie_page_init() ZEROES an in-use trie
 	 * page -> mass directory-entry loss (generic/040/041 hardlink storm; same
-	 * family as the 547 #2 freed-trie-page-reuse path).  The same safety
-	 * argument as sync_blockdev() above holds: briefs_alloc_sync() does
-	 * sb_bread()+sync_dirty_buffer() (lock-free buffer I/O) under write_lock,
-	 * and no BrieFS metadata path takes write_lock during buffer writeback.
+	 * family as the 547 #2 freed-trie-page-reuse path).
 	 */
 	bsi = j->vfs_sb->s_fs_info;
 	if (bsi) {
 		int r2 = briefs_alloc_sync(&bsi->alloc);
-		if (r2)
+		if (r2) {
+			mutex_lock(&j->write_lock);
 			return r2;
+		}
 		r2 = briefs_alloc_sync(&bsi->inode_alloc);
-		if (r2)
+		if (r2) {
+			mutex_lock(&j->write_lock);
 			return r2;
+		}
 	}
+
+	/* Re-acquire j->write_lock to complete the checkpoint. */
+	mutex_lock(&j->write_lock);
 
 	/*
 	 * Refresh superblock free counts from the authoritative allocator state
@@ -2275,8 +2306,11 @@ int briefs_journal_inode_full(struct briefs_journal *j, u64 ino,
 
 		if (cap > (1ull << 20))
 			cap = 1ull << 20;
-		if (base != 0)
-			briefs_btree_drain(j->vfs_sb, base, cap);
+		if (base != 0) {
+			int err = briefs_btree_drain(j->vfs_sb, base, cap);
+			if (err)
+				return err;
+		}
 	}
 
 	memset(&rec, 0, sizeof(rec));

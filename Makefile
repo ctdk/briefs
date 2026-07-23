@@ -30,7 +30,7 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 
 # VM SSH command — used by `make test`
 VAGRANT_KEY ?= $(PWD)/.vagrant/machines/default/libvirt/private_key
-SSH ?= ssh vagrant@192.168.121.234 -p 22 \
+SSH ?= ssh vagrant@192.168.121.132 -p 22 \
 	-o LogLevel=FATAL \
 	-o Compression=yes \
 	-o DSAAuthentication=yes \
