@@ -34,6 +34,28 @@
 #define BRIEFS_DELALLOC_RUN_MAX 256	/* max blocks per coalesced write run */
 #define BRIEFS_INODE_BLOCK_LOCKS 64	/* hash buckets for inode-block RMW locks */
 
+/*
+ * LOCK ORDERING (to prevent deadlocks):
+ *
+ * BrieFS uses multiple fine-grained locks. To prevent AB-BA deadlocks,
+ * all code must acquire locks in this order:
+ *
+ *   1. inode_block_lock (per-inode-block RMW mutex array)
+ *   2. trie_lock (per-directory trie mutation lock)
+ *   3. extent_lock (per-inode extent tree lock)
+ *   4. alloc->lock (global allocator bitmap lock)
+ *   5. xattr_sem (per-inode xattr chain semaphore)
+ *   6. j->write_lock (global journal write lock)
+ *
+ * Violations create deadlock risks:
+ * - alloc->lock -> extent_lock: briefs_fallocate used to do this (FIXED)
+ * - j->write_lock -> alloc->lock: checkpoint used to do this (FIXED)
+ *
+ * When writing new code that takes multiple locks, verify the order matches
+ * the above. When in doubt, hold locks for the shortest time possible and
+ * release before acquiring a "later" lock in the order.
+ */
+
 /* Semantic versioning, yo */
 #define _BRIEFS_MAJOR_VER 0
 #define _BRIEFS_MINOR_VER 9
@@ -1250,8 +1272,9 @@ void briefs_btree_free_nodes_only(struct super_block *sb, struct briefs_inode *d
 
 /* Lock-free: sync every dirty B-tree node reachable from @root_block. Used by
  * the journal snapshot ordering (must run before JRN_INODE_FULL). Bounded by
- * @max_nodes as a guard against corrupt/cyclic trees. */
-void briefs_btree_drain(struct super_block *sb, u64 root_block, u64 max_nodes);
+ * @max_nodes as a guard against corrupt/cyclic trees.
+ * Returns 0 on success, -EIO if any node write failed. */
+int briefs_btree_drain(struct super_block *sb, u64 root_block, u64 max_nodes);
 
 /* Clear BRIEFS_EXT_UNWRITTEN on the tree-backed extent covering @iblock (an
  * in-place flag update on the leaf record -- no split, no block free).  The

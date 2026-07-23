@@ -1519,54 +1519,65 @@ int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
 }
 
 /* Lock-free recursive sync of every dirty tree node, for the journal snapshot
- * ordering. Bounded by @max_nodes. */
-static void btree_drain_subtree(struct super_block *sb, u64 block, u64 *cap)
+ * ordering. Bounded by @max_nodes. Returns 0 on success, -EIO on write error. */
+static int btree_drain_subtree(struct super_block *sb, u64 block, u64 *cap)
 {
 	struct buffer_head *bh;
 	struct briefs_extent_btree_node *node;
-	int i, n;
+	int i, n, err = 0;
 
 	if (block == 0 || *cap == 0)
-		return;
+		return 0;
 	(*cap)--;
 
 	if (block >= (bdev_nr_bytes(sb->s_bdev) >> sb->s_blocksize_bits)) {
 		pr_debug("briefs: btree drain: node %llu out of range\n", block);
-		return;
+		return 0;
 	}
 
 	bh = sb_bread(sb, block);
 	if (!bh) {
 		pr_debug("briefs: btree drain: sb_bread node %llu failed\n",
 			 block);
-		return;
+		return -EIO;
 	}
 	if (buffer_dirty(bh)) {
 		sync_dirty_buffer(bh);
-		if (briefs_check_meta_write_error(bh))
+		if (briefs_check_meta_write_error(bh)) {
 			briefs_handle_meta_write_error(sb, "btree drain");
+			err = -EIO;
+		}
 	}
 
 	node = (struct briefs_extent_btree_node *)bh->b_data;
 	if (le32_to_cpu(node->hdr.magic) == BRIEFS_BTREE_MAGIC &&
 	    !(le32_to_cpu(node->hdr.flags) & BRIEFS_BTREE_LEAF)) {
 		n = le16_to_cpu(node->hdr.num_keys);
-		for (i = 0; i < n; i++)
-			btree_drain_subtree(sb,
-				le64_to_cpu(node->u.internal.idx[i].child), cap);
-		btree_drain_subtree(sb,
-			le64_to_cpu(node->u.internal.trailing_child), cap);
+		for (i = 0; i < n; i++) {
+			if (err == 0)
+				err = btree_drain_subtree(sb,
+					le64_to_cpu(node->u.internal.idx[i].child), cap);
+		}
+		if (err == 0)
+			err = btree_drain_subtree(sb,
+				le64_to_cpu(node->u.internal.trailing_child), cap);
 	}
 	brelse(bh);
+	return err;
 }
 
-void briefs_btree_drain(struct super_block *sb, u64 root_block, u64 max_nodes)
+/*
+ * briefs_btree_drain - sync all dirty btree nodes in a subtree.
+ * Returns 0 on success, -EIO if any node write failed.
+ * Used before journaling an inode snapshot to ensure btree nodes are on disk.
+ */
+int briefs_btree_drain(struct super_block *sb, u64 root_block, u64 max_nodes)
 {
 	u64 cap = max_nodes;
 
 	if (root_block == 0)
-		return;
+		return 0;
 	if (cap == 0)
 		cap = 1ull << 20;
-	btree_drain_subtree(sb, root_block, &cap);
+	return btree_drain_subtree(sb, root_block, &cap);
 }
