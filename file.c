@@ -1410,7 +1410,6 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 	int ret = 0;
 	int i;
 
-		 inode->i_ino, offset, len, start_blk, end_blk);
 
 	need_partial_start = (offset & (BRIEFS_BLOCK_SIZE - 1)) != 0;
 	need_partial_end = (end & (BRIEFS_BLOCK_SIZE - 1)) != 0;
@@ -1435,7 +1434,6 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 		loff_t punch_start = max_t(loff_t, offset, 0);
 		loff_t punch_end = min_t(loff_t, end, inode->i_size);
 
-			 inode->i_ino, punch_start, punch_end, inode->i_size);
 
 		if (punch_start < punch_end) {
 			memset(binfo->disk_inode.inline_data + punch_start, 0,
@@ -1504,7 +1502,6 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 		u64 del_end = end_blk - (need_partial_end ? 1 : 0);
 		u64 total_before = binfo->disk_inode.num_extents_total;
 
-			 inode->i_ino, del_start, del_end, total_before);
 
 		if (total_before != 0) {
 			bool del_modified = false;
@@ -1615,7 +1612,6 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 
 			if (binfo->disk_inode.num_extents_total != total_before)
 				changed = true;
-				binfo->disk_inode.num_extents_total, total_before, del_modified, changed, ret);
 			/* An extent split (interior blocks freed, a straddler
 			 * kept) leaves num_extents_total unchanged, but the
 			 * mapping DID change: the freed blocks are now holes and
