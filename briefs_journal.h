@@ -174,10 +174,12 @@ struct briefs_replay_nlink {
 
 /*
  * Checkpoint threshold — perform a checkpoint after this many records.
- * Bumped from 64 to 1024 to reduce synchronous flush overhead during
- * metadata-heavy workloads.
+ * Increased from 1024 to 4096 to reduce checkpoint frequency under
+ * heavy metadata workloads (generic/127 fsx stress). With a larger
+ * default journal (auto-scaled up to 4096 blocks), we can safely
+ * accumulate more records before checkpointing.
  */
-#define JRN_CHECKPOINT_INTERVAL 1024
+#define JRN_CHECKPOINT_INTERVAL 4096
 
 /* Initialize journal from superblock */
 int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb);
