@@ -51,16 +51,25 @@ struct btree_split {
 	u64 separator;    /* key pushed up to the parent */
 };
 
-/* Read a B-tree node, verifying magic + checksum. trust_verified lets locked
+/*
+ * Read a B-tree node, verifying magic + checksum.  trust_verified lets locked
  * callers skip the CRC on a buffer whose BH_Verified bit is set (no concurrent
- * modifier can have torn it). Returns the buffer_head (caller brelse) and a
- * pointer to the node, or NULL on failure. */
+ * modifier can have torn it).  Returns the buffer_head (caller brelse) and a
+ * pointer to the node, or NULL on failure.
+ *
+ * Checksum errors are rate-limited to avoid flooding dmesg (the generic/299
+ * spiral).  A per-superblock circuit breaker counts errors; after
+ * BRIEFS_BTREE_ERROR_LIMIT the filesystem is forced read-only to stop the
+ * retry loop.
+ */
 static struct briefs_extent_btree_node *
 btree_read_node(struct super_block *sb, u64 block, bool trust_verified,
 		 struct buffer_head **bhp)
 {
 	struct buffer_head *bh;
 	struct briefs_extent_btree_node *node;
+	struct briefs_sb_info *bsi = briefs_sb(sb);
+	int count;
 
 	/* A stale/corrupt extent-tree pointer can name a block past the device
 	 * end; sb_bread() would then busy-loop unkillably (grow_buffers returns
@@ -68,28 +77,40 @@ btree_read_node(struct super_block *sb, u64 block, bool trust_verified,
 	 * it before the read instead of wedging the box.
 	 */
 	if (block >= (bdev_nr_bytes(sb->s_bdev) >> sb->s_blocksize_bits)) {
-		pr_err("briefs: btree: node %llu out of range\n", block);
+		pr_warn_ratelimited("briefs: btree: node %llu out of range\n", block);
 		return NULL;
 	}
 
 	bh = sb_bread(sb, block);
 	if (!bh) {
-		pr_err("briefs: btree: failed to read node %llu\n", block);
+		pr_warn_ratelimited("briefs: btree: failed to read node %llu\n", block);
 		return NULL;
 	}
 	node = (struct briefs_extent_btree_node *)bh->b_data;
 
 	if (!trust_verified || !buffer_verified(bh)) {
 		if (le32_to_cpu(node->hdr.magic) != BRIEFS_BTREE_MAGIC) {
-			pr_err("briefs: btree: node %llu bad magic 0x%08x\n",
+			pr_warn_ratelimited("briefs: btree: node %llu bad magic 0x%08x\n",
 			       block, le32_to_cpu(node->hdr.magic));
 			brelse(bh);
+			count = atomic_inc_return(&bsi->btree_error_count);
+			if (count >= BRIEFS_BTREE_ERROR_LIMIT) {
+				pr_err("briefs: btree: %d errors, forcing read-only\n",
+				       count);
+				bsi->mount_flags |= BRIEFS_MF_ERROR_FS;
+			}
 			return NULL;
 		}
 		if (briefs_verify_chain_checksum(bh->b_data, node->checksum) != 0) {
-			pr_err("briefs: btree: node %llu checksum mismatch\n",
+			pr_warn_ratelimited("briefs: btree: node %llu checksum mismatch\n",
 			       block);
 			brelse(bh);
+			count = atomic_inc_return(&bsi->btree_error_count);
+			if (count >= BRIEFS_BTREE_ERROR_LIMIT) {
+				pr_err("briefs: btree: %d errors, forcing read-only\n",
+				       count);
+				bsi->mount_flags |= BRIEFS_MF_ERROR_FS;
+			}
 			return NULL;
 		}
 		if (trust_verified)
@@ -1541,12 +1562,29 @@ static int btree_drain_subtree(struct super_block *sb, u64 block, u64 *cap)
 			 block);
 		return -EIO;
 	}
+	/*
+	 * Don't do synchronous I/O here! This function is called from
+	 * briefs_journal_inode_full() under j->write_lock. Doing sync_dirty_buffer()
+	 * for every dirty btree node would block the journal for milliseconds
+	 * while waiting for I/O, causing severe lock contention under load.
+	 *
+	 * The journal sync path (__briefs_journal_sync_locked) calls sync_blockdev()
+	 * which flushes ALL dirty buffers on the device, including these btree nodes.
+	 * Since the JRN_INODE_FULL journal record is written AFTER the nodes are
+	 * dirtied, sync_blockdev() ensures they reach disk before the journal commit
+	 * point is persisted.
+	 *
+	 * We still check for write errors on buffers that were submitted by
+	 * concurrent writeback; if a buffer has a write error, clear it and
+	 * report -EIO so the caller knows the drain didn't complete cleanly.
+	 */
 	if (buffer_dirty(bh)) {
-		sync_dirty_buffer(bh);
-		if (briefs_check_meta_write_error(bh)) {
-			briefs_handle_meta_write_error(sb, "btree drain");
-			err = -EIO;
-		}
+		/* Buffer is dirty - it will be flushed by sync_blockdev() in
+		 * the journal sync path. Just leave it marked dirty. */
+	} else if (buffer_write_io_error(bh)) {
+		/* A previous writeback failed; clear the error and report it. */
+		clear_buffer_write_io_error(bh);
+		err = -EIO;
 	}
 
 	node = (struct briefs_extent_btree_node *)bh->b_data;

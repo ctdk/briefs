@@ -11,6 +11,15 @@
 /* Journal constants */
 #define JOURNAL_BLOCK_SIZE 4096
 
+/*
+ * Journal ring size bounds.  The on-disk superblock carries the actual size
+ * (journal_blocks); these constants document the expected range and provide
+ * a floor for validation at mount time.  mkfs.briefs scales the default with
+ * volume size: max(64, total_blocks / 4096), capped at 4096 (16 MiB).
+ */
+#define BRIEFS_MIN_JOURNAL_BLOCKS 4
+#define BRIEFS_MAX_JOURNAL_BLOCKS 65536
+
 /* Journal context */
 struct briefs_journal {
 	struct briefs_superblock *sb;     /* on-disk superblock pointer */

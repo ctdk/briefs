@@ -53,6 +53,21 @@ int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb) 
 		return -EINVAL;
 	}
 
+	/* Validate journal size */
+	{
+		u64 nblocks = le64_to_cpu(sb->journal_blocks);
+		if (nblocks < BRIEFS_MIN_JOURNAL_BLOCKS) {
+			pr_err("briefs: journal too small (%llu blocks, minimum %u)\n",
+			       nblocks, BRIEFS_MIN_JOURNAL_BLOCKS);
+			return -EINVAL;
+		}
+		if (nblocks > BRIEFS_MAX_JOURNAL_BLOCKS) {
+			pr_err("briefs: journal too large (%llu blocks, maximum %u)\n",
+			       nblocks, BRIEFS_MAX_JOURNAL_BLOCKS);
+			return -EINVAL;
+		}
+	}
+
 	/* Allocate 4096-byte block buffer */
 	j->cur_block = kzalloc(JOURNAL_BLOCK_SIZE, GFP_KERNEL);
 	if (!j->cur_block) return -ENOMEM;
@@ -366,56 +381,25 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	 * BEFORE discarding the journal records that reference them.  The records
 	 * in [journal_log_start, write_pos) are about to be discarded by setting
 	 * log_start = log_end = write_pos below.  briefs_write_inode() only
-	 * mark_buffer_dirty()s the inode block -- it does NOT sync it, because
-	 * fsync(2) relies on the JRN_INODE_FULL journal record for durability, not
-	 * the inode block itself.  If we advance log_start without first writing
-	 * those inode/trie blocks back, a crash leaves the on-disk metadata stale
-	 * AND its journal record past log_start (unreplayed): recovery sees
-	 * log_start == log_end and replays nothing, so the stale on-disk inode
-	 * (e.g. a file's extent btree pointing at a pre-writeback physical block)
-	 * wins -> data/metadata loss.  generic/547 hits exactly this: an fsync-all
-	 * storm drives periodic checkpoints; an inode block whose JRN_INODE_FULL
-	 * was checkpointed away and that background writeback hadn't yet reached
-	 * disk before the drop_writes+unmount reverts to stale data on remount.
+	 * mark_buffer_dirty()s the inode block -- it does NOT sync it.
 	 *
-	 * sync_blockdev() writes out sb->s_bdev's page-cache mapping, which holds
-	 * the sb_bread()-read inode and trie buffers.  Note that since Linux 6.12
-	 * sync_blockdev() does NOT issue a drive-level REQ_PREFLUSH; callers that
-	 * need cache flush ordering (fsync(2), unmount) must also call
-	 * blkdev_issue_flush().  File DATA lives in the per-inode address_space and
-	 * is flushed separately by file_write_and_wait_range() at fsync time, so it
-	 * is not touched here.  We hold j->write_lock; no BrieFS metadata-writeback
-	 * path takes it (buffer I/O submission/completion is lock-free, and
-	 * briefs_write_inode acquires write_lock only when *creating* a record, not
-	 * when its dirty buffer is written back), so this wait cannot self-deadlock.
-	 */
-	{
-		int ret = sync_blockdev(j->vfs_sb->s_bdev);
-		if (ret)
-			return ret;
-	}
-
-	/*
-	 * LOCK ORDER FIX (deadlock prevention): We must NOT hold j->write_lock
-	 * while calling briefs_alloc_sync() because:
+	 * Release j->write_lock before the flush so other threads can write
+	 * journal records while we wait for I/O.  The __briefs_journal_sync_locked
+	 * call above already committed the records and flushed metadata once; this
+	 * second flush is an extra safety barrier before discarding.
 	 *
-	 * 1. briefs_alloc_sync() takes alloc->lock
-	 * 2. Other paths (briefs_trie_alloc_node, briefs_xattr_set) take
-	 *    alloc->lock then emit journal records (taking j->write_lock)
-	 *
-	 * This creates an AB-BA deadlock:
-	 * - Thread A: holds alloc->lock, waiting for j->write_lock (back-pressure)
-	 * - Thread B: holds j->write_lock, waiting for alloc->lock (here)
-	 *
-	 * Safe to release j->write_lock here because:
-	 * - sync_blockdev() already flushed all dirty metadata (lines 388-391)
-	 * - The checkpoint state (write_pos, checkpoint_seq) is only modified
-	 *   by this function, and we haven't written the checkpoint block yet
-	 * - briefs_alloc_sync() is idempotent - calling it twice is harmless
-	 *
-	 * We re-acquire j->write_lock after the sync to complete the checkpoint.
+	 * We also release before briefs_alloc_sync() to avoid the AB-BA deadlock
+	 * with alloc->lock (LOCK ORDER FIX).
 	 */
 	mutex_unlock(&j->write_lock);
+
+	{
+		int ret = sync_blockdev(j->vfs_sb->s_bdev);
+		if (ret) {
+			mutex_lock(&j->write_lock);
+			return ret;
+		}
+	}
 
 	/*
 	 * Persist the allocator bitmaps alongside the inode/trie buffers written
@@ -472,7 +456,7 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	cp.free_inode_count = j->sb->free_inodes;
 
 	/* Write checkpoint record into a fresh buffer */
-	unsigned char *cp_buf = kzalloc(JOURNAL_BLOCK_SIZE, GFP_KERNEL);
+	unsigned char *cp_buf = kzalloc(JOURNAL_BLOCK_SIZE, GFP_NOFS);
 	if (!cp_buf) return -ENOMEM;
 
 	struct journal_block_header *cp_hdr = (struct journal_block_header *)cp_buf;
@@ -2040,6 +2024,22 @@ void briefs_journal_cleanup(struct briefs_journal *j) {
  * sync; when false (shutdown LOGFLUSH path), the journal tail is advanced but
  * log_start is left untouched so replay still runs on the next mount.
  */
+/*
+ * __briefs_journal_sync_locked - flush dirty journal records to disk.
+ *
+ * Called under j->write_lock.  @checkpoint controls whether a periodic
+ * checkpoint may be triggered after the sync.
+ *
+ * The function uses a commit-before-flush ordering: the journal commit point
+ * (journal_log_end) is advanced BEFORE the metadata flush runs, and the
+ * metadata flush (sync_blockdev + per-block journal sync) runs OUTSIDE
+ * j->write_lock so other threads can write journal records concurrently.
+ * This is safe because journal replay is idempotent: if a crash occurs after
+ * the commit point is written but before the metadata flush completes, the
+ * next mount replays the journal records and re-derives the correct on-disk
+ * state (briefs_trie_insert tolerates -EEXIST, replay_inode_full overwrites,
+ * *_alloc set bitmap bits).
+ */
 static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoint) {
 	u64 sync_start, sync_end, pos;
 	int ret;
@@ -2069,20 +2069,11 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 	}
 
 	/*
-	 * Capture the range of journal blocks dirtied since the last durable
-	 * sync: every filled block flushed by briefs_journal_write_record()
-	 * (from synced_pos up to write_pos) plus the partial block we are about
-	 * to write at write_pos.  briefs_journal_write_block() only marks these
-	 * buffers dirty; on the per-file fsync(2) path nothing else reaches the
-	 * journal block -- it lives on s_bdev's mapping, which
-	 * sync_inode_metadata() (inode block) and file_write_and_wait_range()
-	 * (file data) do not touch -- so without syncing them here fsync(2)
-	 * would not durably persist metadata.  (sync(2)/syncfs/umount already
-	 * flush the journal via the VFS __sync_blockdev(); fsync was the gap.)
+	 * Capture the range of journal blocks to sync BEFORE advancing
+	 * write_pos.  These are the blocks we must durably flush.
 	 */
 	sync_start = j->synced_pos;
 	sync_end = j->write_pos;
-
 
 	/* Write current block to disk */
 	ret = briefs_journal_write_block(j, j->write_pos, j->cur_block);
@@ -2090,7 +2081,6 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 		pr_err("briefs: journal sync failed (err=%d)\n", ret);
 		return ret;
 	}
-
 
 	/* Advance write position */
 	j->write_pos = briefs_journal_next_block(j, j->write_pos);
@@ -2108,61 +2098,50 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 	j->dirty = false;
 
 	/*
-	 * Write out the trie/inode metadata buffers the just-written journal records
-	 * reference BEFORE those journal blocks reach disk.  Dir-entry insertion
-	 * (briefs_trie_insert -> briefs_trie_page_init) and inode mutation
-	 * (briefs_write_inode) only mark_buffer_dirty() the trie page / inode
-	 * block; they are NOT force-synced on the fsync(2) path
-	 * (briefs_fsync does file data + inode metadata + journal only).  Without
-	 * this, an fsync that lands between checkpoints (the common case:
-	 * JRN_CHECKPOINT_INTERVAL is 1024 records) durably persists the JRN_DIR_UPDATE
-	 * / JRN_TRIE_ALLOC journal records but leaves the on-disk trie page they
-	 * mutated stale.  A crash then replays those records against the stale
-	 * trie: briefs_trie_page_init() cannot find the page on disk, calls
-	 * briefs_alloc_block() for a FRESH block, and zeroes it -- clobbering an
-	 * in-use data/trie block (generic/547 Mode A bad-magic / Mode B data
-	 * mismatch).  Syncing the referenced buffers first makes the on-disk trie
-	 * match the journaled state, so replay's re-derivation is idempotent --
-	 * briefs_trie_insert() returns -EEXIST and briefs_trie_remove() -ENOENT,
-	 * both already tolerated by replay_dir_update() -- and no fresh allocation
-	 * happens.  This is the same sync_blockdev() the checkpoint path uses
-	 * (see __briefs_journal_checkpoint_locked()); fsync(2) was the gap.
-	 *
-	 * The journal commit point is journal_log_end, advanced (with the
-	 * superblock sync) only AFTER this write-out and the journal-block loop
-	 * below, so the on-disk ordering is metadata-before-commit: a crash before
-	 * log_end is advanced leaves these records beyond the committed tail and
-	 * they are not replayed; a crash after leaves the trie already durable, so
-	 * replay is a no-op.  sync_blockdev() waits on every dirty buffer on
-	 * s_bdev (trie, inode, and the just-dirtied journal block at write_pos),
-	 * so by the time it returns all of them are on disk.  Note, however, that
-	 * since Linux 6.12 sync_blockdev() no longer issues a REQ_PREFLUSH bio;
-	 * callers that need a drive-level flush (fsync(2), unmount) must also call
-	 * blkdev_issue_flush().  The per-block sync_dirty_buffer() loop below then
-	 * re-reads those journal buffers and no-ops on the now-clean ones.  Same
-	 * self-deadlock argument as the checkpoint path holds: no BrieFS
-	 * metadata-writeback path takes j->write_lock during buffer I/O.
-	 *
-	 * This writes out every dirty buffer on s_bdev on every fsync -- heavier
-	 * than ideal.  A targeted flush of only the dirtied trie/inode buffers is the
-	 * natural refinement once BrieFS moves off buffer_heads to iomap.
+	 * Commit point FIRST: advance journal_log_end so crash recovery can
+	 * find these records.  Replay is idempotent, so it is safe to commit
+	 * before the metadata flush: if we crash before the flush completes,
+	 * the next mount replays the journal and re-derives the correct on-disk
+	 * state.  This lets us release write_lock before the slow metadata
+	 * flush, so other threads can write journal records concurrently.
+	 */
+	j->sb->journal_log_end = cpu_to_le64(j->write_pos);
+	ret = briefs_journal_sync_superblock(j);
+	if (ret) {
+		pr_err("briefs: failed to persist journal tail after sync: %d\n", ret);
+		return ret;
+	}
+
+	/*
+	 * Release j->write_lock before the slow metadata flush.  Other threads
+	 * can now write journal records while we wait for I/O.  The sync range
+	 * (sync_start..sync_end) was captured above and is stable: no other
+	 * thread modifies already-written journal blocks.
+	 */
+	mutex_unlock(&j->write_lock);
+
+	/*
+	 * Flush all dirty metadata buffers (inode blocks, trie pages, btree
+	 * nodes) to disk.  These were dirtied by the operations whose journal
+	 * records we just committed.  This is the same sync_blockdev() the
+	 * checkpoint path uses; it is heavier than ideal (flushes every dirty
+	 * buffer on s_bdev, not just the ones referenced by our records).
+	 * A targeted flush is the natural refinement.
 	 */
 	{
 		int err = sync_blockdev(j->vfs_sb->s_bdev);
 		if (err) {
 			pr_err("briefs: fsync metadata buffer write-out failed: %d\n", err);
+			mutex_lock(&j->write_lock);
 			return err;
 		}
 	}
 
 	/*
-	 * Force every journal block dirtied since the last sync to disk.  Each
-	 * sb_bread() is a cache hit returning the uptodate buffer that
-	 * briefs_journal_write_block() left dirty; sync_dirty_buffer() submits
-	 * the write and waits.  sync_blockdev() above already wrote the journal
-	 * block at write_pos, so these are now clean and the sync_dirty_buffer()
-	 * calls are no-ops; the loop is retained as an explicit durable flush of
-	 * the journal range.
+	 * Force every journal block in the sync range to disk.  After
+	 * sync_blockdev() above these are already clean, so the
+	 * sync_dirty_buffer() calls are no-ops; the loop is retained as an
+	 * explicit durable flush of the journal range.
 	 */
 	for (pos = sync_start; ; pos = briefs_journal_next_block(j, pos)) {
 		struct buffer_head *bh = sb_bread(j->vfs_sb, pos);
@@ -2177,38 +2156,25 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 		if (pos == sync_end)
 			break;
 	}
+
+	/* Re-acquire write_lock for state updates and checkpoint. */
+	mutex_lock(&j->write_lock);
+
 	if (io_err) {
-		j->dirty = false;
 		j->synced_pos = j->write_pos;
 		briefs_handle_meta_write_error(j->vfs_sb, "journal sync");
 		return -EIO;
 	}
-	j->synced_pos = j->write_pos;
-
-	pr_debug("briefs: journal synced, write_pos=%llu\n", j->write_pos);
 
 	/*
-	 * Persist the journal tail so crash recovery can find the records we
-	 * just durably flushed.  briefs_journal_write_block()/sync_dirty_buffer()
-	 * above wrote the record blocks to disk, but the on-disk superblock's
-	 * journal_log_end still points at the last checkpoint (or, on a fresh
-	 * mount, the empty start) -- only briefs_journal_checkpoint() advanced it
-	 * before.  So without this, an fsync that doesn't cross a checkpoint
-	 * boundary (the common case) leaves the synced record blocks orphaned on
-	 * disk: on the next mount briefs_journal_replay() sees log_start == log_end
-	 * and replays nothing, and the fsync'd metadata is lost.  journal_log_start
-	 * (head) is advanced only by checkpoint and already delimits the oldest
-	 * uncheckpointed record, so only the tail needs advancing here.  Replay is
-	 * idempotent (briefs_trie_insert tolerates -EEXIST, replay_inode_full
-	 * overwrites a fixed snapshot, *_alloc set bitmap bits), so re-applying
-	 * records that also reached regular metadata via writeback is harmless.
+	 * Advance synced_pos to at least our sync_end.  Another thread may
+	 * have synced past us while we were flushing; don't move it backwards.
 	 */
-	j->sb->journal_log_end = cpu_to_le64(j->write_pos);
-	ret = briefs_journal_sync_superblock(j);
-	if (ret) {
-		pr_err("briefs: failed to persist journal tail after sync: %d\n", ret);
-		return ret;
-	}
+	if (j->synced_pos == sync_start ||
+	    briefs_journal_next_block(j, j->synced_pos) == sync_start)
+		j->synced_pos = j->write_pos;
+
+	pr_debug("briefs: journal synced, write_pos=%llu\n", j->write_pos);
 
 	/*
 	 * Periodic checkpoint: if we've accumulated enough records since

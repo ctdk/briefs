@@ -75,6 +75,19 @@ MKFS_FAIL=0
 MOUNT_FAIL=0
 TIMEOUT_SECS=300
 
+# Per-test timeout overrides for known long-running soak tests.
+# These tests do 1M+ operations and need more than the default 300s.
+get_timeout() {
+    local testname="$1"
+    case "$testname" in
+        generic/089) echo 3600 ;;   # bulk fsx + many small files (~65 min)
+        generic/127) echo 1200 ;;   # 6x concurrent fsx (mmap variants)
+        generic/521) echo 1200 ;;   # 1M-op DIO fsx soak
+        generic/522) echo 1200 ;;   # 1M-op buffered fsx soak
+        *)           echo "$TIMEOUT_SECS" ;;
+    esac
+}
+
 # Unmount a mount point aggressively.  Tests can leave daemons, lazy-unmount
 # the device themselves, or hold references in other ways; a plain umount is
 # not enough for a reliable per-test loop.
@@ -140,7 +153,8 @@ for testname in "$@"; do
     status=0
     # Run without -b briefs so result files land in results/generic/ and the
     # existing generic golden outputs are used.
-    timeout "$TIMEOUT_SECS" ./check "$testname" >/tmp/check_last.log 2>&1 || status=$?
+    tsecs=$(get_timeout "$testname")
+    timeout "$tsecs" ./check "$testname" >/tmp/check_last.log 2>&1 || status=$?
     cat /tmp/check_last.log
 
     # Clean up mounts before moving on, best effort.

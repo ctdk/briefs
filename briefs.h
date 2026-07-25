@@ -33,6 +33,7 @@
 #define BRIEFS_NAME_LEN 255
 #define BRIEFS_DELALLOC_RUN_MAX 256	/* max blocks per coalesced write run */
 #define BRIEFS_INODE_BLOCK_LOCKS 64	/* hash buckets for inode-block RMW locks */
+#define BRIEFS_BTREE_ERROR_LIMIT 100	/* circuit breaker: max btree checksum errors before RO remount */
 
 /*
  * LOCK ORDERING (to prevent deadlocks):
@@ -1026,6 +1027,7 @@ struct briefs_sb_info {
 	struct kobject s_kobj;          /* per-sb sysfs kobject, embedded in bsi */
 	u64 mount_jiffies;              /* time of mount, for debugfs/sysfs/proc */
 	struct mutex inode_block_locks[BRIEFS_INODE_BLOCK_LOCKS]; /* serialize RMW on shared inode blocks */
+	atomic_t btree_error_count;     /* circuit breaker for btree checksum errors */
 };
 
 /* briefs_inode_info - our inode info */

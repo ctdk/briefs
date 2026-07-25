@@ -1410,6 +1410,8 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 	int ret = 0;
 	int i;
 
+		 inode->i_ino, offset, len, start_blk, end_blk);
+
 	need_partial_start = (offset & (BRIEFS_BLOCK_SIZE - 1)) != 0;
 	need_partial_end = (end & (BRIEFS_BLOCK_SIZE - 1)) != 0;
 	partial_start_off = offset & (BRIEFS_BLOCK_SIZE - 1);
@@ -1432,6 +1434,8 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 	if (binfo->disk_inode.flags & InodeFlagInlineData) {
 		loff_t punch_start = max_t(loff_t, offset, 0);
 		loff_t punch_end = min_t(loff_t, end, inode->i_size);
+
+			 inode->i_ino, punch_start, punch_end, inode->i_size);
 
 		if (punch_start < punch_end) {
 			memset(binfo->disk_inode.inline_data + punch_start, 0,
@@ -1500,6 +1504,8 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 		u64 del_end = end_blk - (need_partial_end ? 1 : 0);
 		u64 total_before = binfo->disk_inode.num_extents_total;
 
+			 inode->i_ino, del_start, del_end, total_before);
+
 		if (total_before != 0) {
 			bool del_modified = false;
 
@@ -1508,6 +1514,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 								&binfo->disk_inode,
 								del_start, del_end,
 								&del_modified);
+				pr_debug("briefs: btree_delete_range returned %d del_modified=%d\n", ret, del_modified);
 				if (ret)
 					goto out_unlock;
 			}
@@ -1517,74 +1524,98 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 			 * allocated (delete_range kept them as straddlers), so look
 			 * them up and zero the punched portion. -ENOENT means the
 			 * boundary was already a hole: nothing to zero.
+			 *
+			 * CRITICAL: We must NOT do synchronous I/O (briefs_zero_block_range
+			 * does submit_bio_wait) while holding extent_lock, or concurrent
+			 * punch operations will deadlock waiting for the lock while I/O
+			 * blocks. Release the lock, do the I/O, then re-acquire and verify.
 			 */
 			if (same_boundary_block) {
 				struct briefs_extent pext;
+				u64 ab;
 
 				ret = briefs_inode_lookup_iblock(inode->i_sb, binfo,
 								 start_blk, &pext,
 								 true);
 				if (ret == 0) {
-					u64 ab = pext.phys + (start_blk - pext.offset);
+					ab = pext.phys + (start_blk - pext.offset);
+				} else if (ret == -ENOENT) {
+					ab = 0;
+					ret = 0;  /* Hole is not an error - just nothing to zero */
+				} else {
+					goto out_unlock;
+				}
 
+				if (ab != 0) {
+					mutex_unlock(&binfo->extent_lock);
 					ret = briefs_zero_block_range(inode->i_sb, ab,
 								      partial_start_off,
 								      partial_end_off);
+					mutex_lock(&binfo->extent_lock);
 					if (ret)
 						goto out_unlock;
-					changed = true;
-				} else if (ret == -ENOENT) {
-					ret = 0;
-				} else {
-					goto out_unlock;
 				}
+				changed = true;
 			} else {
 			if (need_partial_start) {
 				struct briefs_extent pext;
+				u64 ab;
 
 				ret = briefs_inode_lookup_iblock(inode->i_sb, binfo,
 								 start_blk, &pext,
 								 true);
 				if (ret == 0) {
-					u64 ab = pext.phys + (start_blk - pext.offset);
-
-					ret = briefs_zero_block_range(inode->i_sb, ab,
-								      partial_start_off,
-								      BRIEFS_BLOCK_SIZE);
-					if (ret)
-						goto out_unlock;
-					changed = true;
+					ab = pext.phys + (start_blk - pext.offset);
 				} else if (ret == -ENOENT) {
-					ret = 0;
+					ab = 0;
+					ret = 0;  /* Hole is not an error - just nothing to zero */
 				} else {
 					goto out_unlock;
 				}
+
+				if (ab != 0) {
+					mutex_unlock(&binfo->extent_lock);
+					ret = briefs_zero_block_range(inode->i_sb, ab,
+								      partial_start_off,
+								      BRIEFS_BLOCK_SIZE);
+					mutex_lock(&binfo->extent_lock);
+					if (ret)
+						goto out_unlock;
+				}
+				changed = true;
 			}
 			if (need_partial_end) {
 				struct briefs_extent pext;
 				u64 pblk = end_blk - 1;
+				u64 ab;
 
 				ret = briefs_inode_lookup_iblock(inode->i_sb, binfo,
 								 pblk, &pext,
 								 true);
 				if (ret == 0) {
-					u64 ab = pext.phys + (pblk - pext.offset);
-
-					ret = briefs_zero_block_range(inode->i_sb, ab,
-								      0, partial_end_off);
-					if (ret)
-						goto out_unlock;
-					changed = true;
+					ab = pext.phys + (pblk - pext.offset);
 				} else if (ret == -ENOENT) {
-					ret = 0;
+					ab = 0;
+					ret = 0;  /* Hole is not an error */
 				} else {
 					goto out_unlock;
 				}
+
+				if (ab != 0) {
+					mutex_unlock(&binfo->extent_lock);
+					ret = briefs_zero_block_range(inode->i_sb, ab,
+								      0, partial_end_off);
+					mutex_lock(&binfo->extent_lock);
+					if (ret)
+						goto out_unlock;
+				}
+				changed = true;
 			}
 			}
 
 			if (binfo->disk_inode.num_extents_total != total_before)
 				changed = true;
+				binfo->disk_inode.num_extents_total, total_before, del_modified, changed, ret);
 			/* An extent split (interior blocks freed, a straddler
 			 * kept) leaves num_extents_total unchanged, but the
 			 * mapping DID change: the freed blocks are now holes and
@@ -1641,37 +1672,48 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 			 * Punch is wholly inside one block: zero only the
 			 * sub-range [partial_start_off, partial_end_off), not
 			 * the whole block.  See same_boundary_block comment above.
+			 *
+			 * CRITICAL: Release extent_lock around synchronous I/O.
 			 */
 			if (start_blk >= ext.offset && start_blk < ext_end) {
 				u64 abs_block = ext.phys + (start_blk - ext.offset);
 
+				mutex_unlock(&binfo->extent_lock);
 				ret = briefs_zero_block_range(inode->i_sb, abs_block,
 							      partial_start_off,
 							      partial_end_off);
+				mutex_lock(&binfo->extent_lock);
 				if (ret)
 					goto out_unlock;
+				changed = true;
 			}
 		} else {
 		if (need_partial_start && start_blk >= ext.offset &&
 		    start_blk < ext_end) {
 			u64 abs_block = ext.phys + (start_blk - ext.offset);
 
+			mutex_unlock(&binfo->extent_lock);
 			ret = briefs_zero_block_range(inode->i_sb, abs_block,
 						      partial_start_off,
 						      BRIEFS_BLOCK_SIZE);
+			mutex_lock(&binfo->extent_lock);
 			if (ret)
 				goto out_unlock;
+			changed = true;
 		}
 
 		if (need_partial_end && (end_blk - 1) >= ext.offset &&
 		    (end_blk - 1) < ext_end) {
 			u64 abs_block = ext.phys + ((end_blk - 1) - ext.offset);
 
+			mutex_unlock(&binfo->extent_lock);
 			ret = briefs_zero_block_range(inode->i_sb, abs_block,
 						      0,
 						      partial_end_off);
+			mutex_lock(&binfo->extent_lock);
 			if (ret)
 				goto out_unlock;
+			changed = true;
 		}
 		}
 
