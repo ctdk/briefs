@@ -30,7 +30,18 @@
  */
 void briefs_free_blocks_range(struct briefs_sb_info *bsi, u64 phys_start, u64 len)
 {
-	u64 rel_start = abs_to_data(bsi->sb, phys_start);
+	u64 rel_start;
+
+	/*
+	 * Don't free blocks if filesystem is shut down or being torn down.
+	 * Prevents NULL pointer dereference during shutdown/umount (generic/052).
+	 */
+	if (bsi->mount_flags & BRIEFS_MF_SHUTDOWN)
+		return;
+	if (!bsi->sb)
+		return;
+
+	rel_start = abs_to_data(bsi->sb, phys_start);
 
 	briefs_free_blocks(&bsi->alloc, rel_start, len);
 }

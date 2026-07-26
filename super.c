@@ -707,6 +707,14 @@ void briefs_put_super(struct super_block *sb) {
 				       flush_ret);
 		}
 
+		/*
+		 * Evict all remaining inodes BEFORE freeing allocator bitmaps.
+		 * This prevents briefs_free_block() from being called after
+		 * briefs_alloc_cleanup() has set l0/l1/l2 to NULL (generic/052 crash).
+		 */
+		pr_debug("briefs: evicting remaining inodes\n");
+		evict_inodes(sb);
+
 		pr_debug("briefs: calling alloc_cleanup\n");
 		briefs_alloc_cleanup(&bsi->alloc);
 		briefs_alloc_cleanup(&bsi->inode_alloc);

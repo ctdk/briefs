@@ -484,7 +484,12 @@ static void briefs_discard_data_buffer(struct briefs_alloc *alloc, u64 rel_block
 {
 	struct briefs_sb_info *bsi = briefs_sb(alloc->sb);
 
-	if (bsi && alloc == &bsi->alloc)
+	/*
+	 * Check bsi->sb is non-NULL to avoid dereferencing NULL during
+	 * teardown (generic/052 crash when inodes are evicted after
+	 * briefs_put_super sets bsi->sb = NULL).
+	 */
+	if (bsi && bsi->sb && alloc == &bsi->alloc)
 		clean_bdev_aliases(alloc->sb->s_bdev,
 				   data_to_abs(bsi->sb, rel_block), 1);
 }
@@ -494,13 +499,23 @@ void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block)
 	u64 w2, b2, w1, b1, w0, b0;
 	struct briefs_sb_info *bsi = briefs_sb(alloc->sb);
 
+	/*
+	 * Early exit if allocator is being torn down or filesystem is shut down.
+	 * This prevents NULL pointer dereference when inodes are evicted after
+	 * briefs_put_super() has freed the allocator bitmaps (generic/052 crash).
+	 */
+	if (!alloc || !alloc->l0 || !alloc->l2)
+		return;
+	if (bsi && (bsi->mount_flags & BRIEFS_MF_SHUTDOWN))
+		return;
+
 	/* See briefs_alloc_block: count data frees only (inode frees are counted
 	 * in briefs_free_inode_num). No cost when -o debug is off. */
 	if (bsi && (bsi->mount_flags & BRIEFS_MF_DEBUG) && alloc == &bsi->alloc)
 		atomic64_inc(&bsi->stats.data_free_calls);
 
 	mutex_lock(&alloc->lock);
-	if (!alloc || !alloc->l0 || rel_block >= alloc->block_count) {
+	if (rel_block >= alloc->block_count) {
 		mutex_unlock(&alloc->lock);
 		return;
 	}
@@ -546,15 +561,21 @@ void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block)
 void briefs_free_blocks(struct briefs_alloc *alloc, u64 rel_start, u64 n)
 {
 	u64 end, w2, w2_first, w2_last, freed = 0;
+	struct briefs_sb_info *bsi;
 
-	if (!alloc || !alloc->l0 || n == 0)
+	/*
+	 * Early exit if allocator is being torn down or filesystem is shut down.
+	 * Prevents NULL pointer dereference during inode eviction after shutdown.
+	 */
+	if (!alloc || !alloc->l0 || !alloc->l2 || n == 0)
 		return;
 
-	{
-		struct briefs_sb_info *bsi = briefs_sb(alloc->sb);
-		if (bsi && (bsi->mount_flags & BRIEFS_MF_DEBUG) && alloc == &bsi->alloc)
-			atomic64_inc(&bsi->stats.data_free_calls);
-	}
+	bsi = briefs_sb(alloc->sb);
+	if (bsi && (bsi->mount_flags & BRIEFS_MF_SHUTDOWN))
+		return;
+
+	if (bsi && (bsi->mount_flags & BRIEFS_MF_DEBUG) && alloc == &bsi->alloc)
+		atomic64_inc(&bsi->stats.data_free_calls);
 
 	mutex_lock(&alloc->lock);
 
