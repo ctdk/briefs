@@ -939,6 +939,13 @@ out:
 
 /*
  * briefs_trie_free_all - free all nodes in a directory trie recursively.
+ *
+ * This function collects all trie node references first while holding trie_lock,
+ * then releases the lock and frees them. This avoids holding trie_lock across
+ * sync_dirty_buffer() calls, which can sleep waiting for I/O completion.
+ * Under heavy concurrent load (e.g., generic/013 fsstress), holding trie_lock
+ * across I/O can cause deadlocks when multiple threads pile up waiting for
+ * sync completion.
  */
 void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di)
 {
@@ -948,6 +955,16 @@ void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di)
 		int state;
 	} *stack;
 	int sp, stack_cap;
+
+	/*
+	 * Collect refs to free in a dynamically grown array. We use vmalloc
+	 * because the array can be large for deep/wide directory trees.
+	 */
+	struct {
+		u64 *refs;
+		int count;
+		int cap;
+	} to_free = { NULL, 0, 0 };
 
 	/*
 	 * Check if sb_info is valid before starting the free. During teardown,
@@ -975,6 +992,7 @@ void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di)
 	stack[sp].state = 0;
 	sp++;
 
+	/* Phase 1: Walk the trie and collect all node refs to free */
 	while (sp > 0) {
 		u64 ref;
 		int state;
@@ -986,7 +1004,25 @@ void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di)
 		state = stack[sp - 1].state;
 
 		if (state == 1) {
-			briefs_trie_free_node(sb, ref);
+			/* Already visited children - just record this ref for later free */
+			if (to_free.count >= to_free.cap) {
+				/* Grow the array */
+				int new_cap = to_free.cap == 0 ? 1024 : to_free.cap * 2;
+				u64 *new_refs = vmalloc_array(new_cap, sizeof(u64));
+				if (!new_refs) {
+					pr_err("briefs: failed to grow trie free list\n");
+					vfree(stack);
+					vfree(to_free.refs);
+					return;
+				}
+				if (to_free.refs && to_free.count > 0) {
+					memcpy(new_refs, to_free.refs, to_free.count * sizeof(u64));
+					vfree(to_free.refs);
+				}
+				to_free.refs = new_refs;
+				to_free.cap = new_cap;
+			}
+			to_free.refs[to_free.count++] = ref;
 			sp--;
 			continue;
 		}
@@ -1000,15 +1036,41 @@ void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di)
 
 		{
 			u64 child = trie_node_first_child(node);
+			int sibling_count = 0;
 			while (!TRIE_REF_IS_NULL(child)) {
 				struct buffer_head *cbh;
 				struct briefs_trie_page *cpage;
 				struct briefs_trie_node *cn;
 				u64 next;
 
+				/* Detect potential infinite loop from corrupted sibling chain */
+				if (++sibling_count > 1000) {
+					pr_err("briefs: trie sibling chain too long (corrupted?) at ref %llu\n",
+					       (unsigned long long)child);
+					WARN_ON(1);
+					break;
+				}
+
+				/* Validate the sibling ref before dereferencing */
+				if (briefs_validate_trie_ref(sb, child) != 0) {
+					pr_err("briefs: invalid trie ref %llu in sibling chain\n",
+					       (unsigned long long)child);
+					break;
+				}
+
 				if (trie_read_node(sb, child, &cbh, &cpage, &cn) != 0)
 					break;
 				next = trie_node_next_sibling(cn);
+
+				/* Detect cycles: next should not point back to current or earlier sibling */
+				if (next == child) {
+					pr_err("briefs: trie sibling cycle detected at ref %llu\n",
+					       (unsigned long long)child);
+					WARN_ON(1);
+					brelse(cbh);
+					break;
+				}
+
 				brelse(cbh);
 
 				if (sp < 512) {
@@ -1025,6 +1087,24 @@ void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di)
 
 	vfree(stack);
 	di->dir_trie_root = 0;
+
+	/*
+	 * Phase 2: Free all collected refs. This is done AFTER releasing trie_lock
+	 * (the caller already released it before calling us, or we're in evict where
+	 * no concurrent access is possible). Each free may call sync_dirty_buffer
+	 * which can sleep waiting for I/O.
+	 *
+	 * Note: briefs_trie_free_node expects to be called without trie_lock held
+	 * when used from this deferred free path. The trie structure is already
+	 * fully torn down at this point - we're just freeing the blocks.
+	 */
+	{
+		int i;
+		for (i = 0; i < to_free.count; i++) {
+			briefs_trie_free_node(sb, to_free.refs[i]);
+		}
+		vfree(to_free.refs);
+	}
 }
 
 /*

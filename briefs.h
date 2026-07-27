@@ -13,6 +13,7 @@
 #include <linux/atomic.h>
 #include <linux/list.h>
 #include <linux/kobject.h>
+#include <linux/lockdep.h>
 #include "briefs_alloc.h"
 
 /* BrieFS magic number */
@@ -55,7 +56,36 @@
  * When writing new code that takes multiple locks, verify the order matches
  * the above. When in doubt, hold locks for the shortest time possible and
  * release before acquiring a "later" lock in the order.
+ *
+ * Lockdep annotations are used to detect violations at runtime.
  */
+
+/*
+ * Lockdep annotations for BrieFS locks.
+ * These help detect lock ordering violations at runtime.
+ */
+#ifdef CONFIG_LOCKDEP
+#define BRIEFS_LOCKDEP_ASSERT_TAKE(lock, held_lock) \
+	lockdep_assert_not_held(&(held_lock))
+
+/* Assert that trie_lock is taken before extent_lock */
+#define BRIEFS_LOCKDEP_ASSERT_TRIE_BEFORE_EXTENT(binfo) \
+	do { \
+		if (debug_locks) \
+			lockdep_assert_held(&(binfo)->trie_lock); \
+	} while (0)
+
+/* Assert that extent_lock is taken before alloc->lock */
+#define BRIEFS_LOCKDEP_ASSERT_EXTENT_BEFORE_ALLOC() \
+	do { \
+		if (debug_locks) \
+			lockdep_assert_held(&alloc->lock); \
+	} while (0)
+#else
+#define BRIEFS_LOCKDEP_ASSERT_TAKE(lock, held_lock) do { } while (0)
+#define BRIEFS_LOCKDEP_ASSERT_TRIE_BEFORE_EXTENT(binfo) do { } while (0)
+#define BRIEFS_LOCKDEP_ASSERT_EXTENT_BEFORE_ALLOC() do { } while (0)
+#endif
 
 /* Semantic versioning, yo */
 #define _BRIEFS_MAJOR_VER 0
@@ -849,6 +879,32 @@ struct briefs_trie_node {
 
 /* Maximum inline name length a packed trie slot can hold */
 #define TRIE_MAX_NAME_LEN BRIEFS_NAME_LEN
+
+/*
+ * Validate a trie node reference before dereferencing. Returns 0 if valid,
+ * -EINVAL if the ref looks corrupted. Used to detect sibling chain corruption
+ * that could cause infinite loops in trie traversal.
+ */
+static inline int briefs_validate_trie_ref(struct super_block *sb, u64 ref)
+{
+	u64 block, slot;
+
+	if (TRIE_REF_IS_NULL(ref))
+		return 0;
+
+	block = TRIE_REF_BLOCK(ref);
+	slot = TRIE_REF_SLOT(ref);
+
+	/* Slot must be in valid range [1, TRIE_SLOTS_PER_BLOCK) */
+	if (slot == 0 || slot >= TRIE_SLOTS_PER_BLOCK)
+		return -EINVAL;
+
+	/* Block must be within trie pool range */
+	if (block >= sb->s_blocksize / sizeof(struct briefs_trie_node))
+		return -EINVAL;
+
+	return 0;
+}
 
 /*
  * Legacy single-node-per-block layout is no longer supported as of BrieFS 0.7.0.
