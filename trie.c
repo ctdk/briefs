@@ -942,11 +942,23 @@ out:
  */
 void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di)
 {
+	struct briefs_sb_info *bsi;
 	struct trie_stack_entry {
 		u64 ref;
 		int state;
 	} *stack;
 	int sp, stack_cap;
+
+	/*
+	 * Check if sb_info is valid before starting the free. During teardown,
+	 * sb->s_fs_info may be NULL. This prevents NULL pointer dereference
+	 * (generic/013 crash).
+	 */
+	bsi = sb->s_fs_info;
+	if (!bsi || !bsi->sb) {
+		pr_warn_ratelimited("briefs: trie_free_all with no bsi (sb_info torn down)\n");
+		return;
+	}
 
 	if (TRIE_REF_IS_NULL(di->dir_trie_root))
 		return;

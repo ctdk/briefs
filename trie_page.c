@@ -788,6 +788,19 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 		if (briefs_check_meta_write_error(bh))
 			briefs_handle_meta_write_error(sb, "trie free");
 		brelse(bh);
+
+		/*
+		 * Check if bsi is valid before journaling/freeing. During teardown
+		 * or after certain errors, sb->s_fs_info may be NULL. The block has
+		 * already been zeroed above, so skipping the journal/free is safe
+		 * (the block will be cleared on next allocation anyway).
+		 * This prevents NULL pointer dereference (generic/013 crash).
+		 */
+		if (!bsi || !bsi->sb) {
+			pr_warn_ratelimited("briefs: trie free with no bsi (sb_info torn down)\n");
+			return;
+		}
+
 		/* Journal the trie page free so recovery does not leave it allocated. */
 		briefs_journal_trie_free(bsi->journal, block);
 		briefs_free_block(&bsi->alloc, abs_to_data(bsi->sb, block));
