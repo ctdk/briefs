@@ -80,9 +80,28 @@ truncate -s "${LOGWRITES_IMG_SIZE_MB}M" "$LOGWRITES_IMG"
 TEST_LOOP="$(losetup -f --show "$TEST_IMG")"
 SCRATCH_LOOP="$(losetup -f --show "$SCRATCH_IMG")"
 LOGWRITES_LOOP="$(losetup -f --show "$LOGWRITES_IMG")"
-echo "  TEST_DEV=$TEST_LOOP  (-> $TEST_IMG)"
-echo "  SCRATCH_DEV=$SCRATCH_LOOP  (-> $SCRATCH_IMG)"
-echo "  LOGWRITES_DEV=$LOGWRITES_LOOP  (-> $LOGWRITES_IMG)"
+
+# Create GPT partition tables and single partitions on each device.
+# This allows using /dev/loopXp1 devices instead of raw /dev/loopX,
+# which is more realistic and avoids issues with tools expecting partitions.
+echo "  creating partition tables..."
+for dev in "$TEST_LOOP" "$SCRATCH_LOOP" "$LOGWRITES_LOOP"; do
+	# Create GPT label and single partition spanning the device
+	parted -s "$dev" mklabel gpt >/dev/null 2>&1
+	parted -s "$dev" mkpart primary 1MiB 100% >/dev/null 2>&1
+	# Force kernel to re-read partition table
+	partx -u "$dev" 2>/dev/null || partprobe "$dev" 2>/dev/null || true
+done
+# Give the kernel a moment to create the partition devices
+sleep 1
+
+TEST_DEV="${TEST_LOOP}p1"
+SCRATCH_DEV="${SCRATCH_LOOP}p1"
+LOGWRITES_DEV="${LOGWRITES_LOOP}p1"
+
+echo "  TEST_DEV=$TEST_DEV  (-> $TEST_IMG)"
+echo "  SCRATCH_DEV=$SCRATCH_DEV  (-> $SCRATCH_IMG)"
+echo "  LOGWRITES_DEV=$LOGWRITES_DEV  (-> $LOGWRITES_IMG)"
 
 echo "=== writing resolved config to $XFSTESTS_DIR/configs/briefs.config ==="
 if [ -d "$XFSTESTS_DIR/configs" ]; then
@@ -92,9 +111,9 @@ if [ -d "$XFSTESTS_DIR/configs" ]; then
 export FSTYP=briefs
 export TEST_DIR=$TEST_MNT
 export SCRATCH_MNT=$SCRATCH_MNT
-export TEST_DEV=$TEST_LOOP
-export SCRATCH_DEV=$SCRATCH_LOOP
-export LOGWRITES_DEV=$LOGWRITES_LOOP
+export TEST_DEV=$TEST_DEV
+export SCRATCH_DEV=$SCRATCH_DEV
+export LOGWRITES_DEV=$LOGWRITES_DEV
 export MKFS_PROG=/go/bin/mkfs.briefs
 # Dedicated prog var (mirrors MKFS_BTRFS_PROG / MKFS_BCACHEFS_PROG, etc.).
 # common/config unconditionally resets MKFS_PROG="$(type -P mkfs)" (the generic
@@ -128,8 +147,8 @@ fi
 echo "=== smoke test ==="
 modprobe -r fs-briefs 2>/dev/null || true
 modprobe fs-briefs && echo "  PASS: modprobe fs-briefs" || { echo "  FAIL: modprobe fs-briefs" >&2; exit 1; }
-/go/bin/mkfs.briefs -f "$TEST_LOOP" >/dev/null 2>&1 && echo "  PASS: mkfs" || { echo "  FAIL: mkfs" >&2; exit 1; }
-mount -t briefs "$TEST_LOOP" "$TEST_MNT" && echo "  PASS: mount -t briefs" || { echo "  FAIL: mount" >&2; exit 1; }
+/go/bin/mkfs.briefs -f "$TEST_DEV" >/dev/null 2>&1 && echo "  PASS: mkfs" || { echo "  FAIL: mkfs" >&2; exit 1; }
+mount -t briefs "$TEST_DEV" "$TEST_MNT" && echo "  PASS: mount -t briefs" || { echo "  FAIL: mount" >&2; exit 1; }
 # O_DIRECT must be rejected at open (-EINVAL) so xfstests _require_odirect skips.
 if xfs_io -d -f -c "pwrite -S 0x55 0 4k" "$TEST_MNT/odirect_test" >/dev/null 2>&1; then
 	echo "  WARN: O_DIRECT open unexpectedly succeeded (reject patch not active?)" >&2
@@ -138,7 +157,7 @@ else
 fi
 rm -f "$TEST_MNT/odirect_test"
 umount "$TEST_MNT"
-/go/bin/fsck.briefs -n "$TEST_LOOP" >/dev/null 2>&1 && echo "  PASS: fsck -n (read-only)" || { echo "  FAIL: fsck -n" >&2; exit 1; }
+/go/bin/fsck.briefs -n "$TEST_DEV" >/dev/null 2>&1 && echo "  PASS: fsck -n (read-only)" || { echo "  FAIL: fsck -n" >&2; exit 1; }
 
 echo
 echo "=== setup complete ==="
