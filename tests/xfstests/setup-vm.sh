@@ -8,8 +8,8 @@
 #      and `mount -t briefs` auto-loads it (MODULE_ALIAS_FS("briefs")).
 #   2. symlink mkfs.briefs / fsck.briefs into /usr/sbin so the util-linux
 #      `fsck -t briefs` / `mkfs -t briefs` front-ends find them.
-#   3. create two loop-backed image files for TEST_DEV / SCRATCH_DEV and the
-#      mount points.
+#   3. Use /dev/vdb and /dev/vdc if available, otherwise create loop-backed
+#      image files for TEST_DEV / SCRATCH_DEV, and create mount points.
 #   4. smoke-test: modprobe fs-briefs, mount, O_DIRECT rejected, fsck -n.
 #
 # Argument (optional): the xfstests checkout dir inside the VM (defaults to
@@ -32,6 +32,16 @@ TEST_IMG_INODE_RATIO=4	# one inode per 4 blocks (was default 8)
 SCRATCH_IMG_SIZE_MB=16384	# 16 GiB
 # Log-writes device needs to record every write to the scratch device.
 LOGWRITES_IMG_SIZE_MB=$((SCRATCH_IMG_SIZE_MB * 2))	# 32 GiB
+
+# Check if we have dedicated devices (/dev/vdb, /dev/vdc) or need loop images.
+USE_DEDICATED=false
+if [ -b /dev/vdb ] && [ -b /dev/vdc ]; then
+	USE_DEDICATED=true
+	echo "=== found dedicated devices /dev/vdb and /dev/vdc ==="
+elif [ -b /dev/vdb1 ] && [ -b /dev/vdc1 ]; then
+	USE_DEDICATED=true
+	echo "=== found dedicated devices /dev/vdb1 and /dev/vdc1 ==="
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
 	echo "must run as root (try: sudo bash $0)" >&2
@@ -66,42 +76,86 @@ for t in mkfs.briefs fsck.briefs; do
 	fi
 done
 
-echo "=== creating loop-backed test/scratch devices ==="
-mkdir -p "$IMG_DIR" "$TEST_MNT" "$SCRATCH_MNT"
-# Detach any old loops pointing at our images.
-for img in "$TEST_IMG" "$SCRATCH_IMG" "$LOGWRITES_IMG"; do
-	lo="$(losetup -j "$img" 2>/dev/null | cut -d: -f1 || true)"
-	[ -n "$lo" ] && losetup -d "$lo" 2>/dev/null || true
-done
-# (Re)create sparse images.
-truncate -s "${TEST_IMG_SIZE_MB}M" "$TEST_IMG"
-truncate -s "${SCRATCH_IMG_SIZE_MB}M" "$SCRATCH_IMG"
-truncate -s "${LOGWRITES_IMG_SIZE_MB}M" "$LOGWRITES_IMG"
-TEST_LOOP="$(losetup -f --show "$TEST_IMG")"
-SCRATCH_LOOP="$(losetup -f --show "$SCRATCH_IMG")"
-LOGWRITES_LOOP="$(losetup -f --show "$LOGWRITES_IMG")"
+if [ "$USE_DEDICATED" = true ]; then
+	# Use dedicated devices with partitions.
+	mkdir -p "$TEST_MNT" "$SCRATCH_MNT"
 
-# Create GPT partition tables and single partitions on each device.
-# This allows using /dev/loopXp1 devices instead of raw /dev/loopX,
-# which is more realistic and avoids issues with tools expecting partitions.
-echo "  creating partition tables..."
-for dev in "$TEST_LOOP" "$SCRATCH_LOOP" "$LOGWRITES_LOOP"; do
-	# Create GPT label and single partition spanning the device
-	parted -s "$dev" mklabel gpt >/dev/null 2>&1
-	parted -s "$dev" mkpart primary 1MiB 100% >/dev/null 2>&1
-	# Force kernel to re-read partition table
-	partx -u "$dev" 2>/dev/null || partprobe "$dev" 2>/dev/null || true
-done
-# Give the kernel a moment to create the partition devices
-sleep 1
+	# Determine if we use the raw device or partition based on what exists.
+	if [ -b /dev/vdb1 ] && [ -b /dev/vdc1 ]; then
+		TEST_DEV=/dev/vdb1
+		SCRATCH_DEV=/dev/vdc1
+		# For log-writes, we still need an image file since there's no dedicated device.
+		mkdir -p "$IMG_DIR"
+		truncate -s "${LOGWRITES_IMG_SIZE_MB}M" "$LOGWRITES_IMG"
+		LOGWRITES_LOOP="$(losetup -f --show "$LOGWRITES_IMG")"
+		parted -s "$LOGWRITES_LOOP" mklabel gpt >/dev/null 2>&1
+		parted -s "$LOGWRITES_LOOP" mkpart primary 1MiB 100% >/dev/null 2>&1
+		partx -u "$LOGWRITES_LOOP" 2>/dev/null || partprobe "$LOGWRITES_LOOP" 2>/dev/null || true
+		sleep 1
+		LOGWRITES_DEV="${LOGWRITES_LOOP}p1"
+	else
+		# Create partitions on /dev/vdb and /dev/vdc.
+		echo "  creating partition tables on /dev/vdb and /dev/vdc..."
+		for dev in /dev/vdb /dev/vdc; do
+			parted -s "$dev" mklabel gpt >/dev/null 2>&1
+			parted -s "$dev" mkpart primary 1MiB 100% >/dev/null 2>&1
+			partx -u "$dev" 2>/dev/null || partprobe "$dev" 2>/dev/null || true
+		done
+		sleep 1
+		TEST_DEV=/dev/vdb1
+		SCRATCH_DEV=/dev/vdc1
+		# For log-writes, we still need an image file.
+		mkdir -p "$IMG_DIR"
+		truncate -s "${LOGWRITES_IMG_SIZE_MB}M" "$LOGWRITES_IMG"
+		LOGWRITES_LOOP="$(losetup -f --show "$LOGWRITES_IMG")"
+		parted -s "$LOGWRITES_LOOP" mklabel gpt >/dev/null 2>&1
+		parted -s "$LOGWRITES_LOOP" mkpart primary 1MiB 100% >/dev/null 2>&1
+		partx -u "$LOGWRITES_LOOP" 2>/dev/null || partprobe "$LOGWRITES_LOOP" 2>/dev/null || true
+		sleep 1
+		LOGWRITES_DEV="${LOGWRITES_LOOP}p1"
+	fi
 
-TEST_DEV="${TEST_LOOP}p1"
-SCRATCH_DEV="${SCRATCH_LOOP}p1"
-LOGWRITES_DEV="${LOGWRITES_LOOP}p1"
+	echo "  TEST_DEV=$TEST_DEV"
+	echo "  SCRATCH_DEV=$SCRATCH_DEV"
+	echo "  LOGWRITES_DEV=$LOGWRITES_DEV"
+else
+	echo "=== creating loop-backed test/scratch devices ==="
+	mkdir -p "$IMG_DIR" "$TEST_MNT" "$SCRATCH_MNT"
+	# Detach any old loops pointing at our images.
+	for img in "$TEST_IMG" "$SCRATCH_IMG" "$LOGWRITES_IMG"; do
+		lo="$(losetup -j "$img" 2>/dev/null | cut -d: -f1 || true)"
+		[ -n "$lo" ] && losetup -d "$lo" 2>/dev/null || true
+	done
+	# (Re)create sparse images.
+	truncate -s "${TEST_IMG_SIZE_MB}M" "$TEST_IMG"
+	truncate -s "${SCRATCH_IMG_SIZE_MB}M" "$SCRATCH_IMG"
+	truncate -s "${LOGWRITES_IMG_SIZE_MB}M" "$LOGWRITES_IMG"
+	TEST_LOOP="$(losetup -f --show "$TEST_IMG")"
+	SCRATCH_LOOP="$(losetup -f --show "$SCRATCH_IMG")"
+	LOGWRITES_LOOP="$(losetup -f --show "$LOGWRITES_IMG")"
 
-echo "  TEST_DEV=$TEST_DEV  (-> $TEST_IMG)"
-echo "  SCRATCH_DEV=$SCRATCH_DEV  (-> $SCRATCH_IMG)"
-echo "  LOGWRITES_DEV=$LOGWRITES_DEV  (-> $LOGWRITES_IMG)"
+	# Create GPT partition tables and single partitions on each device.
+	# This allows using /dev/loopXp1 devices instead of raw /dev/loopX,
+	# which is more realistic and avoids issues with tools expecting partitions.
+	echo "  creating partition tables..."
+	for dev in "$TEST_LOOP" "$SCRATCH_LOOP" "$LOGWRITES_LOOP"; do
+		# Create GPT label and single partition spanning the device
+		parted -s "$dev" mklabel gpt >/dev/null 2>&1
+		parted -s "$dev" mkpart primary 1MiB 100% >/dev/null 2>&1
+		# Force kernel to re-read partition table
+		partx -u "$dev" 2>/dev/null || partprobe "$dev" 2>/dev/null || true
+	done
+	# Give the kernel a moment to create the partition devices
+	sleep 1
+
+	TEST_DEV="${TEST_LOOP}p1"
+	SCRATCH_DEV="${SCRATCH_LOOP}p1"
+	LOGWRITES_DEV="${LOGWRITES_LOOP}p1"
+
+	echo "  TEST_DEV=$TEST_DEV  (-> $TEST_IMG)"
+	echo "  SCRATCH_DEV=$SCRATCH_DEV  (-> $SCRATCH_IMG)"
+	echo "  LOGWRITES_DEV=$LOGWRITES_DEV  (-> $LOGWRITES_IMG)"
+fi
 
 echo "=== writing resolved config to $XFSTESTS_DIR/configs/briefs.config ==="
 if [ -d "$XFSTESTS_DIR/configs" ]; then
