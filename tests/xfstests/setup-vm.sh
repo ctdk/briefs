@@ -97,11 +97,19 @@ if [ "$USE_DEDICATED" = true ]; then
 		# Create partitions on /dev/vdb and /dev/vdc.
 		echo "  creating partition tables on /dev/vdb and /dev/vdc..."
 		for dev in /dev/vdb /dev/vdc; do
-			parted -s "$dev" mklabel gpt >/dev/null 2>&1
-			parted -s "$dev" mkpart primary 1MiB 100% >/dev/null 2>&1
-			partx -u "$dev" 2>/dev/null || partprobe "$dev" 2>/dev/null || true
+			# Wipe any existing partition table first
+			wipefs -a "$dev" >/dev/null 2>&1 || true
+			# Create fresh GPT label and single partition
+			parted -s "$dev" mklabel gpt
+			parted -s "$dev" mkpart primary 1MiB 100%
+			# Force kernel to re-read partition table
+			partx -a "$dev" || partprobe "$dev" || true
 		done
-		sleep 1
+		# Wait for udev to create partition devices
+		for i in 1 2 3 4 5; do
+			[ -b /dev/vdb1 ] && [ -b /dev/vdc1 ] && break
+			sleep 1
+		done
 		TEST_DEV=/dev/vdb1
 		SCRATCH_DEV=/dev/vdc1
 		# For log-writes, we still need an image file.
