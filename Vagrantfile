@@ -59,8 +59,8 @@ Vagrant.configure(2) do |config|
     libvirt.memory = '4096'
     libvirt.cpus = 2
     libvirt.cpu_mode = 'host-passthrough'
-    libvirt.storage :file, :size => '20G'
-    libvirt.storage :file, :size => '30G'
+    libvirt.storage :file, :size => '64G'
+    libvirt.storage :file, :size => '100G'
   end
 
   # Define a Vagrant Push strategy for pushing to Atlas. Other push strategies
