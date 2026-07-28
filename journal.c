@@ -620,7 +620,12 @@ static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
 		}
 	} else {
 		/* Delete directory entry */
-		ret = briefs_trie_remove(sb, &binfo->disk_inode, rec->name, name_len);
+		{
+			struct trie_free_list to_free;
+			trie_free_list_init(&to_free);
+			ret = briefs_trie_remove(sb, &binfo->disk_inode, rec->name, name_len, &to_free);
+			trie_free_list_destroy(sb, &to_free);
+		}
 		if (ret == -ENOENT) {
 			ret = 0;
 		}

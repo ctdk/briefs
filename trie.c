@@ -27,6 +27,55 @@
 static int trie_iter_push(struct trie_iter *iter, u64 ref, u8 emitted);
 
 /*
+ * Initialize a deferred free list. Must be freed with trie_free_list_destroy.
+ */
+void trie_free_list_init(struct trie_free_list *list)
+{
+	list->refs = kmalloc(64 * sizeof(u64), GFP_NOFS);
+	list->count = 0;
+	list->cap = 64;
+}
+
+/*
+ * Add a node ref to the deferred free list. Grows the list if needed.
+ * Returns 0 on success, -ENOMEM on allocation failure.
+ * If allocation fails, the ref is not added but the list remains valid.
+ */
+int trie_free_list_add(struct trie_free_list *list, u64 ref)
+{
+	if (list->count >= list->cap) {
+		int new_cap = list->cap * 2;
+		u64 *new_refs = krealloc(list->refs, new_cap * sizeof(u64), GFP_NOFS);
+		if (!new_refs) {
+			pr_warn_ratelimited("briefs: trie free list OOM, some nodes may leak\n");
+			return -ENOMEM;
+		}
+		list->refs = new_refs;
+		list->cap = new_cap;
+	}
+	list->refs[list->count++] = ref;
+	return 0;
+}
+
+/*
+ * Free all collected node refs and destroy the list.
+ * Must be called WITHOUT trie_lock held, as briefs_trie_free_node
+ * may sleep waiting for I/O.
+ */
+void trie_free_list_destroy(struct super_block *sb,
+                             struct trie_free_list *list)
+{
+	int i;
+	for (i = 0; i < list->count; i++) {
+		briefs_trie_free_node(sb, list->refs[i]);
+	}
+	kfree(list->refs);
+	list->refs = NULL;
+	list->count = 0;
+	list->cap = 0;
+}
+
+/*
  * Name pointer for a node slot.  The 2-byte length prefix lives at (base - 2);
  * the name bytes follow it.
  */
@@ -745,9 +794,15 @@ int briefs_trie_update_entry(struct super_block *sb, struct briefs_inode *di,
 
 /*
  * briefs_trie_remove - remove an entry from the directory trie.
+ *
+ * This function collects node refs to free in @to_free, then returns.
+ * The caller must call trie_free_list_destroy() AFTER releasing trie_lock
+ * to actually free the nodes. This avoids holding trie_lock across
+ * sync_dirty_buffer() I/O waits.
  */
 int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
-                        const char *name, int name_len)
+                        const char *name, int name_len,
+                        struct trie_free_list *to_free)
 {
 	struct buffer_head *bh, *cbh;
 	struct briefs_trie_page *page, *cpage;
@@ -825,7 +880,7 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 				brelse(cbh);
 
 				trie_unlink_child(sb, cur, child_prev, child);
-				briefs_trie_free_node(sb, child);
+				trie_free_list_add(to_free, child);
 				brelse(bh);
 				goto collapse;
 			}
@@ -833,7 +888,7 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 			/* Pure leaf: unlink and free */
 			brelse(cbh);
 			trie_unlink_child(sb, cur, child_prev, child);
-			briefs_trie_free_node(sb, child);
+			trie_free_list_add(to_free, child);
 			brelse(bh);
 			goto collapse;
 		}
@@ -853,11 +908,14 @@ collapse:
 	{
 		int i;
 		/* Collapse empty intermediate nodes including the leaf's immediate
-			 * parent.  The ancestry array holds the path from root to leaf; the
-			 * leaf itself was already removed before this label, so start at the
-			 * parent of the removed leaf (anc - 1).
-			 */
-			for (i = anc - 1; i >= 1; i--) {
+		 * parent.  The ancestry array holds the path from root to leaf; the
+		 * leaf itself was already removed before this label, so start at the
+		 * parent of the removed leaf (anc - 1).
+		 *
+		 * We collect nodes to free in @to_free and actually free them after
+		 * releasing trie_lock to avoid holding the lock across sync_dirty_buffer.
+		 */
+		for (i = anc - 1; i >= 1; i--) {
 			u64 check = ancestry[i];
 			struct buffer_head *cbh2, *pbh2;
 			struct briefs_trie_page *cpage2, *ppage2;
@@ -904,7 +962,8 @@ collapse:
 			mark_buffer_dirty(pbh2);
 			brelse(pbh2);
 
-			briefs_trie_free_node(sb, check);
+			/* Defer the actual free until after releasing trie_lock */
+			trie_free_list_add(to_free, check);
 			brelse(cbh2);
 		}
 
@@ -913,6 +972,8 @@ collapse:
 		 * (no children), free it too and clear the directory trie root.
 		 * Otherwise an unlinked sole entry leaves the directory pointing
 		 * at an empty trie page that is never referenced again.
+		 *
+		 * We defer the root free as well to avoid holding trie_lock across I/O.
 		 */
 		if (!TRIE_REF_IS_NULL(di->dir_trie_root)) {
 			struct buffer_head *rbh;
@@ -924,7 +985,7 @@ collapse:
 				    !(rnode->node_type & NODE_STATUS_LEAF) &&
 				    trie_node_child_count(rnode) == 0 &&
 				    TRIE_REF_IS_NULL(trie_node_first_child(rnode))) {
-					briefs_trie_free_node(sb, di->dir_trie_root);
+					trie_free_list_add(to_free, di->dir_trie_root);
 					di->dir_trie_root = 0;
 				}
 				brelse(rbh);

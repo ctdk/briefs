@@ -927,6 +927,19 @@ struct briefs_trie_node_legacy {
 	__le16 name_offset;
 };
 
+/* Deferred free list for trie nodes - avoids holding trie_lock across I/O */
+struct trie_free_list {
+	u64 *refs;      /* Array of node refs to free */
+	int count;      /* Number of refs collected */
+	int cap;        /* Current capacity */
+};
+
+/* Trie free list helpers - defined in trie.c */
+void trie_free_list_init(struct trie_free_list *list);
+int trie_free_list_add(struct trie_free_list *list, u64 ref);
+void trie_free_list_destroy(struct super_block *sb,
+                             struct trie_free_list *list);
+
 /* Trie operations - directory trie node allocation (uses data block allocator) */
 int briefs_trie_create_root(struct super_block *sb, struct briefs_inode *di);
 int briefs_trie_lookup(struct super_block *sb, struct briefs_inode *di,
@@ -934,7 +947,8 @@ int briefs_trie_lookup(struct super_block *sb, struct briefs_inode *di,
 int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
                        const char *name, int name_len, u64 ino, u8 type);
 int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
-                       const char *name, int name_len);
+                       const char *name, int name_len,
+                       struct trie_free_list *to_free);
 void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di);
 
 /* Packed trie page helpers (briefs_trie_page.c) */

@@ -248,8 +248,13 @@ int briefs_add_dir_entry(struct inode *dir, const char *name, size_t name_len, u
 			 * Fallback: the existing entry is a pure leaf that the
 			 * update helper can't replace.  Remove it and re-insert.
 			 */
-			ret = briefs_trie_remove(dir->i_sb, &binfo->disk_inode,
-						 name, name_len);
+			{
+				struct trie_free_list to_free;
+				trie_free_list_init(&to_free);
+				ret = briefs_trie_remove(dir->i_sb, &binfo->disk_inode,
+							 name, name_len, &to_free);
+				trie_free_list_destroy(dir->i_sb, &to_free);
+			}
 			if (ret == 0) {
 				ret = briefs_trie_insert(dir->i_sb, &binfo->disk_inode,
 							 name, name_len, child_ino, type);
@@ -271,25 +276,36 @@ int briefs_add_dir_entry(struct inode *dir, const char *name, size_t name_len, u
 int briefs_remove_dir_entry(struct inode *dir, const char *name, size_t name_len)
 {
 	struct briefs_inode_info *binfo;
+	struct trie_free_list to_free;
 	int ret;
 
 	if (!dir || !name || name_len < 1 || name_len > BRIEFS_NAME_LEN)
 		return -EINVAL;
 
 	binfo = briefs_i(dir);
+	trie_free_list_init(&to_free);
+
 	mutex_lock(&binfo->trie_lock);
 
 	if (binfo->disk_inode.dir_trie_root == 0) {
-		mutex_unlock(&binfo->trie_lock);
-		return -ENOENT;
+		ret = -ENOENT;
+		goto out_unlock;
 	}
 
-	ret = briefs_trie_remove(dir->i_sb, &binfo->disk_inode, name, name_len);
-		if (ret == 0) {
-			binfo->trie_gen++;
-			briefs_stat_inc(briefs_sb(dir->i_sb), dir_dels);
-		}
+	ret = briefs_trie_remove(dir->i_sb, &binfo->disk_inode, name, name_len, &to_free);
+	if (ret == 0) {
+		binfo->trie_gen++;
+		briefs_stat_inc(briefs_sb(dir->i_sb), dir_dels);
+	}
+
+out_unlock:
 	mutex_unlock(&binfo->trie_lock);
+
+	/* Free the collected nodes AFTER releasing trie_lock */
+	if (to_free.count > 0) {
+		trie_free_list_destroy(dir->i_sb, &to_free);
+	}
+
 	return ret;
 }
 
