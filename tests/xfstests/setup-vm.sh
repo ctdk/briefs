@@ -98,18 +98,32 @@ if [ "$USE_DEDICATED" = true ]; then
 		echo "  creating partition tables on /dev/vdb and /dev/vdc..."
 		for dev in /dev/vdb /dev/vdc; do
 			# Wipe any existing partition table first
-			wipefs -a "$dev" >/dev/null 2>&1 || true
+			wipefs -a "$dev" 2>&1 || true
 			# Create fresh GPT label and single partition
-			parted -s "$dev" mklabel gpt
-			parted -s "$dev" mkpart primary 1MiB 100%
-			# Force kernel to re-read partition table
-			partx -a "$dev" || partprobe "$dev" || true
+			parted -s "$dev" mklabel gpt 2>&1
+			parted -s "$dev" mkpart primary 1MiB 100% 2>&1
+			# Force kernel to re-read partition table using multiple methods
+			blockdev --rereadpt "$dev" 2>&1 || true
+			sleep 2
 		done
 		# Wait for udev to create partition devices
-		for i in 1 2 3 4 5; do
+		echo "  waiting for partition devices to appear..."
+		for i in 1 2 3 4 5 6 7 8 9 10; do
 			[ -b /dev/vdb1 ] && [ -b /dev/vdc1 ] && break
 			sleep 1
 		done
+		if [ ! -b /dev/vdb1 ] || [ ! -b /dev/vdc1 ]; then
+			echo "  WARNING: partition devices not found, trying udev trigger..."
+			udevadm trigger --subsystem-match=block 2>&1 || true
+			udevadm settle 2>&1 || true
+			sleep 2
+		fi
+		if [ ! -b /dev/vdb1 ] || [ ! -b /dev/vdc1 ]; then
+			echo "  ERROR: partition devices still not found!"
+			echo "  Devices available:"
+			ls -la /dev/vd* 2>&1 || true
+			exit 1
+		fi
 		TEST_DEV=/dev/vdb1
 		SCRATCH_DEV=/dev/vdc1
 		# For log-writes, we still need an image file.
