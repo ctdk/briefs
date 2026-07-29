@@ -308,8 +308,15 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 	 * AB-BA of generic/074.  See briefs_journal_replay()'s pre-scan pass, which
 	 * reserves all file-data extent blocks before re-derivation runs, so this
 	 * sync'd trie page cannot alias a later-reserved data block.
+	 *
+	 * NOTE: During journal replay, we MUST sync to ensure the page is on disk
+	 * before replay continues. During normal operation, we can skip the sync
+	 * and let writeback happen asynchronously - the journal record will carry
+	 * the trie page data if needed for recovery.
 	 */
-	sync_dirty_buffer(bh);
+	if (bsi->journal && bsi->journal->in_replay) {
+		sync_dirty_buffer(bh);
+	}
 
 	/*
 	 * The underlying device can fail this synchronous write (dm-thin pool
