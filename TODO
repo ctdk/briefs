@@ -18,3 +18,5 @@ Much further down the list, if ever, items:
 - Optional data journaling
 - reflink/COW, fscrypt, fsverity, casefolding
 - build-in compression
+- tail packing
+- snapshots?
