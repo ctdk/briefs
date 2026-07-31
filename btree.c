@@ -490,9 +490,19 @@ static int btree_maybe_split_child(struct super_block *sb,
 		sib->hdr.next_leaf = child->hdr.next_leaf;
 		memcpy(sib->u.leaf.extents, &child->u.leaf.extents[mid],
 		       (size_t)move * sizeof(child->u.leaf.extents[0]));
+		/* Zero the unused tail of the sibling (indices move to BRIEFS_BTREE_LEAF_FANOUT-1) */
+		if (move < BRIEFS_BTREE_LEAF_FANOUT) {
+			memset(&sib->u.leaf.extents[move], 0,
+			       (BRIEFS_BTREE_LEAF_FANOUT - move) * sizeof(child->u.leaf.extents[0]));
+		}
 
 		/* Left half stays in place (just truncate the count + link). */
 		child->hdr.num_keys = cpu_to_le16(mid);
+		/* Zero the unused tail of the child (indices mid to BRIEFS_BTREE_LEAF_FANOUT-1) */
+		if (mid < BRIEFS_BTREE_LEAF_FANOUT) {
+			memset(&child->u.leaf.extents[mid], 0,
+			       (BRIEFS_BTREE_LEAF_FANOUT - mid) * sizeof(child->u.leaf.extents[0]));
+		}
 		child->hdr.next_leaf = cpu_to_le64(sib_block);
 
 		btree_commit_node(child_bh);
@@ -519,11 +529,21 @@ static int btree_maybe_split_child(struct super_block *sb,
 		memcpy(sib->u.internal.idx, &child->u.internal.idx[mid + 1],
 		       (size_t)move * sizeof(child->u.internal.idx[0]));
 		sib->u.internal.trailing_child = child->u.internal.trailing_child;
+		/* Zero the unused tail of the sibling (indices move to BRIEFS_BTREE_IDX_KEYS-1) */
+		if (move < BRIEFS_BTREE_IDX_KEYS) {
+			memset(&sib->u.internal.idx[move], 0,
+			       (BRIEFS_BTREE_IDX_KEYS - move) * sizeof(child->u.internal.idx[0]));
+		}
 
 		/* Left half: truncate to idx[0..mid-1], trailing = old idx[mid].child. */
 		child->u.internal.trailing_child =
 			child->u.internal.idx[mid].child;
 		child->hdr.num_keys = cpu_to_le16(mid);
+		/* Zero the unused tail of the child (indices mid to BRIEFS_BTREE_IDX_KEYS-1) */
+		if (mid < BRIEFS_BTREE_IDX_KEYS) {
+			memset(&child->u.internal.idx[mid], 0,
+			       (BRIEFS_BTREE_IDX_KEYS - mid) * sizeof(child->u.internal.idx[0]));
+		}
 
 		btree_commit_node(child_bh);
 		btree_commit_node(sib_bh);
@@ -759,8 +779,18 @@ static int btree_ensure_root_room(struct super_block *sb, struct briefs_inode *d
 		sib->hdr.next_leaf = root->hdr.next_leaf;
 		memcpy(sib->u.leaf.extents, &root->u.leaf.extents[mid],
 		       (size_t)move * sizeof(root->u.leaf.extents[0]));
+		/* Zero the unused tail of the sibling */
+		if (move < BRIEFS_BTREE_LEAF_FANOUT) {
+			memset(&sib->u.leaf.extents[move], 0,
+			       (BRIEFS_BTREE_LEAF_FANOUT - move) * sizeof(root->u.leaf.extents[0]));
+		}
 
 		root->hdr.num_keys = cpu_to_le16(mid);
+		/* Zero the unused tail of the root */
+		if (mid < BRIEFS_BTREE_LEAF_FANOUT) {
+			memset(&root->u.leaf.extents[mid], 0,
+			       (BRIEFS_BTREE_LEAF_FANOUT - mid) * sizeof(root->u.leaf.extents[0]));
+		}
 		root->hdr.next_leaf = cpu_to_le64(sib_block);
 
 		separator = le64_to_cpu(sib->u.leaf.extents[0].offset);
@@ -776,9 +806,19 @@ static int btree_ensure_root_room(struct super_block *sb, struct briefs_inode *d
 		memcpy(sib->u.internal.idx, &root->u.internal.idx[mid + 1],
 		       (size_t)move * sizeof(root->u.internal.idx[0]));
 		sib->u.internal.trailing_child = root->u.internal.trailing_child;
+		/* Zero the unused tail of the sibling */
+		if (move < BRIEFS_BTREE_IDX_KEYS) {
+			memset(&sib->u.internal.idx[move], 0,
+			       (BRIEFS_BTREE_IDX_KEYS - move) * sizeof(root->u.internal.idx[0]));
+		}
 
 		root->u.internal.trailing_child = root->u.internal.idx[mid].child;
 		root->hdr.num_keys = cpu_to_le16(mid);
+		/* Zero the unused tail of the root */
+		if (mid < BRIEFS_BTREE_IDX_KEYS) {
+			memset(&root->u.internal.idx[mid], 0,
+			       (BRIEFS_BTREE_IDX_KEYS - mid) * sizeof(root->u.internal.idx[0]));
+		}
 
 		separator = le64_to_cpu(root->u.internal.idx[mid].high_key);
 	}
@@ -879,6 +919,11 @@ static int btree_spill_inline(struct super_block *sb, struct briefs_inode *di,
 	node->hdr.next_leaf = cpu_to_le64(0);
 	for (i = 0; i < m; i++)
 		briefs_cpu_extent_to_disk(&merged[i], &node->u.leaf.extents[i]);
+	/* Zero the unused tail slots */
+	if (m < BRIEFS_BTREE_LEAF_FANOUT) {
+		memset(&node->u.leaf.extents[m], 0,
+		       (BRIEFS_BTREE_LEAF_FANOUT - m) * sizeof(node->u.leaf.extents[0]));
+	}
 	btree_commit_node(bh);
 	brelse(bh);
 
@@ -1323,6 +1368,14 @@ static int btree_leaf_delete_range(struct briefs_extent_btree_node *node,
 			right[(*nright)++] = r;
 		}
 	}
+
+	/* Zero the stale tail entries so the checksum is deterministic.
+	 * The checksum covers the entire block (0-4079), including unused slots. */
+	if (out < n) {
+		memset(&node->u.leaf.extents[out], 0,
+		       (n - out) * sizeof(struct briefs_disk_extent));
+	}
+
 	return out;
 }
 
@@ -1434,6 +1487,14 @@ static bool btree_delete_range_subtree(struct super_block *sb,
 			       le64_to_cpu(node->u.internal.trailing_child);
 		node->u.internal.trailing_child = cpu_to_le64(trailing);
 	}
+
+	/* Zero the stale tail entries so the checksum is deterministic.
+	 * The checksum covers the entire block (0-4079), including unused slots. */
+	if (out < n) {
+		memset(&node->u.internal.idx[out], 0,
+		       (n - out) * sizeof(struct briefs_btree_idx_entry));
+	}
+
 	node->hdr.num_keys = cpu_to_le16(out);
 	btree_commit_node(bh);
 	brelse(bh);
