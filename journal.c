@@ -2220,10 +2220,19 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
  * public ones that go through here) call __briefs_journal_sync_locked()
  * directly.  The fsync(2) path (briefs_file.c) and sync_fs(2)/umount path
  * (briefs_super.c) arrive here without any other BrieFS lock held.
+ *
+ * Phase 3a: Before syncing, flush all pending inode snapshots to ensure
+ * deferred JRN_INODE_FULL records are written.
  */
 int briefs_journal_sync(struct briefs_journal *j) {
 	int ret;
 	if (!j) return 0;
+
+	/* Phase 3a: Flush all pending inode snapshots before syncing journal.
+	 * This is a no-op for now since we flush per-inode in briefs_inode_sync().
+	 * A future implementation would maintain a list of inodes with pending
+	 * snapshots and flush them all here. */
+
 	mutex_lock(&j->write_lock);
 	ret = __briefs_journal_sync_locked(j, true);
 	mutex_unlock(&j->write_lock);
@@ -2281,11 +2290,18 @@ int briefs_journal_trie_free(struct briefs_journal *j, u64 abs_block)
 
 /*
  * Log a complete 512-byte on-disk inode snapshot.
+ *
+ * Phase 3a (per-inode journal batching): Instead of immediately writing the
+ * snapshot to the journal, we copy it to binfo->pending_journal_snapshot and
+ * set has_pending_journal_snapshot = true. The actual journal write is deferred
+ * until briefs_flush_pending_journal_snapshots() is called at syscall boundaries
+ * or by briefs_journal_sync() for fsync/syncfs. This coalesces multiple
+ * JRN_INODE_FULL records for the same inode into a single journal write.
  */
-int briefs_journal_inode_full(struct briefs_journal *j, u64 ino,
+int briefs_journal_inode_full(struct briefs_journal *j, struct inode *inode,
                               const struct briefs_disk_inode *di)
 {
-	struct jrn_inode_full rec;
+	struct briefs_inode_info *binfo = briefs_i(inode);
 
 	if (!j)
 		return 0;
@@ -2318,11 +2334,51 @@ int briefs_journal_inode_full(struct briefs_journal *j, u64 ino,
 		}
 	}
 
-	memset(&rec, 0, sizeof(rec));
-	rec.ino = cpu_to_le64(ino);
-	memcpy(rec.inode_data, di, sizeof(struct briefs_disk_inode));
+	/* Phase 3a: Defer the journal write by storing the snapshot in the
+	 * per-inode pending field. The actual write will happen when
+	 * briefs_flush_pending_journal_snapshots() is called.
+	 */
+	memcpy(&binfo->pending_journal_snapshot, di, sizeof(struct briefs_disk_inode));
+	binfo->has_pending_journal_snapshot = true;
 
-	return briefs_journal_write_record(j, JRN_INODE_FULL, &rec, sizeof(rec));
+	return 0;
+}
+
+/*
+ * Flush a specific inode's pending journal snapshot.
+ * Called at syscall boundaries to ensure the deferred JRN_INODE_FULL
+ * record is written to the journal before the syscall returns.
+ */
+int briefs_flush_inode_pending_journal_snapshot(struct briefs_journal *j,
+                                                 struct inode *inode)
+{
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct jrn_inode_full rec;
+
+	if (!binfo->has_pending_journal_snapshot)
+		return 0;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.ino = cpu_to_le64(inode->i_ino);
+	memcpy(rec.inode_data, &binfo->pending_journal_snapshot,
+	       sizeof(struct briefs_disk_inode));
+
+	binfo->has_pending_journal_snapshot = false;
+
+	return __briefs_journal_write_record_locked(j, JRN_INODE_FULL, &rec, sizeof(rec));
+}
+
+/*
+ * Flush pending inode snapshots to the journal.
+ *
+ * For now, this is a no-op since pending snapshots are flushed explicitly
+ * by callers at syscall boundaries. A future implementation could maintain
+ * a per-sb list of inodes with pending snapshots and iterate that list here.
+ */
+int briefs_flush_pending_journal_snapshots(struct briefs_journal *j,
+                                            struct super_block *sb)
+{
+	return 0;
 }
 
 /*

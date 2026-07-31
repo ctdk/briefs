@@ -818,7 +818,7 @@ static void briefs_xattr_free_block_locked(struct inode *inode)
 	briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
 				  &binfo->disk_inode, false);
 	if (bsi->journal && !bsi->journal->in_replay)
-		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+		briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 
 	briefs_xattr_free_chain_locked(inode, old_block);
 }
@@ -1158,7 +1158,7 @@ int briefs_xattr_set(struct inode *inode, const char *name,
 	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
 	briefs_persist_disk_inode(sb, inode->i_ino, &binfo->disk_inode, false);
 	if (bsi->journal && !bsi->journal->in_replay)
-		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+		briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 
 	/* Drop buffer references now that the chain is published. */
 	for (i = 0; i < nblocks; i++) {

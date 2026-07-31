@@ -263,7 +263,7 @@ int briefs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
 
 	/* Journal a full snapshot so the change survives crash+replay. */
 	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-	ret = briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+	ret = briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 	if (ret) {
 		/* Roll back on journal failure so in-memory and on-disk match. */
 		binfo->disk_inode.user_flags = old_flags;
@@ -277,6 +277,9 @@ int briefs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
 
 /*
  * briefs_inode_sync - flush metadata + journal + drive for IS_SYNC inodes.
+ *
+ * Phase 3a: Also flushes the inode's pending journal snapshot (if any) before
+ * syncing the journal, ensuring deferred JRN_INODE_FULL records are written.
  */
 int briefs_inode_sync(struct inode *inode)
 {
@@ -289,6 +292,11 @@ int briefs_inode_sync(struct inode *inode)
 
 	if (!IS_SYNC(inode) && !IS_DIRSYNC(inode))
 		return 0;
+
+	/* Phase 3a: Flush this inode's pending journal snapshot before syncing. */
+	ret = briefs_flush_inode_pending_journal_snapshot(bsi->journal, inode);
+	if (ret)
+		return ret;
 
 	ret = briefs_journal_sync(bsi->journal);
 	if (ret)
@@ -363,7 +371,7 @@ static int briefs_promote_inline_data(struct inode *inode)
 	{
 		struct briefs_disk_inode disk_di;
 		briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+		briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 	}
 	briefs_persist_disk_inode(inode->i_sb, inode->i_ino, &binfo->disk_inode, false);
 
@@ -985,7 +993,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			{
 				struct briefs_disk_inode disk_di;
 				briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-				briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+				briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 			}
 		} else {
 			ret = briefs_promote_inline_data(inode);
@@ -1001,7 +1009,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			{
 				struct briefs_disk_inode disk_di;
 				briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-				briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+				briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 			}
 		}
 		mutex_unlock(&binfo->extent_lock);
@@ -1033,7 +1041,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		{
 			struct briefs_disk_inode disk_di;
 			briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-			briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+			briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 		}
 		mutex_unlock(&binfo->extent_lock);
 		mark_inode_dirty(inode);
@@ -1065,7 +1073,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		{
 			struct briefs_disk_inode disk_di;
 			briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-			briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+			briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 		}
 		mutex_unlock(&binfo->extent_lock);
 		ret = briefs_inode_sync(inode);
@@ -1182,7 +1190,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	{
 		struct briefs_disk_inode disk_di;
 		briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+		briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 	}
 
 	mutex_unlock(&binfo->extent_lock);
@@ -1451,7 +1459,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 			briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
 						  &binfo->disk_inode, false);
 			briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-			briefs_journal_inode_full(bsi->journal, inode->i_ino,
+			briefs_journal_inode_full(bsi->journal, inode,
 						  &disk_di);
 		}
 		goto out_update;
@@ -1803,7 +1811,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 	briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
 				  &binfo->disk_inode, false);
 	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-	briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+	briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 
 out_unlock:
 	mutex_unlock(&binfo->extent_lock);
@@ -2086,7 +2094,7 @@ falloc_loop_done:
 	briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
 				  &binfo->disk_inode, false);
 	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-	briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+	briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 
 out_update:
 	if (changed) {

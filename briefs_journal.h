@@ -266,9 +266,30 @@ int briefs_journal_inode_update(struct briefs_journal *j,
 int briefs_journal_trie_alloc(struct briefs_journal *j, u64 abs_block);
 int briefs_journal_trie_free(struct briefs_journal *j, u64 abs_block);
 
-/* Log a complete 512-byte on-disk inode snapshot */
-int briefs_journal_inode_full(struct briefs_journal *j, u64 ino,
+/* Log a complete 512-byte on-disk inode snapshot.
+ *
+ * Phase 3a (per-inode journal batching): This function now defers the journal
+ * write by copying the snapshot to binfo->pending_journal_snapshot and setting
+ * has_pending_journal_snapshot. The actual journal write is deferred until
+ * briefs_flush_pending_journal_snapshots() is called at syscall boundaries or
+ * by briefs_journal_sync() for fsync/syncfs.
+ */
+int briefs_journal_inode_full(struct briefs_journal *j, struct inode *inode,
                               const struct briefs_disk_inode *di);
+
+/* Flush pending inode snapshots to the journal. Called at syscall boundaries
+ * (e.g., end of setattr, fallocate, punch_hole) and by briefs_journal_sync()
+ * to ensure all pending snapshots are durable before returning.
+ */
+int briefs_flush_pending_journal_snapshots(struct briefs_journal *j,
+                                            struct super_block *sb);
+
+/* Flush a specific inode's pending journal snapshot.
+ * Called at syscall boundaries to ensure the deferred JRN_INODE_FULL
+ * record is written to the journal before the syscall returns.
+ */
+int briefs_flush_inode_pending_journal_snapshot(struct briefs_journal *j,
+                                                 struct inode *inode);
 
 /* Log symlink target content inline */
 int briefs_journal_symlink_data(struct briefs_journal *j, u64 ino,

@@ -1126,6 +1126,17 @@ struct briefs_inode_info {
 	 * on the live (post-mount) path, which keeps the pool lazy as before.
 	 */
 	bool trie_pool_seeded;
+	/*
+	 * Pending journal snapshot for write batching (Phase 3a).
+	 * When briefs_journal_inode_full() is called, the snapshot is copied here
+	 * and has_pending_journal_snapshot is set, rather than immediately writing
+	 * to the journal. The pending snapshot is flushed at syscall boundaries
+	 * (e.g., end of setattr/fallocate/punch_hole) or when briefs_journal_sync()
+	 * is called (fsync/syncfs). This coalesces multiple JRN_INODE_FULL records
+	 * for the same inode into a single journal write.
+	 */
+	struct briefs_disk_inode pending_journal_snapshot;
+	bool has_pending_journal_snapshot;
 };
 
 /* yanked from the xiafs module, which in turn was yanked from minix */

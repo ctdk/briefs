@@ -259,7 +259,7 @@ int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
 
 	/* Log a full snapshot so replay restores extent metadata exactly. */
 	briefs_cpu_inode_to_disk(di, &disk_di);
-	briefs_journal_inode_full(bsi->journal, di->inode_number, &disk_di);
+	briefs_journal_inode_full(bsi->journal, &binfo->vfs_inode, &disk_di);
 	return 0;
 }
 
@@ -338,7 +338,7 @@ void briefs_free_inode_data(struct inode *inode)
 		binfo->disk_inode.dir_trie_root = 0;
 		briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
 		briefs_persist_disk_inode(inode->i_sb, inode->i_ino, &binfo->disk_inode, false);
-		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+		briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 
 		/*
 		 * Free the trie pages using the saved root.  briefs_trie_free_all
@@ -367,7 +367,7 @@ void briefs_free_inode_data(struct inode *inode)
 		briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
 		briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
 					&binfo->disk_inode, false);
-		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+		briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 		return;
 	}
 
@@ -396,5 +396,5 @@ void briefs_free_inode_data(struct inode *inode)
 
 	/* Log the cleared inode so replay does not resurrect old extent pointers. */
 	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-	briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+	briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 }

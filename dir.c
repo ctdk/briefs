@@ -228,7 +228,7 @@ int briefs_add_dir_entry(struct inode *dir, const char *name, size_t name_len, u
 
 			briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
 			briefs_journal_inode_full(briefs_sb(dir->i_sb)->journal,
-						 dir->i_ino, &disk_di);
+						 dir, &disk_di);
 		}
 	}
 
@@ -1008,7 +1008,7 @@ static int briefs_rename_whiteout(struct mnt_idmap *idmap,
 		struct briefs_disk_inode disk_di;
 
 		briefs_cpu_inode_to_disk(&wbinfo->disk_inode, &disk_di);
-		ret = briefs_journal_inode_full(bsi->journal, whiteout_inode->i_ino,
+		ret = briefs_journal_inode_full(bsi->journal, whiteout_inode,
 						&disk_di);
 		if (ret)
 			goto fail_whiteout_inode;
@@ -1084,7 +1084,7 @@ static int briefs_rename_whiteout(struct mnt_idmap *idmap,
 		if (ret)
 			goto fail;
 		briefs_cpu_inode_to_disk(&minfo->disk_inode, &disk_di);
-		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+		briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 		mark_inode_dirty(inode);
 	}
 
@@ -1354,7 +1354,7 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 		if (ret)
 			goto fail;
 		briefs_cpu_inode_to_disk(&minfo->disk_inode, &disk_di);
-		briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+		briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 		mark_inode_dirty(inode);
 	}
 

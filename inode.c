@@ -406,7 +406,7 @@ int briefs_update_parent_dir(struct inode *dir, struct briefs_sb_info *bsi,
 	{
 		struct briefs_disk_inode disk_di;
 		briefs_cpu_inode_to_disk(&pbinfo->disk_inode, &disk_di);
-		briefs_journal_inode_full(bsi->journal, dir->i_ino, &disk_di);
+		briefs_journal_inode_full(bsi->journal, dir, &disk_di);
 	}
 
 	/* Commit the updates to VFS state only after successful persistence. */
@@ -620,7 +620,7 @@ int briefs_finish_create(struct inode *dir, struct dentry *dentry,
 		struct briefs_inode_info *cbinfo = briefs_i(inode);
 		struct briefs_disk_inode disk_di;
 		briefs_cpu_inode_to_disk(&cbinfo->disk_inode, &disk_di);
-		ret = briefs_journal_inode_full(bsi->journal, inode->i_ino, &disk_di);
+		ret = briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 		if (ret) {
 			pr_err("briefs: failed to journal new inode %lu: %d\n",
 			       inode->i_ino, ret);
@@ -743,7 +743,7 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	 * This captures extent metadata, timestamps, mode, nlink, and the
 	 * trie root in a single record.
 	 */
-	briefs_journal_inode_full(bsi->journal, inode->i_ino, &local_di);
+	briefs_journal_inode_full(bsi->journal, inode, &local_di);
 
 	/*
 	 * Copy the finalized local snapshot into the shared buffer and re-dirty
