@@ -95,6 +95,42 @@ int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
 	if (ret)
 		return ret;
 
+	/* Phase 3a: Capture and write a fresh inode snapshot after data writeback
+	 * completes. This ensures the JRN_INODE_FULL record reflects the current
+	 * state (extent list + size) after writeback, not any stale pending state.
+	 * We write directly instead of using the pending mechanism to avoid races
+	 * with concurrent operations.
+	 */
+	{
+		struct briefs_disk_inode disk_di;
+		struct briefs_inode_info *binfo = briefs_i(inode);
+		struct jrn_inode_full rec;
+
+		briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
+
+		/* Drain any B-tree index blocks before writing the snapshot. */
+		if (le32_to_cpu(disk_di.flags) & InodeFlagIndexed) {
+			u64 base = le64_to_cpu(disk_di.extent_inline_base);
+			u64 total = le64_to_cpu(disk_di.num_extents_total);
+			u64 cap = total + 16;
+			if (cap > (1ull << 20))
+				cap = 1ull << 20;
+			if (base != 0) {
+				ret = briefs_btree_drain(inode->i_sb, base, cap);
+				if (ret)
+					return ret;
+			}
+		}
+
+		memset(&rec, 0, sizeof(rec));
+		rec.ino = cpu_to_le64(inode->i_ino);
+		memcpy(rec.inode_data, &disk_di, sizeof(struct briefs_disk_inode));
+
+		ret = briefs_journal_write_record(bsi->journal, JRN_INODE_FULL, &rec, sizeof(rec));
+		if (ret)
+			return ret;
+	}
+
 	/* Flush journal to disk on explicit fsync */
 	if (bsi->journal && bsi->journal->dirty) {
 		ret = briefs_journal_sync(bsi->journal);
