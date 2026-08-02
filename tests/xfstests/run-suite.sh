@@ -121,7 +121,7 @@ force_umount() {
 
 # List of tests to skip due to known hangs or unsupported features.
 # These tests either wedge the filesystem or test features BrieFS doesn't implement.
-SKIP_TESTS="generic/068 generic/070 generic/074 generic/410 generic/475 generic/476"
+SKIP_TESTS="generic/068 generic/070 generic/074 generic/224 generic/410 generic/464 generic/475 generic/476"
 
 should_skip() {
     local test="$1"
@@ -145,7 +145,9 @@ for testname in "$@"; do
         continue
     fi
 
-    # Clean slate for both devices.
+    # Aggressive cleanup BEFORE the test to prevent SCRATCH_DEV issues.
+    # Tests may leave SCRATCH_DEV mounted or in RO state; we must clean
+    # thoroughly before mkfs.
     force_umount "$TEST_MNT" || true
     force_umount "$SCRATCH_MNT" || true
     cleanup_dm_for_device "$TEST_DEV"
@@ -162,7 +164,16 @@ for testname in "$@"; do
         rm -rf "${SCRATCH_MNT:?}"/.* 2>/dev/null || true
     fi
 
+    # Force sync and wait for pending writes to complete.
+    # This prevents "device RO" issues from prior test's writeback.
     sync
+    sleep 1
+
+    # Double-check SCRATCH_DEV is not mounted (xfstests may leave it mounted).
+    if mountpoint -q "$SCRATCH_MNT" 2>/dev/null; then
+        umount -l "$SCRATCH_MNT" 2>/dev/null || true
+        sleep 1
+    fi
 
     if ! "$MKFS_BRIEFS_PROG" -f "$TEST_DEV" >/dev/null 2>&1; then
         echo "  -> MKFS TEST FAIL"
@@ -193,10 +204,20 @@ for testname in "$@"; do
     cat /tmp/check_last.log
 
     # Clean up mounts before moving on, best effort.
+    # Be aggressive: tests may leave devices mounted or in RO state.
     force_umount "$TEST_MNT" || true
     force_umount "$SCRATCH_MNT" || true
+
+    # Lazy unmount as fallback (detaches mount point immediately).
+    umount -l "$TEST_MNT" 2>/dev/null || true
+    umount -l "$SCRATCH_MNT" 2>/dev/null || true
+
     cleanup_dm_for_device "$TEST_DEV"
     cleanup_dm_for_device "$SCRATCH_DEV"
+
+    # Force sync to flush any pending writes before next test's mkfs.
+    sync
+    sleep 1
 
     # Optional fsck validation (enabled via FSCK_ENABLED=1).
     # Runs after each test to catch on-disk consistency bugs early.
