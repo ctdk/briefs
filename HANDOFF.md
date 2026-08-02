@@ -168,6 +168,10 @@ covers bytes 0-4079, stale data caused non-deterministic checksum mismatches.
 - **4a. Fix xattr lock ordering** — xattr path takes `xattr_sem → alloc->lock`
   but docs say `alloc->lock → xattr_sem`. Either fix code or fix docs.
 - **4b. Move off buffer_heads for metadata** — long-term architectural change
+- **4c. Revisit mount namespaces** — generic/410 and generic/411 (mount propagation
+  tests) now hang on BrieFS but used to pass. Investigate whether BrieFS should
+  support mount propagation features (`--make-shared`, `--make-slave`, etc.) or
+  if these tests should remain skipped.
 
 ### Phase 5 (partially done)
 - **5a. Investigate generic/127 mmap hang** — ✅ RESOLVED (was flaky, now passes consistently after Phase 1-2 fixes)
