@@ -123,7 +123,8 @@ force_umount() {
 # These tests either wedge the filesystem or test features BrieFS doesn't implement.
 # Note: generic/224 and generic/464 used to pass but hung in 2026-08-02 run.
 # They may be intermittent - investigate if time permits.
-SKIP_TESTS="generic/068 generic/070 generic/074 generic/224 generic/410 generic/464 generic/475 generic/476"
+# generic/051: requires shutdown support (FS_IOC_FIFREEZE) - hangs on mount.
+SKIP_TESTS="generic/051 generic/068 generic/070 generic/074 generic/224 generic/410 generic/464 generic/475 generic/476"
 
 should_skip() {
     local test="$1"
