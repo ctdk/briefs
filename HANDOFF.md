@@ -154,10 +154,12 @@ covers bytes 0-4079, stale data caused non-deterministic checksum mismatches.
 - generic/073: ✅ PASS (5/5 iterations) — FIXED
 - generic/127: ✅ PASS (3/3 iterations)
 
-**Full xfstests run (2026-08-02, interrupted by VM reboot):**
-- Through generic/410: 174 PASS, 6 FAIL, 227 NOT RUN, 3 SKIPPED, 0 HANG, 1 UNKNOWN (generic/410 killed)
-- Skip list updated: generic/068, 070, 074, 410, 475, 476
-- Zero hangs in completed tests confirms Phase 3a fsync fix is working
+**Full xfstests run (2026-08-02, full suite):**
+- 205 PASS, 24 actual FAIL, 251 NOT RUN, 6 SKIPPED, 2-3 HANG
+- Skip list: generic/068, 070, 074, 410, 475, 476
+- ~300 false FAILs due to SCRATCH_DEV cleanup issue (device RO/mounted between tests)
+- Zero new hangs confirms Phase 3a fsync fix is working
+- Actual failures are mostly output mismatches for unsupported features
 
 **Expected benefits:**
 - Reduced `j->write_lock` acquisitions for operations with multiple inode updates
