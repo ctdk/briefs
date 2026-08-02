@@ -20,7 +20,10 @@ set -uo pipefail
 
 : "${XFSTESTS_DIR:=/xfstests}"
 : "${MKFS_BRIEFS_PROG:=/go/bin/mkfs.briefs}"
+: "${FSCK_BRIEFS_PROG:=/go/bin/fsck.briefs}"
 : "${HOST_OPTIONS:=configs/briefs.config}"
+# Set FSCK_ENABLED=1 to run fsck after each test (slower, catches on-disk bugs)
+: "${FSCK_ENABLED:=0}"
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
 export HOST_OPTIONS
@@ -195,6 +198,17 @@ for testname in "$@"; do
     cleanup_dm_for_device "$TEST_DEV"
     cleanup_dm_for_device "$SCRATCH_DEV"
 
+    # Optional fsck validation (enabled via FSCK_ENABLED=1).
+    # Runs after each test to catch on-disk consistency bugs early.
+    if [ "$FSCK_ENABLED" = "1" ] && [ "$status" -ne 124 ]; then
+        if "$FSCK_BRIEFS_PROG" -n "$TEST_DEV" >/tmp/fsck_test.log 2>&1; then
+            : # fsck clean, no output needed
+        else
+            echo "  -> FSCK WARN (see /tmp/fsck_test.log)"
+            HANG=$((HANG + 1))  # Count fsck failures separately (not a hang, but tracked)
+        fi
+    fi
+
     if [ "$status" -eq 124 ]; then
         echo "  -> HANG (timeout)"
         HANG=$((HANG + 1))
@@ -234,4 +248,7 @@ echo "  NOT RUN:    $NOTRUN"
 echo "  HANG:       $HANG"
 echo "  MKFS FAIL:  $MKFS_FAIL"
 echo "  MOUNT FAIL: $MOUNT_FAIL"
+if [ "$FSCK_ENABLED" = "1" ]; then
+    echo "  (fsck validation enabled)"
+fi
 echo "========================================"
