@@ -164,10 +164,13 @@ covers bytes 0-4079, stale data caused non-deterministic checksum mismatches.
 - Lower journal pressure from coalesced `JRN_INODE_FULL` records
 - Better throughput under metadata-heavy workloads
 
-### Phase 4 (not started)
-- **4a. Fix xattr lock ordering** — xattr path takes `xattr_sem → alloc->lock`
-  but docs say `alloc->lock → xattr_sem`. Either fix code or fix docs.
-- **4b. Move off buffer_heads for metadata** — long-term architectural change
+### Phase 4 (partially done)
+- **4a. Fix xattr lock ordering** — ✅ DOCUMENTED. The xattr path takes
+  `xattr_sem → alloc->lock` which inverts the documented order. Added explicit
+  exception documentation in `briefs.h` and `xattr.c` explaining this is safe
+  (no other code path takes `alloc->lock → xattr_sem`). TODO: refactor xattr
+  to allocate blocks before taking `xattr_sem` for proper ordering.
+- **4b. Move off buffer_heads for metadata** — NOT STARTED (long-term architectural change)
 - **4c. Revisit mount namespaces** — generic/410 and generic/411 (mount propagation
   tests) now hang on BrieFS but used to pass. Investigate whether BrieFS should
   support mount propagation features (`--make-shared`, `--make-slave`, etc.) or

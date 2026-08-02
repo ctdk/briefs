@@ -20,6 +20,12 @@
  * via JRN_XATTR_DATA before the JRN_INODE_FULL that publishes xattr_offset.
  * xattr_sem (an rwsem) serializes block read/modify/free against get/list,
  * which the VFS does not protect with i_rwsem.
+ *
+ * LOCK ORDER NOTE: This code takes xattr_sem BEFORE alloc->lock when
+ * allocating/freeing xattr blocks. This inverts the documented lock order
+ * (alloc->lock -> xattr_sem) but is safe because no other code path takes
+ * alloc->lock then xattr_sem. TODO: refactor to allocate blocks before
+ * taking xattr_sem for proper lock ordering.
  */
 
 #include <linux/kernel.h>

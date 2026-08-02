@@ -53,6 +53,16 @@
  * - alloc->lock -> extent_lock: briefs_fallocate used to do this (FIXED)
  * - j->write_lock -> alloc->lock: checkpoint used to do this (FIXED)
  *
+ * EXCEPTION: xattr path (briefs_xattr_set, briefs_xattr_free):
+ *   The xattr code takes xattr_sem BEFORE alloc->lock when allocating
+ *   or freeing xattr blocks. This is a deliberate inversion because:
+ *   - The xattr chain must be modified atomically under xattr_sem
+ *   - Block allocation is needed to build the new chain
+ *   - No other code path takes alloc->lock then xattr_sem
+ *   This is safe as long as no other code acquires xattr_sem then
+ *   waits for alloc->lock while holding another lock in the chain.
+ *   TODO: refactor xattr to allocate blocks before taking xattr_sem.
+ *
  * When writing new code that takes multiple locks, verify the order matches
  * the above. When in doubt, hold locks for the shortest time possible and
  * release before acquiring a "later" lock in the order.
