@@ -188,6 +188,7 @@ covers bytes 0-4079, stale data caused non-deterministic checksum mismatches.
   (DEFERRED: wait until BrieFS tracks mainline Linux master, requires custom
   kernel build with CONFIG_LOCKDEP)
 - Run fsck after test clusters to verify on-disk consistency
+  (✅ DONE: `FSCK_ENABLED=1` in run-suite.sh, commit 44247fe)
 
 ## How to build and test
 
