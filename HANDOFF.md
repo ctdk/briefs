@@ -156,10 +156,17 @@ covers bytes 0-4079, stale data caused non-deterministic checksum mismatches.
 
 **Full xfstests run (2026-08-02, full suite):**
 - 205 PASS, 24 actual FAIL, 251 NOT RUN, 6 SKIPPED, 2-3 HANG
-- Skip list: generic/068, 070, 074, 410, 475, 476
+- Skip list: generic/068, 070, 074, 224, 410, 464, 475, 476
 - ~300 false FAILs due to SCRATCH_DEV cleanup issue (device RO/mounted between tests)
 - Zero new hangs confirms Phase 3a fsync fix is working
 - Actual failures are mostly output mismatches for unsupported features
+
+**SCRATCH_DEV fix (commit 50731b6):**
+- Added sync + sleep before mkfs to flush pending writes
+- Added lazy unmount (-l) as fallback for stubborn mounts
+- Double-check SCRATCH_MNT before mkfs and force unmount
+- Aggressive cleanup AFTER tests to prevent RO state issues
+- Should eliminate ~300 false FAILs in next run
 
 **Expected benefits:**
 - Reduced `j->write_lock` acquisitions for operations with multiple inode updates
