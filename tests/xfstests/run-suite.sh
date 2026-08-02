@@ -121,6 +121,8 @@ force_umount() {
 
 # List of tests to skip due to known hangs or unsupported features.
 # These tests either wedge the filesystem or test features BrieFS doesn't implement.
+# Note: generic/224 and generic/464 used to pass but hung in 2026-08-02 run.
+# They may be intermittent - investigate if time permits.
 SKIP_TESTS="generic/068 generic/070 generic/074 generic/224 generic/410 generic/464 generic/475 generic/476"
 
 should_skip() {

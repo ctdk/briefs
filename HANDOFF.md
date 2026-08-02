@@ -161,6 +161,13 @@ covers bytes 0-4079, stale data caused non-deterministic checksum mismatches.
 - Zero new hangs confirms Phase 3a fsync fix is working
 - Actual failures are mostly output mismatches for unsupported features
 
+**Note on generic/224 and generic/464:**
+These tests used to pass but hung in the 2026-08-02 run. They may be
+intermittent failures or regressions from recent changes. Worth
+investigating individually if time permits:
+- generic/224: ENOSPC delayed allocation test
+- generic/464: Concurrent delalloc writeback race test
+
 **SCRATCH_DEV fix (commit 50731b6):**
 - Added sync + sleep before mkfs to flush pending writes
 - Added lazy unmount (-l) as fallback for stubborn mounts
