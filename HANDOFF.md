@@ -147,12 +147,17 @@ covers bytes 0-4079, stale data caused non-deterministic checksum mismatches.
   - Updated `briefs_fsync()` to capture and write fresh inode snapshot after data writeback
   - All call sites (27 total) updated to pass `struct inode *` instead of `u64 ino`
 
-**Test results:**
+**Test results (spot tests):**
 - generic/001: ✅ PASS
 - generic/003: ✅ PASS  
 - generic/013: ✅ PASS (5/5 iterations)
 - generic/073: ✅ PASS (5/5 iterations) — FIXED
 - generic/127: ✅ PASS (3/3 iterations)
+
+**Full xfstests run (2026-08-02, interrupted by VM reboot):**
+- Through generic/410: 174 PASS, 6 FAIL, 227 NOT RUN, 3 SKIPPED, 0 HANG, 1 UNKNOWN (generic/410 killed)
+- Skip list updated: generic/068, 070, 074, 410, 475, 476
+- Zero hangs in completed tests confirms Phase 3a fsync fix is working
 
 **Expected benefits:**
 - Reduced `j->write_lock` acquisitions for operations with multiple inode updates
