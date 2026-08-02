@@ -185,6 +185,8 @@ covers bytes 0-4079, stale data caused non-deterministic checksum mismatches.
 - Run full xfstests suite to measure impact of journal changes on overall
   throughput
 - Check for lockdep warnings from the new lock release/re-acquire pattern
+  (DEFERRED: wait until BrieFS tracks mainline Linux master, requires custom
+  kernel build with CONFIG_LOCKDEP)
 - Run fsck after test clusters to verify on-disk consistency
 
 ## How to build and test
