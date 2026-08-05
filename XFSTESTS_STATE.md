@@ -13,7 +13,7 @@ over every generic test on the VM, kernel `6.12.100+deb13-amd64`, branch
 |------------------|------:|----------------------------------------------------------|
 | Selected         |   793 | all generic tests                                        |
 | Pass             |   327 | per-test runner reported PASS                            |
-| Fail             |     9 | 2 fixed (generic/027, generic/177), 7 remaining (see below) |
+| Fail             |     8 | 3 fixed (generic/027, generic/177, generic/062), 5 remaining (see below) |
 | Not run          |   420 | `_require_*` gate or unsupported feature                 |
 | Hang             |     3 | timeout — generic/461, generic/619, generic/753          |
 | Mount fail       |     0 | leftover DM targets now torn down by the runner          |
@@ -21,6 +21,7 @@ over every generic test on the VM, kernel `6.12.100+deb13-amd64`, branch
 **Changes since 2026-07-13 run:**
 - **generic/027** — FIXED: vfree() warning in briefs_alloc_cleanup. Added is_vmalloc_addr() validation.
 - **generic/177** — FIXED: gawk installed on VM (was using mawk).
+- **generic/062** — FIXED: gawk installed provides asort() function used by common/attr.
 - Skip list updated: added generic/051, generic/461, generic/619, generic/753 (hangs).
 
 **Mount-fail note:** An earlier iteration of this run reported 11 `MOUNT FAIL`
@@ -141,18 +142,18 @@ bulk `./check` invocation.
 
 ---
 
-## Failing tests (2026-08-05 per-test run)
+## Failing tests (2026-08-05 per-test run, updated)
 
-The final 2026-08-05 per-test run reported **9 effective failures** and **3
-hangs**. Two tests that previously failed are now fixed.
+The final 2026-08-05 per-test run reported **8 effective failures** and **3
+hangs**. Three tests that previously failed are now fixed.
 
 **Fixed since 2026-07-13:**
 - `generic/027` — FIXED: vfree() warning in briefs_alloc_cleanup. Added is_vmalloc_addr() validation before vfree() calls.
 - `generic/177` — FIXED: gawk installed on VM (test uses strtonum() function).
+- `generic/062` — FIXED: gawk installed provides asort() function used by common/attr's _sort_getfattr_output().
 
-**Remaining 9 FAIL tests:**
+**Remaining 8 FAIL tests:**
 - `generic/050` — read-only dirty-journal mount output differs; expected-error-string mismatch.
-- `generic/062` — xattr output format difference.
 - `generic/089` — bulk fsx stress test output format mismatch (iteration count format).
 - `generic/311` — pre-existing baseline flake (dm-flakey/fsync timing).
 - `generic/547` — fsstress metadata mismatch; crash-replay family (partial fix in 86fa48b, edge cases remain).
@@ -169,7 +170,6 @@ hangs**. Two tests that previously failed are now fixed.
 
 **Note:** generic/127, generic/521, and generic/522 now pass after the journal
 lock contention and writeback fixes in branch `refactor-round-1`.
-- `generic/521` / `generic/522` — punch/pagecache tests time out.
 
 **Note:** `generic/475` (dm-error crash-replay) passed in this run but remains
 a known flaky/deferred bug in the crash-replay family.

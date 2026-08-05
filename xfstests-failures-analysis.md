@@ -52,19 +52,15 @@ BrieFS allows mounting a read-only device that needs journal replay. This is a b
 
 ---
 
-### 3. generic/062 - Extended attributes (MISSING FEATURE)
-**Failure:** Test expects xattr output during directory descent, but BrieFS returns nothing.
-
+### 3. generic/062 - Extended attributes (FIXED)
+**Failure:** Test was failing with awk errors:
 ```
-- # file: SCRATCH_MNT/descend
-- user.1=0x3233
-- user.x=0x797a
-+ (no xattr output)
++ awk: line 2: function asort never defined
 ```
 
-BrieFS has xattr support (landed 2026-06-25 per MEMORY.md), but this test may be checking specific xattr behaviors or formats that differ from the expected output.
+The test uses `_sort_getfattr_output()` from `common/attr` which relies on GNU awk's `asort()` function. The VM originally had mawk as the default awk provider.
 
-**Verdict:** LIKELY xattr format/behavior difference - check if xattrs are actually working
+**Verdict:** **FIXED** - User installed gawk on VM. The `/etc/alternatives/awk` symlink now points to `/usr/bin/gawk`. Test now passes.
 
 ---
 
@@ -197,18 +193,19 @@ BrieFS didn't trigger an expected I/O error condition. This is likely a test tha
 
 2. **generic/177 - gawk missing** - FIXED. User installed gawk on VM. Test now passes.
 
+3. **generic/062 - gawk asort function** - FIXED. Same fix as #2 - gawk installed. Test now passes.
+
 ### Deferred
-3. **generic/599 - cleanup_mnt VFS warning** - DEFERRED. Requires kernel version-specific handling for proper VFS read-only remount. Not a data corruption issue, only a warning during umount after shutdown ioctl.
+4. **generic/599 - cleanup_mnt VFS warning** - DEFERRED. Requires kernel version-specific handling for proper VFS read-only remount. Not a data corruption issue, only a warning during umount after shutdown ioctl.
 
 ### Low Priority (Accept as-is)
-4. **generic/050, generic/623, generic/730** - Document as expected behavioral differences; no code changes needed
-5. **generic/089** - Update golden output or suppress output comparison for this long-running stress test
-6. **generic/311** - Already documented as pre-existing; accept as baseline failure
-7. **generic/563** - Document as environment-specific; cgroup writeback is working, timing expectations differ
+5. **generic/050, generic/623, generic/730** - Document as expected behavioral differences; no code changes needed
+6. **generic/089** - Update golden output or suppress output comparison for this long-running stress test
+7. **generic/311** - Already documented as pre-existing; accept as baseline failure
+8. **generic/563** - Document as environment-specific; cgroup writeback is working, timing expectations differ
 
 ### Worth Investigating
-8. **generic/547** - The fsstress-induced trie replay issue may still have edge cases after the chown fix; run with FSCK_ENABLED=1 to verify on-disk consistency
-9. **generic/062** - Verify xattr functionality is complete; may just need golden output update
+9. **generic/547** - The fsstress-induced trie replay issue may still have edge cases after the chown fix; run with FSCK_ENABLED=1 to verify on-disk consistency
 
 ---
 
@@ -228,10 +225,11 @@ generic/051 generic/068 generic/070 generic/074 generic/224 generic/410 generic/
 | Result | Count | Notes |
 |--------|-------|-------|
 | PASS | 327 | 41.2% |
-| FAIL | 9 | 1.1% - 2 fixed (generic/027, generic/177), 3 expected diff, 1 xattr, 2 pre-existing, 1 deferred |
+| FAIL | 8 | 1.0% - 3 fixed (generic/027, generic/177, generic/062), 5 remaining (see below) |
 | NOT RUN | 420 | 53.0% - mostly missing features (reflink, ACLs, quotas, etc.) |
 | HANG | 3 | 0.3% - generic/461, generic/619, generic/753 (all in skip list) |
 
-**Fixed:** 2 (generic/027 - vfree validation, generic/177 - gawk installed)
+**Fixed:** 3 (generic/027 - vfree validation, generic/177 - gawk, generic/062 - gawk asort)
+**Remaining FAIL:** 5 (generic/050, generic/089, generic/311, generic/547, generic/563, generic/599, generic/623, generic/730)
 **Deferred:** 1 (generic/599 - VFS warning, not data corruption)
 **Accept as-is:** 6 (behavioral differences, pre-existing flakes)
