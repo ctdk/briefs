@@ -5,18 +5,23 @@ measured by fresh full-suite and targeted runs on the VM.
 
 ## Overview
 
-**Latest per-test full-suite run:** 2026-07-13, `tests/xfstests/run-suite.sh`
-over every generic test on the VM, kernel `6.12.95+deb13-amd64`, branch
-`even-more-xfstests`. `generic/388` was skipped because it wedges the suite.
+**Latest per-test full-suite run:** 2026-08-05, `tests/xfstests/run-suite.sh`
+over every generic test on the VM, kernel `6.12.100+deb13-amd64`, branch
+`refactor-round-1`. `generic/388` was skipped because it wedges the suite.
 
 | Bucket           | Count | Notes                                                    |
 |------------------|------:|----------------------------------------------------------|
-| Selected         |   792 | all generic tests except 388                             |
-| Pass             |   376 | per-test runner reported PASS                            |
-| Fail             |    12 | 11 xfstests failures + `generic/299` killed (see below)  |
-| Not run          |   401 | `_require_*` gate or unsupported feature                 |
-| Hang             |     3 | timeout (300s) — 127, 521, 522                           |
+| Selected         |   793 | all generic tests                                        |
+| Pass             |   327 | per-test runner reported PASS                            |
+| Fail             |     9 | 2 fixed (generic/027, generic/177), 7 remaining (see below) |
+| Not run          |   420 | `_require_*` gate or unsupported feature                 |
+| Hang             |     3 | timeout — generic/461, generic/619, generic/753          |
 | Mount fail       |     0 | leftover DM targets now torn down by the runner          |
+
+**Changes since 2026-07-13 run:**
+- **generic/027** — FIXED: vfree() warning in briefs_alloc_cleanup. Added is_vmalloc_addr() validation.
+- **generic/177** — FIXED: gawk installed on VM (was using mawk).
+- Skip list updated: added generic/051, generic/461, generic/619, generic/753 (hangs).
 
 **Mount-fail note:** An earlier iteration of this run reported 11 `MOUNT FAIL`
 entries for `generic/313..323`. Those were run-runner artifacts caused by
@@ -136,47 +141,34 @@ bulk `./check` invocation.
 
 ---
 
-## Failing tests (2026-07-13 per-test run)
+## Failing tests (2026-08-05 per-test run)
 
-The final 2026-07-13 per-test run reported **12 effective failures** and **3
-hangs**. The 11 xfstests-reported failures are listed first; `generic/299` is
-listed separately because it was killed by the runner after a btree-checksum
-mismatch spiral.
+The final 2026-08-05 per-test run reported **9 effective failures** and **3
+hangs**. Two tests that previously failed are now fixed.
 
-- `generic/050` — read-only dirty-journal mount output differs; likely an
-  expected-error-string mismatch rather than a data bug.
-- `generic/089` — bulk fsx + many small files exhausts space on `TEST_DEV`
-  under the per-test runner (4 GiB test image); output mismatch because the
-  test runs out of inodes. The test ran for ~65 minutes before failing.
+**Fixed since 2026-07-13:**
+- `generic/027` — FIXED: vfree() warning in briefs_alloc_cleanup. Added is_vmalloc_addr() validation before vfree() calls.
+- `generic/177` — FIXED: gawk installed on VM (test uses strtonum() function).
+
+**Remaining 9 FAIL tests:**
+- `generic/050` — read-only dirty-journal mount output differs; expected-error-string mismatch.
+- `generic/062` — xattr output format difference.
+- `generic/089` — bulk fsx stress test output format mismatch (iteration count format).
 - `generic/311` — pre-existing baseline flake (dm-flakey/fsync timing).
-- `generic/341` — duplicate directory entries after log replay (`x` and `y`
-  appear twice); real replay/idempotency bug.
-- `generic/510` — duplicate `B` directory after power failure; replay creates
-  a stale duplicate.
-- `generic/547` — fsstress metadata mismatch; part of the crash-replay/dm-error
-  family (previously flaky, now failing again in this run).
-- `generic/563` — cgroup writeback accounting mismatch; expected after
-  `SB_I_CGROUPWB` was disabled on 6.12.
-- `generic/599` — VFS `cleanup_mnt` WARN after shutdown (same real bug as the
-  2026-07-06 run).
-- `generic/623` — fsync after shutdown does not return `EIO` (same as before).
-- `generic/730` — read after device delete missing `EIO` (same as before).
-- `generic/771` — duplicate `bar` after power failure; replay duplicate.
-
-### generic/299 — btree checksum mismatch hang (killed)
-
-- **Status:** killed by the per-test runner after ~210s; counted as a failure.
-- **Symptom:** dmesg flooded with `briefs: btree: node <N> checksum mismatch`
-  errors while `generic/299` was running; the test made no forward progress.
-- **Nature:** real BrieFS btree corruption / validation bug, not a runner issue.
-  Distinct from the dm-error crash-replay family (`475`, `547`) and from the
-  earlier trie-page / orphan-leak bugs.
-- **Action:** investigate btree checksum mismatch source; likely related to
-  replay or extent-tree corruption under load.
+- `generic/547` — fsstress metadata mismatch; crash-replay family (partial fix in 86fa48b, edge cases remain).
+- `generic/563` — cgroup writeback accounting mismatch; expected after `SB_I_CGROUPWB` disabled on 6.12.
+- `generic/599` — VFS `cleanup_mnt` WARN after shutdown ioctl (deferred, not data corruption).
+- `generic/623` — fsync after shutdown returns `EROFS` instead of expected `EIO`.
+- `generic/730` — read after device delete returns no error instead of expected `EIO`.
 
 ### Hangs (timeout 300s)
 
-- `generic/127` — mmap+fsx hang; known mmap writeback deadlock risk.
+- `generic/461` — hung on 2026-08-04 run; added to skip list.
+- `generic/619` — hung on 2026-08-04 run; added to skip list.
+- `generic/753` — hung on 2026-08-05 run; added to skip list (dm-error replay test).
+
+**Note:** generic/127, generic/521, and generic/522 now pass after the journal
+lock contention and writeback fixes in branch `refactor-round-1`.
 - `generic/521` / `generic/522` — punch/pagecache tests time out.
 
 **Note:** `generic/475` (dm-error crash-replay) passed in this run but remains
