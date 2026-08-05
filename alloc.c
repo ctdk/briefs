@@ -860,15 +860,22 @@ void briefs_alloc_recompute_summaries(struct briefs_alloc *alloc)
 
 /*
  * Cleanup allocator - free vmalloc'd arrays.
+ *
+ * Note: We validate pointers with is_vmalloc_addr() before vfree() because
+ * in error paths or memory corruption scenarios, the pointers may contain
+ * garbage values. vfree() on invalid addresses triggers kernel warnings.
  */
 void briefs_alloc_cleanup(struct briefs_alloc *alloc)
 {
 	if (!alloc)
 		return;
 
-	vfree(alloc->l0);
-	vfree(alloc->l1);
-	vfree(alloc->l2);
+	if (alloc->l0 && is_vmalloc_addr(alloc->l0))
+		vfree(alloc->l0);
+	if (alloc->l1 && is_vmalloc_addr(alloc->l1))
+		vfree(alloc->l1);
+	if (alloc->l2 && is_vmalloc_addr(alloc->l2))
+		vfree(alloc->l2);
 	alloc->l0 = NULL;
 	alloc->l1 = NULL;
 	alloc->l2 = NULL;
