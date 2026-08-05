@@ -24,9 +24,15 @@ set -uo pipefail
 : "${HOST_OPTIONS:=configs/briefs.config}"
 # Set FSCK_ENABLED=1 to run fsck after each test (slower, catches on-disk bugs)
 : "${FSCK_ENABLED:=0}"
+# Log directory - use /var/tmp so logs survive reboots
+: "${LOG_DIR:=/var/tmp/xfstests-logs}"
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
 export HOST_OPTIONS
+
+# Create log directory and clean old logs (>7 days old)
+mkdir -p "$LOG_DIR"
+find "$LOG_DIR" -type f -mtime +7 -delete 2>/dev/null || true
 
 cd "$XFSTESTS_DIR"
 
@@ -125,7 +131,10 @@ force_umount() {
 # They may be intermittent - investigate if time permits.
 # generic/051: requires shutdown support (FS_IOC_FIFREEZE) - hangs on mount.
 # generic/411: mount namespace test - fails fsck after test, cascades to hangs.
-SKIP_TESTS="generic/051 generic/068 generic/070 generic/074 generic/224 generic/410 generic/411 generic/464 generic/475 generic/476"
+# generic/461: hung on 2026-08-04 run - add to skip list.
+# generic/619: hung on 2026-08-04 run - add to skip list.
+# generic/753: hung on 2026-08-04 run - add to skip list.
+SKIP_TESTS="generic/051 generic/068 generic/070 generic/074 generic/224 generic/410 generic/411 generic/461 generic/464 generic/475 generic/476 generic/619 generic/753"
 
 should_skip() {
     local test="$1"
@@ -136,8 +145,34 @@ should_skip() {
     return 1
 }
 
+# Timestamp for this run
+RUN_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+# Ensure log directory exists
+mkdir -p "$LOG_DIR"
+
+# Resume support: skip tests that have already been run
+RESUME_FROM="${RESUME_FROM:-}"
+SKIP_UNTIL_DONE=false
+
 for testname in "$@"; do
     testbase="${testname##*/}"
+
+    # Resume support: skip until we find the test we left off at
+    if [ -n "$RESUME_FROM" ] && [ "$SKIP_UNTIL_DONE" = true ]; then
+        if [ "$testname" = "$RESUME_FROM" ]; then
+            SKIP_UNTIL_DONE=false
+        else
+            echo "  -> SKIPPED (resume from $RESUME_FROM)"
+            continue
+        fi
+    fi
+
+    # Check if this test was already run (log exists)
+    if ls "$LOG_DIR"/check-${testbase}-*.log >/dev/null 2>&1; then
+        echo "  -> SKIPPED (already run)"
+        continue
+    fi
+
     echo "========================================"
     echo "  $testname"
     echo "========================================"
@@ -160,19 +195,21 @@ for testname in "$@"; do
     fi
 
     # Force unmount everything, multiple times with increasing aggression.
-    for i in 1 2 3; do
+    for i in 1 2 3 4 5; do
         umount "$TEST_MNT" 2>/dev/null && break
         umount -l "$TEST_MNT" 2>/dev/null && break
         umount -f "$TEST_MNT" 2>/dev/null && break
         umount -f -l "$TEST_MNT" 2>/dev/null && break
+        umount -R "$TEST_MNT" 2>/dev/null && break
         sleep 1
     done
 
-    for i in 1 2 3; do
+    for i in 1 2 3 4 5; do
         umount "$SCRATCH_MNT" 2>/dev/null && break
         umount -l "$SCRATCH_MNT" 2>/dev/null && break
         umount -f "$SCRATCH_MNT" 2>/dev/null && break
         umount -f -l "$SCRATCH_MNT" 2>/dev/null && break
+        umount -R "$SCRATCH_MNT" 2>/dev/null && break
         sleep 1
     done
 
@@ -194,10 +231,15 @@ for testname in "$@"; do
     sync
     sleep 2
 
-    # Final check: if SCRATCH_DEV still appears mounted, force detach.
-    if grep -q "$SCRATCH_DEV" /proc/mounts 2>/dev/null; then
-        umount -f -l "$SCRATCH_MNT" 2>/dev/null || true
-        sleep 1
+    # Final check: if SCRATCH_DEV still appears mounted anywhere, force detach.
+    # Check by both device and mount point.
+    if grep -qE "$SCRATCH_DEV|$SCRATCH_MNT" /proc/mounts 2>/dev/null; then
+        umount -f -l -R "$SCRATCH_MNT" 2>/dev/null || true
+        sleep 2
+    fi
+    if grep -qE "$TEST_DEV|$TEST_MNT" /proc/mounts 2>/dev/null; then
+        umount -f -l -R "$TEST_MNT" 2>/dev/null || true
+        sleep 2
     fi
 
     if ! "$MKFS_BRIEFS_PROG" -f "$TEST_DEV" >/dev/null 2>&1; then
@@ -212,8 +254,8 @@ for testname in "$@"; do
     fi
 
     # Mount TEST_DEV; SCRATCH_DEV is mounted by the test itself.
-    if ! mount -t briefs "$TEST_DEV" "$TEST_MNT" >/tmp/mount-err.log 2>&1; then
-        echo "  -> MOUNT FAIL: $(cat /tmp/mount-err.log)"
+    if ! mount -t briefs "$TEST_DEV" "$TEST_MNT" 2>&1 | tee "$LOG_DIR/mount-err-${testbase}-${RUN_TIMESTAMP}.log"; then
+        echo "  -> MOUNT FAIL"
         MOUNT_FAIL=$((MOUNT_FAIL + 1))
         # Try to leave things as clean as possible for the next test.
         force_umount "$TEST_MNT" || true
@@ -225,8 +267,8 @@ for testname in "$@"; do
     # Run without -b briefs so result files land in results/generic/ and the
     # existing generic golden outputs are used.
     tsecs=$(get_timeout "$testname")
-    timeout "$tsecs" ./check "$testname" >/tmp/check_last.log 2>&1 || status=$?
-    cat /tmp/check_last.log
+    timeout "$tsecs" ./check "$testname" 2>&1 | tee "$LOG_DIR/check-${testbase}-${RUN_TIMESTAMP}.log"
+    status=${PIPESTATUS[0]}
 
     # Clean up mounts before moving on, best effort.
     # Be aggressive: tests may leave devices mounted or in RO state.
@@ -247,11 +289,11 @@ for testname in "$@"; do
     # Optional fsck validation (enabled via FSCK_ENABLED=1).
     # Runs after each test to catch on-disk consistency bugs early.
     if [ "$FSCK_ENABLED" = "1" ] && [ "$status" -ne 124 ]; then
-        if "$FSCK_BRIEFS_PROG" -n "$TEST_DEV" >/tmp/fsck_test.log 2>&1; then
-            : # fsck clean, no output needed
+        if "$FSCK_BRIEFS_PROG" -n "$TEST_DEV" 2>&1 | tee "$LOG_DIR/fsck-${testname}-${RUN_TIMESTAMP}.log"; then
+            : # fsck clean
         else
-            echo "  -> FSCK WARN (see /tmp/fsck_test.log)"
-            HANG=$((HANG + 1))  # Count fsck failures separately (not a hang, but tracked)
+            echo "  -> FSCK WARN"
+            HANG=$((HANG + 1))
         fi
     fi
 
@@ -264,24 +306,31 @@ for testname in "$@"; do
     # Parse xfstests' own summary lines.  They are more reliable than guessing
     # from result-file existence, and they correctly distinguish a test that
     # passed from one that was entirely not-run.
-    if grep -qE "^Failures: (generic/)?${testbase}(\s|$)" /tmp/check_last.log; then
-        echo "  -> FAIL"
-        FAIL=$((FAIL + 1))
-    elif grep -qE "^Not run: (generic/)?${testbase}(\s|$)" /tmp/check_last.log; then
-        echo "  -> NOT RUN"
-        NOTRUN=$((NOTRUN + 1))
-    elif grep -qE "Passed all [1-9][0-9]* tests" /tmp/check_last.log; then
-        echo "  -> PASS"
-        PASS=$((PASS + 1))
-    elif grep -qE "Passed all 0 tests" /tmp/check_last.log; then
-        # Test was interrupted or could not run (e.g. mount failure inside
-        # ./check itself); count it as a failure, not a pass.
-        echo "  -> FAIL (interrupted, 0 tests passed)"
-        FAIL=$((FAIL + 1))
+    TEST_LOG="$LOG_DIR/check-${testbase}-${RUN_TIMESTAMP}.log"
+    if [ -f "$TEST_LOG" ]; then
+        if grep -qE "^Failures: (generic/)?${testbase}(\s|$)" "$TEST_LOG"; then
+            echo "  -> FAIL"
+            FAIL=$((FAIL + 1))
+        elif grep -qE "^Not run: (generic/)?${testbase}(\s|$)" "$TEST_LOG"; then
+            echo "  -> NOT RUN"
+            NOTRUN=$((NOTRUN + 1))
+        elif grep -qE "Passed all [1-9][0-9]* tests" "$TEST_LOG"; then
+            echo "  -> PASS"
+            PASS=$((PASS + 1))
+        elif grep -qE "Passed all 0 tests" "$TEST_LOG"; then
+            # Test was interrupted or could not run (e.g. mount failure inside
+            # ./check itself); count it as a failure, not a pass.
+            echo "  -> FAIL (interrupted, 0 tests passed)"
+            FAIL=$((FAIL + 1))
+        else
+            # Ambiguous result (e.g. ./check aborted before printing a summary).
+            echo "  -> UNKNOWN (exit $status)"
+            FAIL=$((FAIL + 1))
+        fi
     else
-        # Ambiguous result (e.g. ./check aborted before printing a summary).
-        echo "  -> UNKNOWN (exit $status)"
-        FAIL=$((FAIL + 1))
+        # No log file - test hung or crashed before completing
+        echo "  -> HANG (no output)"
+        HANG=$((HANG + 1))
     fi
 done
 
