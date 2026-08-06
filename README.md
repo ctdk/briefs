@@ -64,7 +64,7 @@ BrieFS recognizes the following filesystem-specific mount options:
 RELATED
 -------
 
-* [github.com/ctdk/briefs-utils](https://github.com/ctdk/briefs-utils): The briefs utilities, written in Golang, composed of `mkfs.briefs`, `fsck.briefs`, and `fuse.briefs`. `mkfs.briefs` creates BrieFS volumes, `fsck.briefs` checks and repairs BrieFS volumes, and `fuse.briefs` provides a read-only FUSE bridge for those same BrieFS volumes.
+* [github.com/ctdk/briefs-utils](https://github.com/ctdk/briefs-utils): The briefs utilities, written in Golang, composed of `mkfs.briefs`, `fsck.briefs`, and `fuse.briefs`. `mkfs.briefs` creates BrieFS volumes, `fsck.briefs` checks and repairs BrieFS volumes, and `fuse.briefs` provides an **experimental** read-write FUSE bridge for those same BrieFS volumes. The FUSE bridge implements full kernel parity (all dir/file ops, xattrs, fileattr/chattr, renameat2, fallocate/setattr/killpriv) with a Go port of the kernel journal, but has not yet been tested across the full xfstests suite. See the `xfstests-fuse-status.md` document in `briefs-utils` for the current xfstests pass/fail record and known issues.
 * [github.com/ctdk/modern-xiafs](https://github.com/ctdk/modern-xiafs): Computer filesystem archaeology. A port of an ancient Linux filesystem to modern kernels, updated as I get around to it.
 
 RATIONALE
