@@ -1,18 +1,54 @@
 #!/bin/bash
-# fuse-briefs-mount — MOUNT_PROG wrapper that mounts via fuse.briefs.
-# Usage (xfstests): fuse-briefs-mount [-t briefs] [opts] <dev> <mnt>
-# Backgrounds the fuse.briefs daemon and waits for the mountpoint to come up.
-set -euo pipefail
-dev="${@: -2:1}"          # second-to-last arg
-mnt="${@: -1}"            # last arg
-pidfile="/tmp/fuse-briefs-$(echo "$mnt" | tr / _).pid"
-setsid /go/bin/fuse.briefs -i "$dev" -m "$mnt" \
-  </dev/null >/tmp/fuse-"$(echo "$mnt" | tr / _).log" 2>&1 &
-echo $! > "$pidfile"
-# Wait for the FUSE mount to become visible.
-for i in $(seq 1 50); do
+# fuse-briefs-mount — MOUNT_PROG wrapper that mounts via the fuse.briefs
+# FUSE bridge using the mount(8) type helper.
+#
+# xfstests calls this as:  fuse-briefs-mount -t briefs [-o opts] <dev> <mnt>
+# (the `-t briefs` comes from FSTYP=briefs).  We strip that and substitute
+# `-t fuse.briefs` so mount(8) dispatches to /usr/sbin/mount.fuse.briefs,
+# which backgrounds the fuse.briefs daemon, records its PID for the umount
+# wrapper, and waits for the mountpoint to come up.  Mount options (-o) are
+# forwarded.  Using the mount helper (rather than exec'ing fuse.briefs here)
+# keeps a single, tested mount path for both `mount -t fuse.briefs` and
+# xfstests.
+set -uo pipefail
+
+dev=""
+mnt=""
+opts=""
+# Consume leading flags until only <dev> <mnt> remain.
+while [ $# -gt 2 ]; do
+  case "$1" in
+    -o)  opts="$2"; shift 2 ;;
+    -o*) opts="${1#-o}"; shift ;;
+    -t)  shift 2 ;;            # drop `-t briefs`
+    -t*) shift ;;
+    -v|-f|-n|-i) shift ;;
+    --)  shift; break ;;
+    *)   shift ;;
+  esac
+done
+# Remaining args are <dev> <mnt> (plus any leftovers after `--`).
+for a in "$@"; do
+  if [ -z "$dev" ]; then dev="$a"
+  elif [ -z "$mnt" ]; then mnt="$a"; fi
+done
+
+if [ -z "$dev" ] || [ -z "$mnt" ]; then
+  echo "fuse-briefs-mount: usage: fuse-briefs-mount [-t briefs] [-o opts] <dev> <mnt>" >&2
+  exit 64
+fi
+
+if [ -n "$opts" ]; then
+  mount -t fuse.briefs -o "$opts" "$dev" "$mnt"
+else
+  mount -t fuse.briefs "$dev" "$mnt"
+fi
+rc=$?
+
+# mount(8) returns after the helper has brought the mount up, but settle
+# briefly in case the mountpoint is still propagating.
+for i in 1 2 3 4 5; do
   mountpoint -q "$mnt" 2>/dev/null && exit 0
   sleep 0.1
 done
-echo "fuse-briefs-mount: timeout waiting for $mnt" >&2
-exit 1
+exit $rc

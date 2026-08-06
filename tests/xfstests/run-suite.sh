@@ -97,6 +97,8 @@ get_timeout() {
         generic/127) echo 1200 ;;   # 6x concurrent fsx (mmap variants)
         generic/521) echo 1200 ;;   # 1M-op DIO fsx soak
         generic/522) echo 1200 ;;   # 1M-op buffered fsx soak
+        generic/011) echo 900 ;;    # dirstress (concurrent dir ops)
+        generic/475) echo 900 ;;    # dm-error crash-replay
         *)           echo "$TIMEOUT_SECS" ;;
     esac
 }
@@ -158,7 +160,12 @@ wait_fuse_exit() {
 # generic/461: hung on 2026-08-04 run - add to skip list.
 # generic/619: hung on 2026-08-04 run - add to skip list.
 # generic/753: hung on 2026-08-04 run - add to skip list.
-SKIP_TESTS="generic/051 generic/068 generic/070 generic/074 generic/224 generic/410 generic/411 generic/461 generic/464 generic/475 generic/476 generic/619 generic/753"
+# Tests to skip due to known hangs or unsupported features.  Overridable via the
+# environment (e.g. run-fuse-subset.sh exports SKIP_TESTS="" to run the FUSE
+# subset, which includes generic/475, in full).  Use the "+set" test so an
+# explicitly empty SKIP_TESTS is honored (a plain := would re-apply this default
+# to an empty value).
+[ -n "${SKIP_TESTS+set}" ] || SKIP_TESTS="generic/051 generic/068 generic/070 generic/074 generic/224 generic/410 generic/411 generic/461 generic/464 generic/475 generic/476 generic/619 generic/753"
 
 should_skip() {
     local test="$1"
@@ -322,7 +329,7 @@ for testname in "$@"; do
     # Optional fsck validation (enabled via FSCK_ENABLED=1).
     # Runs after each test to catch on-disk consistency bugs early.
     if [ "$FSCK_ENABLED" = "1" ] && [ "$status" -ne 124 ]; then
-        if "$FSCK_BRIEFS_PROG" -n "$TEST_DEV" 2>&1 | tee "$LOG_DIR/fsck-${testname}-${RUN_TIMESTAMP}.log"; then
+        if "$FSCK_BRIEFS_PROG" -n "$TEST_DEV" 2>&1 | tee "$LOG_DIR/fsck-${testbase}-${RUN_TIMESTAMP}.log"; then
             : # fsck clean
         else
             echo "  -> FSCK WARN"
