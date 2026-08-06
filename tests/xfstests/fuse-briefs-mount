@@ -1,0 +1,18 @@
+#!/bin/bash
+# fuse-briefs-mount — MOUNT_PROG wrapper that mounts via fuse.briefs.
+# Usage (xfstests): fuse-briefs-mount [-t briefs] [opts] <dev> <mnt>
+# Backgrounds the fuse.briefs daemon and waits for the mountpoint to come up.
+set -euo pipefail
+dev="${@: -2:1}"          # second-to-last arg
+mnt="${@: -1}"            # last arg
+pidfile="/tmp/fuse-briefs-$(echo "$mnt" | tr / _).pid"
+setsid /go/bin/fuse.briefs -i "$dev" -m "$mnt" \
+  </dev/null >/tmp/fuse-"$(echo "$mnt" | tr / _).log" 2>&1 &
+echo $! > "$pidfile"
+# Wait for the FUSE mount to become visible.
+for i in $(seq 1 50); do
+  mountpoint -q "$mnt" 2>/dev/null && exit 0
+  sleep 0.1
+done
+echo "fuse-briefs-mount: timeout waiting for $mnt" >&2
+exit 1

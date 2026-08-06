@@ -26,6 +26,10 @@ set -uo pipefail
 : "${FSCK_ENABLED:=0}"
 # Log directory - use /var/tmp so logs survive reboots
 : "${LOG_DIR:=/var/tmp/xfstests-logs}"
+# Mount command: defaults to the kernel mount; set MOUNT_CMD=fuse-briefs-mount
+# (via run-suite-fuse.sh) to test against the Go FUSE bridge instead.
+: "${MOUNT_CMD:=mount -t briefs}"
+: "${UMOUNT_CMD:=umount}"
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
 export HOST_OPTIONS
@@ -123,6 +127,26 @@ force_umount() {
 
     # If it is still mounted, give up; the caller will report the problem.
     return 1
+}
+
+# Wait for any fuse.briefs process servicing @mnt to finish its checkpoint
+# and exit.  The fuse-briefs-mount wrapper records the PID in a file; if the
+# mount was killed (crash test) or the PID file is missing, this is a no-op.
+wait_fuse_exit() {
+    local mnt="$1"
+    local pidfile="/tmp/fuse-briefs-$(echo "$mnt" | tr / _).pid"
+    [ -f "$pidfile" ] || return 0
+    local pid
+    pid=$(cat "$pidfile" 2>/dev/null || true)
+    if [ -n "$pid" ]; then
+        local i
+        for i in $(seq 1 50); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
 }
 
 # List of tests to skip due to known hangs or unsupported features.
@@ -242,6 +266,15 @@ for testname in "$@"; do
         sleep 2
     fi
 
+    # Ensure any fuse.briefs process from the previous test has exited (its
+    # journal checkpoint) before mkfs.briefs reformats the device.  Kill any
+    # stray processes first (a crashed test may leave fuse.briefs running with
+    # no PID file).
+    pkill -9 -f fuse.briefs 2>/dev/null || true
+    sleep 0.5
+    wait_fuse_exit "$TEST_MNT"
+    wait_fuse_exit "$SCRATCH_MNT"
+
     if ! "$MKFS_BRIEFS_PROG" -f "$TEST_DEV" >/dev/null 2>&1; then
         echo "  -> MKFS TEST FAIL"
         MKFS_FAIL=$((MKFS_FAIL + 1))
@@ -254,7 +287,7 @@ for testname in "$@"; do
     fi
 
     # Mount TEST_DEV; SCRATCH_DEV is mounted by the test itself.
-    if ! mount -t briefs "$TEST_DEV" "$TEST_MNT" 2>&1 | tee "$LOG_DIR/mount-err-${testbase}-${RUN_TIMESTAMP}.log"; then
+    if ! $MOUNT_CMD "$TEST_DEV" "$TEST_MNT" 2>&1 | tee "$LOG_DIR/mount-err-${testbase}-${RUN_TIMESTAMP}.log"; then
         echo "  -> MOUNT FAIL"
         MOUNT_FAIL=$((MOUNT_FAIL + 1))
         # Try to leave things as clean as possible for the next test.

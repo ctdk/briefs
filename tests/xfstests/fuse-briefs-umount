@@ -1,0 +1,24 @@
+#!/bin/bash
+# fuse-briefs-umount — UMOUNT_PROG wrapper that unmounts a fuse.briefs FUSE mount.
+# Usage (xfstests): fuse-briefs-umount [-f] <mnt>
+# Unmounts and waits for the fuse.briefs process to exit (checkpoint completes)
+# so the next test's mkfs doesn't race the journal checkpoint.
+set -uo pipefail
+mnt="${@: -1}"
+pidfile="/tmp/fuse-briefs-$(echo "$mnt" | tr / _).pid"
+# Try umount (kernel umount works on FUSE mounts) then fusermount fallback.
+umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || \
+  fusermount -u "$mnt" 2>/dev/null || fusermount -uz "$mnt" 2>/dev/null || true
+# Wait for the fuse.briefs process to finish its checkpoint and exit.
+if [ -f "$pidfile" ]; then
+  pid=$(cat "$pidfile" 2>/dev/null || true)
+  if [ -n "$pid" ]; then
+    for i in $(seq 1 50); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -9 "$pid" 2>/dev/null || true   # last resort if checkpoint hung
+  fi
+  rm -f "$pidfile"
+fi
+exit 0
