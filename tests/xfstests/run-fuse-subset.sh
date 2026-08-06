@@ -17,10 +17,10 @@ export SCRATCH_DEV=/dev/vdc1
 
 cd /xfstests
 
-# generic/547 (fsstress data mismatch) is skipped intentionally — it is a
-# known FUSE-bridge bug, see xfstests-fuse-status.md.
+# generic/547 (fsstress + fsync + crash-replay) now passes after the FUSE
+# bridge gained journal replay on mount; see xfstests-fuse-status.md.
 for t in generic/003 generic/029 generic/030 generic/032 generic/321 \
-         generic/322 generic/640 generic/475 generic/011; do
+         generic/322 generic/547 generic/640 generic/475 generic/011; do
   echo "===== $t ====="
   pkill -9 -f fuse.briefs 2>/dev/null; sleep 0.5
   umount /mnt/briefs-test /mnt/briefs-scratch 2>/dev/null
