@@ -316,9 +316,8 @@ void briefs_free_inode_data(struct inode *inode)
 		 * at blocks that are about to be marked free.
 		 */
 		binfo->disk_inode.dir_trie_root = 0;
-		briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-		briefs_persist_disk_inode(inode->i_sb, inode->i_ino, &binfo->disk_inode, false);
-		briefs_journal_inode_full(bsi->journal, inode, &disk_di);
+		briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
+				&binfo->disk_inode);
 
 		/*
 		 * Free the trie pages using the saved root.  briefs_trie_free_all
@@ -344,10 +343,8 @@ void briefs_free_inode_data(struct inode *inode)
 		binfo->disk_inode.filesize = 0;
 		write_seqcount_end(&binfo->extent_seq);
 
-		briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-		briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
-					&binfo->disk_inode, false);
-		briefs_journal_inode_full(bsi->journal, inode, &disk_di);
+		briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
+				&binfo->disk_inode);
 		return;
 	}
 

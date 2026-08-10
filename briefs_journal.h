@@ -277,6 +277,53 @@ int briefs_journal_trie_free(struct briefs_journal *j, u64 abs_block);
 int briefs_journal_inode_full(struct briefs_journal *j, struct inode *inode,
                               const struct briefs_disk_inode *di);
 
+/*
+ * briefs_persist_and_journal_inode - persist a CPU inode to its on-disk block
+ * and journal a full on-disk snapshot of it.  Bundles the persist +
+ * cpu_inode_to_disk + journal_inode_full sequence repeated at every inode
+ * metadata write site.  Returns the persist error; the journal snapshot is
+ * built and logged only when persist succeeded (a persist failure leaves the
+ * on-disk inode unchanged, so logging a newer snapshot would diverge it).
+ *
+ * Callers that propagate the error use the return value; callers that
+ * historically discarded it should still discard but pr_warn_ratelimited on a
+ * nonzero return so a swallowed persist EIO is at least logged.  Sites that
+ * must suppress journaling during replay (briefs_xattr_free / briefs_xattr_set,
+ * which guard on !journal->in_replay) keep their own guard and are NOT routed
+ * here -- the wrapper journals unconditionally.
+ */
+static inline int briefs_persist_and_journal_inode(struct super_block *sb,
+						    struct inode *vfs_inode,
+						    struct briefs_inode *di,
+						    bool sync)
+{
+	struct briefs_disk_inode disk_di;
+	int ret;
+
+	ret = briefs_persist_disk_inode(sb, vfs_inode->i_ino, di, sync);
+	if (ret)
+		return ret;
+	briefs_cpu_inode_to_disk(di, &disk_di);
+	briefs_journal_inode_full(briefs_sb(sb)->journal, vfs_inode, &disk_di);
+	return 0;
+}
+
+/*
+ * briefs_persist_and_journal_inode_warn - the discard variant: persist + journal
+ * the inode, and on a persist failure pr_warn_ratelimited rather than propagate
+ * (the historical call sites swallowed the error).  Centralizes the warn so the
+ * ~10 discard sites don't each open-code it.  Always async (sync=false): the
+ * discard path is never a replay/sync persist.
+ */
+static inline void briefs_persist_and_journal_inode_warn(struct super_block *sb,
+							  struct inode *vfs_inode,
+							  struct briefs_inode *di)
+{
+	if (briefs_persist_and_journal_inode(sb, vfs_inode, di, false))
+		pr_warn_ratelimited("briefs: inode %lu persist+journal failed\n",
+				    vfs_inode->i_ino);
+}
+
 /* Flush pending inode snapshots to the journal. Called at syscall boundaries
  * (e.g., end of setattr, fallocate, punch_hole) and by briefs_journal_sync()
  * to ensure all pending snapshots are durable before returning.

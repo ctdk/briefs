@@ -1073,18 +1073,15 @@ static int briefs_rename_whiteout(struct mnt_idmap *idmap,
 	/* Renaming moves which entry points at @inode, so its ctime advances. */
 	{
 		struct briefs_inode_info *minfo = briefs_i(inode);
-		struct briefs_disk_inode disk_di;
 		struct timespec64 now = current_time(inode);
 
 		inode->i_ctime_sec = now.tv_sec;
 		inode->i_ctime_nsec = now.tv_nsec;
 		briefs_sync_inode_times(inode, &minfo->disk_inode);
-		ret = briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
-						&minfo->disk_inode, false);
+		ret = briefs_persist_and_journal_inode(inode->i_sb, inode,
+						       &minfo->disk_inode, false);
 		if (ret)
 			goto fail;
-		briefs_cpu_inode_to_disk(&minfo->disk_inode, &disk_di);
-		briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 		mark_inode_dirty(inode);
 	}
 
@@ -1342,19 +1339,16 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 	 * above handled the directory mtimes; the inode itself still needs this. */
 	{
 		struct briefs_inode_info *minfo = briefs_i(inode);
-		struct briefs_disk_inode disk_di;
 		struct timespec64 now;
 
 		now = current_time(inode);
 		inode->i_ctime_sec = now.tv_sec;
 		inode->i_ctime_nsec = now.tv_nsec;
 		briefs_sync_inode_times(inode, &minfo->disk_inode);
-		ret = briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
-						&minfo->disk_inode, false);
+		ret = briefs_persist_and_journal_inode(inode->i_sb, inode,
+						       &minfo->disk_inode, false);
 		if (ret)
 			goto fail;
-		briefs_cpu_inode_to_disk(&minfo->disk_inode, &disk_di);
-		briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 		mark_inode_dirty(inode);
 	}
 

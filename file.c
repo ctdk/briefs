@@ -1029,13 +1029,8 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			inode->i_blocks = 0;
 			write_seqcount_end(&binfo->extent_seq);
 
-			briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
-						  &binfo->disk_inode, false);
-			{
-				struct briefs_disk_inode disk_di;
-				briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-				briefs_journal_inode_full(bsi->journal, inode, &disk_di);
-			}
+			briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
+					&binfo->disk_inode);
 		} else {
 			ret = briefs_promote_inline_data(inode);
 			if (ret)
@@ -1045,13 +1040,8 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			binfo->disk_inode.filesize = new_size;
 			inode->i_size = new_size;
 			inode->i_blocks = (BRIEFS_BLOCK_SIZE / 512);
-			briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
-						  &binfo->disk_inode, false);
-			{
-				struct briefs_disk_inode disk_di;
-				briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-				briefs_journal_inode_full(bsi->journal, inode, &disk_di);
-			}
+			briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
+					&binfo->disk_inode);
 		}
 		mutex_unlock(&binfo->extent_lock);
 		ret = briefs_inode_sync(inode);
@@ -1077,13 +1067,8 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (new_size > old_size) {
 		truncate_setsize(inode, new_size);
 		binfo->disk_inode.filesize = new_size;
-		briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
-					  &binfo->disk_inode, false);
-		{
-			struct briefs_disk_inode disk_di;
-			briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-			briefs_journal_inode_full(bsi->journal, inode, &disk_di);
-		}
+		briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
+				&binfo->disk_inode);
 		mutex_unlock(&binfo->extent_lock);
 		mark_inode_dirty(inode);
 		ret = briefs_inode_sync(inode);
@@ -1109,13 +1094,8 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		inode->i_blocks = 0;
 		write_seqcount_end(&binfo->extent_seq);
 
-		briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
-					  &binfo->disk_inode, false);
-		{
-			struct briefs_disk_inode disk_di;
-			briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-			briefs_journal_inode_full(bsi->journal, inode, &disk_di);
-		}
+		briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
+				&binfo->disk_inode);
 		mutex_unlock(&binfo->extent_lock);
 		ret = briefs_inode_sync(inode);
 		return ret;
@@ -1222,17 +1202,10 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 						  &binfo->disk_inode);
 
 	/* Persist the inode to disk */
-	briefs_persist_disk_inode(inode->i_sb, inode->i_ino, &binfo->disk_inode, false);
-
-	/*
-	 * Log a full snapshot after truncate so replay restores the exact
-	 * extent list and size, not just the freed bitmap bits.
-	 */
-	{
-		struct briefs_disk_inode disk_di;
-		briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-		briefs_journal_inode_full(bsi->journal, inode, &disk_di);
-	}
+	/* Persist + journal: replay restores the exact extent list and size,
+	 * not just the freed bitmap bits. */
+	briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
+			&binfo->disk_inode);
 
 	mutex_unlock(&binfo->extent_lock);
 	ret = briefs_inode_sync(inode);
@@ -1442,7 +1415,6 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 	struct inode *inode = file_inode(file);
 	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
 	struct briefs_inode_info *binfo = briefs_i(inode);
-	struct briefs_disk_inode disk_di;
 	struct timespec64 now;
 	loff_t end = offset + len;
 	u64 start_blk = offset >> BRIEFS_BLOCK_SHIFT;
@@ -1495,11 +1467,8 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 			inode->i_ctime_sec = now.tv_sec;
 			inode->i_ctime_nsec = now.tv_nsec;
 			briefs_sync_inode_times(inode, &binfo->disk_inode);
-			briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
-						  &binfo->disk_inode, false);
-			briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-			briefs_journal_inode_full(bsi->journal, inode,
-						  &disk_di);
+			briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
+					&binfo->disk_inode);
 		}
 		goto out_update;
 	}
@@ -1847,10 +1816,8 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 		briefs_sync_inode_times(inode, &binfo->disk_inode);
 	}
 
-	briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
-				  &binfo->disk_inode, false);
-	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-	briefs_journal_inode_full(bsi->journal, inode, &disk_di);
+	briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
+			&binfo->disk_inode);
 
 out_unlock:
 	mutex_unlock(&binfo->extent_lock);
@@ -1881,7 +1848,6 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	struct inode *inode = file_inode(file);
 	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
 	struct briefs_inode_info *binfo = briefs_i(inode);
-	struct briefs_disk_inode disk_di;
 	struct timespec64 now;
 	loff_t end;
 	u64 start_blk, end_blk, blk;
@@ -2130,10 +2096,8 @@ falloc_loop_done:
 
 	inode->i_blocks = briefs_compute_i_blocks(inode->i_sb, &binfo->disk_inode);
 
-	briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
-				  &binfo->disk_inode, false);
-	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-	briefs_journal_inode_full(bsi->journal, inode, &disk_di);
+	briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
+			&binfo->disk_inode);
 
 out_update:
 	if (changed) {

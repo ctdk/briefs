@@ -391,24 +391,15 @@ int briefs_update_parent_dir(struct inode *dir, struct briefs_sb_info *bsi,
 	 * the trie root on disk even though the journal records are not replayed
 	 * (generic/417).  Synchronous writes here would make every create/unlink
 	 * wait for disk, so leave the buffer dirty and let the normal metadata
-	 * flush paths batch it.
+	 * flush paths batch it.  briefs_update_parent_dir does not mark the inode
+	 * dirty, so briefs_write_inode() is not called for this persistence path.
 	 */
-	ret = briefs_persist_disk_inode(dir->i_sb, dir->i_ino, &pbinfo->disk_inode, false);
+	ret = briefs_persist_and_journal_inode(dir->i_sb, dir,
+					       &pbinfo->disk_inode, false);
 	if (ret) {
 		pbinfo->disk_inode.filesize = old_size;
 		pbinfo->disk_inode.nlinks = old_nlink;
 		return ret;
-	}
-
-	/*
-	 * Log the full parent-directory snapshot. briefs_update_parent_dir does
-	 * not mark the inode dirty, so briefs_write_inode() is not called for
-	 * this persistence path.
-	 */
-	{
-		struct briefs_disk_inode disk_di;
-		briefs_cpu_inode_to_disk(&pbinfo->disk_inode, &disk_di);
-		briefs_journal_inode_full(bsi->journal, dir, &disk_di);
 	}
 
 	/* Commit the updates to VFS state only after successful persistence. */
