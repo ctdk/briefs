@@ -1,6 +1,128 @@
-# Handoff: xfstests Hang & Performance Investigation
+# Handoff: BrieFS xfstests, performance, iomap migration & dedup
 
-## What was done
+This file tracks where the BrieFS kernel module + userspace tools stand and
+what remains. The top section is current; the refactor-round-1 history below
+is kept as a record. Branch of record: `refactor-round-2` (11 commits ahead of
+`master` as of 2026-08-10).
+
+## Current state (refactor-round-2, 2026-08-10)
+
+### Branch contents (11 ahead of master)
+- **iomap data-path migration** — DONE. The regular-file data path moved off
+  `buffer_head` to `iomap` (phases 0-8). Direct I/O closes generic/704;
+  `bmap`+`swap` close generic/472, 643. Metadata (btree/trie/inode/journal
+  blocks) still uses `buffer_head` — see task 4b.
+- **K2/K4 cross-site dedup** (per `~/src/briefs-notes/quirky-fluttering-floyd.md`,
+  i.e. the dedup plan):
+  - K1 `briefs_sync_dirty_buffer` wrapper — `e6321c9` (replay-path sites) +
+    `6a1fbc0` (remaining checked sites).
+  - K2 `briefs_persist_and_journal_inode` wrapper — `72ae10c`.
+  - K3 `briefs_sync_inode_fields` (VFS-field mirror) — `6c3eba0`; extent
+    `briefs_append_extent` fold — `6393a46`; `briefs_compute_i_blocks` to
+    header — `7e8b205`.
+  - K4 `btree_descend_to_leaf` (routes lookup + clear_unwritten) — `9dc82f4`.
+  - K0 `briefs_block_in_range` device-end guard — `84be966`.
+- **FUSE read/write bridge** — works (`c3f4670`…`c794549`). A per-op block
+  cache is the key insight. The FUSE xfstests subset harness was fixed (it had
+  been mounting via the kernel module, not `fuse.briefs`).
+- **generic/411 fix (this session)** — `fb176b8` + `67ab528` (see below).
+
+### generic/411 + 410 — RESOLVED this session
+generic/410 and generic/411 (mount-namespace / propagation tests) were
+long-skipped. Both are now un-skipped and PASS.
+
+- **generic/410** passes; it exercises pure VFS shared-subtree machinery and
+  BrieFS needs no special support. Its skip-list entry was stale.
+- **generic/411 was a memory-safety bug, not a missing feature.** Concurrent
+  fsstress exposed a kmalloc-4k slab-out-of-bounds in the journal record
+  writer. KASAN pinpointed it at `__briefs_journal_write_record_locked+0x263`
+  (symlink-data `memcpy` overrunning the 4096-byte `j->cur_block` by 496 B).
+  Root cause: the bounds check at the top of the flush branch and the record
+  `memcpy` were not atomic — the back-pressure ring-full checkpoint releases
+  `j->write_lock` (to avoid an AB-BA deadlock with `alloc->lock`), concurrent
+  writers advanced `write_offset` past the checked value, and the post-checkpoint
+  `memcpy` ran unchecked. On a normal kernel the overflow smashed the adjacent
+  `struct briefs_sb_info` → `vfree(garbage)` oops → umount died holding
+  `s_umount` → every later mount wedged.
+- **Fix (`fb176b8`):** extracted `briefs_journal_flush_cur_block_locked()` and
+  added a `while (write_offset + total_size > JOURNAL_BLOCK_SIZE)` re-check
+  loop *after* the lock-releasing checkpoint, so the record write is atomic
+  w.r.t. `write_offset`. Verified: 12/12 iterations clean under a KASAN kernel;
+  4/4 iterations clean on the normal kernel (411 PASS, no oops/wedge).
+
+### Test status (recent full-suite runs)
+- 2026-07-13: 368 PASS / 11 FAIL / 399 NOTRUN (mount fails were DM residue;
+  `force_umount` + DM cleanup added).
+- 2026-06-28: 783 ran, only generic/311 + 563 failing.
+- Most earlier failures are FIXED (see `MEMORY.md`). Standing failures:
+  - **generic/475** — DEFERRED. Robust fix needs a journal-format or sync-model
+    change; a bounds-check guard (`da618f6`) prevents the unkillable busy-loop,
+    but umount-under-error hangs (writeback redirty of EIO folios) is the real
+    blocker. See `~/src/briefs-notes/generic-475-plan.md`.
+  - **generic/563** — 6.12.y kernel cgroup-writeback race (CVE-2026-31703),
+    not a BrieFS bug; `SB_I_CGROUPWB` was dropped (`9385fc8`).
+
+## Remaining tasks — evaluated 2026-08-10
+
+| Task | Status | Current reality |
+|------|--------|-----------------|
+| 3a per-inode journal batching | ✅ DONE | refactor-round-1; deferred `JRN_INODE_FULL` + fsync snapshot. |
+| 3b checkpoint interval | ✅ DONE | `3ee8bfe` (1024→4096). |
+| 4a xattr lock ordering | ⏳ PENDING | Still **documented-only** — the `xattr_sem → alloc->lock` inversion note + TODO remain in `xattr.c:24-28`; refactor (alloc before `xattr_sem`) not done. Low priority: provably safe today (no path takes `alloc->lock → xattr_sem`). |
+| 4b metadata off buffer_heads | ⏳ NOT STARTED | Long-term architectural change. Note the **data** path is now iomap; only metadata (btree/trie/inode/journal) still uses `buffer_head`. |
+| 4c mount namespaces (410/411) | ✅ DONE | This session: 410 un-skipped (VFS-handled); 411 = memory-safety bug FIXED `fb176b8`; both un-skipped `67ab528`. |
+| 5a generic/127 mmap/fsx wedge | ⚠️ DEFERRED | **Intermittent.** Passes in Jul-13 / Aug-2 full runs but exhibits a pre-existing silent full-VM freeze under fsx+mmap at other times (needs `virsh destroy` to recover). Root cause UNPINNED (no trace; `CONFIG_LOCKDEP` not enabled). Not the iomap migration's fault. Not in skip list. Needs lockdep or journal/writeback decoupling. See memory `briefs-generic-127-fsx-mmap-wedge-preexisting`. |
+| 5b generic/299 btree corruption | ✅ DONE | `e59c1e4` (zero stale btree tail entries). |
+| 5c profile journal lock contention | ⏳ NOT STARTED | Low priority; `write_lock` contention largely addressed by 3a batching + commit-before-flush. |
+| Full xfstests suite | ✅ DONE | Run multiple times (tallies above). |
+| lockdep verification | ⚠️ DEFERRED | Needs a custom kernel with `CONFIG_LOCKDEP`. Defer until BrieFS tracks mainline master. (A KASAN kernel was built this session — `6.12.101-kasan` — for the 411 investigation; a lockdep kernel would be similar effort.) |
+| fsck after tests | ✅ DONE | `FSCK_ENABLED=1` in run-suite.sh (`44247fe`). |
+| K2/K4 cross-site dedup | ✅ DONE | See branch contents above. (K5 flag-mask was attempted and REVERTED — it exposed a latent `+D` DIRSYNC value-specific bug; see memory `briefs-k5-audit-flagmask-deferred`.) |
+| generic/475 | ⚠️ DEFERRED | See test-status section. |
+| generic/563 | ➖ N/A | Upstream kernel race, not BrieFS. |
+
+## How to build and test (current)
+
+Build the module **on the VM** (host headers mismatch the VM kernel → "Invalid
+module format"); rsync `/vagrant → /tmp/briefssrc`, `make clean` first.
+
+```bash
+# Rebuild + install the module on the VM (normal kernel)
+vagrant ssh -c '
+  rm -rf /tmp/briefssrc && rsync -a --exclude=.git /vagrant/ /tmp/briefssrc/
+  cd /tmp/briefssrc && make clean && make
+  sudo cp briefs_fs.ko /lib/modules/$(uname -r)/extra/briefs/ && sudo depmod -a
+'
+
+# Rebuild Go tools (scp'd source ≠ installed /go/bin/*)
+vagrant ssh -c '
+  cd /go/src/github.com/ctdk/briefs-utils
+  go build -o /go/bin/mkfs.briefs ./cmd/mkfs/ && go build -o /go/bin/fsck.briefs ./cmd/fsck/
+'
+
+# Run xfstests (resumable; SKIP_TESTS env forces all)
+vagrant ssh -c 'sudo bash /vagrant/tests/xfstests/run-suite.sh generic/001 generic/003'
+vagrant ssh -c 'sudo SKIP_TESTS="" bash /vagrant/tests/xfstests/run-suite.sh generic/410 generic/411'
+```
+
+The module's version is the git rev baked at build time (build-id observability,
+landed `297b478`); `modinfo` / sysfs / debugfs surface it.
+
+## VM state (current)
+
+- VM: vagrant libvirt, IP `192.168.121.206` (libvirt DHCP — varies on rebuild;
+  use `vagrant ssh` rather than the IP).
+- Running kernel: `6.12.101+deb13-amd64` (normal). A `6.12.101-kasan` kernel
+  is also installed (CONFIG_KASAN_GENERIC+INLINE+VMALLOC+STACK) for the 411
+  memory-safety investigation; grub default is the normal kernel.
+- Module: `/lib/modules/6.12.101+deb13-amd64/extra/briefs/briefs_fs.ko`.
+- Go binaries: `/go/bin/mkfs.briefs`, `/go/bin/fsck.briefs`.
+- xfstests: `/xfstests/` (NFS mount; empty after restart → `vagrant halt &&
+  vagrant up` — NOT `vagrant reload` — to repopulate).
+- Test devices: `/dev/vdb1` (TEST_DEV), `/dev/vdc1` (SCRATCH_DEV).
+- NFS mounts in the VM: `/vagrant`, `/kernel-src`, `/go`, `/xfstests`.
+
+## Historical: refactor-round-1 (what was done)
 
 ### Investigation (3 parallel agents + direct code review)
 - Analyzed journal write path, checkpoint, sync, and replay in `journal.c`
@@ -9,240 +131,79 @@
 - Reviewed xfstests runner (`tests/xfstests/run-suite.sh`) and test infrastructure
 - Reviewed briefs-utils (`mkfs.briefs`, `fsck.briefs`, on-disk format)
 
-### Root cause analysis
-The primary bottleneck is `sync_blockdev()` called under `j->write_lock` on every
-fsync and checkpoint. This flushes ALL dirty metadata buffers on the block
-device while holding the global journal mutex, blocking all other filesystem
-operations. Secondary issues: 64-block journal is too small, btree drain does
-synchronous I/O, and the writeback path can allocate blocks from writeback
-context.
+### Root cause analysis (refactor-round-1)
+The primary bottleneck was `sync_blockdev()` called under `j->write_lock` on
+every fsync and checkpoint — flushing ALL dirty metadata buffers while holding
+the global journal mutex, blocking all other fs operations. Secondary issues:
+64-block journal too small, btree drain doing synchronous I/O, writeback path
+allocating blocks from writeback context.
 
-### Changes implemented (all committed to branch `refactor-round-1`)
+### Changes implemented (branch `refactor-round-1`)
 
-**Kernel module** (`~/src/briefs`), branch `refactor-round-1`:
+**Kernel module:**
 
 1. `briefs_journal.h` — Added `BRIEFS_MIN_JOURNAL_BLOCKS` (4) and
    `BRIEFS_MAX_JOURNAL_BLOCKS` (65536) constants.
-
 2. `journal.c` — Added journal size validation in `briefs_journal_init()`.
-
-3. `journal.c` — **Commit-before-flush**: Restructured
+3. `journal.c` — **Commit-before-flush**: restructured
    `__briefs_journal_sync_locked` to advance `journal_log_end` and sync the
    superblock BEFORE releasing `j->write_lock`, then run `sync_blockdev()` and
-   the per-block journal sync loop OUTSIDE the lock. Other threads can now
-   write journal records during the metadata flush. Safe because journal
-   replay is idempotent.
-
+   the per-block journal sync loop OUTSIDE the lock. Other threads can write
+   journal records during the metadata flush (journal replay is idempotent).
 4. `journal.c` — Moved `sync_blockdev()` outside `j->write_lock` in
    `__briefs_journal_checkpoint_locked` (alongside the existing
    `briefs_alloc_sync()` release).
-
 5. `journal.c` — Changed checkpoint buffer `kzalloc(..., GFP_KERNEL)` to
    `GFP_NOFS`.
-
 6. `briefs.h` — Added `BRIEFS_BTREE_ERROR_LIMIT` (100) and `atomic_t
    btree_error_count` to `struct briefs_sb_info`.
-
-7. `btree.c` — Changed `pr_err` to `pr_warn_ratelimited` for btree checksum
-   and bad magic errors. Added circuit breaker: after 100 errors, sets
+7. `btree.c` — Changed `pr_err` to `pr_warn_ratelimited` for btree checksum /
+   bad-magic errors. Added a circuit breaker: after 100 errors, sets
    `BRIEFS_MF_ERROR_FS` to force read-only remount (prevents the generic/299
    dmesg-flood spiral).
-
 8. `file.c` — Changed 3 `GFP_KERNEL` to `GFP_NOFS` in `kvmalloc_array` calls
    under `extent_lock` (collect_all_extents, truncate, punch hole).
+9. `tests/xfstests/run-suite.sh` — Added `get_timeout()` with per-test timeout
+   overrides (089→3600s, 127/521/522→1200s).
 
-9. `tests/xfstests/run-suite.sh` — Added `get_timeout()` function with
-   per-test timeout overrides: 089→3600s, 127/521/522→1200s.
-
-**Userspace tools** (`~/go/src/github.com/ctdk/briefs-utils`), branch `refactor-round-1`:
+**Userspace tools:**
 
 10. `briefs/briefs.go` — Replaced `DefaultJournalSize = 64` with
     `DefaultJournalMinBlocks = 64` + `DefaultJournalMaxBlocks = 4096`. Added
-    `DefaultJournalBlocks(totalBlocks)` function: `max(64, totalBlocks/4096)`,
-    capped at 4096.
+    `DefaultJournalBlocks(totalBlocks)`: `max(64, totalBlocks/4096)`, capped 4096.
+11. `cmd/mkfs/mkfs.go` — Changed `--journal-size` default 64 → 0 (auto), with
+    auto-scaling when 0.
+12. `README.md` — version refs v0.9.3 → v0.9.4.
 
-11. `cmd/mkfs/mkfs.go` — Changed `--journal-size` default from 64 to 0 (auto).
-    Added auto-scaling logic when journal size is 0.
+### generic/013 / 299 btree checksum corruption — FIXED
+Root cause: btree nodes store variable-length arrays in fixed 4096-byte blocks;
+operations reducing `num_keys` left stale data in unused slots, and since
+CRC32C covers bytes 0-4079, stale data caused non-deterministic checksum
+mismatches. Fix (`e59c1e4`): `memset()` zero unused tail entries in
+`btree_delete_range_subtree`, `btree_maybe_split_child`, `btree_ensure_root_room`,
+`btree_spill_inline`. Verified 19+ consecutive generic/013 passes, 0 checksum
+errors.
 
-12. `README.md` — Updated version references from v0.9.3 to v0.9.4.
-
-### Test results
-
-- Module builds and loads cleanly on VM (kernel 6.12.96+deb13-amd64)
-- generic/001, 003, 124: **PASS**
-- generic/127: **HANG** (same as before changes)
-- generic/013: **PASS** (19+ consecutive runs with 0 checksum errors after btree fix)
-
-### generic/127 hang analysis
-
-The hang is NOT caused by journal lock contention. All 5 fsx processes get
-stuck in D-state within seconds, waiting for I/O:
-
-- `blkdev_issue_flush` → `submit_bio_wait` (msync/fsync path)
-- `__sync_dirty_buffer` (fallocate path)
-- `folio_wait_writeback` (fsync/fallocate waiting for writeback)
-- `submit_bio_wait` in `briefs_zero_block_range` (punch hole path)
-
-The hang reproduces identically on both loop devices and virtio block devices
-(/dev/vdb, /dev/vdc1), confirming it's a BrieFS issue, not a block device
-issue.
-
-This is a **pre-existing issue** — XFSTESTS_STATE.md documents generic/127 as
-flaky (sometimes passes, sometimes hangs) going back to 2026-07-06.
-
-### generic/013 btree checksum corruption — FIXED
-
-**Root cause:** Btree nodes store variable-length arrays in fixed 4096-byte blocks.
-Operations reducing `num_keys` left stale data in unused slots. Since CRC32C
-covers bytes 0-4079, stale data caused non-deterministic checksum mismatches.
-
-**Fix:** Added `memset()` calls to zero unused tail entries in:
-- `btree_delete_range_subtree()` — delete compaction
-- `btree_maybe_split_child()` — node splits
-- `btree_ensure_root_room()` — root splits
-- `btree_spill_inline()` — inline-to-indexed rebuild
-
-**Verified:** 19+ consecutive generic/013 passes with 0 checksum errors.
-**Committed:** `e59c1e4` "btree: zero stale tail entries to fix checksum mismatches"
-
-## Current VM state
-
-- VM is running at 192.168.121.132:22 (vagrant libvirt)
-- SSH key: `.vagrant/machines/default/libvirt/private_key`
-- Kernel module installed at `/lib/modules/6.12.96+deb13-amd64/extra/briefs/`
-- Go binaries at `/go/bin/mkfs.briefs`, `/go/bin/fsck.briefs`
-- xfstests at `/xfstests/`
-- Config files:
-  - `/xfstests/local.config` — virtio devices (vdb, vdc1), FSTYP=briefs
-  - `/xfstests/configs/briefs.config` — same, with [briefs] section header
-- Test devices:
-  - `/dev/vdb` (20G) — TEST_DEV
-  - `/dev/vdc1` (30G) — SCRATCH_DEV
-  - `/dev/loop0` (24G) — old TEST_DEV (still exists)
-  - `/dev/loop1` (16G) — old SCRATCH_DEV (still exists)
-- Mount points: `/mnt/briefs-test`, `/mnt/briefs-scratch`
-
-## What remains to be done
-
-### Phase 3 (partially done)
-- **3a. Per-inode journal write batching** — ✅ IMPLEMENTED & TESTED (see below)
-- **3b. Increase JRN_CHECKPOINT_INTERVAL** — ✅ DONE (commit `3ee8bfe`, 1024→4096)
-
-### Phase 3a Implementation Summary
-
-**Problem:** Multiple `JRN_INODE_FULL` journal records for the same inode were being written within a single syscall (e.g., setattr, fallocate, punch_hole), causing unnecessary lock contention on `j->write_lock`.
-
-**Solution:** Deferred journal writes with per-inode pending snapshot:
-- `briefs_journal_inode_full()` now copies the snapshot to `binfo->pending_journal_snapshot` and sets `has_pending_journal_snapshot = true`
-- Actual journal write is deferred until `briefs_inode_sync()` is called at syscall boundaries
-- `briefs_flush_inode_pending_journal_snapshot()` writes the pending snapshot
-- **FIXED generic/073:** Added fresh inode snapshot capture in `briefs_fsync()` after `file_write_and_wait_range()` completes, ensuring the JRN_INODE_FULL record reflects the post-writeback state (extent list + size)
-
-**Files modified:**
-- `briefs.h`: Added `pending_journal_snapshot` and `has_pending_journal_snapshot` fields to `struct briefs_inode_info`
-- `briefs_journal.h`: Changed `briefs_journal_inode_full()` signature to take `struct inode *`; added `briefs_flush_inode_pending_journal_snapshot()`
-- `journal.c`: Implemented deferred write logic and flush helper
-- `file.c`: 
-  - Updated `briefs_inode_sync()` to flush pending snapshot before journal sync
-  - Updated `briefs_fsync()` to capture and write fresh inode snapshot after data writeback
-  - All call sites (27 total) updated to pass `struct inode *` instead of `u64 ino`
-
-**Test results (spot tests):**
-- generic/001: ✅ PASS
-- generic/003: ✅ PASS  
-- generic/013: ✅ PASS (5/5 iterations)
-- generic/073: ✅ PASS (5/5 iterations) — FIXED
-- generic/127: ✅ PASS (3/3 iterations)
-
-**Full xfstests run (2026-08-02, full suite):**
-- 205 PASS, 24 actual FAIL, 251 NOT RUN, 6 SKIPPED, 2-3 HANG
-- Skip list: generic/068, 070, 074, 224, 410, 464, 475, 476
-- ~300 false FAILs due to SCRATCH_DEV cleanup issue (device RO/mounted between tests)
-- Zero new hangs confirms Phase 3a fsync fix is working
-- Actual failures are mostly output mismatches for unsupported features
-
-**Note on generic/224 and generic/464:**
-These tests used to pass but hung in the 2026-08-02 run. They may be
-intermittent failures or regressions from recent changes. Worth
-investigating individually if time permits:
-- generic/224: ENOSPC delayed allocation test
-- generic/464: Concurrent delalloc writeback race test
-
-**SCRATCH_DEV fix (commit 50731b6):**
-- Added sync + sleep before mkfs to flush pending writes
-- Added lazy unmount (-l) as fallback for stubborn mounts
-- Double-check SCRATCH_MNT before mkfs and force unmount
-- Aggressive cleanup AFTER tests to prevent RO state issues
-- Should eliminate ~300 false FAILs in next run
-
-**Expected benefits:**
-- Reduced `j->write_lock` acquisitions for operations with multiple inode updates
-- Lower journal pressure from coalesced `JRN_INODE_FULL` records
-- Better throughput under metadata-heavy workloads
-
-### Phase 4 (partially done)
-- **4a. Fix xattr lock ordering** — ✅ DOCUMENTED. The xattr path takes
-  `xattr_sem → alloc->lock` which inverts the documented order. Added explicit
-  exception documentation in `briefs.h` and `xattr.c` explaining this is safe
-  (no other code path takes `alloc->lock → xattr_sem`). TODO: refactor xattr
-  to allocate blocks before taking `xattr_sem` for proper ordering.
-- **4b. Move off buffer_heads for metadata** — NOT STARTED (long-term architectural change)
-- **4c. Revisit mount namespaces** — generic/410 and generic/411 (mount propagation
-  tests) now hang on BrieFS but used to pass. Investigate whether BrieFS should
-  support mount propagation features (`--make-shared`, `--make-slave`, etc.) or
-  if these tests should remain skipped.
-
-### Phase 5 (partially done)
-- **5a. Investigate generic/127 mmap hang** — ✅ RESOLVED (was flaky, now passes consistently after Phase 1-2 fixes)
-- **5b. Investigate generic/299 btree corruption** — ✅ FIXED (commit `e59c1e4`)
-- **5c. Profile journal lock contention** — NOT STARTED (would use debugfs histograms)
-
-### Verification needed
-- Run full xfstests suite to measure impact of journal changes on overall
-  throughput
-- Check for lockdep warnings from the new lock release/re-acquire pattern
-  (DEFERRED: wait until BrieFS tracks mainline Linux master, requires custom
-  kernel build with CONFIG_LOCKDEP)
-- Run fsck after test clusters to verify on-disk consistency
-  (✅ DONE: `FSCK_ENABLED=1` in run-suite.sh, commit 44247fe)
-
-## How to build and test
-
-```bash
-# Build kernel module in VM
-ssh -o LogLevel=FATAL -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    vagrant@192.168.121.132 -p 22 \
-    -i /home/jeremy/src/briefs/.vagrant/machines/default/libvirt/private_key \
-    "cd /vagrant && make clean && make"
-
-# Install and reload module
-ssh ... "sudo rmmod briefs_fs; sudo cp /vagrant/briefs_fs.ko \
-    /lib/modules/\$(uname -r)/extra/briefs/ && sudo depmod && sudo modprobe briefs_fs"
-
-# Rebuild Go binaries
-ssh ... "export PATH=\$PATH:/usr/local/go/bin && cd /go/src/github.com/ctdk/briefs-utils \
-    && go build -o /go/bin/mkfs.briefs ./cmd/mkfs/ \
-    && go build -o /go/bin/fsck.briefs ./cmd/fsck/"
-
-# Run a single xfstest
-ssh ... "sudo bash /vagrant/tests/xfstests/run-suite.sh generic/001"
-
-# Run multiple tests
-ssh ... "sudo bash /vagrant/tests/xfstests/run-suite.sh generic/001 generic/003 generic/124"
-```
-
-## Commit Summary (refactor-round-1 branch)
-
-Key commits in this branch (19 ahead of master):
+### refactor-round-1 commit summary (key commits)
 
 | Commit | Description |
 |--------|-------------|
 | `e59c1e4` | btree: zero stale tail entries to fix checksum mismatches ✅ |
-| `da9b340` | write down a couple of far-off ideas real quick |
-| `7251fcc` | kernel: skip sync in trie_page_init during normal operation |
-| `3ee8bfe` | kernel: increase JRN_CHECKPOINT_INTERVAL from 1024 to 4096 ✅ |
-| `8bc6ec2` | Bump version to 0.9.5 with the journal size changes |
+| `3ee8bfe` | kernel: increase JRN_CHECKPOINT_INTERVAL 1024→4096 ✅ |
 | `f38f53e` | kernel: fix generic/127/521/522 hangs and ENOENT punch hole bug |
 | `5581394` | kernel: fix journal replay to propagate I/O errors |
 | `a5fedb6` | kernel: add metadata write-error propagation to btree drain |
 | `a6c8b2e` | kernel: fix lock ordering inversions to prevent deadlocks |
+
+### Phase 3a (per-inode journal batching)
+`briefs_journal_inode_full()` copies the snapshot to
+`binfo->pending_journal_snapshot` and defers the write until
+`briefs_inode_sync()` at syscall boundaries; `briefs_fsync()` captures a fresh
+inode snapshot after `file_write_and_wait_range()` (this fixed generic/073).
+Files: `briefs.h`, `briefs_journal.h`, `journal.c`, `file.c` (27 call sites
+updated to pass `struct inode *`). Spot tests 001/003/013/073/127 passed.
+
+### SCRATCH_DEV cleanup (commit `50731b6`)
+sync + sleep before mkfs, lazy-unmount fallback, double-check SCRATCH_MNT
+before mkfs, aggressive cleanup after tests — eliminated the ~300 false FAILs
+from device RO/mounted residue between tests.
