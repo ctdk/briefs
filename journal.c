@@ -490,11 +490,9 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 		struct buffer_head *cpbh = sb_bread(j->vfs_sb, j->checkpoint_block);
 		if (cpbh) {
 			if (buffer_dirty(cpbh)) {
-				sync_dirty_buffer(cpbh);
-				if (briefs_check_meta_write_error(cpbh)) {
+				if (briefs_sync_dirty_buffer(cpbh, j->vfs_sb,
+							      "checkpoint block sync")) {
 					brelse(cpbh);
-					briefs_handle_meta_write_error(j->vfs_sb,
-						"checkpoint block sync");
 					return -EIO;
 				}
 			}
@@ -804,6 +802,7 @@ int briefs_journal_sync_superblock(struct briefs_journal *j)
 	struct super_block *vfs_sb = j->vfs_sb;
 	struct buffer_head *bh;
 	struct briefs_superblock *disk_sb;
+	int err;
 
 	if (!vfs_sb)
 		return -EINVAL;
@@ -844,14 +843,9 @@ int briefs_journal_sync_superblock(struct briefs_journal *j)
 	disk_sb->free_inodes = j->sb->free_inodes;
 
 	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
-	if (briefs_check_meta_write_error(bh)) {
-		briefs_handle_meta_write_error(vfs_sb, "superblock sync");
-		brelse(bh);
-		return -EIO;
-	}
+	err = briefs_sync_dirty_buffer(bh, vfs_sb, "superblock sync");
 	brelse(bh);
-	return 0;
+	return err;
 }
 
 /*
@@ -2170,8 +2164,8 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 		struct buffer_head *bh = sb_bread(j->vfs_sb, pos);
 		if (bh) {
 			if (buffer_dirty(bh)) {
-				sync_dirty_buffer(bh);
-				if (briefs_check_meta_write_error(bh))
+				if (briefs_sync_dirty_buffer(bh, j->vfs_sb,
+							    "journal sync block"))
 					io_err = true;
 			}
 			brelse(bh);
@@ -2185,7 +2179,6 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 
 	if (io_err) {
 		j->synced_pos = j->write_pos;
-		briefs_handle_meta_write_error(j->vfs_sb, "journal sync");
 		return -EIO;
 	}
 

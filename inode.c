@@ -290,9 +290,12 @@ int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
 	mark_buffer_dirty(bh);
 	unlock_buffer(bh);
 
-	if (sync)
-		sync_dirty_buffer(bh);
-	if (briefs_check_meta_write_error(bh)) {
+	if (sync) {
+		if (briefs_sync_dirty_buffer(bh, sb, "persist disk inode")) {
+			ret = -EIO;
+			goto out_release;
+		}
+	} else if (briefs_check_meta_write_error(bh)) {
 		briefs_handle_meta_write_error(sb, "persist disk inode");
 		ret = -EIO;
 		goto out_release;

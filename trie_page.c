@@ -314,26 +314,30 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 	 * and let writeback happen asynchronously - the journal record will carry
 	 * the trie page data if needed for recovery.
 	 */
-	if (bsi->journal && bsi->journal->in_replay) {
-		sync_dirty_buffer(bh);
-	}
-
 	/*
-	 * The underlying device can fail this synchronous write (dm-thin pool
+	 * The underlying device can fail a synchronous write (dm-thin pool
 	 * exhaustion after its no_space_timeout, a failing loop backing store,
-	 * etc.).  Without checking, BrieFS would journal + reference a block
-	 * whose on-disk content is still zero, so every later traversal that
-	 * reads it logs "trie page N has bad magic 0x0" and the dir op fails;
-	 * the caller (briefs_trie_alloc_node) would also re-mark this buffer
-	 * dirty, tripping the kernel's mark_buffer_dirty() write-error WARN.
-	 * Detect the error (clearing dirty+EIO via the shared helper so pdflush
-	 * does not later write stale trie content to the freed block and a future
-	 * re-allocation via briefs_get_zero_block() -- which memsets +
-	 * set_buffer_uptodate + re-dirties -- does not WARN), free the block, and
-	 * propagate -EIO so the caller unwinds (does not insert a dir entry
-	 * pointing at the zeroed page).
+	 * etc.).  During journal replay we sync the page to disk before replay
+	 * continues (see NOTE above); route that sync through
+	 * briefs_sync_dirty_buffer() so a write failure is quiesced (clearing
+	 * dirty+EIO so pdflush does not later write stale trie content to the
+	 * freed block and a future re-allocation via briefs_get_zero_block() --
+	 * which memsets + set_buffer_uptodate + re-dirties -- does not WARN) and
+	 * handled per the errors= policy.  In normal operation the sync is
+	 * skipped (async writeback; the journal record carries the page data for
+	 * recovery), but a stale write-error flag from a prior failed writeback
+	 * is still quiesced and handled here so the caller (briefs_trie_alloc_node)
+	 * does not re-mark this buffer dirty and trip the kernel write-error WARN.
+	 * Either way, free the block and propagate -EIO so the caller unwinds
+	 * (does not insert a dir entry pointing at the zeroed page).
 	 */
-	if (briefs_check_meta_write_error(bh)) {
+	if (bsi->journal && bsi->journal->in_replay) {
+		if (briefs_sync_dirty_buffer(bh, sb, "trie page init")) {
+			briefs_free_block(&bsi->alloc, rel);
+			brelse(bh);
+			return -EIO;
+		}
+	} else if (briefs_check_meta_write_error(bh)) {
 		briefs_handle_meta_write_error(sb, "trie page init");
 		briefs_free_block(&bsi->alloc, rel);
 		brelse(bh);
@@ -785,15 +789,15 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 		 * Sync the now-empty page header to disk before returning the
 		 * block to the allocator.  This prevents a later allocation from
 		 * seeing stale trie metadata in the on-disk block.  A failing
-		 * device (dm-error/dm-thin) can fail this write; clear the
-		 * dirty+EIO flags (the block is being freed, and its next
-		 * allocation memset+re-dirties via briefs_get_zero_block(), so a
-		 * stale on-disk header is overwritten before any reader sees it)
-		 * and warn rather than abort the directory op.
+		 * device (dm-error/dm-thin) can fail this write; route it through
+		 * briefs_sync_dirty_buffer() so the dirty+EIO flags are quiesced
+		 * (the block is being freed, and its next allocation memset +
+		 * re-dirties via briefs_get_zero_block(), so a stale on-disk
+		 * header is overwritten before any reader sees it) and the error
+		 * is handled per the errors= policy.  Warn rather than abort the
+		 * directory op: discard the returned -EIO and continue.
 		 */
-		sync_dirty_buffer(bh);
-		if (briefs_check_meta_write_error(bh))
-			briefs_handle_meta_write_error(sb, "trie free");
+		briefs_sync_dirty_buffer(bh, sb, "trie free");
 		brelse(bh);
 
 		/*

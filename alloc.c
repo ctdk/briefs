@@ -669,6 +669,7 @@ static int briefs_alloc_sync_level(struct briefs_alloc *alloc, u64 *array,
 {
 	u64 level_blocks = (words + words_per_block - 1) / words_per_block;
 	u64 i, j;
+	int err;
 
 	for (i = 0; i < level_blocks; i++) {
 		struct buffer_head *bh;
@@ -696,11 +697,11 @@ static int briefs_alloc_sync_level(struct briefs_alloc *alloc, u64 *array,
 
 		if (dirty) {
 			mark_buffer_dirty(bh);
-			sync_dirty_buffer(bh);
-			if (briefs_check_meta_write_error(bh)) {
-				briefs_handle_meta_write_error(alloc->sb, "alloc bitmap sync");
+			err = briefs_sync_dirty_buffer(bh, alloc->sb,
+							"alloc bitmap sync");
+			if (err) {
 				brelse(bh);
-				return -EIO;
+				return err;
 			}
 		}
 		brelse(bh);
@@ -759,18 +760,18 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 	/* Update the header block's free_count */
 	{
 		struct buffer_head *bh = sb_bread(alloc->sb, alloc->alloc_pool_start);
+		int err;
 		if (bh) {
 			struct alloc_pool_header *hdr = (struct alloc_pool_header *)bh->b_data;
 			hdr->free_count = cpu_to_le64(alloc->free_count);
 			mark_buffer_dirty(bh);
-			sync_dirty_buffer(bh);
-			if (briefs_check_meta_write_error(bh)) {
-				briefs_handle_meta_write_error(alloc->sb, "alloc header sync");
-				brelse(bh);
-				mutex_unlock(&alloc->lock);
-				return -EIO;
-			}
+			err = briefs_sync_dirty_buffer(bh, alloc->sb,
+						       "alloc header sync");
 			brelse(bh);
+			if (err) {
+				mutex_unlock(&alloc->lock);
+				return err;
+			}
 		}
 	}
 

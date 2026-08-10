@@ -1133,9 +1133,7 @@ int briefs_xattr_set(struct inode *inode, const char *name,
 
 	/* Make the chain durable before publishing the inode pointer. */
 	for (i = 0; i < nblocks; i++) {
-		sync_dirty_buffer(bhs[i]);
-		if (briefs_check_meta_write_error(bhs[i])) {
-			briefs_handle_meta_write_error(sb, "xattr chain sync");
+		if (briefs_sync_dirty_buffer(bhs[i], sb, "xattr chain sync")) {
 			ret = -EIO;
 			goto out_chain;
 		}
