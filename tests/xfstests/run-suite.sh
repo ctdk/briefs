@@ -280,7 +280,20 @@ write_archive() {
 # Note: generic/224 and generic/464 used to pass but hung in 2026-08-02 run.
 # They may be intermittent - investigate if time permits.
 # generic/051: requires shutdown support (FS_IOC_FIFREEZE) - hangs on mount.
-# generic/411: mount namespace test - fails fsck after test, cascades to hangs.
+# generic/410: mount namespace / propagation test - PASSES (pure VFS shared-
+# subtree machinery; BrieFS needs no special support). Un-skipped after
+# isolated reproduction confirmed PASS.
+# generic/411: mount namespace + concurrent fsstress - PASSES. Was a
+# memory-safety bug, not a feature gap: the journal record bounds check in
+# __briefs_journal_write_record_locked and the record memcpy were not atomic
+# because the back-pressure checkpoint releases j->write_lock, so a concurrent
+# writer advanced j->write_offset past the checked value and the memcpy
+# overran the 4096-byte cur_block (kmalloc-4k slab-out-of-bounds, pinpointed via
+# KASAN: __briefs_journal_write_record_locked+0x263). On a normal kernel the
+# overflow smashed the adjacent struct briefs_sb_info -> vfree(garbage) oops ->
+# umount died holding s_umount -> every later mount wedged. Fixed by
+# re-validating the record bounds after the lock-releasing checkpoint; see
+# briefs_journal_flush_cur_block_locked() and the re-check loop in journal.c.
 # generic/461: hung on 2026-08-04 run - add to skip list.
 # generic/619: hung on 2026-08-04 run - add to skip list.
 # generic/753: hung on 2026-08-04 run - add to skip list.
@@ -289,7 +302,9 @@ write_archive() {
 # subset, which includes generic/475, in full).  Use the "+set" test so an
 # explicitly empty SKIP_TESTS is honored (a plain := would re-apply this default
 # to an empty value).
-[ -n "${SKIP_TESTS+set}" ] || SKIP_TESTS="generic/051 generic/068 generic/070 generic/074 generic/224 generic/410 generic/411 generic/461 generic/464 generic/475 generic/476 generic/619 generic/753"
+[ -n "${SKIP_TESTS+set}" ] || SKIP_TESTS="generic/051 generic/068 generic/070 \
+generic/074 generic/224 generic/461 generic/464 generic/475 generic/476 \
+generic/619 generic/753"
 
 should_skip() {
     local test="$1"
