@@ -1286,7 +1286,6 @@ void briefs_free_inode(struct inode *inode);
 u64 briefs_alloc_inode(struct super_block *sb);
 void briefs_free_inode_num(struct super_block *sb, u64 ino);
 void briefs_free_inode_data(struct inode *inode);
-u64 briefs_compute_i_blocks(struct super_block *sb, struct briefs_inode *di);
 int briefs_read_extent(struct super_block *sb, struct briefs_inode *di, int index, struct briefs_extent *ext);
 
 /* Find the extent covering logical block @iblock. Dispatches on InodeFlagIndexed
@@ -1357,6 +1356,31 @@ int briefs_btree_for_each_extent(struct super_block *sb, struct briefs_inode *di
 				 int (*cb)(const struct briefs_extent *ext,
 					   void *ctx),
 				 void *ctx);
+
+/* briefs_sum_len_cb - for_each callback accumulating extent length (in blocks)
+ * into the u64 @ctx points at. */
+static inline int briefs_sum_len_cb(const struct briefs_extent *ext, void *ctx)
+{
+	u64 *blocks = ctx;
+	*blocks += ext->len;
+	return 0;
+}
+
+/*
+ * briefs_compute_i_blocks - compute number of 512-byte sectors used by the
+ * data blocks described by an inode's extents. Sums each extent's length in a
+ * single in-order walk of the B+ tree (or the inline array for inline-only
+ * inodes): O(E), no per-extent chain re-walk.  A static inline in the header so
+ * the i_blocks recompute at every write/truncate/setattr site can be inlined.
+ */
+static inline u64 briefs_compute_i_blocks(struct super_block *sb,
+                                           struct briefs_inode *di)
+{
+	struct { u64 blocks; } acc = { .blocks = 0 };
+
+	briefs_btree_for_each_extent(sb, di, briefs_sum_len_cb, &acc);
+	return acc.blocks * (BRIEFS_BLOCK_SIZE / 512);
+}
 
 /* Remove every extent overlapping [start,end) from a tree-backed inode, freeing
  * the data blocks in the overlap. Empty leaves are freed and dropped from their

@@ -281,28 +281,9 @@ int briefs_append_extent_nojournal(struct super_block *sb, struct briefs_inode *
 	return ret;
 }
 
-/* briefs_sum_len_cb - for_each callback accumulating extent length (in blocks)
- * into the u64 @ctx points at. */
-static int briefs_sum_len_cb(const struct briefs_extent *ext, void *ctx)
-{
-	u64 *blocks = ctx;
-	*blocks += ext->len;
-	return 0;
-}
-
-/*
- * briefs_compute_i_blocks - compute number of 512-byte sectors used by the
- * data blocks described by an inode's extents. Sums each extent's length in a
- * single in-order walk of the B+ tree (or the inline array for inline-only
- * inodes): O(E), no per-extent chain re-walk.
- */
-inline u64 briefs_compute_i_blocks(struct super_block *sb, struct briefs_inode *di)
-{
-	struct { u64 blocks; } acc = { .blocks = 0 };
-
-	briefs_btree_for_each_extent(sb, di, briefs_sum_len_cb, &acc);
-	return acc.blocks * (BRIEFS_BLOCK_SIZE / 512);
-}
+/* briefs_sum_len_cb and briefs_compute_i_blocks now live in briefs.h as
+ * static inlines (after the briefs_btree_for_each_extent declaration) so the
+ * per-write/truncate i_blocks recompute can be inlined at the call sites. */
 
 
 
