@@ -218,6 +218,42 @@ static int verify_record_checksum(struct journal_record_hdr *rh, const void *dat
 }
 
 /*
+ * Flush cur_block to disk at the current write position, advance write_pos
+ * (skipping the checkpoint block), and reset cur_block to an empty block ready
+ * for new records.  Sets j->dirty=false to mirror the post-flush state of
+ * briefs_journal_sync(), so a back-pressure checkpoint triggered right after
+ * this sees nothing pending and skips its internal sync (which would
+ * otherwise re-trigger the periodic checkpoint and recurse).  The record
+ * appended by the caller re-sets j->dirty=true at the bottom of
+ * __briefs_journal_write_record_locked().
+ *
+ * Caller holds j->write_lock; this routine does NOT release it
+ * (briefs_journal_write_block only marks the buffer dirty).  The back-pressure
+ * ring-full checkpoint, which DOES release write_lock, is handled separately by
+ * the caller so it never runs between a write_offset bounds check and the
+ * record memcpy that depends on it.
+ */
+static int briefs_journal_flush_cur_block_locked(struct briefs_journal *j)
+{
+	int ret;
+
+	ret = briefs_journal_write_block(j, j->write_pos, j->cur_block);
+	if (ret)
+		return ret;
+
+	j->write_pos = briefs_journal_next_block(j, j->write_pos);
+	if (j->write_pos == j->checkpoint_block)
+		j->write_pos = briefs_journal_next_block(j, j->write_pos);
+
+	memset(j->cur_block, 0, JOURNAL_BLOCK_SIZE);
+	j->cur_hdr->magic = cpu_to_le32(JOURNAL_MAGIC);
+	j->cur_hdr->block_seq = cpu_to_le32(le32_to_cpu(j->cur_hdr->block_seq) + 1);
+	j->write_offset = sizeof(struct journal_block_header);
+	j->dirty = false;
+	return 0;
+}
+
+/*
  * Write a record to the journal.
  * Records are appended sequentially within the current block.
  * If a record doesn't fit, the current block is flushed to disk,
@@ -243,32 +279,18 @@ static int __briefs_journal_write_record_locked(struct briefs_journal *j,
 
 	/* Check if record fits in remaining block space */
 	if (j->write_offset + total_size > JOURNAL_BLOCK_SIZE) {
-		/* Flush current block to disk */
-		int ret = briefs_journal_write_block(j, j->write_pos, j->cur_block);
-		if (ret) return ret;
-
-		/* Advance write position */
-		j->write_pos = briefs_journal_next_block(j, j->write_pos);
-
-		/* Don't clobber the checkpoint block */
-		if (j->write_pos == j->checkpoint_block)
-			j->write_pos = briefs_journal_next_block(j, j->write_pos);
-
-		/* Reset block buffer for new records */
-		memset(j->cur_block, 0, JOURNAL_BLOCK_SIZE);
-		j->cur_hdr->magic = cpu_to_le32(JOURNAL_MAGIC);
-		j->cur_hdr->block_seq = cpu_to_le32(le32_to_cpu(j->cur_hdr->block_seq) + 1);
-		j->write_offset = hdr_size;
 		/*
-		 * cur_block is now empty and the just-flushed block lives only in
-		 * the buffer cache (mark_buffer_dirty, written back by pdflush /
-		 * sync).  Mirror briefs_journal_sync()'s post-flush state so the
-		 * back-pressure checkpoint below sees nothing pending and skips
-		 * its internal sync (which would otherwise re-trigger the periodic
-		 * checkpoint and recurse).  The record we are about to append
-		 * re-sets this true at the bottom of this function.
+		 * Flush current block to disk and reset for new records.  This
+		 * routine does NOT release j->write_lock, but the back-pressure
+		 * checkpoint below DOES (to avoid an AB-BA deadlock with
+		 * alloc->lock), which is why the bounds check that admitted us into
+		 * this flush branch must be re-validated after it -- see the
+		 * re-check loop below the ring-full block.
 		 */
-		j->dirty = false;
+		int ret = briefs_journal_flush_cur_block_locked(j);
+
+		if (ret)
+			return ret;
 
 		/*
 		 * Back-pressure (0a): the live, un-checkpointed region is
@@ -315,6 +337,37 @@ static int __briefs_journal_write_record_locked(struct briefs_journal *j,
 			    le64_to_cpu(j->sb->journal_log_start)) {
 				pr_err("briefs: journal ring exhausted (size=%llu blocks)\n",
 				       j->journal_end - j->journal_start);
+				return -ENOSPC;
+			}
+		}
+		/*
+		 * The back-pressure checkpoint above released j->write_lock while
+		 * flushing metadata.  Concurrent journal writers may therefore have
+		 * appended records to cur_block and advanced j->write_offset past
+		 * the value our bounds check at the top of this flush branch saw (it
+		 * was reset to the block-header size, then grown by other threads).
+		 * Re-verify the record still fits; if the block filled while we were
+		 * away, flush it again.  This runs under write_lock with no further
+		 * lock release, so the record write below is now atomic w.r.t.
+		 * write_offset -- closing the race that caused the kmalloc-4k
+		 * slab-out-of-bounds in this function under concurrent fsstress
+		 * (e.g. generic/411): the check saw a small write_offset, the
+		 * lock-releasing checkpoint let another writer grow it, and the
+		 * memcpy then ran past the 4096-byte cur_block.
+		 *
+		 * A single record always fits in an empty block (every record's
+		 * data_len is <= JOURNAL_BLOCK_SIZE - 2 * sizeof(record header)),
+		 * so this loop runs at most once and cannot itself wrap the ring;
+		 * the post-flush wrap guard is retained for safety against a future
+		 * oversized record type.
+		 */
+		while (j->write_offset + total_size > JOURNAL_BLOCK_SIZE) {
+			ret = briefs_journal_flush_cur_block_locked(j);
+			if (ret)
+				return ret;
+			if (j->write_pos ==
+			    le64_to_cpu(j->sb->journal_log_start)) {
+				pr_err("briefs: journal ring exhausted after back-pressure checkpoint\n");
 				return -ENOSPC;
 			}
 		}
