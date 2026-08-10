@@ -658,6 +658,7 @@ static int replay_inode_update(struct super_block *sb, struct jrn_inode_update *
 {
 	struct briefs_disk_inode *di;
 	struct buffer_head *bh;
+	int err;
 	u64 ino = le64_to_cpu(rec->ino);
 	u32 mode = le32_to_cpu(rec->mode);
 	u32 nlink = le32_to_cpu(rec->nlink);
@@ -702,8 +703,10 @@ static int replay_inode_update(struct super_block *sb, struct jrn_inode_update *
 	di->flags = cpu_to_le32(flags);
 
 	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
+	err = briefs_sync_dirty_buffer(bh, sb, "replay inode update");
 	brelse(bh);
+	if (err)
+		return err;
 
 	pr_debug("briefs: replay restored inode %llu (mode=%o nlink=%u size=%llu)\n",
 		ino, mode, nlink, size);
@@ -860,6 +863,7 @@ static int replay_inode_full(struct super_block *sb, struct jrn_inode_full *rec)
 {
 	struct briefs_disk_inode *di;
 	struct buffer_head *bh;
+	int err;
 	u64 ino = le64_to_cpu(rec->ino);
 
 	bh = briefs_read_inode_block(sb, ino, &di);
@@ -878,8 +882,10 @@ static int replay_inode_full(struct super_block *sb, struct jrn_inode_full *rec)
 
 	memcpy(di, rec->inode_data, sizeof(struct briefs_disk_inode));
 	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
+	err = briefs_sync_dirty_buffer(bh, sb, "replay inode full");
 	brelse(bh);
+	if (err)
+		return err;
 
 	pr_debug("briefs: replay restored full inode %llu\n", ino);
 	return 0;
@@ -896,6 +902,7 @@ static int replay_symlink_data(struct super_block *sb, struct jrn_symlink_data *
 	struct briefs_inode_info *binfo;
 	struct briefs_extent ext;
 	struct buffer_head *bh;
+	int err;
 	u64 ino, phys;
 	u32 len;
 
@@ -934,9 +941,11 @@ static int replay_symlink_data(struct super_block *sb, struct jrn_symlink_data *
 	memset(bh->b_data, 0, sb->s_blocksize);
 	memcpy(bh->b_data, rec->target, len);
 	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
+	err = briefs_sync_dirty_buffer(bh, sb, "replay symlink data");
 	brelse(bh);
 	iput(inode);
+	if (err)
+		return err;
 
 	pr_debug("briefs: replay restored symlink target ino=%llu phys=%llu len=%u\n",
 		 ino, phys, len);
@@ -1181,6 +1190,7 @@ static int replay_xattr_data(struct super_block *sb, struct jrn_xattr_data *rec)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
 	struct buffer_head *bh;
+	int err;
 	u64 phys, ino;
 	u32 used;
 
@@ -1211,8 +1221,10 @@ static int replay_xattr_data(struct super_block *sb, struct jrn_xattr_data *rec)
 	*(__le64 *)(bh->b_data + BRIEFS_BLOCK_SIZE - 2 * sizeof(__u64)) =
 		cpu_to_le64(briefs_chain_checksum(bh->b_data));
 	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
+	err = briefs_sync_dirty_buffer(bh, sb, "replay xattr data");
 	brelse(bh);
+	if (err)
+		return err;
 
 	pr_debug("briefs: replay restored xattr block ino=%llu phys=%llu used=%u\n",
 		 ino, phys, used);
@@ -1604,6 +1616,7 @@ static int replay_reconcile_nlinks(struct super_block *sb)
 		struct buffer_head *bh;
 		struct briefs_replay_nlink *e;
 		u32 expected, old;
+		int err = 0;
 
 		if (!replay_inode_allocated(bsi, ino))
 			continue;
@@ -1630,13 +1643,18 @@ static int replay_reconcile_nlinks(struct super_block *sb)
 		if (old != expected) {
 			di->nlinks = cpu_to_le32(expected);
 			mark_buffer_dirty(bh);
-			sync_dirty_buffer(bh);
-			patched++;
-			pr_debug("briefs: replay reconciled nlink ino=%llu %u -> %u\n",
-			         ino, old, expected);
+			err = briefs_sync_dirty_buffer(bh, sb,
+						      "replay nlink reconcile");
+			if (!err) {
+				patched++;
+				pr_debug("briefs: replay reconciled nlink ino=%llu %u -> %u\n",
+				         ino, old, expected);
+			}
 		}
 
 		brelse(bh);
+		if (err)
+			return err;
 
 		if ((ino & 4095) == 0)
 			cond_resched();

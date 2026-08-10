@@ -355,6 +355,7 @@ static int briefs_promote_inline_data(struct inode *inode)
 	struct briefs_inode_info *binfo = briefs_i(inode);
 	u64 old_size = inode->i_size;
 	u64 rel, phys;
+	int err;
 	struct buffer_head *bh;
 
 	if (!(binfo->disk_inode.flags & InodeFlagInlineData))
@@ -381,8 +382,12 @@ static int briefs_promote_inline_data(struct inode *inode)
 	memset(bh->b_data, 0, inode->i_sb->s_blocksize);
 	memcpy(bh->b_data, binfo->disk_inode.inline_data, old_size);
 	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
+	err = briefs_sync_dirty_buffer(bh, inode->i_sb, "promote inline data");
 	brelse(bh);
+	if (err) {
+		briefs_free_block(&bsi->alloc, rel);
+		return err;
+	}
 
 	write_seqcount_begin(&binfo->extent_seq);
 	binfo->disk_inode.flags &= ~InodeFlagInlineData;
@@ -1347,14 +1352,15 @@ static bool briefs_block_mapped(struct inode *inode, u64 iblock)
 static int briefs_zero_block(struct super_block *sb, u64 abs_block)
 {
 	struct buffer_head *bh;
+	int err;
 
 	bh = briefs_get_zero_block(sb, abs_block);
 	if (!bh)
 		return -EIO;
 	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
+	err = briefs_sync_dirty_buffer(bh, sb, "zero block");
 	brelse(bh);
-	return 0;
+	return err;
 }
 
 /*

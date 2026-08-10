@@ -1398,6 +1398,30 @@ struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
                                              struct briefs_disk_inode **di);
 bool briefs_check_meta_write_error(struct buffer_head *bh);
 void briefs_handle_meta_write_error(struct super_block *sb, const char *ctx);
+
+/* Synchronously write back @bh and surface a metadata write error through the
+ * central chokepoint: sync_dirty_buffer() + briefs_check_meta_write_error()
+ * (which quiesces the buffer, clearing BH_Dirty/BH_Write_EIO so the next
+ * mark_buffer_dirty() does not trip the kernel write-error WARN) +
+ * briefs_handle_meta_write_error() (which logs and applies the errors= mount
+ * policy).  Returns 0 on success, -EIO on a write error.  The wrapper does
+ * NOT brelse(@bh): the caller owns the buffer lifetime and must release it on
+ * both the success and error paths.  This is the single metadata write-back
+ * chokepoint every caller should route through instead of an open-coded
+ * sync_dirty_buffer() that silently ignores the write-error flag.
+ */
+static inline int briefs_sync_dirty_buffer(struct buffer_head *bh,
+					    struct super_block *sb,
+					    const char *ctx)
+{
+	sync_dirty_buffer(bh);
+	if (briefs_check_meta_write_error(bh)) {
+		briefs_handle_meta_write_error(sb, ctx);
+		return -EIO;
+	}
+	return 0;
+}
+
 bool briefs_sb_shutdown(struct super_block *sb);
 int briefs_shutdown(struct super_block *sb, u32 flags);
 const char *briefs_error_policy_name(struct super_block *sb);
