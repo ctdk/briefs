@@ -76,7 +76,7 @@ btree_read_node(struct super_block *sb, u64 block, bool trust_verified,
 	 * NULL, __bread_gfp retries forever with no signal-check point). Reject
 	 * it before the read instead of wedging the box.
 	 */
-	if (block >= (bdev_nr_bytes(sb->s_bdev) >> sb->s_blocksize_bits)) {
+	if (!briefs_block_in_range(sb, block)) {
 		pr_warn_ratelimited("briefs: btree: node %llu out of range\n", block);
 		return NULL;
 	}
@@ -1612,7 +1612,7 @@ static int btree_drain_subtree(struct super_block *sb, u64 block, u64 *cap)
 		return 0;
 	(*cap)--;
 
-	if (block >= (bdev_nr_bytes(sb->s_bdev) >> sb->s_blocksize_bits)) {
+	if (!briefs_block_in_range(sb, block)) {
 		pr_debug("briefs: btree drain: node %llu out of range\n", block);
 		return 0;
 	}

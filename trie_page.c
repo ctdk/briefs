@@ -170,7 +170,7 @@ struct buffer_head *briefs_trie_read_page(struct super_block *sb, u64 node_ref,
 	 * NULL, __bread_gfp retries forever with no signal-check point), so reject
 	 * it here instead of looping the whole box into an unkillable wedge.
 	 */
-	if (block >= (bdev_nr_bytes(sb->s_bdev) >> sb->s_blocksize_bits))
+	if (!briefs_block_in_range(sb, block))
 		return ERR_PTR(-EIO);
 
 	bh = sb_bread(sb, block);
@@ -208,7 +208,7 @@ struct buffer_head *briefs_trie_get_page(struct super_block *sb, u64 node_ref,
 	if (slot >= TRIE_SLOTS_PER_BLOCK)
 		return ERR_PTR(-EINVAL);
 
-	if (block >= (bdev_nr_bytes(sb->s_bdev) >> sb->s_blocksize_bits))
+	if (!briefs_block_in_range(sb, block))
 		return ERR_PTR(-EIO);
 
 	bh = sb_getblk(sb, block);

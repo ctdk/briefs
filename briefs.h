@@ -8,6 +8,7 @@
 #include <linux/types.h>
 #include <linux/stddef.h>
 #include <linux/blk_types.h>
+#include <linux/blkdev.h>
 #include <linux/buffer_head.h>
 #include <linux/unaligned.h>
 #include <linux/atomic.h>
@@ -914,6 +915,20 @@ static inline int briefs_validate_trie_ref(struct super_block *sb, u64 ref)
 		return -EINVAL;
 
 	return 0;
+}
+
+/*
+ * Report whether a block number names a real block on the backing device.
+ * A stale or corrupt on-disk pointer can name a block past the device end,
+ * and sb_bread()/sb_getblk() of such a block busy-loop unkillably
+ * (grow_buffers returns NULL and __bread_gfp retries forever with no
+ * signal-check point), so every read of a block derived from on-disk
+ * metadata must be gated by this check first. Returns true for an
+ * in-range block, false for one at or past the device end.
+ */
+static inline bool briefs_block_in_range(struct super_block *sb, u64 block)
+{
+	return block < (bdev_nr_bytes(sb->s_bdev) >> sb->s_blocksize_bits);
 }
 
 /*
