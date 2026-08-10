@@ -1497,6 +1497,24 @@ static inline void briefs_set_new_inode_times(struct inode *inode,
 	di->creation_time_nsec = inode->i_ctime_nsec;
 }
 
+/* Mirror the VFS-derived non-timestamp fields (mode/uid/gid/nlinks) into the
+ * in-memory CPU-endian disk inode.  Used after a setattr (chown/chmod/etc)
+ * or write_inode so a later operation that journals from binfo->disk_inode
+ * emits the current values, not stale ones (generic/547: a chown'd directory's
+ * uid/gid reverted to 0 after crash+replay because a later child create
+ * re-journaled the parent from the stale in-memory disk inode).  filesize is
+ * NOT mirrored here: it is extent-seqcount-protected and updated separately at
+ * the write/truncate sites.
+ */
+static inline void briefs_sync_inode_fields(struct inode *inode,
+                                            struct briefs_inode *di)
+{
+	di->filemode = inode->i_mode;
+	di->uid = from_kuid(&init_user_ns, inode->i_uid);
+	di->gid = from_kgid(&init_user_ns, inode->i_gid);
+	di->nlinks = inode->i_nlink;
+}
+
 /* Update a parent directory after adding/removing an entry */
 int briefs_update_parent_dir(struct inode *dir, struct briefs_sb_info *bsi,
                               ssize_t size_delta, int link_delta);

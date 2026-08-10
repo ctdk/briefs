@@ -1253,10 +1253,7 @@ out_copy:
 	 * re-journaled the parent from the stale in-memory disk inode).
 	 */
 	setattr_copy(idmap, inode, attr);
-	binfo->disk_inode.filemode = inode->i_mode;
-	binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
-	binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);
-	binfo->disk_inode.nlinks = inode->i_nlink;
+	briefs_sync_inode_fields(inode, &binfo->disk_inode);
 	briefs_sync_inode_times(inode, &binfo->disk_inode);
 	mark_inode_dirty(inode);
 	ret = briefs_inode_sync(inode);

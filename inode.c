@@ -735,10 +735,7 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	 * write outside the retry loop is safe; cpu_inode_to_disk above already
 	 * snapshotted the extent fields under the seqcount.
 	 */
-	binfo->disk_inode.filemode = inode->i_mode;
-	binfo->disk_inode.uid = from_kuid(&init_user_ns, inode->i_uid);
-	binfo->disk_inode.gid = from_kgid(&init_user_ns, inode->i_gid);
-	binfo->disk_inode.nlinks = inode->i_nlink;
+	briefs_sync_inode_fields(inode, &binfo->disk_inode);
 
 	/*
 	 * Log the complete on-disk inode snapshot for crash recovery.
