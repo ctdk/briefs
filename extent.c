@@ -236,24 +236,23 @@ int briefs_clear_extent_unwritten(struct inode *inode, u64 iblock)
 }
 
 /*
- * briefs_append_extent - insert an extent into the index.  Takes the per-inode
- * extent lock and calls the locked tree/inline mutator.  This is the entry
- * point for callers that are not already holding the lock.  Returns 0 or
- * -errno; on success logs a full inode snapshot so replay restores the extent
- * metadata exactly.
+ * briefs_append_extent - insert an extent into the index and journal it.  This
+ * is the entry point for callers that are not already holding the extent lock.
+ * Returns 0 or -errno; on success logs a full inode snapshot so replay
+ * restores the extent metadata exactly.  The lock/insert/unlock is shared with
+ * briefs_append_extent_nojournal (which callers handling a batch of inserts use
+ * to avoid one journal record per extent).
  */
 int briefs_append_extent(struct super_block *sb, struct briefs_inode *di,
                          struct briefs_extent *ext)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
-	struct briefs_inode_info *binfo;
+	struct briefs_inode_info *binfo =
+		container_of(di, struct briefs_inode_info, disk_inode);
 	struct briefs_disk_inode disk_di;
 	int ret;
 
-	binfo = container_of(di, struct briefs_inode_info, disk_inode);
-	mutex_lock(&binfo->extent_lock);
-	ret = briefs_btree_insert_locked(sb, di, ext);
-	mutex_unlock(&binfo->extent_lock);
+	ret = briefs_append_extent_nojournal(sb, di, ext);
 	if (ret)
 		return ret;
 
