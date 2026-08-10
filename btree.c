@@ -172,53 +172,87 @@ static int btree_leaf_find_pos(const struct briefs_extent_btree_node *n,
 	return num_keys;
 }
 
-/* Binary-search-free lookup: descend the tree for the extent covering @iblock.
- * Returns 0 and fills *ext, -ENOENT, or -EIO. */
-static int btree_lookup_block(struct super_block *sb, u64 block, u64 iblock,
-			      struct briefs_extent *ext, bool trust_verified)
+/* Leaf callback: invoked once the descent reaches the leaf whose subtree holds
+ * @iblock. @node is the mapped leaf node (in @bh->b_data); @ctx is the caller's
+ * context. Returns 0, -ENOENT, or -EIO. The helper owns bh lifetime and brelse's
+ * after the callback returns, so the callback must NOT brelse(bh) (it may use bh
+ * for a commit, which only marks dirty). */
+typedef int (*btree_leaf_cb)(struct briefs_extent_btree_node *node,
+			     struct buffer_head *bh, u64 iblock, void *ctx);
+
+/* Leaf callback for the lookup walk: scan the leaf for the extent covering
+ * @iblock and fill *@ext. Returns 0, -ENOENT if none covers it. */
+static int btree_lookup_leaf(struct briefs_extent_btree_node *node,
+			     struct buffer_head *bh, u64 iblock, void *ctx)
+{
+	struct briefs_extent *ext = ctx;
+	int i, num_keys = le16_to_cpu(node->hdr.num_keys);
+
+	for (i = 0; i < num_keys; i++) {
+		struct briefs_disk_extent *de = &node->u.leaf.extents[i];
+		u64 off = le64_to_cpu(de->offset);
+		u64 len = le64_to_cpu(de->len);
+
+		if (iblock >= off && iblock < off + len) {
+			briefs_disk_extent_to_cpu(de, ext);
+			return 0;
+		}
+		if (off > iblock)
+			break;	/* sorted: no later extent can cover it */
+	}
+	return -ENOENT;
+}
+
+/* Descend the B+ tree to the leaf whose subtree holds @iblock and invoke @cb to
+ * perform the leaf-specific work. The internal-node descent skeleton (read
+ * node, find the child whose subtree holds @iblock, null-check, recurse) is
+ * shared by the lookup and clear_unwritten walks, which differ only in their
+ * leaf behavior; @cb supplies that. The helper owns bh lifetime: it brelse's
+ * after @cb returns on the leaf path and before recursing on the internal path.
+ * Returns @cb's result (0/-ENOENT) or -EIO on a read or null-child failure.
+ *
+ * btree_lower_bound_block is NOT routed here: its leaf work (scan for the first
+ * extent with offset > @iblock, then follow next_leaf once with a stale-linkage
+ * re-scan) is too different from a single leaf callback to share cleanly. */
+static int btree_descend_to_leaf(struct super_block *sb, u64 block, u64 iblock,
+				 btree_leaf_cb cb, void *ctx, bool trust_verified)
 {
 	struct buffer_head *bh;
 	struct briefs_extent_btree_node *node;
-	int ret;
+	int p;
+	u64 child;
 
 	node = btree_read_node(sb, block, trust_verified, &bh);
 	if (!node)
 		return -EIO;
 
 	if (btree_node_is_leaf(node)) {
-		int i, num_keys = le16_to_cpu(node->hdr.num_keys);
+		int ret = cb(node, bh, iblock, ctx);
 
-		for (i = 0; i < num_keys; i++) {
-			struct briefs_disk_extent *de = &node->u.leaf.extents[i];
-			u64 off = le64_to_cpu(de->offset);
-			u64 len = le64_to_cpu(de->len);
-
-			if (iblock >= off && iblock < off + len) {
-				briefs_disk_extent_to_cpu(de, ext);
-				brelse(bh);
-				return 0;
-			}
-			if (off > iblock)
-				break;	/* sorted: no later extent can cover it */
-		}
 		brelse(bh);
-		return -ENOENT;
-	}
-
-	{
-		int p = btree_internal_find_child(node, iblock);
-		u64 child = (p < le16_to_cpu(node->hdr.num_keys))
-			    ? le64_to_cpu(node->u.internal.idx[p].child)
-			    : le64_to_cpu(node->u.internal.trailing_child);
-		brelse(bh);
-		if (child == 0) {
-			pr_err("briefs: btree: internal node %llu has null child\n",
-			       block);
-			return -EIO;
-		}
-		ret = btree_lookup_block(sb, child, iblock, ext, trust_verified);
 		return ret;
 	}
+
+	p = btree_internal_find_child(node, iblock);
+	child = (p < le16_to_cpu(node->hdr.num_keys))
+		? le64_to_cpu(node->u.internal.idx[p].child)
+		: le64_to_cpu(node->u.internal.trailing_child);
+	brelse(bh);
+	if (child == 0) {
+		pr_err("briefs: btree: internal node %llu has null child\n",
+		       block);
+		return -EIO;
+	}
+	return btree_descend_to_leaf(sb, child, iblock, cb, ctx, trust_verified);
+}
+
+/* Lookup: descend to the leaf covering @iblock and return the matching extent.
+ * Returns 0 and fills *ext, -ENOENT, or -EIO. */
+static int btree_lookup_block(struct super_block *sb, u64 block, u64 iblock,
+			      struct briefs_extent *ext, bool trust_verified)
+{
+	return btree_descend_to_leaf(sb, block, iblock, btree_lookup_leaf, ext,
+				     trust_verified);
 }
 
 /* Lower-bound descent: find the first extent with offset > @iblock (the extent
@@ -326,57 +360,44 @@ int briefs_btree_lookup(struct super_block *sb, u64 root_block, u64 iblock,
 	return btree_lookup_block(sb, root_block, iblock, ext, trust_verified);
 }
 
-/* Descend to the leaf covering @iblock and clear BRIEFS_EXT_UNWRITTEN on the
- * matching extent record in place (no split, no block free).  Caller holds
- * extent_lock, so we may read nodes with trust_verified=true.  Returns 0 if
- * converted, -ENOENT if no extent covers @iblock, -EIO on a read failure. */
+/* Leaf callback for the clear_unwritten walk: scan the leaf for the extent
+ * covering @iblock and clear BRIEFS_EXT_UNWRITTEN in place (no split, no block
+ * free).  Caller holds extent_lock, so trust_verified=true is threaded through
+ * the descent.  Returns 0 if converted (or already written), -ENOENT if no
+ * extent covers @iblock. */
+static int btree_clear_unwritten_leaf(struct briefs_extent_btree_node *node,
+				      struct buffer_head *bh, u64 iblock,
+				      void *ctx)
+{
+	int i, num_keys = le16_to_cpu(node->hdr.num_keys);
+
+	for (i = 0; i < num_keys; i++) {
+		struct briefs_disk_extent *de = &node->u.leaf.extents[i];
+		u64 off = le64_to_cpu(de->offset);
+		u64 len = le64_to_cpu(de->len);
+
+		if (iblock >= off && iblock < off + len) {
+			if (le32_to_cpu(de->flags) & BRIEFS_EXT_UNWRITTEN) {
+				de->flags = cpu_to_le32(
+					le32_to_cpu(de->flags) &
+					~BRIEFS_EXT_UNWRITTEN);
+				btree_commit_node(bh);
+			}
+			return 0;
+		}
+		if (off > iblock)
+			break;	/* sorted: no later extent can cover it */
+	}
+	return -ENOENT;
+}
+
+/* Clear BRIEFS_EXT_UNWRITTEN on the extent covering @iblock.  Caller holds
+ * extent_lock (trust_verified=true).  Returns 0, -ENOENT, or -EIO. */
 static int btree_clear_unwritten_block(struct super_block *sb, u64 block,
 					u64 iblock)
 {
-	struct buffer_head *bh;
-	struct briefs_extent_btree_node *node;
-	int ret;
-
-	node = btree_read_node(sb, block, true, &bh);
-	if (!node)
-		return -EIO;
-
-	if (btree_node_is_leaf(node)) {
-		int i, num_keys = le16_to_cpu(node->hdr.num_keys);
-
-		for (i = 0; i < num_keys; i++) {
-			struct briefs_disk_extent *de = &node->u.leaf.extents[i];
-			u64 off = le64_to_cpu(de->offset);
-			u64 len = le64_to_cpu(de->len);
-
-			if (iblock >= off && iblock < off + len) {
-				if (le32_to_cpu(de->flags) & BRIEFS_EXT_UNWRITTEN) {
-					de->flags = cpu_to_le32(
-						le32_to_cpu(de->flags) &
-						~BRIEFS_EXT_UNWRITTEN);
-					btree_commit_node(bh);
-				}
-				brelse(bh);
-				return 0;
-			}
-			if (off > iblock)
-				break;	/* sorted: no later extent can cover it */
-		}
-		brelse(bh);
-		return -ENOENT;
-	}
-
-	{
-		int p = btree_internal_find_child(node, iblock);
-		u64 child = (p < le16_to_cpu(node->hdr.num_keys))
-			    ? le64_to_cpu(node->u.internal.idx[p].child)
-			    : le64_to_cpu(node->u.internal.trailing_child);
-		brelse(bh);
-		if (child == 0)
-			return -EIO;
-		ret = btree_clear_unwritten_block(sb, child, iblock);
-		return ret;
-	}
+	return btree_descend_to_leaf(sb, block, iblock,
+				     btree_clear_unwritten_leaf, NULL, true);
 }
 
 int briefs_btree_clear_unwritten(struct super_block *sb, struct briefs_inode *di,
