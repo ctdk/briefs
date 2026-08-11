@@ -1,4 +1,4 @@
-- Broader test coverage (e.g., xfstests integration, crash-consistency tests)
+- [Done] Broader test coverage (e.g., xfstests integration, crash-consistency tests)
 - Annotate the source code thoroughly once things are more stable
 - Move away from any deprecated kernel functions BrieFS may be using. Likely to
   come naturally as it's updated to work with newer kernels, but still needs
@@ -10,8 +10,8 @@
 - POSIX ACLs
 - online resize (or any resize)
 - extend inode map/add inodes to existing volume
-- Make journal size configurable.
-- Make default journal size scale according to the size of the volume.
+- [Done] Make journal size configurable.
+- [Done] Make default journal size scale according to the size of the volume.
 
 Much further down the list, if ever, items:
 - Optional data journaling

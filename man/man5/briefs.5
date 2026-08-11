@@ -1,6 +1,6 @@
 .\" BrieFS on-disk format man page
 .\" To install: cp briefs.5 /usr/share/man/man5/ ; mandb
-.TH BRIEFS 5 "2026-06-21" "BrieFS v0.9.3" "File formats"
+.TH BRIEFS 5 "2026-08-11" "BrieFS v0.9.6" "File formats"
 .SH NAME
 briefs \- the BrieFS extents-and-tries filesystem on-disk format
 .SH DESCRIPTION
@@ -12,7 +12,7 @@ This manual describes the on-disk format used by BrieFS volumes created with
 .BR mkfs.briefs (8)
 and checked with
 .BR fsck.briefs (8).
-The authoritative version is v0.9.3.
+The authoritative version is v0.9.6.
 .SH OVERVIEW
 A BrieFS volume is laid out as a sequence of fixed-size blocks, defaulting to
 4096 bytes.  Block addresses are absolute 64-bit block numbers starting at 0.
@@ -133,7 +133,8 @@ An inode record contains:
     416       8   dir_trie_root
     424       8   rdev
     432       8   generation
-    440      72   reserved
+    440       4   user_flags     chattr/lsattr flags (FS_*_FL bits)
+    444      68   reserved
 .fi
 .PP
 The inline region may hold either up to 8 inline extent records (32 bytes each)
@@ -386,24 +387,29 @@ and
 .RB ( system.posix_acl_access / system.posix_acl_default )
 are not supported.
 .PP
-Each inode may own at most one external 4096-byte xattr block, allocated from
-the data block pool (the same allocator that backs directory-trie pages and
-B+ tree nodes) and referenced by the inode's
+Each inode may own one or more chained external 4096-byte xattr blocks,
+allocated from the data block pool (the same allocator that backs
+directory-trie pages and B+ tree nodes) and referenced by the inode's
 .B xattr_offset
-(absolute block number; 0 means no block) and
+(absolute block number of the first block; 0 means no block) and
 .B xattr_size
-(bytes of the block actually in use).  There is no inline xattr storage in
-the inode.
+(bytes used in the first block).  Large values are split across
+continuation blocks linked by the
+.B next_block
+header field.  There is no inline xattr storage in the inode.
 .PP
 The block is a flat BrieFS-native layout (not ext2's bidirectional fill):
 .PP
 .nf
     Offset  Size   Field
       0       4    magic          0x58415454 ("XATT")
-      4       4    version        1
+      4       4    version        2 (v1 blocks are accepted for compatibility)
       8       4    used_size      header + entries + name/value bytes
      12       4    entry_count
-     16     8*N    briefs_xattr_entry[entry_count]
+     16       8    next_block     absolute block of next xattr block (0 = none)
+     24       4    flags          bit 0 = BRIEFS_XATTR_FLAG_CONT (block continues prior value)
+     28       4    reserved       zero
+     32     8*N    briefs_xattr_entry[entry_count]   (v2; v1 starts at 16)
    ...           name/value bytes (4-byte aligned)
    4080      8    CRC32C over [0,4080)
    4088      8    slack

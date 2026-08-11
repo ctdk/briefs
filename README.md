@@ -84,7 +84,7 @@ Since trying out AI assisted coding was part of the reason for this in the first
 SUPPORTED KERNEL VERSIONS
 -------------------------
 
-For certain values of "support", anyway. As of this writing, all BrieFS development is being done using the Debian Linux kernel version 6.12.48 or 6.12.90 (in other words, the default on trixie when I set things up). Once it gets far enough along, it will jump up to track the current `linux` git repo. Other kernel versions and specific distro kernels may come as time and interest permit and dictate.
+For certain values of "support", anyway. As of this writing, all BrieFS development is being done using the Debian Linux kernel version 6.12.101 (in other words, the default on trixie when I set things up). Once it gets far enough along, it will jump up to track the current `linux` git repo. Other kernel versions and specific distro kernels may come as time and interest permit and dictate.
 
 BUGS
 ----
@@ -141,7 +141,7 @@ DEFINITELY MISSING OR BROKEN
 * No POSIX ACLs, quotas, reflink/COW, fscrypt, fsverity, or online resize.
   Extended attributes (user, trusted, and security namespaces), direct I/O, and
   chattr/lsattr inode flags are supported.
-* FUSE implementation (requires less commitment than the kernel module). A read-only FUSE bridge exists via briefs-utils; read-write FUSE is not yet implemented.
+* FUSE implementation (requires less commitment than the kernel module). An experimental read-write FUSE bridge exists via briefs-utils (`fuse.briefs`), with full kernel parity (all dir/file ops, xattrs, fileattr/chattr, renameat2, fallocate/setattr/killpriv) and a Go port of the kernel journal, but it has not yet been tested across the full xfstests suite. See the `xfstests-fuse-status.md` document in `briefs-utils` for the current pass/fail record and known issues.
 * Thorough annotations - Annotating the source code thoroughly will wait until things settle down. Right now everything's still in constant flux, so there's no point thoroughly annotating something that may change unrecognizably or flat out disappear soon.
 * Refactoring. Since BrieFS is partly a project to learn about using AI assistance while coding, even though I've been reviewing what it's doing there's definitely some weirdness and clunkiness that needs to be gussied up and organized so it's easier to understand. This will go nicely hand in hand with the annotation project above.
 
