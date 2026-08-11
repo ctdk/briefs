@@ -5,7 +5,7 @@ what remains. The top section is current; the refactor-round-1 history below
 is kept as a record. Branch of record: `refactor-round-2` (11 commits ahead of
 `master` as of 2026-08-10).
 
-## Current state (refactor-round-2, 2026-08-10)
+## Current state (refactor-round-2, 2026-08-11)
 
 ### Branch contents (11 ahead of master)
 - **iomap data-path migration** — DONE. The regular-file data path moved off
@@ -25,7 +25,11 @@ is kept as a record. Branch of record: `refactor-round-2` (11 commits ahead of
 - **FUSE read/write bridge** — works (`c3f4670`…`c794549`). A per-op block
   cache is the key insight. The FUSE xfstests subset harness was fixed (it had
   been mounting via the kernel module, not `fuse.briefs`).
-- **generic/411 fix (this session)** — `fb176b8` + `67ab528` (see below).
+- **generic/411 fix (prior session)** — `fb176b8` + `67ab528` (see below).
+- **4b investigation (prior session)** — researched whether to move metadata
+  off `buffer_head`; conclusion: **reject 4b as written**, reframe to
+  "journal-owned metadata buffer lifetimes". See task table + full report at
+  `~/src/briefs-notes/4b-metadata-off-buffer_head-plan.md`.
 
 ### generic/411 + 410 — RESOLVED this session
 generic/410 and generic/411 (mount-namespace / propagation tests) were
@@ -62,14 +66,14 @@ long-skipped. Both are now un-skipped and PASS.
   - **generic/563** — 6.12.y kernel cgroup-writeback race (CVE-2026-31703),
     not a BrieFS bug; `SB_I_CGROUPWB` was dropped (`9385fc8`).
 
-## Remaining tasks — evaluated 2026-08-10
+## Remaining tasks — evaluated 2026-08-11
 
 | Task | Status | Current reality |
 |------|--------|-----------------|
 | 3a per-inode journal batching | ✅ DONE | refactor-round-1; deferred `JRN_INODE_FULL` + fsync snapshot. |
 | 3b checkpoint interval | ✅ DONE | `3ee8bfe` (1024→4096). |
 | 4a xattr lock ordering | ⏳ PENDING | Still **documented-only** — the `xattr_sem → alloc->lock` inversion note + TODO remain in `xattr.c:24-28`; refactor (alloc before `xattr_sem`) not done. Low priority: provably safe today (no path takes `alloc->lock → xattr_sem`). |
-| 4b metadata off buffer_heads | ⏳ NOT STARTED | Long-term architectural change. Note the **data** path is now iomap; only metadata (btree/trie/inode/journal) still uses `buffer_head`. |
+| 4b metadata off buffer_heads | ❌ REJECTED (reframed) | Investigated; **do NOT move metadata off `buffer_head`.** iomap has no metadata API (by design — Chinner: "never intended for metadata use"); bespoke alternatives (XFS `xfs_buf`, Btrfs, bcachefs) are all ~22k lines, larger than BrieFS's whole module; no filesystem has migrated existing metadata off bh. BrieFS's "iomap data + bh metadata" split IS the destination (GFS2 in-tree precedent; ext4 converging there; LSFMM 2023). **Reframed successor:** harden the bh-metadata layer by borrowing GFS2's `gfs2_bufdata` (off `bh->b_private`) + `BH_Pinned` pattern so the journal owns metadata bh lifetimes — addresses the real recurring bugs (8 unchecked `sync_dirty_buffer` sites, 18 dropped persist `-EIO`s, generic/475 umount-redirty-EIO wedge). 4-phase plan (Phase 1 `briefs_bufdata`; Phase 2 `BH_Pinned`; Phase 3 error funnel + fsync ordering; Phase 4 deferred folio cache only if `CONFIG_BUFFER_HEAD` pressure forces it). Full report: `~/src/briefs-notes/4b-metadata-off-buffer_head-plan.md`. |
 | 4c mount namespaces (410/411) | ✅ DONE | This session: 410 un-skipped (VFS-handled); 411 = memory-safety bug FIXED `fb176b8`; both un-skipped `67ab528`. |
 | 5a generic/127 mmap/fsx wedge | ⚠️ DEFERRED | **Intermittent.** Passes in Jul-13 / Aug-2 full runs but exhibits a pre-existing silent full-VM freeze under fsx+mmap at other times (needs `virsh destroy` to recover). Root cause UNPINNED (no trace; `CONFIG_LOCKDEP` not enabled). Not the iomap migration's fault. Not in skip list. Needs lockdep or journal/writeback decoupling. See memory `briefs-generic-127-fsx-mmap-wedge-preexisting`. |
 | 5b generic/299 btree corruption | ✅ DONE | `e59c1e4` (zero stale btree tail entries). |
