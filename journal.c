@@ -27,6 +27,104 @@ static int __briefs_journal_write_record_locked(struct briefs_journal *j,
 	enum journal_record_type type, void *data, u32 data_len);
 static int __briefs_journal_checkpoint_locked(struct briefs_journal *j);
 static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoint);
+
+/*
+ * briefs_journal_track - record a dirty metadata block in the owned set.
+ *
+ * Called from briefs_mark_buffer_dirty() at dirty time.  Non-sleeping
+ * (owned_lock is a leaf spinlock; GFP_ATOMIC preserves mark_buffer_dirty's
+ * "may run in any context" contract, even though all current BrieFS callers
+ * hold a sleeping mutex).  Dedups: a block already present is skipped.  On
+ * kmalloc failure the block is simply not tracked -- it stays dirty in the
+ * page cache; the only consequence is that briefs_journal_flush_owned() will
+ * not write it back per-buffer, so under the (vanishingly rare for a 16-byte
+ * GFP_ATOMIC alloc) failure a metadata block could miss the targeted flush.
+ * We accept that gap rather than keep a looping sync_blockdev() backstop,
+ * which would re-introduce the generic/475 umount-redirty-EIO hang this
+ * machinery exists to close.
+ */
+void briefs_journal_track(struct briefs_journal *j, u64 block)
+{
+	struct briefs_owned_block *ob;
+
+	if (!j)
+		return;
+
+	spin_lock(&j->owned_lock);
+	hash_for_each_possible(j->owned_blocks, ob, node, block) {
+		if (ob->block == block)
+			goto out;		/* already tracked */
+	}
+	ob = kmalloc(sizeof(*ob), GFP_ATOMIC);
+	if (ob) {
+		ob->block = block;
+		hash_add(j->owned_blocks, &ob->node, block);
+	}
+out:
+	spin_unlock(&j->owned_lock);
+}
+
+/*
+ * briefs_journal_flush_owned - write back every tracked dirty metadata block
+ * per-buffer, loop-free, and free the tracking entries.
+ *
+ * Replaces the coarse looping sync_blockdev() at BrieFS's sync points.  The
+ * owned set is DRAINED under owned_lock (concurrent dirtiers attach to the
+ * now-empty table), then each block is read back from the buffer cache and
+ * written once via briefs_sync_dirty_buffer(): on a write error that helper
+ * quiesces the buffer (clearing BH_Dirty/BH_Write_EIO so it is not
+ * re-submitted and redirtied) and applies the errors= policy.  This is the
+ * generic/475 fix -- unlike sync_blockdev(), which re-submits and redirties
+ * an EIO buffer forever (umount hang), each buffer gets exactly one write
+ * and is then quiesced.  sb_bread() of an in-cache buffer is a cheap lookup
+ * (no I/O); of an evicted clean block is one read (rare, and those are not
+ * the EIO-wedged buffers).  Eviction is safe because the set holds block
+ * NUMBERS, not buffer_head pointers.  Returns 0 on success, -EIO if any
+ * metadata write failed.
+ */
+int briefs_journal_flush_owned(struct briefs_journal *j)
+{
+	HLIST_HEAD(batch);
+	struct briefs_owned_block *ob;
+	struct hlist_node *tmp;
+	int bkt;
+	int ret = 0;
+
+	if (!j || !j->vfs_sb)
+		return 0;
+
+	/*
+	 * Drain the owned set into a local list under owned_lock.  Concurrent
+	 * briefs_journal_track() callers now insert into the emptied table, so
+	 * the drained batch is exactly the pre-flush set -- the equivalent of
+	 * a table swap for an embedded DECLARE_HASHTABLE.
+	 */
+	spin_lock(&j->owned_lock);
+	hash_for_each_safe(j->owned_blocks, bkt, tmp, ob, node) {
+		hash_del(&ob->node);
+		hlist_add_head(&ob->node, &batch);
+	}
+	spin_unlock(&j->owned_lock);
+
+	hlist_for_each_entry_safe(ob, tmp, &batch, node) {
+		struct buffer_head *bh = sb_bread(j->vfs_sb, ob->block);
+
+		if (bh) {
+			if (buffer_dirty(bh) &&
+			    briefs_sync_dirty_buffer(bh, j->vfs_sb,
+						     "owned flush"))
+				ret = -EIO;
+			brelse(bh);
+		}
+		hlist_del(&ob->node);
+		kfree(ob);
+	}
+
+	if (ret)
+		briefs_handle_meta_write_error(j->vfs_sb, "owned flush");
+	return ret;
+}
+
 /*
  * Initialize journal from superblock
  */
@@ -35,6 +133,8 @@ int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb) 
 
 	memset(j, 0, sizeof(*j));
 	mutex_init(&j->write_lock);
+	spin_lock_init(&j->owned_lock);
+	hash_init(j->owned_blocks);
 	j->sb = sb;
 	j->journal_start = le64_to_cpu(sb->journal_offset);
 	j->journal_end = le64_to_cpu(sb->journal_offset) + le64_to_cpu(sb->journal_blocks);
@@ -434,12 +534,19 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	 * BEFORE discarding the journal records that reference them.  The records
 	 * in [journal_log_start, write_pos) are about to be discarded by setting
 	 * log_start = log_end = write_pos below.  briefs_write_inode() only
-	 * mark_buffer_dirty()s the inode block -- it does NOT sync it.
+	 * briefs_mark_buffer_dirty()s the inode block -- it does NOT sync it, but
+	 * the dirty block is now in the journal-owned set.
 	 *
 	 * Release j->write_lock before the flush so other threads can write
 	 * journal records while we wait for I/O.  The __briefs_journal_sync_locked
 	 * call above already committed the records and flushed metadata once; this
 	 * second flush is an extra safety barrier before discarding.
+	 *
+	 * briefs_journal_flush_owned() writes each tracked block back per-buffer
+	 * (loop-free, quiesce-on-EIO) instead of the coarse looping sync_blockdev()
+	 * -- the targeted flush the old comment asked for, and the generic/475 fix:
+	 * a deferred-dirty buffer that hits a write error is quiesced once rather
+	 * than re-submitted and redirtied forever (umount hang).
 	 *
 	 * We also release before briefs_alloc_sync() to avoid the AB-BA deadlock
 	 * with alloc->lock (LOCK ORDER FIX).
@@ -447,7 +554,7 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	mutex_unlock(&j->write_lock);
 
 	{
-		int ret = sync_blockdev(j->vfs_sb->s_bdev);
+		int ret = briefs_journal_flush_owned(j);
 		if (ret) {
 			mutex_lock(&j->write_lock);
 			return ret;
@@ -458,8 +565,9 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	 * Persist the allocator bitmaps alongside the inode/trie buffers written
 	 * above.  briefs_alloc_sync() is the ONLY path that marks the bitmap
 	 * buffer_heads dirty -- the alloc/free hot paths mutate only the in-memory
-	 * l0/l1/l2 arrays and never dirty the backing buffers -- so sync_blockdev()
-	 * does NOT reach them (it writes only already-dirty buffers).  Without this,
+	 * l0/l1/l2 arrays and never dirty the backing buffers -- so neither the
+	 * owned-walk nor sync_blockdev() reaches them (both write only already-dirty
+	 * buffers).  Without this,
 	 * a back-pressure checkpoint mid-burst advances log_start past the
 	 * JRN_TRIE_ALLOC/JRN_INODE_ALLOC records that recorded the just-allocated
 	 * blocks while the on-disk bitmap still fails to mark those blocks
@@ -753,7 +861,7 @@ static int replay_inode_update(struct super_block *sb, struct jrn_inode_update *
 	di->ctime_nsec = cpu_to_le64(ctime_nsec);
 	di->flags = cpu_to_le32(flags);
 
-	mark_buffer_dirty(bh);
+	briefs_mark_buffer_dirty(bh, sb);
 	err = briefs_sync_dirty_buffer(bh, sb, "replay inode update");
 	brelse(bh);
 	if (err)
@@ -895,7 +1003,7 @@ int briefs_journal_sync_superblock(struct briefs_journal *j)
 	disk_sb->free_data_blocks = j->sb->free_data_blocks;
 	disk_sb->free_inodes = j->sb->free_inodes;
 
-	mark_buffer_dirty(bh);
+	briefs_mark_buffer_dirty(bh, vfs_sb);
 	err = briefs_sync_dirty_buffer(bh, vfs_sb, "superblock sync");
 	brelse(bh);
 	return err;
@@ -928,7 +1036,7 @@ static int replay_inode_full(struct super_block *sb, struct jrn_inode_full *rec)
 	}
 
 	memcpy(di, rec->inode_data, sizeof(struct briefs_disk_inode));
-	mark_buffer_dirty(bh);
+	briefs_mark_buffer_dirty(bh, sb);
 	err = briefs_sync_dirty_buffer(bh, sb, "replay inode full");
 	brelse(bh);
 	if (err)
@@ -987,7 +1095,7 @@ static int replay_symlink_data(struct super_block *sb, struct jrn_symlink_data *
 
 	memset(bh->b_data, 0, sb->s_blocksize);
 	memcpy(bh->b_data, rec->target, len);
-	mark_buffer_dirty(bh);
+	briefs_mark_buffer_dirty(bh, sb);
 	err = briefs_sync_dirty_buffer(bh, sb, "replay symlink data");
 	brelse(bh);
 	iput(inode);
@@ -1267,7 +1375,7 @@ static int replay_xattr_data(struct super_block *sb, struct jrn_xattr_data *rec)
 	/* Recompute the CRC at offset 4080 over [0, 4080). */
 	*(__le64 *)(bh->b_data + BRIEFS_BLOCK_SIZE - 2 * sizeof(__u64)) =
 		cpu_to_le64(briefs_chain_checksum(bh->b_data));
-	mark_buffer_dirty(bh);
+	briefs_mark_buffer_dirty(bh, sb);
 	err = briefs_sync_dirty_buffer(bh, sb, "replay xattr data");
 	brelse(bh);
 	if (err)
@@ -1689,7 +1797,7 @@ static int replay_reconcile_nlinks(struct super_block *sb)
 		old = le32_to_cpu(di->nlinks);
 		if (old != expected) {
 			di->nlinks = cpu_to_le32(expected);
-			mark_buffer_dirty(bh);
+			briefs_mark_buffer_dirty(bh, sb);
 			err = briefs_sync_dirty_buffer(bh, sb,
 						      "replay nlink reconcile");
 			if (!err) {
@@ -2076,7 +2184,22 @@ int briefs_journal_inode_update(struct briefs_journal *j,
  * Cleanup journal
  */
 void briefs_journal_cleanup(struct briefs_journal *j) {
+	struct briefs_owned_block *ob;
+	struct hlist_node *tmp;
+	int bkt;
+
 	if (!j) return;
+
+	/* Free any tracked dirty blocks left behind (e.g. error-path unmount
+	 * that never reached a flush_owned).  The buffers themselves stay in
+	 * the page cache; only the tracking entries are reclaimed.
+	 */
+	spin_lock(&j->owned_lock);
+	hash_for_each_safe(j->owned_blocks, bkt, tmp, ob, node) {
+		hash_del(&ob->node);
+		kfree(ob);
+	}
+	spin_unlock(&j->owned_lock);
 
 	kfree(j->cur_block);
 	j->cur_block = NULL;
@@ -2192,14 +2315,14 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 
 	/*
 	 * Flush all dirty metadata buffers (inode blocks, trie pages, btree
-	 * nodes) to disk.  These were dirtied by the operations whose journal
-	 * records we just committed.  This is the same sync_blockdev() the
-	 * checkpoint path uses; it is heavier than ideal (flushes every dirty
-	 * buffer on s_bdev, not just the ones referenced by our records).
-	 * A targeted flush is the natural refinement.
+	 * nodes) to disk.  These were dirtied (and tracked in the journal-owned
+	 * set) by the operations whose journal records we just committed.
+	 * briefs_journal_flush_owned() writes each one back per-buffer, loop-free
+	 * with quiesce-on-EIO -- the targeted flush the old sync_blockdev() comment
+	 * asked for, and the generic/475 umount-redirty-EIO fix.
 	 */
 	{
-		int err = sync_blockdev(j->vfs_sb->s_bdev);
+		int err = briefs_journal_flush_owned(j);
 		if (err) {
 			pr_err("briefs: fsync metadata buffer write-out failed: %d\n", err);
 			mutex_lock(&j->write_lock);
@@ -2208,10 +2331,11 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 	}
 
 	/*
-	 * Force every journal block in the sync range to disk.  After
-	 * sync_blockdev() above these are already clean, so the
-	 * sync_dirty_buffer() calls are no-ops; the loop is retained as an
-	 * explicit durable flush of the journal range.
+	 * Force every journal block in the sync range to disk.  Journal record
+	 * blocks are written by briefs_journal_write_block() (not tracked in the
+	 * owned set, which holds metadata only), so this loop is their durable
+	 * flush; the briefs_sync_dirty_buffer() calls are no-ops on already-clean
+	 * blocks and an explicit barrier on any still-dirty one.
 	 */
 	for (pos = sync_start; ; pos = briefs_journal_next_block(j, pos)) {
 		struct buffer_head *bh = sb_bread(j->vfs_sb, pos);

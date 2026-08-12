@@ -287,7 +287,7 @@ int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
 		goto out_release;
 	}
 	briefs_cpu_inode_to_disk(src, di);
-	mark_buffer_dirty(bh);
+	briefs_mark_buffer_dirty(bh, sb);
 	unlock_buffer(bh);
 
 	if (sync) {
@@ -329,7 +329,7 @@ struct buffer_head *briefs_get_zero_block(struct super_block *sb, u64 block)
 
 	memset(bh->b_data, 0, sb->s_blocksize);
 	set_buffer_uptodate(bh);
-	mark_buffer_dirty(bh);
+	briefs_mark_buffer_dirty(bh, sb);
 	return bh;
 }
 
@@ -755,7 +755,7 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 		goto out_release;
 	}
 	memcpy(disk_inode, &local_di, sizeof(local_di));
-	mark_buffer_dirty(bh);
+	briefs_mark_buffer_dirty(bh, inode->i_sb);
 	unlock_buffer(bh);
 
 out_release:

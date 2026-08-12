@@ -696,7 +696,7 @@ static int briefs_alloc_sync_level(struct briefs_alloc *alloc, u64 *array,
 		}
 
 		if (dirty) {
-			mark_buffer_dirty(bh);
+			briefs_mark_buffer_dirty(bh, alloc->sb);
 			err = briefs_sync_dirty_buffer(bh, alloc->sb,
 							"alloc bitmap sync");
 			if (err) {
@@ -764,7 +764,7 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 		if (bh) {
 			struct alloc_pool_header *hdr = (struct alloc_pool_header *)bh->b_data;
 			hdr->free_count = cpu_to_le64(alloc->free_count);
-			mark_buffer_dirty(bh);
+			briefs_mark_buffer_dirty(bh, alloc->sb);
 			err = briefs_sync_dirty_buffer(bh, alloc->sb,
 						       "alloc header sync");
 			brelse(bh);

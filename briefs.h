@@ -1446,6 +1446,30 @@ static inline int briefs_sync_dirty_buffer(struct buffer_head *bh,
 	return 0;
 }
 
+/* briefs_journal_track() is defined in journal.c; see briefs_journal.h. */
+struct briefs_journal;
+void briefs_journal_track(struct briefs_journal *j, u64 block);
+
+/*
+ * Mark @bh dirty and record its block number in the journal-owned dirty
+ * metadata set, so briefs_journal_flush_owned() can write it back per-buffer
+ * (loop-free, quiesce-on-EIO) at BrieFS's sync points instead of relying on
+ * the coarse looping sync_blockdev().  This is the dirty-time attach point
+ * for the journal-owned buffer-lifetimes work; every BrieFS metadata
+ * mark_buffer_dirty() should route through here so the owned set is complete
+ * (a missed site is a durability gap -- the owned-walk replaces sync_blockdev
+ * coverage).  Cheap and non-sleeping: a spinlock + hashtable insert.
+ */
+static inline void briefs_mark_buffer_dirty(struct buffer_head *bh,
+					    struct super_block *sb)
+{
+	struct briefs_sb_info *bsi = briefs_sb(sb);
+
+	mark_buffer_dirty(bh);
+	if (bsi->journal)
+		briefs_journal_track(bsi->journal, bh->b_blocknr);
+}
+
 bool briefs_sb_shutdown(struct super_block *sb);
 int briefs_shutdown(struct super_block *sb, u32 flags);
 const char *briefs_error_policy_name(struct super_block *sb);

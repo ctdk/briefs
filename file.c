@@ -381,7 +381,7 @@ static int briefs_promote_inline_data(struct inode *inode)
 	}
 	memset(bh->b_data, 0, inode->i_sb->s_blocksize);
 	memcpy(bh->b_data, binfo->disk_inode.inline_data, old_size);
-	mark_buffer_dirty(bh);
+	briefs_mark_buffer_dirty(bh, inode->i_sb);
 	err = briefs_sync_dirty_buffer(bh, inode->i_sb, "promote inline data");
 	brelse(bh);
 	if (err) {
@@ -1327,7 +1327,7 @@ static int briefs_zero_block(struct super_block *sb, u64 abs_block)
 	bh = briefs_get_zero_block(sb, abs_block);
 	if (!bh)
 		return -EIO;
-	mark_buffer_dirty(bh);
+	briefs_mark_buffer_dirty(bh, sb);
 	err = briefs_sync_dirty_buffer(bh, sb, "zero block");
 	brelse(bh);
 	return err;
@@ -2178,7 +2178,7 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		}
 		memset(bh->b_data, 0, dir->i_sb->s_blocksize);
 		memcpy(bh->b_data, symname, len);
-		mark_buffer_dirty(bh);
+		briefs_mark_buffer_dirty(bh, dir->i_sb);
 
 		/*
 		 * Journal the symlink target bytes so replay can restore them even

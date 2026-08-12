@@ -19,15 +19,34 @@
 
 /*
  * briefs_sync_fs - sync the filesystem (called by sync(2), syncfs(2), umount).
- * Flushes the journal to ensure crash-recovery ordering is up to date.
+ * Flushes the journal to ensure crash-recovery ordering is up to date, then
+ * writes back every tracked dirty metadata block per-buffer via
+ * briefs_journal_flush_owned().
+ *
+ * The flush_owned() call is the umount interception point: the VFS invokes
+ * ->sync_fs BEFORE its own sync_blockdev() in sync_filesystem(), so BrieFS
+ * syncs+quiesces its metadata first.  On a failing device (dm-error) a
+ * deferred-dirty metadata buffer is quiesced once (BH_Dirty/BH_Write_EIO
+ * cleared) instead of being re-submitted and redirtied forever by the VFS
+ * sync_blockdev() -- that loop is the generic/475 umount hang.  briefs_journal
+ * _sync() already drains the owned set internally, so this is usually a no-op
+ * walk; it exists to catch anything dirtied during/after the journal sync and
+ * to be the explicit pre-VFS-quiesce barrier.
  */
 int briefs_sync_fs(struct super_block *sb, int wait)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
+	int ret = 0;
 
 	if (bsi->journal && bsi->journal->dirty)
-		return briefs_journal_sync(bsi->journal);
-	return 0;
+		ret = briefs_journal_sync(bsi->journal);
+	if (bsi->journal) {
+		int r2 = briefs_journal_flush_owned(bsi->journal);
+
+		if (ret == 0)
+			ret = r2;
+	}
+	return ret;
 }
 
 /*
@@ -542,7 +561,7 @@ int briefs_fill_super(struct super_block *sb, struct fs_context *fc) {
 	pr_info("briefs: superblock loaded, mounting successful\n");
 
 	if (!sb_rdonly(sb))
-		mark_buffer_dirty(bh);
+		briefs_mark_buffer_dirty(bh, sb);
 
 	return 0;
 
@@ -623,15 +642,22 @@ void briefs_put_super(struct super_block *sb) {
 		/*
 		 * Write back all dirty metadata buffers before checkpointing the
 		 * journal.  BrieFS metadata lives in the bdev buffer cache and is
-		 * dirtied by briefs_persist_disk_inode() / mark_buffer_dirty(); a
-		 * journal record that references a metadata block is not truly
+		 * dirtied by briefs_persist_disk_inode() / briefs_mark_buffer_dirty();
+		 * a journal record that references a metadata block is not truly
 		 * durable until that block is also on disk.  If we checkpoint a
 		 * clean journal while inode/trie buffers are still dirty, a later
 		 * clean mount sees stale on-disk metadata and has no journal records
 		 * left to replay (generic/417: directory root stale after a
 		 * NOLOGFLUSH shutdown/umount/remount cycle).
+		 *
+		 * briefs_journal_flush_owned() writes each tracked block back
+		 * per-buffer, loop-free with quiesce-on-EIO, instead of the looping
+		 * sync_blockdev() -- a loop-free backstop for any late-dirtied buffer
+		 * after sync_fs, and the generic/475 umount-redirty-EIO fix.  The
+		 * always-checkpoint below follows.
 		 */
-		sync_blockdev(sb->s_bdev);
+		if (bsi->journal)
+			briefs_journal_flush_owned(bsi->journal);
 
 		/*
 		 * Always checkpoint the journal before unmount.

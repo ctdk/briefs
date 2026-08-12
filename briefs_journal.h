@@ -121,6 +121,22 @@ struct briefs_journal {
 	 * entries after a partial-tail crash (generic/475).
 	 */
 	DECLARE_HASHTABLE(replay_nlink_hash, 16);
+
+	/*
+	 * Journal-owned dirty metadata block set (Phase 1 of the journal-owned
+	 * buffer-lifetimes work).  briefs_mark_buffer_dirty() records each dirty
+	 * metadata block NUMBER here under owned_lock; briefs_journal_flush_owned()
+	 * swaps the table out and writes each block back per-buffer via
+	 * briefs_sync_dirty_buffer (one write + wait, quiesce-on-EIO) instead of
+	 * the looping sync_blockdev().  Numbers -- not buffer_head pointers --
+	 * are tracked because BrieFS metadata lives in the generic bdev buffer
+	 * cache with no BrieFS address_space/release_folio, so a held bh pointer
+	 * could be dangled by eviction; a block number is eviction-safe.  The
+	 * full GFS2 gfs2_bufdata + BH_Pinned pin/unpin port (Phase 2) needs a
+	 * BrieFS metadata address_space first and is deferred.
+	 */
+	spinlock_t owned_lock;
+	DECLARE_HASHTABLE(owned_blocks, 9);
 };
 
 /*
@@ -170,6 +186,15 @@ struct briefs_replay_nlink {
 	u64 ino;
 	u32 link_count;
 	u32 subdir_count;
+};
+
+/*
+ * One entry in the journal-owned dirty metadata block set (above).  Freed by
+ * briefs_journal_flush_owned() after the per-buffer writeback.
+ */
+struct briefs_owned_block {
+	struct hlist_node node;
+	u64 block;
 };
 
 /*
@@ -350,5 +375,22 @@ int briefs_journal_xattr_data(struct briefs_journal *j, u64 ino,
 
 /* Persist in-memory superblock fields back to the on-disk superblock */
 int briefs_journal_sync_superblock(struct briefs_journal *j);
+
+/*
+ * Record @block in the journal-owned dirty metadata set.  Cheap, non-sleeping
+ * (owned_lock is a leaf spinlock).  Dedups: a block already present is skipped.
+ * Declared here (not in briefs.h) because it takes the journal directly; the
+ * briefs_mark_buffer_dirty() inline in briefs.h forward-declares it too.
+ */
+void briefs_journal_track(struct briefs_journal *j, u64 block);
+
+/*
+ * Write back every block in the owned set per-buffer via
+ * briefs_sync_dirty_buffer (loop-free, quiesce-on-EIO) and free the entries.
+ * Returns 0 on success, -EIO if any metadata write failed (the errors= policy
+ * is applied via briefs_handle_meta_write_error).  Replaces the coarse looping
+ * sync_blockdev() at BrieFS's sync points.
+ */
+int briefs_journal_flush_owned(struct briefs_journal *j);
 
 #endif /* _BRIEFS_JOURNAL_H */

@@ -540,7 +540,7 @@ static u64 trie_alloc_from_block(struct super_block *sb, struct briefs_trie_page
 		trie_node_set_name_offset(node, trie_page_free_name_off(page));
 	}
 	set_buffer_uptodate(bh);
-	mark_buffer_dirty(bh);
+	briefs_mark_buffer_dirty(bh, sb);
 	ref = TRIE_MAKE_REF(block, slot);
 
 	if (trie_page_free_slots(page) == 0 ||
@@ -650,7 +650,7 @@ u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len)
 		trie_page_set_free_name_off(page, trie_page_free_name_off(page) + name_size);
 		trie_node_set_name_len(node, name_size);
 		trie_node_set_name_offset(node, trie_page_free_name_off(page));
-		mark_buffer_dirty(bh);
+		briefs_mark_buffer_dirty(bh, sb);
 		brelse(bh);
 	}
 
@@ -699,7 +699,7 @@ int briefs_trie_node_store_name(struct super_block *sb, u64 node_ref,
 	memcpy(dest, name, name_len);
 	trie_node_set_name_len(node, 2 + name_len);
 
-	mark_buffer_dirty(bh);
+	briefs_mark_buffer_dirty(bh, sb);
 	brelse(bh);
 	return 0;
 }
@@ -758,7 +758,7 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 		trie_page_set_free_slots(page, trie_page_free_slots(page) | (1ULL << slot));
 		trie_page_set_live_count(page, trie_page_live_count(page) - 1);
 		memset(node, 0, sizeof(*node));
-		mark_buffer_dirty(bh);
+		briefs_mark_buffer_dirty(bh, sb);
 	}
 
 	page_empty = (trie_page_live_count(page) == 0);

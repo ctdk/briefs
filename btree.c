@@ -122,14 +122,14 @@ btree_read_node(struct super_block *sb, u64 block, bool trust_verified,
 }
 
 /* Recompute a node's checksum, memoize it, and mark the buffer dirty. */
-static void btree_commit_node(struct buffer_head *bh)
+static void btree_commit_node(struct buffer_head *bh, struct super_block *sb)
 {
 	struct briefs_extent_btree_node *node =
 		(struct briefs_extent_btree_node *)bh->b_data;
 
 	node->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
 	set_buffer_verified(bh);
-	mark_buffer_dirty(bh);
+	briefs_mark_buffer_dirty(bh, sb);
 }
 
 /* Allocate a fresh zeroed node buffer (caller fills header + payload, then
@@ -369,6 +369,7 @@ static int btree_clear_unwritten_leaf(struct briefs_extent_btree_node *node,
 				      struct buffer_head *bh, u64 iblock,
 				      void *ctx)
 {
+	struct super_block *sb = ctx;
 	int i, num_keys = le16_to_cpu(node->hdr.num_keys);
 
 	for (i = 0; i < num_keys; i++) {
@@ -381,7 +382,7 @@ static int btree_clear_unwritten_leaf(struct briefs_extent_btree_node *node,
 				de->flags = cpu_to_le32(
 					le32_to_cpu(de->flags) &
 					~BRIEFS_EXT_UNWRITTEN);
-				btree_commit_node(bh);
+				btree_commit_node(bh, sb);
 			}
 			return 0;
 		}
@@ -397,7 +398,7 @@ static int btree_clear_unwritten_block(struct super_block *sb, u64 block,
 					u64 iblock)
 {
 	return btree_descend_to_leaf(sb, block, iblock,
-				     btree_clear_unwritten_leaf, NULL, true);
+				     btree_clear_unwritten_leaf, sb, true);
 }
 
 int briefs_btree_clear_unwritten(struct super_block *sb, struct briefs_inode *di,
@@ -415,7 +416,8 @@ int briefs_btree_clear_unwritten(struct super_block *sb, struct briefs_inode *di
  * a new child to its right, inheriting the left child's old upper bound. */
 static void btree_absorb_split(struct briefs_extent_btree_node *parent,
 			       struct buffer_head *parent_bh, int p,
-			       u64 sibling, u64 separator)
+			       u64 sibling, u64 separator,
+			       struct super_block *sb)
 {
 	int num_keys = le16_to_cpu(parent->hdr.num_keys);
 
@@ -440,7 +442,7 @@ static void btree_absorb_split(struct briefs_extent_btree_node *parent,
 	}
 
 	parent->hdr.num_keys = cpu_to_le16(num_keys + 1);
-	btree_commit_node(parent_bh);
+	btree_commit_node(parent_bh, sb);
 }
 
 /* If the child at position @p of @parent is full, split it and absorb the
@@ -526,14 +528,15 @@ static int btree_maybe_split_child(struct super_block *sb,
 		}
 		child->hdr.next_leaf = cpu_to_le64(sib_block);
 
-		btree_commit_node(child_bh);
-		btree_commit_node(sib_bh);
+		btree_commit_node(child_bh, sb);
+		btree_commit_node(sib_bh, sb);
 
 		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
 					    0, sib_block, 1, -1);
 
 		btree_absorb_split(parent, parent_bh, p, sib_block,
-				   le64_to_cpu(sib->u.leaf.extents[0].offset));
+				   le64_to_cpu(sib->u.leaf.extents[0].offset),
+				   sb);
 	} else {
 		/* Internal split: push the median separator up. With 253 keys
 		 * (idx[0..252], 254 children), median index = 126. Left keeps
@@ -566,14 +569,15 @@ static int btree_maybe_split_child(struct super_block *sb,
 			       (BRIEFS_BTREE_IDX_KEYS - mid) * sizeof(child->u.internal.idx[0]));
 		}
 
-		btree_commit_node(child_bh);
-		btree_commit_node(sib_bh);
+		btree_commit_node(child_bh, sb);
+		btree_commit_node(sib_bh, sb);
 
 		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
 					    0, sib_block, 1, -1);
 
 		btree_absorb_split(parent, parent_bh, p, sib_block,
-				   le64_to_cpu(child->u.internal.idx[mid].high_key));
+				   le64_to_cpu(child->u.internal.idx[mid].high_key),
+				   sb);
 	}
 
 	brelse(sib_bh);
@@ -644,7 +648,7 @@ static int btree_leaf_insert(struct super_block *sb, struct briefs_inode *di,
 		    left.flags == ext->flags) {
 			left.len += ext->len;
 			briefs_cpu_extent_to_disk(&left, &ents[pos - 1]);
-			btree_commit_node(bh);
+			btree_commit_node(bh, sb);
 			briefs_journal_extent_alloc(bsi->journal,
 						    di->inode_number, ext->offset,
 						    ext->phys, ext->len, -1);
@@ -665,7 +669,7 @@ static int btree_leaf_insert(struct super_block *sb, struct briefs_inode *di,
 			right.phys = ext->phys;
 			right.len += ext->len;
 			briefs_cpu_extent_to_disk(&right, &ents[pos]);
-			btree_commit_node(bh);
+			btree_commit_node(bh, sb);
 			briefs_journal_extent_alloc(bsi->journal,
 						    di->inode_number, ext->offset,
 						    ext->phys, ext->len, -1);
@@ -679,7 +683,7 @@ static int btree_leaf_insert(struct super_block *sb, struct briefs_inode *di,
 		(size_t)(n - pos) * sizeof(ents[0]));
 	briefs_cpu_extent_to_disk(ext, &ents[pos]);
 	node->hdr.num_keys = cpu_to_le16(n + 1);
-	btree_commit_node(bh);
+	btree_commit_node(bh, sb);
 	briefs_journal_extent_alloc(bsi->journal, di->inode_number, ext->offset,
 				    ext->phys, ext->len, -1);
 	*added = true;
@@ -844,8 +848,8 @@ static int btree_ensure_root_room(struct super_block *sb, struct briefs_inode *d
 		separator = le64_to_cpu(root->u.internal.idx[mid].high_key);
 	}
 
-	btree_commit_node(root_bh);
-	btree_commit_node(sib_bh);
+	btree_commit_node(root_bh, sb);
+	btree_commit_node(sib_bh, sb);
 
 	/* New internal root, one level above the old root. */
 	newroot->hdr.magic = cpu_to_le32(BRIEFS_BTREE_MAGIC);
@@ -856,7 +860,7 @@ static int btree_ensure_root_room(struct super_block *sb, struct briefs_inode *d
 	newroot->u.internal.idx[0].child = cpu_to_le64(root_block);
 	newroot->u.internal.idx[0].high_key = cpu_to_le64(separator);
 	newroot->u.internal.trailing_child = cpu_to_le64(sib_block);
-	btree_commit_node(newroot_bh);
+	btree_commit_node(newroot_bh, sb);
 
 	briefs_journal_extent_alloc(bsi->journal, di->inode_number,
 				    0, sib_block, 1, -1);
@@ -945,7 +949,7 @@ static int btree_spill_inline(struct super_block *sb, struct briefs_inode *di,
 		memset(&node->u.leaf.extents[m], 0,
 		       (BRIEFS_BTREE_LEAF_FANOUT - m) * sizeof(node->u.leaf.extents[0]));
 	}
-	btree_commit_node(bh);
+	btree_commit_node(bh, sb);
 	brelse(bh);
 
 	briefs_journal_extent_alloc(bsi->journal, di->inode_number, 0,
@@ -1442,7 +1446,7 @@ static bool btree_delete_range_subtree(struct super_block *sb,
 			return true;
 		}
 		node->hdr.num_keys = cpu_to_le16(new_n);
-		btree_commit_node(bh);
+		btree_commit_node(bh, sb);
 		brelse(bh);
 		return false;
 	}
@@ -1517,7 +1521,7 @@ static bool btree_delete_range_subtree(struct super_block *sb,
 	}
 
 	node->hdr.num_keys = cpu_to_le16(out);
-	btree_commit_node(bh);
+	btree_commit_node(bh, sb);
 	brelse(bh);
 	return false;
 }

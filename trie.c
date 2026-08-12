@@ -187,7 +187,7 @@ static int trie_link_child(struct super_block *sb, u64 parent_ref, u64 child_ref
 	if (TRIE_REF_IS_NULL(trie_node_first_child(pnode))) {
 		trie_node_set_first_child(pnode, child_ref);
 		trie_node_set_child_count(pnode, trie_node_child_count(pnode) + 1);
-		mark_buffer_dirty(pbh);
+		briefs_mark_buffer_dirty(pbh, sb);
 		brelse(pbh);
 		return 0;
 	}
@@ -212,11 +212,11 @@ static int trie_link_child(struct super_block *sb, u64 parent_ref, u64 child_ref
 	}
 
 	trie_node_set_next_sibling(last_node, child_ref);
-	mark_buffer_dirty(lbh);
+	briefs_mark_buffer_dirty(lbh, sb);
 	brelse(lbh);
 
 	trie_node_set_child_count(pnode, trie_node_child_count(pnode) + 1);
-	mark_buffer_dirty(pbh);
+	briefs_mark_buffer_dirty(pbh, sb);
 	brelse(pbh);
 	return 0;
 }
@@ -245,7 +245,7 @@ static u64 briefs_trie_create_child(struct super_block *sb, u64 parent_ref,
 	cnode->depth = depth;
 	cnode->byte_val = byte_val;
 	cnode->node_type = node_type;
-	mark_buffer_dirty(cbh);
+	briefs_mark_buffer_dirty(cbh, sb);
 	brelse(cbh);
 
 	if (trie_link_child(sb, parent_ref, child_ref) != 0) {
@@ -501,13 +501,13 @@ static void trie_unlink_child(struct super_block *sb, u64 parent_ref,
 
 		if (trie_get_node(sb, child_prev, &prev_bh, &prev_page, &prev_node) == 0) {
 			trie_node_set_next_sibling(prev_node, next);
-			mark_buffer_dirty(prev_bh);
+			briefs_mark_buffer_dirty(prev_bh, sb);
 			brelse(prev_bh);
 		}
 	}
 
 	trie_node_set_child_count(pnode, trie_node_child_count(pnode) - 1);
-	mark_buffer_dirty(pbh);
+	briefs_mark_buffer_dirty(pbh, sb);
 	brelse(pbh);
 }
 
@@ -534,7 +534,7 @@ static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
 		/* Old leaf is a prefix of the new name. */
 		lnode->node_type = NODE_TYPE_INTERM | NODE_STATUS_LEAF;
 		lnode->depth = pos + 1;
-		mark_buffer_dirty(lbh);
+		briefs_mark_buffer_dirty(lbh, sb);
 		brelse(lbh);
 		*cur_out = child;
 		return 0;
@@ -563,7 +563,7 @@ static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
 				break;
 			if (trie_node_next_sibling(tmp) == child) {
 				trie_node_set_next_sibling(tmp, internal);
-				mark_buffer_dirty(tbh);
+				briefs_mark_buffer_dirty(tbh, sb);
 				brelse(tbh);
 				break;
 			}
@@ -571,7 +571,7 @@ static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
 			brelse(tbh);
 		}
 	}
-	mark_buffer_dirty(gbh);
+	briefs_mark_buffer_dirty(gbh, sb);
 	brelse(gbh);
 
 	/* Link old leaf as child of internal. */
@@ -579,7 +579,7 @@ static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
 		trie_node_set_first_child(inode, child);
 		trie_node_set_next_sibling(inode, old_sibling);
 		trie_node_set_child_count(inode, 1);
-		mark_buffer_dirty(ibh);
+		briefs_mark_buffer_dirty(ibh, sb);
 		brelse(ibh);
 	}
 
@@ -590,7 +590,7 @@ static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
 			TRIE_SET_FTYPE(inode, type);
 			trie_node_set_inode(inode, ino);
 			trie_store_name(sb, internal, name, name_len);
-			mark_buffer_dirty(ibh);
+			briefs_mark_buffer_dirty(ibh, sb);
 			brelse(ibh);
 		}
 	}
@@ -648,7 +648,7 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 					TRIE_SET_FTYPE(cnode, type);
 					trie_node_set_inode(cnode, ino);
 					trie_store_name(sb, existing, name, name_len);
-					mark_buffer_dirty(cbh);
+					briefs_mark_buffer_dirty(cbh, sb);
 					brelse(cbh);
 					return 0;
 				}
@@ -686,7 +686,7 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 			TRIE_SET_FTYPE(node, type);
 			trie_node_set_inode(node, ino);
 			trie_store_name(sb, new_leaf, name, name_len);
-			mark_buffer_dirty(bh);
+			briefs_mark_buffer_dirty(bh, sb);
 			brelse(bh);
 			return 0;
 		}
@@ -755,7 +755,7 @@ int briefs_trie_update_entry(struct super_block *sb, struct briefs_inode *di,
 				    memcmp(ename, name, name_len) == 0) {
 					trie_node_set_inode(cnode, new_ino);
 					TRIE_SET_FTYPE(cnode, new_type);
-					mark_buffer_dirty(cbh);
+					briefs_mark_buffer_dirty(cbh, sb);
 					brelse(cbh);
 					return 0;
 				}
@@ -870,13 +870,13 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 
 				node->node_type &= ~NODE_STATUS_LEAF;
 				if (has_children) {
-					mark_buffer_dirty(cbh);
+					briefs_mark_buffer_dirty(cbh, sb);
 					brelse(cbh);
 					brelse(bh);
 					ret = 0;
 					goto out;
 				}
-				mark_buffer_dirty(cbh);
+				briefs_mark_buffer_dirty(cbh, sb);
 				brelse(cbh);
 
 				trie_unlink_child(sb, cur, child_prev, child);
@@ -950,7 +950,7 @@ collapse:
 						break;
 					if (trie_node_next_sibling(wn) == check) {
 						trie_node_set_next_sibling(wn, trie_node_next_sibling(cn2));
-						mark_buffer_dirty(wbh);
+						briefs_mark_buffer_dirty(wbh, sb);
 						brelse(wbh);
 						break;
 					}
@@ -959,7 +959,7 @@ collapse:
 				}
 			}
 			trie_node_set_child_count(pn2, trie_node_child_count(pn2) - 1);
-			mark_buffer_dirty(pbh2);
+			briefs_mark_buffer_dirty(pbh2, sb);
 			brelse(pbh2);
 
 			/* Defer the actual free until after releasing trie_lock */

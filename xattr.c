@@ -1128,7 +1128,7 @@ int briefs_xattr_set(struct inode *inode, const char *name,
 		memset(bh->b_data + used, 0, BRIEFS_BLOCK_SIZE - used);
 		*xattr_crc_slot(bh->b_data) =
 			cpu_to_le64(briefs_chain_checksum(bh->b_data));
-		mark_buffer_dirty(bh);
+		briefs_mark_buffer_dirty(bh, sb);
 	}
 
 	/* Make the chain durable before publishing the inode pointer. */
