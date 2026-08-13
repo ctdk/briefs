@@ -277,8 +277,13 @@ write_archive() {
 
 # List of tests to skip due to known hangs or unsupported features.
 # These tests either wedge the filesystem or test features BrieFS doesn't implement.
-# Note: generic/224 and generic/464 used to pass but hung in 2026-08-02 run.
-# They may be intermittent - investigate if time permits.
+# generic/070, generic/224, generic/619: previously skipped for intermittent
+# hangs (notes from 2026-08-02/08-04, before Phase 1). Re-verified 2026-08-13
+# on current (Phase 1, 134d4a4) code: 40x/20x/20x loop iterations on both the
+# stock and lockdep kernels, zero hangs - un-skipped. 068/074/464/476 are
+# documented as fixed in memory but were not loop-verified this session, so
+# they stay skipped pending re-verification.
+# generic/464: trie_iter_grow double-free (fixed 4ef6ccb) - kept skipped, see above.
 # generic/051: requires shutdown support (FS_IOC_FIFREEZE) - hangs on mount.
 # generic/410: mount namespace / propagation test - PASSES (pure VFS shared-
 # subtree machinery; BrieFS needs no special support). Un-skipped after
@@ -295,16 +300,14 @@ write_archive() {
 # re-validating the record bounds after the lock-releasing checkpoint; see
 # briefs_journal_flush_cur_block_locked() and the re-check loop in journal.c.
 # generic/461: hung on 2026-08-04 run - add to skip list.
-# generic/619: hung on 2026-08-04 run - add to skip list.
 # generic/753: hung on 2026-08-04 run - add to skip list.
 # Tests to skip due to known hangs or unsupported features.  Overridable via the
 # environment (e.g. run-fuse-subset.sh exports SKIP_TESTS="" to run the FUSE
 # subset, which includes generic/475, in full).  Use the "+set" test so an
 # explicitly empty SKIP_TESTS is honored (a plain := would re-apply this default
 # to an empty value).
-[ -n "${SKIP_TESTS+set}" ] || SKIP_TESTS="generic/051 generic/068 generic/070 \
-generic/074 generic/224 generic/461 generic/464 generic/475 generic/476 \
-generic/619 generic/753"
+[ -n "${SKIP_TESTS+set}" ] || SKIP_TESTS="generic/051 generic/068 generic/074 \
+generic/461 generic/464 generic/475 generic/476 generic/753"
 
 should_skip() {
     local test="$1"
