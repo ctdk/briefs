@@ -122,6 +122,7 @@ get_timeout() {
         generic/127) echo 1200 ;;   # 6x concurrent fsx (mmap variants)
         generic/521) echo 1200 ;;   # 1M-op DIO fsx soak
         generic/522) echo 1200 ;;   # 1M-op buffered fsx soak
+        generic/017) echo 900 ;;    # 10k nested fcollapse ops (collect/rebuild O(E)/op)
         generic/011) echo 900 ;;    # dirstress (concurrent dir ops)
         generic/475) echo 900 ;;    # dm-error crash-replay
         *)           echo "$TIMEOUT_SECS" ;;

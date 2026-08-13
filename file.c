@@ -1870,10 +1870,567 @@ out_free:
 }
 
 /*
+ * briefs_zero_alloc_hole - allocate fresh unwritten blocks for the hole
+ * [h_start, h_end) and append the resulting extent(s) to @new (advancing
+ * *@n_new), recording each allocation in @allocd (advancing *@n_allocd) so
+ * the caller can free them on a later failure.  *@added accumulates the
+ * newly-unwritten block count for the meta_shield reserve.  Caller holds
+ * extent_lock; briefs_alloc_blocks/briefs_alloc_block take alloc->lock under
+ * it (the established extent_lock -> alloc->lock order).  Returns 0 or
+ * -ENOSPC (the recorded allocations are the caller's to free on error).
+ */
+static int briefs_zero_alloc_hole(struct briefs_sb_info *bsi,
+				  struct briefs_extent *new, int *n_new,
+				  struct briefs_extent *allocd, int *n_allocd,
+				  u64 h_start, u64 h_end, u64 *added)
+{
+	u64 seg = h_end - h_start;
+	u64 rel, phys;
+	int i;
+
+	/* Prefer one contiguous run so rebuild can keep a single extent. */
+	rel = briefs_alloc_blocks(&bsi->alloc, seg);
+	if (rel != 0) {
+		phys = data_to_abs(bsi->sb, rel);
+		new[*n_new].offset = h_start;
+		new[*n_new].phys = phys;
+		new[*n_new].len = seg;
+		new[*n_new].flags = BRIEFS_EXT_UNWRITTEN;
+		new[*n_new].pad = 0;
+		(*n_new)++;
+		allocd[*n_allocd].offset = h_start;
+		allocd[*n_allocd].phys = phys;
+		allocd[*n_allocd].len = seg;
+		(*n_allocd)++;
+		*added += seg;
+		return 0;
+	}
+
+	/* No contiguous run of seg fit: fall back to per-block allocation. */
+	for (i = 0; i < seg; i++) {
+		rel = briefs_alloc_block(&bsi->alloc);
+		if (rel == 0)
+			return -ENOSPC;
+		phys = data_to_abs(bsi->sb, rel);
+		new[*n_new].offset = h_start + i;
+		new[*n_new].phys = phys;
+		new[*n_new].len = 1;
+		new[*n_new].flags = BRIEFS_EXT_UNWRITTEN;
+		new[*n_new].pad = 0;
+		(*n_new)++;
+		allocd[*n_allocd].offset = h_start + i;
+		allocd[*n_allocd].phys = phys;
+		allocd[*n_allocd].len = 1;
+		(*n_allocd)++;
+		(*added)++;
+	}
+	return 0;
+}
+
+/*
+ * briefs_do_zero_range - FALLOC_FL_ZERO_RANGE.  Zero the contents of
+ * [offset, offset+len), matching ext4/xfs semantics (generic/009):
+ *
+ *   - byte-granular pagecache zeroing over the whole range via
+ *     iomap_zero_range with the read ops.  Written blocks are zeroed in
+ *     place and stay "data"; holes/unwritten already read as zero.  This
+ *     alone covers partial-block ranges, which must NOT convert to unwritten
+ *     (generic/009 case 17: a partial-block zero keeps the block as "data").
+ *
+ *   - the block-aligned middle [ceil(offset), floor(end)) is converted to
+ *     UNWRITTEN extents: written blocks have their flag flipped in place
+ *     (the on-disk data is masked by IOMAP_UNWRITTEN, as on ext4 -- no free
+ *     or realloc), and holes are allocated as fresh unwritten blocks.  fiemap
+ *     then reports the zeroed region as "unwritten", not "hole".
+ *
+ * The conversion reuses the collect/rebuild frame (like punch and collapse):
+ * collect the sorted extent set, build a new sorted set with in-range extents
+ * flipped to unwritten and hole segments allocated as unwritten, and rebuild
+ * (whose insert merges adjacent unwritten extents).  The pagecache for the
+ * converted middle is then dropped so reads return the unwritten zeros rather
+ * than the stale on-disk data they still occupy.  The unwritten reserve
+ * (meta_shield) is raised for the newly-unwritten blocks so a later
+ * partial-write conversion can allocate its split metadata.
+ *
+ * With !KEEP_SIZE the file may be extended to end; the extension is allocated
+ * unwritten and reads as zero.  The caller (briefs_fallocate) holds inode_lock
+ * and file_remove_privs has already run.
+ */
+static long briefs_do_zero_range(struct file *file, int mode, loff_t offset,
+				 loff_t len)
+{
+	struct inode *inode = file_inode(file);
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct super_block *sb = inode->i_sb;
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct timespec64 now;
+	loff_t end = offset + len;
+	loff_t old_size;
+	u64 s_full, e_full;
+	bool grew_size = false;
+	int ret;
+
+	if (binfo->disk_inode.flags & InodeFlagInlineData) {
+		if (end <= BRIEFS_INODE_INLINE_DATA_SIZE) {
+			loff_t z_start = max_t(loff_t, offset, 0);
+			loff_t z_end = min_t(loff_t, end, inode->i_size);
+
+			if (z_start < z_end)
+				memset(binfo->disk_inode.inline_data + z_start,
+				       0, z_end - z_start);
+			if (!(mode & FALLOC_FL_KEEP_SIZE) && end > inode->i_size) {
+				briefs_extent_write_begin(binfo);
+				inode->i_size = end;
+				binfo->disk_inode.filesize = end;
+				briefs_extent_write_end(binfo);
+				grew_size = true;
+			}
+			now = current_time(inode);
+			inode->i_ctime_sec = now.tv_sec;
+			inode->i_ctime_nsec = now.tv_nsec;
+			if (grew_size) {
+				inode->i_mtime_sec = now.tv_sec;
+				inode->i_mtime_nsec = now.tv_nsec;
+			}
+			briefs_sync_inode_times(inode, &binfo->disk_inode);
+			briefs_persist_and_journal_inode_warn(sb, inode,
+					&binfo->disk_inode);
+			mark_inode_dirty(inode);
+			inode_unlock(inode);
+			return briefs_inode_sync(inode);
+		}
+		ret = briefs_promote_inline_data(inode);
+		if (ret)
+			goto out;
+		truncate_inode_pages(inode->i_mapping, 0);
+	}
+
+	/* Flush delalloc so iomap_zero_range sees real mappings, not BH_Delay
+	 * blocks absent from the extent list (same reason as punch). */
+	ret = filemap_write_and_wait_range(inode->i_mapping, offset, end - 1);
+	if (ret)
+		goto out;
+
+	/* Byte-granular zero of the pagecache over the whole range.  For
+	 * written blocks this zeroes and dirties the folio; for holes/unwritten
+	 * it is a no-op (they already read as zero).  This covers partial-block
+	 * ranges, which stay "data" (generic/009 case 17). */
+	ret = iomap_zero_range(inode, offset, len, NULL, &briefs_iomap_ops);
+	if (ret)
+		goto out;
+
+	/* Convert the block-aligned middle [s_full, e_full) to unwritten
+	 * extents.  Partial head/tail blocks (when offset/end are not
+	 * block-aligned) are excluded: they were zeroed in the pagecache above
+	 * and keep their type. */
+	s_full = (offset + BRIEFS_BLOCK_SIZE - 1) >> BRIEFS_BLOCK_SHIFT;
+	e_full = end >> BRIEFS_BLOCK_SHIFT;
+	if (s_full < e_full) {
+		struct briefs_extent *old = NULL, *new = NULL, *allocd = NULL;
+		int n_ext = 0, n_new = 0, n_allocd = 0, i;
+		u64 cursor, added = 0;
+
+		mutex_lock(&binfo->extent_lock);
+		ret = briefs_collect_all_extents(sb, &binfo->disk_inode,
+						 &old, &n_ext);
+		if (ret) {
+			mutex_unlock(&binfo->extent_lock);
+			goto out;
+		}
+		/* Upper bound: kept/flipped extents (<= 2 each from straddle
+		 * splits) plus the hole segments we allocate (<= 1 extent per
+		 * block in the per-block fallback). */
+		new = kvmalloc_array((n_ext * 2) + (e_full - s_full) + 2,
+				     sizeof(*new), GFP_KERNEL);
+		allocd = kvmalloc_array((e_full - s_full) + 1,
+					sizeof(*allocd), GFP_KERNEL);
+		if (!new || !allocd) {
+			ret = -ENOMEM;
+			goto conv_fail;
+		}
+
+		cursor = s_full;
+		for (i = 0; i < n_ext; i++) {
+			struct briefs_extent e = old[i];
+			u64 o = e.offset, ee = o + e.len;
+
+			/* Hole before this extent, inside [s_full, e_full):
+			 * allocate unwritten.  cursor is always >= s_full, so
+			 * [cursor, min(o,e_full)) lies inside the range. */
+			if (o > cursor) {
+				u64 he = min_t(u64, o, e_full);
+
+				if (cursor < he) {
+					ret = briefs_zero_alloc_hole(bsi, new,
+								 &n_new,
+								 allocd,
+								 &n_allocd,
+								 cursor, he,
+								 &added);
+					if (ret)
+						goto conv_fail;
+				}
+			}
+
+			if (ee <= s_full) {
+				/* Entirely before the range: keep as-is. */
+				new[n_new++] = e;
+			} else if (o >= e_full) {
+				/* Entirely after the range: keep as-is. */
+				new[n_new++] = e;
+			} else {
+				u64 ms, me;
+
+				/* Prefix before the range: keep as-is. */
+				if (o < s_full) {
+					struct briefs_extent p = e;
+
+					p.len = s_full - o;
+					new[n_new++] = p;
+				}
+				/* In-range portion: flip to unwritten (same
+				 * phys; the data is masked by IOMAP_UNWRITTEN,
+				 * as on ext4). */
+				ms = max_t(u64, o, s_full);
+				me = min_t(u64, ee, e_full);
+				new[n_new].offset = ms;
+				new[n_new].phys = e.phys + (ms - o);
+				new[n_new].len = me - ms;
+				new[n_new].flags = BRIEFS_EXT_UNWRITTEN;
+				new[n_new].pad = 0;
+				n_new++;
+				if (!(e.flags & BRIEFS_EXT_UNWRITTEN))
+					added += me - ms;	/* data->unwritten */
+				/* (unwritten->unwritten stays counted) */
+
+				/* Suffix after the range: keep as-is. */
+				if (ee > e_full) {
+					struct briefs_extent s = e;
+
+					s.offset = e_full;
+					s.phys = e.phys + (e_full - o);
+					s.len = ee - e_full;
+					new[n_new++] = s;
+				}
+			}
+			cursor = max_t(u64, cursor, min_t(u64, ee, e_full));
+		}
+		/* Trailing hole after the last extent, inside the range. */
+		if (cursor < e_full) {
+			ret = briefs_zero_alloc_hole(bsi, new, &n_new, allocd,
+						     &n_allocd, cursor, e_full,
+						     &added);
+			if (ret)
+				goto conv_fail;
+		}
+
+		ret = briefs_rebuild_extent_list(sb, binfo, new, n_new);
+		if (ret)
+			goto conv_fail;
+
+		briefs_raise_unwritten_reserve(inode, added);
+		kvfree(new);
+		kvfree(old);
+		kvfree(allocd);
+		mutex_unlock(&binfo->extent_lock);
+
+		/* Drop the pagecache for the converted middle: the in-range
+		 * blocks are now unwritten (read as zero), so the stale on-disk
+		 * data they still occupy must not be served from the cache. */
+		truncate_inode_pages_range(inode->i_mapping,
+					   s_full << BRIEFS_BLOCK_SHIFT,
+					   (e_full << BRIEFS_BLOCK_SHIFT) - 1);
+		goto converted;
+
+conv_fail:
+		/* Free the blocks allocated this call (no rebuild ran, so the
+		 * extent index is unchanged) and release everything. */
+		for (i = 0; i < n_allocd; i++)
+			briefs_free_blocks_range(bsi, allocd[i].phys,
+						 allocd[i].len);
+		kvfree(new);
+		kvfree(old);
+		kvfree(allocd);
+		mutex_unlock(&binfo->extent_lock);
+		goto out;
+	}
+converted:
+	old_size = inode->i_size;
+	if (!(mode & FALLOC_FL_KEEP_SIZE) && end > inode->i_size) {
+		/* Zero the old-EOF block's tail before i_size advances past it,
+		 * so a mid-block EOF (possibly mmap-polluted) does not leak as
+		 * valid data (generic/363).  Skip when the EOF block was just
+		 * converted to unwritten: it already reads as zero, and
+		 * dirtying its folio would let writeback flip it back to "data"
+		 * (breaking the unwritten layout). */
+		if ((old_size & (BRIEFS_BLOCK_SIZE - 1)) &&
+		    (old_size >> BRIEFS_BLOCK_SHIFT) < s_full)
+			briefs_zero_eof_tail(inode->i_mapping, old_size);
+		briefs_extent_write_begin(binfo);
+		inode->i_size = end;
+		binfo->disk_inode.filesize = end;
+		briefs_extent_write_end(binfo);
+		grew_size = true;
+	}
+
+	inode->i_blocks = briefs_compute_i_blocks(sb, &binfo->disk_inode);
+	now = current_time(inode);
+	inode->i_ctime_sec = now.tv_sec;
+	inode->i_ctime_nsec = now.tv_nsec;
+	if (grew_size) {
+		inode->i_mtime_sec = now.tv_sec;
+		inode->i_mtime_nsec = now.tv_nsec;
+	}
+	briefs_sync_inode_times(inode, &binfo->disk_inode);
+	briefs_persist_and_journal_inode_warn(sb, inode, &binfo->disk_inode);
+	mark_inode_dirty(inode);
+
+out:
+	inode_unlock(inode);
+	if (ret == 0)
+		ret = briefs_inode_sync(inode);
+	return ret;
+}
+
+/*
+ * briefs_shift_extents - shared collect/shift/rebuild core for collapse_range
+ * and insert_range.  Both rewrite the extent index by collecting the sorted
+ * extent set, transforming each extent's logical offset at/after the split
+ * point @S, and rebuilding via briefs_rebuild_extent_list (which frees the old
+ * tree nodes and re-inserts the kept extents).  Caller holds extent_lock.
+ *
+ * For collapse (@dir == -1, @L == len/blk): the middle [S, S+L) is removed --
+ * its data blocks are freed (and journaled) and dropped from the index; every
+ * extent at/after S+L shifts down by L; extents straddling S or S+L are split.
+ *
+ * For insert (@dir == +1, @L == len/blk): a hole [S, S+L) is opened; every
+ * extent at/after S shifts up by L; an extent straddling S is split into a
+ * prefix (kept) and a shifted suffix.  No blocks are freed or allocated (the
+ * gap is a plain hole, which reads as zero).
+ *
+ * Returns 0 or -errno.  On collapse, *@unwritten_freed accumulates the count
+ * of freed unwritten blocks so the caller can release the meta_shield reserve.
+ */
+static int briefs_shift_extents(struct inode *inode, u64 S, u64 L, int dir,
+				u64 *unwritten_freed)
+{
+	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct super_block *sb = inode->i_sb;
+	struct briefs_extent *old = NULL, *new = NULL;
+	int old_n = 0, new_n = 0, i;
+	int ret;
+
+	ret = briefs_collect_all_extents(sb, &binfo->disk_inode, &old, &old_n);
+	if (ret)
+		return ret;
+	if (old_n == 0)
+		return 0;	/* nothing to shift; caller still adjusts i_size */
+
+	new = kvmalloc_array(old_n * 2, sizeof(*new), GFP_KERNEL);
+	if (!new) {
+		kvfree(old);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < old_n; i++) {
+		struct briefs_extent e = old[i];
+		u64 o = e.offset, eend = o + e.len;
+
+		if (dir < 0) {
+			/* collapse: remove [S, S+L), shift >= S+L down by L */
+			if (eend <= S) {
+				new[new_n++] = e;
+			} else if (o >= S + L) {
+				e.offset = o - L;
+				new[new_n++] = e;
+			} else if (o >= S && eend <= S + L) {
+				/* wholly inside the removed range: free, drop */
+				if (e.flags & BRIEFS_EXT_UNWRITTEN)
+					*unwritten_freed += e.len;
+				briefs_journal_extent_free(bsi->journal,
+							   inode->i_ino, o,
+							   e.phys, e.len);
+				briefs_free_blocks_range(bsi, e.phys, e.len);
+			} else {
+				/* straddles S and/or S+L */
+				u64 mid_start = max(o, S);
+				u64 mid_end = min(eend, S + L);
+
+				if (o < S) {
+					struct briefs_extent left = e;
+
+					left.len = S - o;
+					new[new_n++] = left;
+				}
+				if (mid_start < mid_end) {
+					u64 fp = e.phys + (mid_start - o);
+					u64 fl = mid_end - mid_start;
+
+					if (e.flags & BRIEFS_EXT_UNWRITTEN)
+						*unwritten_freed += fl;
+					briefs_journal_extent_free(bsi->journal,
+								   inode->i_ino,
+								   mid_start, fp, fl);
+					briefs_free_blocks_range(bsi, fp, fl);
+				}
+				if (eend > S + L) {
+					struct briefs_extent right = e;
+
+					right.offset = S;	/* (S+L) - L */
+					right.phys = e.phys + (S + L - o);
+					right.len = eend - (S + L);
+					new[new_n++] = right;
+				}
+			}
+		} else {
+			/* insert: open hole [S, S+L), shift >= S up by L */
+			if (eend <= S) {
+				new[new_n++] = e;
+			} else if (o >= S) {
+				e.offset = o + L;
+				new[new_n++] = e;
+			} else {
+				/* straddles S: prefix kept, suffix shifted up */
+				struct briefs_extent left = e;
+				struct briefs_extent right = e;
+
+				left.len = S - o;
+				new[new_n++] = left;
+
+				right.offset = S + L;
+				right.phys = e.phys + (S - o);
+				right.len = eend - S;
+				new[new_n++] = right;
+			}
+		}
+	}
+
+	ret = briefs_rebuild_extent_list(sb, binfo, new, new_n);
+	kvfree(old);
+	kvfree(new);
+	return ret;
+}
+
+/*
+ * briefs_do_collapse_range - FALLOC_FL_COLLAPSE_RANGE.  Remove
+ * [offset, offset+len) and shift the data after it down by len; i_size -= len.
+ * The VFS guarantees offset/len are block-aligned and offset+len <= i_size.
+ */
+static long briefs_do_collapse_range(struct file *file, loff_t offset, loff_t len)
+{
+	struct inode *inode = file_inode(file);
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct super_block *sb = inode->i_sb;
+	struct timespec64 now;
+	u64 S = offset >> BRIEFS_BLOCK_SHIFT;
+	u64 L = len >> BRIEFS_BLOCK_SHIFT;
+	u64 unwritten_freed = 0;
+	int ret;
+
+	if (binfo->disk_inode.flags & InodeFlagInlineData) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	ret = filemap_write_and_wait_range(inode->i_mapping, offset,
+					   inode->i_size - 1);
+	if (ret)
+		goto out;
+
+	mutex_lock(&binfo->extent_lock);
+	ret = briefs_shift_extents(inode, S, L, -1, &unwritten_freed);
+	if (ret) {
+		mutex_unlock(&binfo->extent_lock);
+		goto out;
+	}
+	briefs_release_unwritten_reserve(inode, unwritten_freed);
+	mutex_unlock(&binfo->extent_lock);
+
+	/* Pages at/after @offset now map to shifted/removed extents: drop them
+	 * so reads repopulate from the new mapping. */
+	truncate_inode_pages_range(inode->i_mapping, offset, (loff_t)-1);
+
+	inode->i_size -= len;
+	binfo->disk_inode.filesize = inode->i_size;
+	inode->i_blocks = briefs_compute_i_blocks(sb, &binfo->disk_inode);
+	now = current_time(inode);
+	inode->i_mtime_sec = now.tv_sec;
+	inode->i_mtime_nsec = now.tv_nsec;
+	inode->i_ctime_sec = now.tv_sec;
+	inode->i_ctime_nsec = now.tv_nsec;
+	briefs_sync_inode_times(inode, &binfo->disk_inode);
+	briefs_persist_and_journal_inode_warn(sb, inode, &binfo->disk_inode);
+	mark_inode_dirty(inode);
+
+out:
+	inode_unlock(inode);
+	if (ret == 0)
+		ret = briefs_inode_sync(inode);
+	return ret;
+}
+
+/*
+ * briefs_do_insert_range - FALLOC_FL_INSERT_RANGE.  Open a hole of len at
+ * offset, shifting the data at/after offset up by len; i_size += len.  The VFS
+ * guarantees offset/len are block-aligned and offset < i_size.  The inserted
+ * range is a plain hole (reads as zero); no blocks are allocated.
+ */
+static long briefs_do_insert_range(struct file *file, loff_t offset, loff_t len)
+{
+	struct inode *inode = file_inode(file);
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct super_block *sb = inode->i_sb;
+	struct timespec64 now;
+	u64 S = offset >> BRIEFS_BLOCK_SHIFT;
+	u64 L = len >> BRIEFS_BLOCK_SHIFT;
+	int ret;
+
+	if (binfo->disk_inode.flags & InodeFlagInlineData) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	ret = filemap_write_and_wait_range(inode->i_mapping, offset,
+					   inode->i_size - 1);
+	if (ret)
+		goto out;
+
+	mutex_lock(&binfo->extent_lock);
+	ret = briefs_shift_extents(inode, S, L, 1, NULL);
+	if (ret) {
+		mutex_unlock(&binfo->extent_lock);
+		goto out;
+	}
+	mutex_unlock(&binfo->extent_lock);
+
+	truncate_inode_pages_range(inode->i_mapping, offset, (loff_t)-1);
+
+	inode->i_size += len;
+	binfo->disk_inode.filesize = inode->i_size;
+	inode->i_blocks = briefs_compute_i_blocks(sb, &binfo->disk_inode);
+	now = current_time(inode);
+	inode->i_mtime_sec = now.tv_sec;
+	inode->i_mtime_nsec = now.tv_nsec;
+	inode->i_ctime_sec = now.tv_sec;
+	inode->i_ctime_nsec = now.tv_nsec;
+	briefs_sync_inode_times(inode, &binfo->disk_inode);
+	briefs_persist_and_journal_inode_warn(sb, inode, &binfo->disk_inode);
+	mark_inode_dirty(inode);
+
+out:
+	inode_unlock(inode);
+	if (ret == 0)
+		ret = briefs_inode_sync(inode);
+	return ret;
+}
+
+/*
  * briefs_fallocate - VFS fallocate implementation.
  *
- * Supports plain pre-allocation (mode == 0), FALLOC_FL_KEEP_SIZE, and
- * FALLOC_FL_PUNCH_HOLE (which must be combined with FALLOC_FL_KEEP_SIZE).
+ * Supports plain pre-allocation (mode == 0), FALLOC_FL_KEEP_SIZE,
+ * FALLOC_FL_PUNCH_HOLE (with KEEP_SIZE), FALLOC_FL_ZERO_RANGE,
+ * FALLOC_FL_COLLAPSE_RANGE, and FALLOC_FL_INSERT_RANGE.
  */
 long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 {
@@ -1891,7 +2448,9 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	bool grew_size = false;
 	int ret = 0;
 
-	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE))
+	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |
+		     FALLOC_FL_ZERO_RANGE | FALLOC_FL_COLLAPSE_RANGE |
+		     FALLOC_FL_INSERT_RANGE))
 		return -EOPNOTSUPP;
 
 	if (offset < 0 || len <= 0)
@@ -1929,8 +2488,29 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	 * (generic/228: fallocate past the FSIZE ulimit must fail with "File
 	 * too large").  KEEP_SIZE and PUNCH_HOLE never grow i_size, so they
 	 * are exempt.  The inode is now locked, as inode_newsize_ok() requires.
+	 * INSERT_RANGE grows i_size by len (a new hole is punched at @offset and
+	 * the tail shifts up), so it must clear the ulimit gate for i_size+len too;
+	 * ZERO_RANGE without KEEP_SIZE can grow i_size to end (handled here as the
+	 * generic !KEEP_SIZE case).  COLLAPSE_RANGE only shrinks i_size.
+	 *
+	 * Compute the new size with an overflow-safe comparison: i_size may sit
+	 * at s_maxbytes (MAX_LFS_FILESIZE), so "i_size + len" would wrap to
+	 * negative in signed loff_t and slip past inode_newsize_ok()'s
+	 * s_maxbytes check (generic/485: insert past the FS max must fail with
+	 * "File too large", the XFS signed-overflow regression).  Test len
+	 * against the headroom (s_maxbytes - i_size) instead.
 	 */
-	if (!(mode & FALLOC_FL_KEEP_SIZE) && end > inode->i_size) {
+	if (mode & FALLOC_FL_INSERT_RANGE) {
+		if (len > inode->i_sb->s_maxbytes - inode->i_size) {
+			inode_unlock(inode);
+			return -EFBIG;
+		}
+		ret = inode_newsize_ok(inode, inode->i_size + len);
+		if (ret) {
+			inode_unlock(inode);
+			return ret;
+		}
+	} else if (!(mode & FALLOC_FL_KEEP_SIZE) && end > inode->i_size) {
 		ret = inode_newsize_ok(inode, end);
 		if (ret) {
 			inode_unlock(inode);
@@ -1941,6 +2521,21 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	if (mode & FALLOC_FL_PUNCH_HOLE) {
 		briefs_stat_inc(bsi, punch_holes);
 		ret = briefs_do_punch_hole(file, offset, len);
+		return ret;
+	}
+
+	if (mode & FALLOC_FL_COLLAPSE_RANGE) {
+		ret = briefs_do_collapse_range(file, offset, len);
+		return ret;
+	}
+
+	if (mode & FALLOC_FL_INSERT_RANGE) {
+		ret = briefs_do_insert_range(file, offset, len);
+		return ret;
+	}
+
+	if (mode & FALLOC_FL_ZERO_RANGE) {
+		ret = briefs_do_zero_range(file, mode, offset, len);
 		return ret;
 	}
 
