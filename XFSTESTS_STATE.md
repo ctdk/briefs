@@ -5,24 +5,81 @@ measured by fresh full-suite and targeted runs on the VM.
 
 ## Overview
 
-**Latest per-test full-suite run:** 2026-08-05, `tests/xfstests/run-suite.sh`
-over every generic test on the VM, kernel `6.12.100+deb13-amd64`, branch
-`refactor-round-1`. `generic/388` was skipped because it wedges the suite.
+**Latest per-test full-suite run:** 2026-08-13, `tests/xfstests/run-suite.sh`
+over every generic test on the VM, kernel `6.12.101+deb13-amd64`, branch
+`refactor-round-3`, commit `3835ac5` (post split-on-conversion + B1; before
+the `generic/274` meta_shield fix). Archive:
+`tests/xfstests/runs/run-20260813-113611-kernel.txt`.
 
 | Bucket           | Count | Notes                                                    |
 |------------------|------:|----------------------------------------------------------|
 | Selected         |   793 | all generic tests                                        |
-| Pass             |   327 | per-test runner reported PASS                            |
-| Fail             |     8 | 3 fixed (generic/027, generic/177, generic/062), 5 remaining (see below) |
-| Not run          |   420 | `_require_*` gate or unsupported feature                 |
-| Hang             |     3 | timeout — generic/461, generic/619, generic/753          |
-| Mount fail       |     0 | leftover DM targets now torn down by the runner          |
+| Pass             |   378 | per-test runner reported PASS                            |
+| Fail             |    10 | 050 250 252 274 311 346 563 599 623 730 (see below)      |
+| Not run          |   397 | `_require_*` gate or unsupported feature                 |
+| Skipped          |     8 | 051 068 074 461 464 475 476 753 (known hangs/deferred)   |
+| Hang             |     0 | former timeout hangs now skipped (461/753) or passing (619) |
+| Mount fail       |     0 | runner tears down DM targets before each test            |
 
-**Changes since 2026-07-13 run:**
-- **generic/027** — FIXED: vfree() warning in briefs_alloc_cleanup. Added is_vmalloc_addr() validation.
-- **generic/177** — FIXED: gawk installed on VM (was using mawk).
-- **generic/062** — FIXED: gawk installed provides asort() function used by common/attr.
-- Skip list updated: added generic/051, generic/461, generic/619, generic/753 (hangs).
+**Post-run fixes (not yet re-confirmed by a full suite):**
+- `generic/274` — FIXED by `141be8c` (meta_shield count-shield reserves
+  B+tree metadata for unwritten fallocate extents at 100%-full). Targeted
+  re-run of 274 + the regression cluster (011/032/092/521/616/363/091/015/003)
+  was 10/10 PASS (`run-20260813-182156`). Effective full-suite tally is
+  therefore **379 pass / 9 fail** pending a fresh full run.
+- `53679e3` (follow-up #74) releases the unwritten reserve on punch/truncate
+  so `df` is honest immediately (was held until evict). No test pass/fail
+  change; verified by a df-honesty spot-check (4/4) + 9 targeted tests PASS
+  + clean fsck.
+- `e2f023c` (fallocate zero_range/collapse_range/insert_range): the mode gate
+  now accepts the three ops. 31 of the 32 generic tests they gate move from
+  NOT RUN to PASS — the 11 zero_range tests (008 009 033 042 096 456 469 511
+  610 685 758), the 12 collapse tests (012 016 021 022 031 072 497 499 503
+  687), and the 9 insert tests (058 060 061 063 064 404 686 735), plus
+  `generic/485` (insert EFBIG overflow fix) and `generic/017` (collapse
+  timeout bump). `generic/641` stays NOT RUN — it needs
+  `_scratch_mkfs_blocksized` support in `common/briefs` (xfstests-dev repo),
+  not a kernel change. The regression cluster (011 015 025 026 092 274 363
+  522 616) stays PASS, fsck clean after each. Effective full-suite tally is
+  therefore **410 pass / 9 fail** pending a fresh full run.
+
+**Changes since the 2026-08-05 run** (iomap migration + refactor-round-3):
+- **iomap migration** (buffer_head → iomap, phases 0-8): DIO landed (closes
+  `generic/704`), bmap + swapfile landed (closes `generic/472`, `generic/643`),
+  moving ~23 formerly not-run tests into the passing set.
+- **POSIX ACLs** (`a113c76`): ACLs as `system.posix_acl_*` xattrs via
+  `.get_inode_acl`/`.set_acl`; the 14 ACL-gated tests (026 053 077 099 105
+  237 307 318 319 375 444 449 529 697) now PASS (were "ACLs not supported").
+- **split-on-conversion** (`c9e3eb2` + `afc8a93` + `3835ac5`): a partial write
+  into a preallocated unwritten extent now splits it (written middle +
+  unwritten wings) instead of flipping the whole extent to MAPPED, and
+  truncate keeps the unwritten EOF block unwritten. Fixed the `44f41eb`
+  stale-data regression (521/091/263/522/616/363) but regressed `generic/274`
+  at 100%-full (the split needs a metadata block) — fixed by `141be8c`.
+- **journal-owned bh lifetimes** (`134d4a4`): journal-tracked dirty metadata
+  block set + `briefs_journal_flush_owned` replaces `sync_blockdev`; fixes
+  `generic/475` umount-redirty-EIO.
+- **lockdep Phase 2** (`54f1984`): extent_seq preempt_disable wrappers; the
+  `6.12.101-lockdep` kernel is used for targeted lock-order verification
+  (the full suite above ran on the stock kernel).
+- Skip list changed: 070/224 un-skipped after Phase-1 re-verification (619
+  was also un-skipped and now passes); the 461/753 former timeout hangs are
+  skipped rather than timed-out; 074/464/476 skipped pending re-verify; 475
+  skipped (flaky/deferred); 051/068 skipped.
+
+**`generic/388`** now PASSES (in the 2026-08-13 PASS list); it is no longer
+excluded or wedging. **`generic/299`** still needs investigation (btree
+checksum mismatch under stress). **`generic/127`/`521`** pass in the full
+suite but are flaky mmap+fsx flush-deadlock candidates (see failing-test
+notes; `521` confirmed via bisect 2026-08-13 to wedge on the pre-#74 build
+too, so it is a pre-existing 455/127-class flush deadlock, not a #74
+regression).
+
+---
+
+**Prior per-test run:** 2026-08-05, kernel `6.12.100+deb13-amd64`, branch
+`refactor-round-1` — 327 pass / 8 fail / 420 not-run / 3 hang (461/619/753).
+The notes immediately below are from that run.
 
 **Mount-fail note:** An earlier iteration of this run reported 11 `MOUNT FAIL`
 entries for `generic/313..323`. Those were run-runner artifacts caused by
@@ -128,51 +185,74 @@ bulk `./check` invocation.
 
 ---
 
-## Excluded test
+## Formerly excluded test
 
-### generic/388 — shutdown-recovery stress wedge
+### generic/388 — shutdown-recovery stress wedge (now PASSING)
 
-- **Status:** expunged from the full suite via `/xfstests/tests/generic/.exclude`
-  containing `388`.
-- **Nature:** repeated `XFS_IOC_GOINGDOWN NOLOGFLUSH` shutdown / remount cycles
-  corrupt BrieFS trie pages (bad-magic flood) and eventually leave `godown`
-  stuck in `briefs_dir_open` in D-state, wedging the suite.
-- **Action:** real shutdown/replay bug; not fixed in this run. Re-add to the
-  suite only after the corruption is fixed.
+- **Status:** **PASSING** as of the 2026-08-13 full-suite run (in the PASS
+  list; no longer in the skip list). The earlier `XFS_IOC_GOINGDOWN
+  NOLOGFLUSH` shutdown/replay corruption that left `godown` stuck in
+  `briefs_dir_open` D-state has since been resolved by the shutdown/replay
+  durability work (always-checkpoint-at-unmount `f8ef293`, journal-replay
+  write_pos `321/322`, and the journal-owned-bh / sync-model changes).
+- **History:** was expunged via `/xfstests/tests/generic/.exclude` in the
+  2026-07-06 run because it wedged the suite. Re-added and green in
+  refactor-round-3.
 
 ---
 
-## Failing tests (2026-08-05 per-test run, updated)
+## Failing tests (2026-08-13 per-test run)
 
-The final 2026-08-05 per-test run reported **8 effective failures** and **3
-hangs**. Three tests that previously failed are now fixed.
+The 2026-08-13 full-suite run reported **10 failures**, **0 hangs** (the
+former 461/753 timeout hangs are now in the skip list; 619 was un-skipped and
+passes). Classification vs the prior run, from
+`briefs-remaining-xfstests-failures-triage`:
 
-**Fixed since 2026-07-13:**
-- `generic/027` — FIXED: vfree() warning in briefs_alloc_cleanup. Added is_vmalloc_addr() validation before vfree() calls.
-- `generic/177` — FIXED: gawk installed on VM (test uses strtonum() function).
-- `generic/062` — FIXED: gawk installed provides asort() function used by common/attr's _sort_getfattr_output().
+**10 FAIL tests:**
+- `generic/050` — read-only dirty-journal mount output differs; expected-error-string mismatch. Pre-existing/expected.
+- `generic/250` — DIO-error sibling: direct I/O after a failing device does not propagate `EIO` (needs deferred-conversion / DIO error wiring).
+- `generic/252` — DIO-error sibling of 250 (same family).
+- `generic/274` — **NEW split regression at 100%-full** (split-on-conversion
+  `c9e3eb2` needs a metadata block for the extent split, which hit ENOSPC).
+  **FIXED post-run by `141be8c`** (meta_shield count-shield; targeted re-run
+  10/10 PASS). Counted as failing in the archived run; effective tally below
+  treats it as fixed.
+- `generic/311` — pre-existing baseline flake (dm-flakey/fsync timing); reproduces on a known-good baseline.
+- `generic/346` — flake (intermittent; not a steady BrieFS bug).
+- `generic/563` — cgroup writeback accounting mismatch; expected after `SB_I_CGROUPWB` was disabled on 6.12 (`9385fc8`).
+- `generic/599` — shutdown cluster: VFS `cleanup_mnt` WARN after shutdown ioctl (`_check_dmesg` catches it; not data corruption).
+- `generic/623` — shutdown cluster: fsync after shutdown returns `EROFS` instead of expected `EIO`.
+- `generic/730` — shutdown cluster: read after device delete returns no error instead of expected `EIO`.
 
-**Remaining 8 FAIL tests:**
-- `generic/050` — read-only dirty-journal mount output differs; expected-error-string mismatch.
-- `generic/089` — bulk fsx stress test output format mismatch (iteration count format).
-- `generic/311` — pre-existing baseline flake (dm-flakey/fsync timing).
-- `generic/547` — fsstress metadata mismatch; crash-replay family (partial fix in 86fa48b, edge cases remain).
-- `generic/563` — cgroup writeback accounting mismatch; expected after `SB_I_CGROUPWB` disabled on 6.12.
-- `generic/599` — VFS `cleanup_mnt` WARN after shutdown ioctl (deferred, not data corruption).
-- `generic/623` — fsync after shutdown returns `EROFS` instead of expected `EIO`.
-- `generic/730` — read after device delete returns no error instead of expected `EIO`.
+**Post-run fixes (not yet re-confirmed by a fresh full suite):**
+- `141be8c` fixes `generic/274` (meta_shield). Effective full-suite tally is
+  therefore **379 pass / 9 fail** (050 250 252 311 346 563 599 623 730).
+- `53679e3` (follow-up #74, df-honesty for punch/truncate) changes no test
+  pass/fail; verified by a df-honesty spot-check + 9 targeted tests PASS.
 
-### Hangs (timeout 300s)
+**Moved into PASS since 2026-08-05** (23 tests): the 14 ACL-gated tests
+(`026 053 077 099 105 237 307 318 319 375 444 449 529 697`, via `a113c76`),
+`089` (bulk fsx format now matches), `127`/`521`/`522` (fsx flush, passing in
+this run though flaky — see below), `388` (formerly excluded, now green),
+`341`/`510`/`771` (replay duplicate-entry bugs now resolved), and `547`
+(crash-replay, now passing). `250`/`252`/`274`/`346` moved out of the passing
+set (the four non-skip regressions/​flakes above).
 
-- `generic/461` — hung on 2026-08-04 run; added to skip list.
-- `generic/619` — hung on 2026-08-04 run; added to skip list.
-- `generic/753` — hung on 2026-08-05 run; added to skip list (dm-error replay test).
+**Skipped (8, in the skip list — not counted as fail):** `051 068 074 461 464
+475 476 753`. These are known hangs/deferred re-verifications: 461/619/753 were
+former timeout hangs; 074/464/476 are skipped pending re-verification; 475 is
+the flaky/deferred dm-error crash-replay bug; 051/068 were un-skipped then
+re-skipped during the Phase-1 re-verification churn. (`619` is **not** in the
+current skip list — it passed in this run; the historical "619 hung" note is
+stale.)
 
-**Note:** generic/127, generic/521, and generic/522 now pass after the journal
-lock contention and writeback fixes in branch `refactor-round-1`.
-
-**Note:** `generic/475` (dm-error crash-replay) passed in this run but remains
-a known flaky/deferred bug in the crash-replay family.
+**Note on `127`/`521`/`522`.** These pass in the full suite but are flaky
+mmap+fsx flush-deadlock candidates. `521` was confirmed via bisect
+(2026-08-13) to wedge on the pre-`#74` build too: it is a pre-existing
+455/127-class flush deadlock (`msync → blkdev_issue_flush → submit_bio_wait`,
+introduced by the 455 fix `82c9a61`), not a `#74` regression. Treat a 521/127
+hang as a pre-existing flake until the flush deadlock is fixed; do not
+attribute it to a new change without a bisect.
 
 ## Failing tests (6) (2026-07-06 `./check -g auto` run)
 
@@ -302,18 +382,30 @@ a known flaky/deferred bug in the crash-replay family.
 
 ---
 
-## Not-run tests (398)
+## Not-run tests (397 in the 2026-08-13 run; table below from 2026-07-06)
+
+The 2026-08-13 per-test run reported **397 not-run**. The detailed
+reason-grouped table below was built from the 2026-07-06 `./check -g auto`
+run's `.notrun` artifacts (the per-test runner archives do not record the
+reason text), so the table's per-row counts are from that older run and are
+representative of the reason *taxonomy* rather than the exact 2026-08-13
+counts. Two shifts since that table were built: the 14 **ACL** tests moved to
+PASS (`a113c76` — that row is now historical), and the iomap migration moved
+~23 DIO/bmap/swapfile tests from not-run into PASS. Use the 2026-08-13 PASS /
+NOT RUN lists above for exact membership; use this table for "why a test is
+not run".
 
 Every not-run is gated by a `_require_*` probe that actually exercises the
 filesystem or the VM environment, so a not-run is a genuine unimplemented
 feature or an environment gap — not a stale declaration. The `.notrun` reasons
-from the run were read and grouped; all gates are legitimate.
+were read and grouped; all gates are legitimate.
 
 **Two meta-categories:**
 
 - **Absent feature** (BrieFS does not implement it): reflink/COW, quota,
-  shutdown-state probing, fscrypt/fsverity, exchangerange, POSIX ACL,
-  fcollapse/fzero/finsert, dedupe, idmapped mounts, O_TMPFILE, FITRIM, DAX,
+  shutdown-state probing, fscrypt/fsverity, exchangerange, ~~POSIX ACL~~
+  (now implemented — `a113c76`), fcollapse/fzero/finsert, dedupe, idmapped
+  mounts, O_TMPFILE, FITRIM, DAX,
   atomic writes, defrag, casefold, setdeleg, fsmap, swapext/startupdate,
   file_getattr/file_setattr syscalls, connectable file handles, fanotify ioerrors,
   duplicate fsid, cross-device copy_file_range, project quota, etc. Most are
@@ -331,7 +423,7 @@ from the run were read and grouped; all gates are legitimate.
 | disk quotas not supported                                 | 31 | 082 219 230 231 232 233 234 235 244 270 280 379 380 381 382 383 384 385 386 400 506 566 587 594 600 601 603 681 682 691 762 |
 | No encryption support (fscrypt)                           | 28 | 368 369 395 396 397 398 399 419 421 429 435 440 548 549 550 580 581 582 583 584 592 593 595 602 613 621 693 739 |
 | xfs_io exchangerange not supported                        | 16 | 709 710 712 714 716 717 718 719 720 722 723 724 725 726 727 752 |
-| ACLs not supported                                        | 14 | 026 053 077 099 105 237 307 318 319 375 444 449 529 697 |
+| ACLs not supported ~~(now PASSING via `a113c76`)~~          | ~~14~~ | ~~026 053 077 099 105 237 307 318 319 375 444 449 529 697~~ — all 14 now PASS in 2026-08-13 (POSIX ACLs landed); row kept for history |
 | xfs_io fcollapse failed (no COLLAPSE_RANGE)               | 12 | 012 016 017 021 022 031 072 497 499 503 641 687 |
 | fsverity utility required (no fsverity)                   | 11 | 572 573 574 575 576 577 579 624 625 692 788 |
 | xfs_io fzero failed (no ZERO_RANGE)                       | 11 | 008 009 033 042 096 456 469 511 610 685 758 |
@@ -400,56 +492,62 @@ from the run were read and grouped; all gates are legitimate.
 
 ---
 
-## Passing tests (376)
+## Passing tests (378)
+
+From the 2026-08-13 run archive (`run-20260813-113611-kernel.txt`, commit
+`3835ac5`). With the post-run `141be8c` fix for `generic/274`, the effective
+pass count is **379** (274 moves from FAIL to PASS); a fresh full suite to
+re-confirm is pending.
 
 ```
 001  002  003  005  006  007  011  013
-014  015  020  023  024  025  027  028
-029  030  032  034  035  036  037  039
-040  041  043  044  045  046  047  048
-049  051  056  057  059  062  065  066
-067  068  069  070  071  073  074  075
-076  078  079  080  081  083  084  085
-086  087  088  090  091  092  093  094
-095  097  098  100  101  102  103  104
-106  107  108  109  112  113  114  117
-120  123  124  125  126  128  129  130
-131  132  133  135  141  169  177  184
-192  193  198  204  207  208  209  210
-211  212  213  214  215  221  224  225
-226  228  236  239  240  241  245  246
-247  248  249  250  252  255  256  257
-258  263  269  273  274  275  277  285
-286  294  300  306  308  309  310  312
-313  314  315  316  317  320  321  322
-323  325  335  336  337  338  339  340
-342  343  344  345  346  347  348  350
-354  355  360  361  362  363  364  366
-371  376  377  378  390  391  392  393
-394  401  403  405  406  409  410  411
-412  416  417  418  420  422  423  424
-426  427  428  430  431  432  433  434
-436  437  438  439  441  442  443  445
-446  448  450  451  452  453  454  455
-459  460  461  464  465  466  467  468
-471  472  473  474  475  476  477  478
+014  015  020  023  024  025  026  027
+028  029  030  032  034  035  036  037
+039  040  041  043  044  045  046  047
+048  049  053  056  057  059  062  065
+066  067  069  070  071  073  075  076
+077  078  079  080  081  083  084  085
+086  087  088  089  090  091  092  093
+094  097  098  099  100  101  102  103
+104  105  106  107  108  109  112  113
+114  117  120  123  124  125  126  127
+128  129  130  131  132  133  135  141
+169  177  184  192  193  198  204  207
+208  209  210  211  212  213  214  215
+221  224  225  226  228  236  237  239
+240  245  246  247  248  249  255  256
+257  258  263  269  273  275  277  285
+286  294  306  307  308  309  310  312
+313  314  315  316  317  318  319  320
+321  322  323  325  335  336  337  338
+339  340  341  342  343  344  345  347
+348  350  354  355  360  361  362  363
+364  371  375  376  377  378  388  390
+391  392  393  394  401  403  405  406
+409  410  411  412  416  417  418  420
+422  423  424  426  427  428  430  431
+432  433  434  436  437  438  439  441
+442  443  444  445  446  448  449  450
+451  452  453  454  459  460  465  466
+467  468  471  472  473  474  477  478
 479  480  481  483  484  486  488  489
 490  491  494  495  496  498  502  504
-505  507  508  512  519  520  523  524
-525  526  527  528  530  532  533  534
-535  536  538  539  545  551  552  553
-554  555  557  558  564  567  568  569
-571  585  586  589  590  591  596  597
-598  604  609  611  615  616  617  618
-619  620  622  626  627  629  631  632
-633  634  635  636  637  638  639  640
-642  643  646  647  650  676  677  678
-679  680  683  684  688  690  694  695
-696  701  703  704  705  706  707  708
-728  729  731  732  736  737  738  740
-741  742  743  747  748  749  750  751
-753  754  755  756  759  760  761  763
-764  779  782  784  785  789  790  792
+505  507  508  510  512  519  520  521
+522  523  524  525  526  527  528  529
+530  532  533  534  535  536  538  539
+545  547  551  552  553  554  555  557
+558  564  567  568  569  571  585  586
+589  590  591  597  598  604  609  611
+615  616  617  618  619  620  622  626
+629  631  632  633  634  635  636  637
+638  639  640  642  643  646  647  650
+676  677  678  679  680  683  684  688
+690  694  695  696  697  701  704  705
+706  707  708  728  729  731  732  736
+737  738  740  741  742  743  747  748
+749  750  754  755  756  759  760  761
+763  764  771  779  782  784  785  789
+790  792
 ```
 
 ### xfstests xattr cluster (13/13, 2026-07-02)
@@ -471,7 +569,9 @@ Newly-exposed shutdown-related failures:
 (read after device delete missing EIO), `753` (dm-error metadata-sync WARN), and
 historically `127` (mmap+fsx D-state hang — passed in this run). `generic/417`
 (xattr EA race) and `generic/737` (file lost after O_DIRECT+shutdown) are now
-fixed. `generic/388` is excluded from the full suite because it wedges.
+fixed. `generic/388` was excluded from the full suite because it wedged
+(**update:** it now PASSES in 2026-08-13 after the shutdown/replay durability
+work — see "Formerly excluded test" above).
 
 With `LOGWRITES_DEV` now configured, `455` passes (was an md5 mismatch in the
 previous run). `482` and `757` are correctly not-run because BrieFS does not
@@ -525,24 +625,27 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | 048                           | 62167fa  | sync+shutdown file size bug (inode dirty on i_size growth + inode-block RMW lock) |
 | 737                           | 8f4a27b  | O_DIRECT+shutdown file lost (directory sync durability + journal ring back-pressure) |
 
-> Open BrieFS code bugs after this run:
-> - `299` — new btree checksum mismatch hang (killed by runner); needs
->   investigation as a real corruption bug.
-> - `341`, `510`, `771` — replay creates duplicate directory entries after power
->   failure; idempotency/replay bugs.
-> - `547` — fsstress metadata mismatch; crash-replay family.
-> - `599` — VFS `cleanup_mnt` WARN after shutdown.
-> - `623` — fsync after shutdown does not return `EIO`.
-> - `730` — read after device delete missing `EIO`.
-> - `388` — excluded shutdown/replay wedge.
+> Open BrieFS code bugs as of the 2026-07-06 run (status updated to 2026-08-13):
+> - `299` — btree checksum mismatch under stress; still needs investigation
+>   (not in the 2026-08-13 fail set — not run or passing there; treat as
+>   deferred).
+> - `341`, `510`, `771` — replay duplicate directory entries: **now PASS** in
+>   2026-08-13 (idempotency/replay work resolved them).
+> - `547` — fsstress metadata mismatch: **now PASS** in 2026-08-13 (crash-replay
+>   durability work; still watched as flaky).
+> - `599` — VFS `cleanup_mnt` WARN after shutdown: still FAIL (shutdown cluster).
+> - `623` — fsync after shutdown does not return `EIO`: still FAIL (shutdown cluster).
+> - `730` — read after device delete missing `EIO`: still FAIL (shutdown cluster).
+> - `388` — was an excluded shutdown/replay wedge: **now PASS** in 2026-08-13.
 >
-> `generic/127`, `521`, `522` timed out (hangs). `generic/311` is a pre-existing
-> baseline flake. `generic/050` is an expected-error-string mismatch on
-> read-only dirty-journal mount. `generic/089` fails because the 4 GiB `TEST_DEV`
-> image is too small for the test's bulk fsx workload. `generic/563` fails because
-> cgroup writeback was disabled (`SB_I_CGROUPWB` workaround). `generic/455`,
-> `475`, and `753` passed in this run; `475` and `547` remain known flaky/deferred
-> crash-replay bugs.
+> `generic/127`, `521`, `522` **pass** in 2026-08-13 (no longer hangs) but are
+> flaky mmap+fsx flush-deadlock candidates (see failing-test notes). `311` is a
+> pre-existing baseline flake. `050` is an expected-error-string mismatch on
+> read-only dirty-journal mount. `089` **now passes** (was a `TEST_DEV`-size
+> artifact). `563` fails because cgroup writeback was disabled
+> (`SB_I_CGROUPWB` workaround). `250`/`252` are DIO-error siblings (deferred
+> conversion); `274` was a split regression now fixed by `141be8c`; `346` is a
+> flake.
 
 ---
 
