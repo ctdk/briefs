@@ -1350,23 +1350,6 @@ static bool briefs_block_mapped(struct inode *inode, u64 iblock)
 }
 
 /*
- * briefs_zero_block - ensure the on-disk block at @abs_block is zero-filled.
- */
-static int briefs_zero_block(struct super_block *sb, u64 abs_block)
-{
-	struct buffer_head *bh;
-	int err;
-
-	bh = briefs_get_zero_block(sb, abs_block);
-	if (!bh)
-		return -EIO;
-	briefs_mark_buffer_dirty(bh, sb);
-	err = briefs_sync_dirty_buffer(bh, sb, "zero block");
-	brelse(bh);
-	return err;
-}
-
-/*
  * briefs_zero_block_range - zero bytes [start, end) inside the physical data
  * block at @abs_block.  Used by punch-hole to zero the portion of a
  * partially-holed block that remains allocated.
@@ -2029,8 +2012,10 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 				 * The run is recorded as BRIEFS_EXT_UNWRITTEN, so
 				 * the iomap read path maps it to IOMAP_UNWRITTEN and
 				 * returns zeros without reading these data blocks; a
-				 * later write converts the extent in place.  Do NOT
-				 * zero the blocks here: briefs_zero_block does a
+				 * later write converts just the written blocks,
+				 * splitting the extent so the un-written wings stay
+				 * unwritten (briefs_convert_unwritten_range).  Do
+				 * NOT zero the blocks here: zeroing would do a
 				 * synchronous sync_dirty_buffer per block, so a large
 				 * fallocate issued millions of sync writes and ran
 				 * for hours (generic/103: 100 GB fill), and the loop
