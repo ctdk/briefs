@@ -8,6 +8,7 @@
 #include <linux/fiemap.h>
 #include <linux/statfs.h>
 #include <linux/slab.h>
+#include <linux/sched/signal.h>
 #include <linux/buffer_head.h>
 #include <linux/seqlock.h>
 #include <linux/pagemap.h>
@@ -1983,6 +1984,10 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	 */
 	blk = start_blk;
 	while (blk < end_blk) {
+		if (fatal_signal_pending(current)) {
+			ret = -EINTR;
+			goto falloc_loop_done;
+		}
 		/* Unlocked check for already-mapped blocks (fast path). */
 		if (briefs_block_mapped(inode, blk)) {
 			blk++;
@@ -1998,16 +2003,20 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 			rel_run = briefs_alloc_blocks(&bsi->alloc, run_len);
 			if (rel_run != 0) {
 				phys_run = data_to_abs(bsi->sb, rel_run);
-				for (i = 0; i < run_len; i++) {
-					ret = briefs_zero_block(inode->i_sb,
-							       phys_run + i);
-					if (ret) {
-						for (j = 0; j < run_len; j++)
-							briefs_free_block(&bsi->alloc,
-									  rel_run + j);
-						goto falloc_loop_done;
-					}
-				}
+				/*
+				 * The run is recorded as BRIEFS_EXT_UNWRITTEN, so
+				 * the iomap read path maps it to IOMAP_UNWRITTEN and
+				 * returns zeros without reading these data blocks; a
+				 * later write converts the extent in place.  Do NOT
+				 * zero the blocks here: briefs_zero_block does a
+				 * synchronous sync_dirty_buffer per block, so a large
+				 * fallocate issued millions of sync writes and ran
+				 * for hours (generic/103: 100 GB fill), and the loop
+				 * never checked fatal_signal_pending() so it could
+				 * not be interrupted (SIGKILL would not land).  The
+				 * per-block fallback below likewise stores unwritten
+				 * extents and skips the zeroing.
+				 */
 				/* Take extent_lock BEFORE insert to maintain lock order. */
 				mutex_lock(&binfo->extent_lock);
 				ext.offset = blk;
@@ -2046,6 +2055,10 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 
 		/* per-block fallback: run_len == 1, or no contiguous run fit */
 		for (i = 0; i < run_len; i++) {
+			if (fatal_signal_pending(current)) {
+				ret = -EINTR;
+				goto falloc_loop_done;
+			}
 			/* Allocate single block (takes alloc->lock). */
 			rel = briefs_alloc_block(&bsi->alloc);
 			if (rel == 0) {
@@ -2054,11 +2067,7 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 			}
 			phys = data_to_abs(bsi->sb, rel);
 
-			ret = briefs_zero_block(inode->i_sb, phys);
-			if (ret) {
-				briefs_free_block(&bsi->alloc, rel);
-				goto falloc_loop_done;
-			}
+			/* No zeroing: the block is recorded unwritten (see above). */
 
 			/* Take extent_lock BEFORE insert to maintain lock order. */
 			mutex_lock(&binfo->extent_lock);
