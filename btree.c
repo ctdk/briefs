@@ -206,7 +206,7 @@ static int btree_lookup_leaf(struct briefs_extent_btree_node *node,
 /* Descend the B+ tree to the leaf whose subtree holds @iblock and invoke @cb to
  * perform the leaf-specific work. The internal-node descent skeleton (read
  * node, find the child whose subtree holds @iblock, null-check, recurse) is
- * shared by the lookup and clear_unwritten walks, which differ only in their
+ * shared by the lookup and convert_unwritten walks, which differ only in their
  * leaf behavior; @cb supplies that. The helper owns bh lifetime: it brelse's
  * after @cb returns on the leaf path and before recursing on the internal path.
  * Returns @cb's result (0/-ENOENT) or -EIO on a read or null-child failure.
@@ -360,53 +360,146 @@ int briefs_btree_lookup(struct super_block *sb, u64 root_block, u64 iblock,
 	return btree_lookup_block(sb, root_block, iblock, ext, trust_verified);
 }
 
-/* Leaf callback for the clear_unwritten walk: scan the leaf for the extent
- * covering @iblock and clear BRIEFS_EXT_UNWRITTEN in place (no split, no block
- * free).  Caller holds extent_lock, so trust_verified=true is threaded through
- * the descent.  Returns 0 if converted (or already written), -ENOENT if no
- * extent covers @iblock. */
-static int btree_clear_unwritten_leaf(struct briefs_extent_btree_node *node,
-				      struct buffer_head *bh, u64 iblock,
-				      void *ctx)
+/* Context for the convert_unwritten leaf callback: the sub-range [start_blk,
+ * end_blk) to convert to written, and any unwritten prefix/suffix split off for
+ * the caller to re-insert via briefs_btree_insert_locked().  The in-place leaf
+ * edit only shrinks the found record to the written middle; the prefix/suffix
+ * are re-inserted after the descent releases the leaf buffer (avoiding holding
+ * two leaf buffers, which could deadlock a concurrent split).
+ */
+struct btree_conv_ctx {
+	struct super_block *sb;
+	u64 start_blk;
+	u64 end_blk;
+	struct briefs_extent prefix;
+	struct briefs_extent suffix;
+	bool have_prefix;
+	bool have_suffix;
+};
+
+/* Leaf callback: find the unwritten extent covering start_blk and convert the
+ * sub-range [cstart, cend) to written.  If the write covers the whole extent,
+ * clear BRIEFS_EXT_UNWRITTEN in place.  Otherwise shrink the record to the
+ * written middle [cstart, cend) (in place, no block free) and stash the
+ * unwritten prefix [off, cstart) and suffix [cend, off+len) for the caller to
+ * re-insert.  Splitting -- rather than clearing the whole extent -- keeps the
+ * un-written blocks as IOMAP_UNWRITTEN so reads return zeros; the data blocks
+ * are never zeroed, which avoids the millions of synchronous writes a large
+ * fallocate would otherwise issue.  Caller holds extent_lock.
+ */
+static int btree_convert_unwritten_leaf(struct briefs_extent_btree_node *node,
+					 struct buffer_head *bh, u64 iblock,
+					 void *ctx)
 {
-	struct super_block *sb = ctx;
+	struct btree_conv_ctx *c = ctx;
+	struct super_block *sb = c->sb;
 	int i, num_keys = le16_to_cpu(node->hdr.num_keys);
 
 	for (i = 0; i < num_keys; i++) {
 		struct briefs_disk_extent *de = &node->u.leaf.extents[i];
 		u64 off = le64_to_cpu(de->offset);
 		u64 len = le64_to_cpu(de->len);
+		u64 phys = le64_to_cpu(de->phys);
+		u32 flags = le32_to_cpu(de->flags);
+		u64 eend = off + len;
+		u64 cstart, cend;
 
-		if (iblock >= off && iblock < off + len) {
-			if (le32_to_cpu(de->flags) & BRIEFS_EXT_UNWRITTEN) {
-				de->flags = cpu_to_le32(
-					le32_to_cpu(de->flags) &
-					~BRIEFS_EXT_UNWRITTEN);
-				btree_commit_node(bh, sb);
-			}
+		if (!(c->start_blk >= off && c->start_blk < eend)) {
+			if (off > c->start_blk)
+				break;	/* sorted: no later extent covers it */
+			continue;
+		}
+
+		if (!(flags & BRIEFS_EXT_UNWRITTEN))
+			return 0;		/* already written */
+
+		cstart = c->start_blk;
+		if (cstart < off)
+			cstart = off;
+		cend = c->end_blk;
+		if (cend > eend)
+			cend = eend;
+
+		if (cstart == off && cend == eend) {
+			/* Whole extent is written: clear the flag in place. */
+			de->flags = cpu_to_le32(flags & ~BRIEFS_EXT_UNWRITTEN);
+			btree_commit_node(bh, sb);
 			return 0;
 		}
-		if (off > iblock)
-			break;	/* sorted: no later extent can cover it */
+
+		/* Partial write: shrink this record to the written middle.  The
+		 * record stays sorted (prev ends <= off <= cstart, next starts
+		 * >= eend >= cend).  Re-insert the unwritten wings afterwards.
+		 */
+		de->offset = cpu_to_le64(cstart);
+		de->phys = cpu_to_le64(phys + (cstart - off));
+		de->len = cpu_to_le64(cend - cstart);
+		de->flags = cpu_to_le32(flags & ~BRIEFS_EXT_UNWRITTEN);
+		btree_commit_node(bh, sb);
+
+		if (cstart > off) {
+			c->prefix.offset = off;
+			c->prefix.phys = phys;
+			c->prefix.len = cstart - off;
+			c->prefix.flags = flags;	/* keep UNWRITTEN */
+			c->have_prefix = true;
+		}
+		if (cend < eend) {
+			c->suffix.offset = cend;
+			c->suffix.phys = phys + (cend - off);
+			c->suffix.len = eend - cend;
+			c->suffix.flags = flags;	/* keep UNWRITTEN */
+			c->have_suffix = true;
+		}
+		return 0;
 	}
 	return -ENOENT;
 }
 
-/* Clear BRIEFS_EXT_UNWRITTEN on the extent covering @iblock.  Caller holds
- * extent_lock (trust_verified=true).  Returns 0, -ENOENT, or -EIO. */
-static int btree_clear_unwritten_block(struct super_block *sb, u64 block,
-					u64 iblock)
+/* Convert the unwritten blocks in [start_blk, end_blk) of the tree-backed extent
+ * covering start_blk to written, splitting the extent so the un-written wings
+ * stay unwritten (and read back as zeros).  Caller holds extent_lock.  Returns
+ * 0, -ENOENT, or -EIO.  No-op (-ENOENT) for inline-only inodes.
+ */
+int briefs_btree_convert_unwritten_range(struct super_block *sb,
+					  struct briefs_inode *di,
+					  u64 start_blk, u64 end_blk)
 {
-	return btree_descend_to_leaf(sb, block, iblock,
-				     btree_clear_unwritten_leaf, sb, true);
-}
+	struct btree_conv_ctx c = {
+		.sb = sb,
+		.start_blk = start_blk,
+		.end_blk = end_blk,
+		.have_prefix = false,
+		.have_suffix = false,
+	};
+	int ret;
 
-int briefs_btree_clear_unwritten(struct super_block *sb, struct briefs_inode *di,
-				 u64 iblock)
-{
 	if (!(di->flags & InodeFlagIndexed) || di->extent_inline_base == 0)
 		return -ENOENT;
-	return btree_clear_unwritten_block(sb, di->extent_inline_base, iblock);
+
+	ret = btree_descend_to_leaf(sb, di->extent_inline_base, start_blk,
+				    btree_convert_unwritten_leaf, &c, true);
+	if (ret)
+		return ret;
+
+	/* Re-insert the unwritten wings.  briefs_btree_insert_locked() merges
+	 * them with same-state neighbors (unwritten+unwritten) and handles leaf
+	 * overflow / inline->btree spill; it never merges a written neighbor
+	 * with an unwritten one (generic/092).  Each insert may itself allocate
+	 * blocks and journal, which is safe under the held extent_lock (the
+	 * normal insert path takes the same lock).
+	 */
+	if (c.have_prefix) {
+		ret = briefs_btree_insert_locked(sb, di, &c.prefix);
+		if (ret)
+			return ret;
+	}
+	if (c.have_suffix) {
+		ret = briefs_btree_insert_locked(sb, di, &c.suffix);
+		if (ret)
+			return ret;
+	}
+	return 0;
 }
 
 /* ---------- insertion ---------- */

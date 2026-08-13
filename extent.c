@@ -192,26 +192,42 @@ int briefs_next_extent(struct super_block *sb, struct briefs_inode_info *binfo,
 }
 
 /*
- * briefs_clear_extent_unwritten - convert the unwritten extent covering
- * @iblock to written (clear BRIEFS_EXT_UNWRITTEN, in place -- no split, no
- * block free).  Called by the iomap write path (briefs_iomap_begin) when a
- * write targets a previously-fallocated (unwritten) extent, so a subsequent
- * fiemap reports it as written data instead of unwritten.  Caller MUST hold
- * binfo->extent_lock.  Returns 0 if an
- * extent covered @iblock (converted or already written), -ENOENT if none.
+ * briefs_convert_unwritten_range - convert the unwritten blocks in
+ * [start_blk, end_blk) of the extent covering @start_blk to written, splitting
+ * the extent so any un-written prefix/suffix stays unwritten (and reads back as
+ * zeros via IOMAP_UNWRITTEN).  Called by the iomap write path when a write
+ * targets a previously-fallocated (unwritten) extent, so the written blocks
+ * report as written data and the un-written wings keep returning zeros.
  *
- * For inline-only inodes the flag lives in binfo->disk_inode.inline_extents[],
- * mutated under extent_seq (mirroring briefs_btree_insert_locked) and
- * persisted by briefs_write_inode's INODE_FULL snapshot.  For tree-backed
- * inodes the leaf record is updated on disk (briefs_btree_clear_unwritten).
+ * BrieFS does NOT zero the data blocks of an unwritten extent at fallocate
+ * time (that would be millions of synchronous writes -- it wedged generic/103).
+ * Correctness therefore depends on the un-written blocks remaining reachable
+ * only as IOMAP_UNWRITTEN: a partial write must NOT flip the whole extent to
+ * written, or the un-zeroed blocks would read back as stale on-disk data
+ * (generic/363/521/522/616).  This function splits the extent instead of
+ * clearing the flag in place: the written sub-range becomes a written extent,
+ * and each unwritten wing is re-inserted as its own unwritten extent.
+ *
+ * If the write covers the whole extent, the flag is cleared in place (no split,
+ * no stale data, since every block is written).  Caller MUST hold
+ * binfo->extent_lock.  Returns 0 if an extent covered @start_blk (converted or
+ * already written), -ENOENT if none.
+ *
+ * For inline-only inodes the extents live in binfo->disk_inode.inline_extents[],
+ * mutated under extent_seq and persisted by briefs_write_inode's INODE_FULL
+ * snapshot (mark_inode_dirty schedules it).  For tree-backed inodes the leaf
+ * record is shrunk on disk and the wings re-inserted
+ * (briefs_btree_convert_unwritten_range).
  */
-int briefs_clear_extent_unwritten(struct inode *inode, u64 iblock)
+int briefs_convert_unwritten_range(struct inode *inode, u64 start_blk,
+				   u64 end_blk)
 {
 	struct briefs_inode_info *binfo = briefs_i(inode);
 	struct briefs_inode *di = &binfo->disk_inode;
 
 	if (di->flags & InodeFlagIndexed)
-		return briefs_btree_clear_unwritten(inode->i_sb, di, iblock);
+		return briefs_btree_convert_unwritten_range(inode->i_sb, di,
+							    start_blk, end_blk);
 
 	{
 		int k, n = di->num_extents_inline;
@@ -220,16 +236,78 @@ int briefs_clear_extent_unwritten(struct inode *inode, u64 iblock)
 			n = 8;
 		for (k = 0; k < n; k++) {
 			struct briefs_extent *e = &di->inline_extents[k];
+			u64 off, phys, eend, cstart, cend;
+			u32 eflags;
 
-			if (iblock >= e->offset && iblock < e->offset + e->len) {
-				if (e->flags & BRIEFS_EXT_UNWRITTEN) {
-					briefs_extent_write_begin(binfo);
-					e->flags &= ~BRIEFS_EXT_UNWRITTEN;
-					briefs_extent_write_end(binfo);
-					mark_inode_dirty(inode);
-				}
+			if (!(start_blk >= e->offset &&
+			      start_blk < e->offset + e->len)) {
+				if (e->offset > start_blk)
+					break;
+				continue;
+			}
+
+			if (!(e->flags & BRIEFS_EXT_UNWRITTEN))
+				return 0;		/* already written */
+
+			off = e->offset;
+			phys = e->phys;
+			eend = e->offset + e->len;
+			eflags = e->flags;
+
+			cstart = start_blk;
+			if (cstart < off)
+				cstart = off;
+			cend = end_blk;
+			if (cend > eend)
+				cend = eend;
+
+			if (cstart == off && cend == eend) {
+				/* Whole extent written: clear the flag in place. */
+				briefs_extent_write_begin(binfo);
+				e->flags &= ~BRIEFS_EXT_UNWRITTEN;
+				briefs_extent_write_end(binfo);
+				mark_inode_dirty(inode);
 				return 0;
 			}
+
+			/* Shrink this slot to the written middle.  The wings are
+			 * re-inserted as unwritten extents below; the insert
+			 * path merges them with same-state neighbors and spills
+			 * to the btree if the 8-slot inline array overflows.
+			 */
+			briefs_extent_write_begin(binfo);
+			e->offset = cstart;
+			e->phys = phys + (cstart - off);
+			e->len = cend - cstart;
+			e->flags = eflags & ~BRIEFS_EXT_UNWRITTEN;
+			briefs_extent_write_end(binfo);
+			mark_inode_dirty(inode);
+
+			if (cstart > off) {
+				struct briefs_extent prefix = {
+					.offset = off,
+					.phys = phys,
+					.len = cstart - off,
+					.flags = eflags,
+				};
+				int ret = briefs_btree_insert_locked(inode->i_sb,
+								     di, &prefix);
+				if (ret)
+					return ret;
+			}
+			if (cend < eend) {
+				struct briefs_extent suffix = {
+					.offset = cend,
+					.phys = phys + (cend - off),
+					.len = eend - cend,
+					.flags = eflags,
+				};
+				int ret = briefs_btree_insert_locked(inode->i_sb,
+								     di, &suffix);
+				if (ret)
+					return ret;
+			}
+			return 0;
 		}
 		return -ENOENT;
 	}

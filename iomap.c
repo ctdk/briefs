@@ -11,7 +11,7 @@
  * (inode table, directory trie pages, btree extent-index nodes, allocator
  * bitmaps, journal) stays on sb_bread/mark_buffer_dirty/sync_dirty_buffer and
  * is unaffected.  The extent lookup machinery -- briefs_inode_lookup_iblock,
- * briefs_btree_insert_locked, briefs_clear_extent_unwritten, briefs_alloc_block
+ * briefs_btree_insert_locked, briefs_convert_unwritten_range, briefs_alloc_block
  * -- is reused unchanged; it is called from iomap_begin instead of get_block.
  *
  * Two ops share one begin translation:
@@ -223,8 +223,21 @@ locked_create:
 	 * a buffer we cached under this same lock). */
 	ret = briefs_inode_lookup_iblock(inode->i_sb, binfo, iblock, &ext, true);
 	if (ret == 0) {
-		if (ext.flags & BRIEFS_EXT_UNWRITTEN)
-			briefs_clear_extent_unwritten(inode, iblock);
+		if (ext.flags & BRIEFS_EXT_UNWRITTEN) {
+			/* Convert only the blocks this write actually covers,
+			 * clamped to the extent, so a partial write splits the
+			 * extent and the un-written wings stay IOMAP_UNWRITTEN
+			 * (read as zeros) instead of being flipped to written
+			 * and exposing un-zeroed stale data.
+			 */
+			u64 end_blk = (u64)(pos + length +
+					    BRIEFS_BLOCK_SIZE - 1) >>
+				      BRIEFS_BLOCK_SHIFT;
+
+			if (end_blk > ext.offset + ext.len)
+				end_blk = ext.offset + ext.len;
+			briefs_convert_unwritten_range(inode, iblock, end_blk);
+		}
 		briefs_iomap_fill_mapped(inode, &ext, 0, iomap);
 		mutex_unlock(&binfo->extent_lock);
 		return 0;

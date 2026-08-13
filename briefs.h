@@ -1327,10 +1327,13 @@ int briefs_inode_lookup_iblock(struct super_block *sb, struct briefs_inode_info 
 int briefs_next_extent(struct super_block *sb, struct briefs_inode_info *binfo,
 		       u64 iblock, struct briefs_extent *ext, bool trust_verified);
 
-/* Convert the unwritten extent covering @iblock to written (clear
- * BRIEFS_EXT_UNWRITTEN in place).  Caller holds binfo->extent_lock.  Returns 0
- * if an extent covered @iblock, -ENOENT otherwise. */
-int briefs_clear_extent_unwritten(struct inode *inode, u64 iblock);
+/* Convert the unwritten blocks in [start_blk, end_blk) of the extent covering
+ * @start_blk to written, splitting the extent so un-written wings stay unwritten
+ * (read as zeros).  Caller holds binfo->extent_lock.  Returns 0 if an extent
+ * covered @start_blk, -ENOENT otherwise.
+ */
+int briefs_convert_unwritten_range(struct inode *inode, u64 start_blk,
+				   u64 end_blk);
 
 int briefs_append_extent(struct super_block *sb, struct briefs_inode *di, struct briefs_extent *ext);
 int briefs_append_extent_nojournal(struct super_block *sb, struct briefs_inode *di,
@@ -1433,14 +1436,18 @@ void briefs_btree_free_nodes_only(struct super_block *sb, struct briefs_inode *d
  * Returns 0 on success, -EIO if any node write failed. */
 int briefs_btree_drain(struct super_block *sb, u64 root_block, u64 max_nodes);
 
-/* Clear BRIEFS_EXT_UNWRITTEN on the tree-backed extent covering @iblock (an
- * in-place flag update on the leaf record -- no split, no block free).  The
- * extent's blocks are kept and its length unchanged; only the unwritten bit is
- * cleared.  Caller holds extent_lock.  Returns 0 if the extent was found and
- * converted, -ENOENT if no extent covers @iblock, -EIO on a read failure.
- * No-op (returns -ENOENT) for inline-only inodes (handled by the caller). */
-int briefs_btree_clear_unwritten(struct super_block *sb, struct briefs_inode *di,
-				 u64 iblock);
+/* Convert the unwritten blocks in [start_blk, end_blk) of the tree-backed
+ * extent covering @start_blk to written, splitting the extent so un-written
+ * wings stay unwritten.  The found leaf record is shrunk to the written middle
+ * in place (no block free); the unwritten prefix/suffix are re-inserted via
+ * briefs_btree_insert_locked().  Caller holds extent_lock.  Returns 0 if the
+ * extent was found and converted, -ENOENT if no extent covers @start_blk, -EIO
+ * on a read failure.  No-op (-ENOENT) for inline-only inodes (handled by the
+ * caller).
+ */
+int briefs_btree_convert_unwritten_range(struct super_block *sb,
+					  struct briefs_inode *di,
+					  u64 start_blk, u64 end_blk);
 
 /* Disk inode I/O helpers (briefs_inode.c) */
 struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
