@@ -223,9 +223,9 @@ int briefs_clear_extent_unwritten(struct inode *inode, u64 iblock)
 
 			if (iblock >= e->offset && iblock < e->offset + e->len) {
 				if (e->flags & BRIEFS_EXT_UNWRITTEN) {
-					write_seqcount_begin(&binfo->extent_seq);
+					briefs_extent_write_begin(binfo);
 					e->flags &= ~BRIEFS_EXT_UNWRITTEN;
-					write_seqcount_end(&binfo->extent_seq);
+					briefs_extent_write_end(binfo);
 					mark_inode_dirty(inode);
 				}
 				return 0;
@@ -336,12 +336,12 @@ void briefs_free_inode_data(struct inode *inode)
 
 	/* Inline-data files have no allocated data blocks to free. */
 	if (binfo->disk_inode.flags & InodeFlagInlineData) {
-		write_seqcount_begin(&binfo->extent_seq);
+		briefs_extent_write_begin(binfo);
 		binfo->disk_inode.flags &= ~InodeFlagInlineData;
 		memset(binfo->disk_inode.inline_data, 0,
 		       sizeof(binfo->disk_inode.inline_data));
 		binfo->disk_inode.filesize = 0;
-		write_seqcount_end(&binfo->extent_seq);
+		briefs_extent_write_end(binfo);
 
 		briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
 				&binfo->disk_inode);
@@ -360,7 +360,7 @@ void briefs_free_inode_data(struct inode *inode)
 	mutex_lock(&binfo->extent_lock);
 	briefs_btree_free_all(inode->i_sb, &binfo->disk_inode);
 
-	write_seqcount_begin(&binfo->extent_seq);
+	briefs_extent_write_begin(binfo);
 	binfo->disk_inode.flags &= ~InodeFlagIndexed;
 	binfo->disk_inode.num_extents_inline = 0;
 	binfo->disk_inode.num_extents_total = 0;
@@ -368,7 +368,7 @@ void briefs_free_inode_data(struct inode *inode)
 	memset(binfo->disk_inode.inline_extents, 0, sizeof(binfo->disk_inode.inline_extents));
 	/* All extents freed -> invalidate the tail cache (0 = unknown). */
 	binfo->cached_max_end = 0;
-	write_seqcount_end(&binfo->extent_seq);
+	briefs_extent_write_end(binfo);
 	mutex_unlock(&binfo->extent_lock);
 
 	/* Log the cleared inode so replay does not resurrect old extent pointers. */

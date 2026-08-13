@@ -870,9 +870,9 @@ static int btree_ensure_root_room(struct super_block *sb, struct briefs_inode *d
 	/* Publish the new root last: root, sibling, and new root are all dirty
 	 * on disk (or will be via the drain) before the snapshot can reference
 	 * newroot_block. */
-	write_seqcount_begin(&binfo->extent_seq);
+	briefs_extent_write_begin(binfo);
 	di->extent_inline_base = newroot_block;
-	write_seqcount_end(&binfo->extent_seq);
+	briefs_extent_write_end(binfo);
 
 	brelse(sib_bh);
 	brelse(newroot_bh);
@@ -958,13 +958,13 @@ static int btree_spill_inline(struct super_block *sb, struct briefs_inode *di,
 	briefs_journal_extent_alloc(bsi->journal, di->inode_number, ext->offset,
 				    ext->phys, ext->len, -1);
 
-	write_seqcount_begin(&binfo->extent_seq);
+	briefs_extent_write_begin(binfo);
 	memset(di->inline_extents, 0, sizeof(di->inline_extents));
 	di->flags |= InodeFlagIndexed;
 	di->extent_inline_base = root_block;
 	di->num_extents_inline = 0;
 	di->num_extents_total = m;
-	write_seqcount_end(&binfo->extent_seq);
+	briefs_extent_write_end(binfo);
 
 	return 0;
 }
@@ -1039,13 +1039,13 @@ static int btree_inline_insert(struct super_block *sb, struct briefs_inode *di,
 		return 0;
 	}
 
-	write_seqcount_begin(&binfo->extent_seq);
+	briefs_extent_write_begin(binfo);
 	for (i = n; i > pos; i--)
 		di->inline_extents[i] = di->inline_extents[i - 1];
 	di->inline_extents[pos] = *ext;
 	di->num_extents_inline = n + 1;
 	di->num_extents_total++;
-	write_seqcount_end(&binfo->extent_seq);
+	briefs_extent_write_end(binfo);
 
 	briefs_journal_extent_alloc(bsi->journal, di->inode_number, ext->offset,
 				    ext->phys, ext->len, pos);
@@ -1066,10 +1066,10 @@ int briefs_btree_insert_locked(struct super_block *sb, struct briefs_inode *di,
 	 * extent's end is the only value that can raise the running max. */
 	{
 		u64 new_end = ext->offset + ext->len;
-		write_seqcount_begin(&binfo->extent_seq);
+		briefs_extent_write_begin(binfo);
 		if (new_end > binfo->cached_max_end)
 			binfo->cached_max_end = new_end;
-		write_seqcount_end(&binfo->extent_seq);
+		briefs_extent_write_end(binfo);
 	}
 
 	if (di->flags & InodeFlagIndexed) {
@@ -1083,9 +1083,9 @@ int briefs_btree_insert_locked(struct super_block *sb, struct briefs_inode *di,
 		if (ret)
 			return ret;
 		if (added) {
-			write_seqcount_begin(&binfo->extent_seq);
+			briefs_extent_write_begin(binfo);
 			di->num_extents_total++;
-			write_seqcount_end(&binfo->extent_seq);
+			briefs_extent_write_end(binfo);
 		}
 		return 0;
 	}
@@ -1594,14 +1594,14 @@ int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
 		 * cache and count.
 		 */
 		*modified = true;
-		write_seqcount_begin(&binfo->extent_seq);
+		briefs_extent_write_begin(binfo);
 		di->flags &= ~InodeFlagIndexed;
 		di->extent_inline_base = 0;
 		di->num_extents_inline = 0;
 		di->num_extents_total = 0;
 		memset(di->inline_extents, 0, sizeof(di->inline_extents));
 		binfo->cached_max_end = 0;
-		write_seqcount_end(&binfo->extent_seq);
+		briefs_extent_write_end(binfo);
 
 		if (nright == 0)
 			return 0;
@@ -1618,10 +1618,10 @@ int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
 	 * lowered the max, and removed extents lower num_extents_total (used by
 	 * the journal drain cap and fsck's count check). */
 	briefs_btree_for_each_extent(sb, di, btree_max_cb, &mc);
-	write_seqcount_begin(&binfo->extent_seq);
+	briefs_extent_write_begin(binfo);
 	binfo->cached_max_end = mc.max_end;
 	di->num_extents_total = mc.count;
-	write_seqcount_end(&binfo->extent_seq);
+	briefs_extent_write_end(binfo);
 	return 0;
 }
 

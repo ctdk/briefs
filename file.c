@@ -363,9 +363,9 @@ static int briefs_promote_inline_data(struct inode *inode)
 
 	/* Empty inline file: just clear the flag, let the write path allocate. */
 	if (old_size == 0) {
-		write_seqcount_begin(&binfo->extent_seq);
+		briefs_extent_write_begin(binfo);
 		binfo->disk_inode.flags &= ~InodeFlagInlineData;
-		write_seqcount_end(&binfo->extent_seq);
+		briefs_extent_write_end(binfo);
 		return 0;
 	}
 
@@ -389,7 +389,7 @@ static int briefs_promote_inline_data(struct inode *inode)
 		return err;
 	}
 
-	write_seqcount_begin(&binfo->extent_seq);
+	briefs_extent_write_begin(binfo);
 	binfo->disk_inode.flags &= ~InodeFlagInlineData;
 	memset(binfo->disk_inode.inline_extents, 0,
 	       sizeof(binfo->disk_inode.inline_extents));
@@ -404,7 +404,7 @@ static int briefs_promote_inline_data(struct inode *inode)
 	 * here: the promoted extent is {offset 0, len 1} -> end 1. */
 	if (binfo->cached_max_end < 1)
 		binfo->cached_max_end = 1;
-	write_seqcount_end(&binfo->extent_seq);
+	briefs_extent_write_end(binfo);
 
 	inode->i_blocks = (BRIEFS_BLOCK_SIZE / 512);
 
@@ -686,13 +686,13 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			}
 			memcpy(binfo->disk_inode.inline_data + pos, tmp, count);
 
-			write_seqcount_begin(&binfo->extent_seq);
+			briefs_extent_write_begin(binfo);
 			binfo->disk_inode.flags |= InodeFlagInlineData;
 			if (total_size > inode->i_size) {
 				inode->i_size = total_size;
 				binfo->disk_inode.filesize = total_size;
 			}
-			write_seqcount_end(&binfo->extent_seq);
+			briefs_extent_write_end(binfo);
 
 			inode->i_blocks = 0;
 			/* Inline writes bypass generic_file_write_iter, whose
@@ -820,14 +820,14 @@ static int briefs_rebuild_extent_list(struct super_block *sb,
 	briefs_btree_free_nodes_only(sb, di);
 
 	/* Reset to empty inline-only. */
-	write_seqcount_begin(&binfo->extent_seq);
+	briefs_extent_write_begin(binfo);
 	di->flags &= ~InodeFlagIndexed;
 	di->extent_inline_base = 0;
 	di->num_extents_inline = 0;
 	di->num_extents_total = 0;
 	memset(di->inline_extents, 0, sizeof(di->inline_extents));
 	binfo->cached_max_end = 0;
-	write_seqcount_end(&binfo->extent_seq);
+	briefs_extent_write_end(binfo);
 
 	/* Re-insert kept extents in offset order. */
 	for (i = 0; i < n; i++) {
@@ -1021,13 +1021,13 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	 */
 	if (new_size > old_size && (binfo->disk_inode.flags & InodeFlagInlineData)) {
 		if (new_size <= BRIEFS_INODE_INLINE_DATA_SIZE) {
-			write_seqcount_begin(&binfo->extent_seq);
+			briefs_extent_write_begin(binfo);
 			memset(binfo->disk_inode.inline_data + old_size, 0,
 			       new_size - old_size);
 			binfo->disk_inode.filesize = new_size;
 			inode->i_size = new_size;
 			inode->i_blocks = 0;
-			write_seqcount_end(&binfo->extent_seq);
+			briefs_extent_write_end(binfo);
 
 			briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
 					&binfo->disk_inode);
@@ -1080,7 +1080,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 	/* Inline-data truncate is handled separately. */
 	if (binfo->disk_inode.flags & InodeFlagInlineData) {
-		write_seqcount_begin(&binfo->extent_seq);
+		briefs_extent_write_begin(binfo);
 		if (new_size == 0) {
 			binfo->disk_inode.flags &= ~InodeFlagInlineData;
 			memset(binfo->disk_inode.inline_data, 0,
@@ -1092,7 +1092,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		binfo->disk_inode.filesize = new_size;
 		inode->i_size = new_size;
 		inode->i_blocks = 0;
-		write_seqcount_end(&binfo->extent_seq);
+		briefs_extent_write_end(binfo);
 
 		briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
 				&binfo->disk_inode);
@@ -1921,10 +1921,10 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	if (binfo->disk_inode.flags & InodeFlagInlineData) {
 		if (end <= BRIEFS_INODE_INLINE_DATA_SIZE) {
 			if (!(mode & FALLOC_FL_KEEP_SIZE) && end > inode->i_size) {
-				write_seqcount_begin(&binfo->extent_seq);
+				briefs_extent_write_begin(binfo);
 				inode->i_size = end;
 				binfo->disk_inode.filesize = end;
-				write_seqcount_end(&binfo->extent_seq);
+				briefs_extent_write_end(binfo);
 				changed = true;
 				grew_size = true;
 			}

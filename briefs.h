@@ -15,6 +15,7 @@
 #include <linux/list.h>
 #include <linux/kobject.h>
 #include <linux/lockdep.h>
+#include <linux/preempt.h>
 #include "briefs_alloc.h"
 
 /* BrieFS magic number */
@@ -1171,6 +1172,30 @@ static inline struct briefs_sb_info *briefs_sb(struct super_block *sb) {
 
 static inline struct briefs_inode_info *briefs_i(struct inode *inode) {
 	return container_of(inode, struct briefs_inode_info, vfs_inode);
+}
+
+/*
+ * extent_seq is a raw seqcount_t guarding the on-disk inode's in-memory extent
+ * fields (inline array, flags, counts, cached_max_end). Writers mutate it from
+ * process context under either inode_lock (inline-data paths) or extent_lock
+ * (tree paths) -- two lock classes, so no single seqcount_mutex_t fits. A raw
+ * seqcount writer must run with preemption disabled: under CONFIG_PROVE_LOCKING
+ * write_seqcount_begin() asserts this (include/linux/seqlock.h
+ * __seqprop_assert -> lockdep_assert_preemption_disabled). Every writer
+ * critical section here is pure in-memory mutation (no sleeping), so wrap the
+ * begin/end pair in preempt_disable/enable. Lockless readers (extent.c,
+ * iomap.c) retry on the odd sequence exactly as before.
+ */
+static inline void briefs_extent_write_begin(struct briefs_inode_info *binfo)
+{
+	preempt_disable();
+	write_seqcount_begin(&binfo->extent_seq);
+}
+
+static inline void briefs_extent_write_end(struct briefs_inode_info *binfo)
+{
+	write_seqcount_end(&binfo->extent_seq);
+	preempt_enable();
 }
 
 /*
