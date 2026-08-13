@@ -984,8 +984,30 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		{
 			bool did_zero = false;
 
+			/* Use the READ ops, not the write ops.  A write begin would
+			 * CONVERT an unwritten EOF block to mapped (it clears
+			 * BRIEFS_EXT_UNWRITTEN and splits the extent) yet still
+			 * report the block to the iomap core as IOMAP_UNWRITTEN (the
+			 * stale pre-conversion extent copy).  iomap_zero_iter treats
+			 * IOMAP_UNWRITTEN as "already zero" and skips the zero-write
+			 * entirely, so the conversion would flip the block to mapped
+			 * on disk WITHOUT ever writing the zeros -- exposing the
+			 * un-zeroed fallocate-time stale data on the next read
+			 * (generic/363: punch -> fallocate-unwritten -> truncate-down
+			 * into the unwritten EOF block -> mapread returns stale).
+			 *
+			 * The read ops report an unwritten block truthfully, so
+			 * iomap_zero_iter no-ops (correct: an unwritten block reads
+			 * back as zeros) and the block stays unwritten -- no stale
+			 * disk is ever exposed.  A mapped EOF block still reports
+			 * IOMAP_MAPPED and takes the zero-write path exactly as before
+			 * (the tail is zeroed and dirtied for writeback); a hole
+			 * no-ops.  The read ops never enter locked_create, so no
+			 * extent_lock is taken here, preserving the no-AB-BA ordering
+			 * with the writeback path explained above.
+			 */
 			ret = iomap_truncate_page(inode, new_size, &did_zero,
-						  &briefs_write_iomap_ops);
+						  &briefs_iomap_ops);
 			if (ret)
 				return ret;
 		}
