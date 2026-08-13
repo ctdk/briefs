@@ -1436,7 +1436,7 @@ static int btree_leaf_delete_range(struct briefs_extent_btree_node *node,
 				   u64 start, u64 end, struct briefs_inode *di,
 				   struct briefs_sb_info *bsi,
 				   struct briefs_extent *right, int *nright,
-				   bool *modified)
+				   bool *modified, u64 *unwritten_freed)
 {
 	int n = le16_to_cpu(node->hdr.num_keys);
 	int i, out = 0;
@@ -1467,6 +1467,13 @@ static int btree_leaf_delete_range(struct briefs_extent_btree_node *node,
 			if (free_len > 0) {
 				u64 free_phys = ext.phys + (free_start - ext.offset);
 
+				/* Count unwritten blocks returned to the allocator so
+				 * briefs_btree_delete_range can release the metadata
+				 * reservation held for them.  The left/right straddlers
+				 * kept below retain ext.flags (stay unwritten, still
+				 * counted), so only the freed middle is counted. */
+				if (ext.flags & BRIEFS_EXT_UNWRITTEN)
+					*unwritten_freed += free_len;
 				briefs_journal_extent_free(bsi->journal,
 							   di->inode_number,
 							   free_start, free_phys,
@@ -1518,7 +1525,8 @@ static bool btree_delete_range_subtree(struct super_block *sb,
 				       struct briefs_inode *di, u64 block,
 				       u64 start, u64 end,
 				       struct briefs_extent *right, int *nright,
-				       u64 *cap, bool *modified)
+				       u64 *cap, bool *modified,
+				       u64 *unwritten_freed)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
 	struct buffer_head *bh;
@@ -1541,7 +1549,8 @@ static bool btree_delete_range_subtree(struct super_block *sb,
 
 	if (btree_node_is_leaf(node)) {
 		new_n = btree_leaf_delete_range(node, start, end, di, bsi,
-						right, nright, modified);
+						right, nright, modified,
+						unwritten_freed);
 		if (new_n == 0) {
 			/* Leaf emptied: free it; caller drops the pointer. */
 			brelse(bh);
@@ -1572,7 +1581,7 @@ static bool btree_delete_range_subtree(struct super_block *sb,
 		if (child != 0 && low < end && high > start) {
 			if (btree_delete_range_subtree(sb, di, child, start, end,
 						       right, nright, cap,
-						       modified))
+						       modified, unwritten_freed))
 				set_bit(i, child_empty);
 		}
 	}
@@ -1664,6 +1673,7 @@ int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
 	int nright = 0, i, ret;
 	u64 cap;
 	bool root_empty;
+	u64 unwritten_freed = 0;
 	struct btree_max_ctx mc = { .max_end = 0, .count = 0 };
 
 	*modified = false;
@@ -1681,7 +1691,15 @@ int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
 
 	root_empty = btree_delete_range_subtree(sb, di, di->extent_inline_base,
 						start, end, right, &nright, &cap,
-						modified);
+						modified, &unwritten_freed);
+
+	/* Release the metadata reservation held for the unwritten blocks just
+	 * freed (punch hole / truncate-down over a preallocated region).  No-op
+	 * when no unwritten extents were removed.  Done right after the walk so
+	 * the root_empty early return and the straddler re-insert path below
+	 * cannot skip it: the walk is the only thing that frees data blocks, so
+	 * unwritten_freed is final here. */
+	briefs_release_unwritten_reserve(&binfo->vfs_inode, unwritten_freed);
 
 	if (root_empty) {
 		/* Every extent was removed from the tree: free the root (already

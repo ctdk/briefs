@@ -1157,6 +1157,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			 */
 			struct briefs_extent *old, *kept;
 			int n_ext, n_kept = 0, j;
+			u64 unwritten_freed = 0;
 
 			ret = briefs_collect_all_extents(inode->i_sb,
 							 &binfo->disk_inode,
@@ -1186,6 +1187,8 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 					u64 free_phys = e->phys + keep_len;
 					u64 free_len = e->len - keep_len;
 
+					if (e->flags & BRIEFS_EXT_UNWRITTEN)
+						unwritten_freed += free_len;
 					briefs_journal_extent_free(bsi->journal,
 								   inode->i_ino,
 								   e->offset + keep_len,
@@ -1199,6 +1202,8 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 					n_kept++;
 				} else {
 					/* Entirely at/after truncation - drop, free data. */
+					if (e->flags & BRIEFS_EXT_UNWRITTEN)
+						unwritten_freed += e->len;
 					briefs_journal_extent_free(bsi->journal,
 								   inode->i_ino,
 								   e->offset, e->phys,
@@ -1206,6 +1211,11 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 					briefs_free_blocks_range(bsi, e->phys, e->len);
 				}
 			}
+
+			/* Release the metadata reservation held for the unwritten
+			 * blocks just freed.  No-op when none of the truncated
+			 * extents were unwritten. */
+			briefs_release_unwritten_reserve(inode, unwritten_freed);
 
 			/* Rebuild the index from the kept extents. Frees old tree
 			 * nodes (none for inline-only), resets the inode, re-inserts
@@ -1780,6 +1790,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 	 * removed data blocks.  briefs_rebuild_extent_list already freed the
 	 * old tree node blocks (the old chain blocks, in chain terms).
 	 */
+	u64 unwritten_freed = 0;
 	for (i = 0; i < old_count; i++) {
 		struct briefs_extent ext = old_exts[i];
 		u64 ext_end = ext.offset + ext.len;
@@ -1803,6 +1814,8 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 			u64 free_phys = ext.phys + (free_start - ext.offset);
 			u64 free_len = free_end - free_start;
 
+			if (ext.flags & BRIEFS_EXT_UNWRITTEN)
+				unwritten_freed += free_len;
 			briefs_journal_extent_free(bsi->journal, inode->i_ino,
 						   free_start, free_phys,
 						   free_len);
@@ -1810,6 +1823,9 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 			changed = true;
 		}
 	}
+	/* Release the metadata reservation held for the unwritten blocks just
+	 * freed.  No-op when none of the punched extents were unwritten. */
+	briefs_release_unwritten_reserve(inode, unwritten_freed);
 	} /* end inline-only punch */
 
 	inode->i_blocks = briefs_compute_i_blocks(inode->i_sb,
