@@ -27,7 +27,10 @@ const struct inode_operations briefs_dir_inode_ops = {
 	.unlink = briefs_unlink,
 	.rmdir = briefs_rmdir,
 	.rename = briefs_rename,
+	.setattr = briefs_setattr,
 	.listxattr = briefs_xattr_list,
+	.get_inode_acl = briefs_get_acl,
+	.set_acl = briefs_set_acl,
 	.fileattr_get = briefs_fileattr_get,
 	.fileattr_set = briefs_fileattr_set,
 };
@@ -38,6 +41,8 @@ const struct inode_operations briefs_file_inode_ops = {
 	.getattr = briefs_getattr,
 	.fiemap = briefs_fiemap,
 	.listxattr = briefs_xattr_list,
+	.get_inode_acl = briefs_get_acl,
+	.set_acl = briefs_set_acl,
 	.fileattr_get = briefs_fileattr_get,
 	.fileattr_set = briefs_fileattr_set,
 };

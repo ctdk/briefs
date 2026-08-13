@@ -424,6 +424,12 @@ int briefs_fill_super(struct super_block *sb, struct fs_context *fc) {
 	 */
 	sb->s_xattr = briefs_xattr_handlers;
 	sb->s_flags |= SB_ACTIVE;
+	/* Enable POSIX ACL permission checking (IS_POSIXACL).  Must be set
+	 * before any inode is allocated: generic_permission -> acl_permission
+	 * -> .get_inode_acl is only reached when this flag is on.  ACLs are
+	 * stored as system.posix_acl_access/_default xattrs; volumes without
+	 * any ACL xattr fall back to plain mode permission. */
+	sb->s_flags |= SB_POSIXACL;
 
 	/*
 	 * Cgroup-aware writeback is deliberately disabled on this kernel.

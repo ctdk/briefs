@@ -18,6 +18,7 @@
 #include <linux/uaccess.h>
 #include <linux/migrate.h>
 #include <linux/fileattr.h>
+#include <linux/posix_acl.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
@@ -1226,6 +1227,15 @@ out_copy:
 	 * re-journaled the parent from the stale in-memory disk inode).
 	 */
 	setattr_copy(idmap, inode, attr);
+	/* A chmod updates the mode; if the inode has an access ACL, its mask
+	 * entry must be recomputed to match the new group class.  No-op when
+	 * there is no ACL.  posix_acl_chmod -> .set_acl (briefs_set_acl)
+	 * persists the updated ACL xattr and inode.  Mirrors ext2_setattr. */
+	if (attr->ia_valid & ATTR_MODE) {
+		ret = posix_acl_chmod(idmap, dentry, inode->i_mode);
+		if (ret)
+			return ret;
+	}
 	briefs_sync_inode_fields(inode, &binfo->disk_inode);
 	briefs_sync_inode_times(inode, &binfo->disk_inode);
 	mark_inode_dirty(inode);

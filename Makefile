@@ -10,7 +10,7 @@
 obj-m += briefs_fs.o
 
 # Add C files as they appear.
-briefs_fs-objs := init.o alloc.o journal.o crc32c.o ops.o trie.o trie_page.o super.o inode.o dir.o file.o extent.o btree.o debug.o sysfs.o proc.o export.o iomap.o xattr.o
+briefs_fs-objs := init.o alloc.o journal.o crc32c.o ops.o trie.o trie_page.o super.o inode.o dir.o file.o extent.o btree.o debug.o sysfs.o proc.o export.o iomap.o xattr.o acl.o
 
 # Build identifier: git revision of the source tree, surfaced via modinfo
 # (/sys/module/briefs_fs/version) and the per-superblock sysfs/debugfs "build"

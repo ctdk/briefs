@@ -1646,6 +1646,13 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
                    struct iattr *attr);
 int briefs_getattr(struct mnt_idmap *idmap, const struct path *path,
                    struct kstat *stat, u32 request_mask, unsigned int query_flags);
+
+/* POSIX ACLs (stored as system.posix_acl_access/_default xattrs). */
+struct posix_acl;
+struct posix_acl *briefs_get_acl(struct inode *inode, int type, bool rcu);
+int briefs_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+                   struct posix_acl *acl, int type);
+int briefs_init_acl(struct inode *inode, struct inode *dir);
 int briefs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
                   u64 start, u64 len);
 int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync);

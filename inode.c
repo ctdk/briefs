@@ -11,6 +11,7 @@
 #include <linux/seqlock.h>
 #include <linux/pagemap.h>
 #include <linux/random.h>
+#include <linux/posix_acl.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
@@ -527,6 +528,17 @@ struct inode *briefs_new_inode(struct mnt_idmap *idmap, struct inode *dir,
 	}
 
 	unlock_new_inode(inode);
+
+	/* Inherit ACLs from the parent directory's default ACL.  Placed after
+	 * unlock_new_inode so the fail_iget cleanup (iput on an unlocked inode)
+	 * is correct; the inode is not yet linked into any directory, so the
+	 * brief unlocked window is not concurrently reachable.  May adjust
+	 * inode->i_mode (default ACL mask) and persists the ACL xattrs + the
+	 * (possibly adjusted) mode.  The persist below then writes the final
+	 * mode idempotently. */
+	ret = briefs_init_acl(inode, dir);
+	if (ret)
+		goto fail_iget;
 
 	/* Persist the on-disk inode */
 	ret = briefs_persist_disk_inode(dir->i_sb, ino, &binfo->disk_inode, false);
