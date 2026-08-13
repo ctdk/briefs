@@ -772,11 +772,20 @@ int briefs_statfs(struct dentry *dentry, struct kstatfs *buf) {
 	buf->f_bsize = sb->s_blocksize;
 	/*
 	 * The allocator state is authoritative for free space; the superblock
-	 * cached values may be stale between checkpoints.
+	 * cached values may be stale between checkpoints.  f_bfree/f_bavail
+	 * exclude meta_shield: those blocks are reserved for future B+tree
+	 * metadata of outstanding unwritten-extent reservations (ext4-style),
+	 * not available to data writers, so df reports the data-allocatable free.
 	 */
-	buf->f_blocks = sbi->alloc.block_count;
-	buf->f_bfree = sbi->alloc.free_count;
-	buf->f_bavail = sbi->alloc.free_count;
+	{
+		u64 shield = sbi->alloc.meta_shield;
+		u64 free_data = sbi->alloc.free_count > shield
+			? sbi->alloc.free_count - shield : 0;
+
+		buf->f_blocks = sbi->alloc.block_count;
+		buf->f_bfree = free_data;
+		buf->f_bavail = free_data;
+	}
 	buf->f_files = sbi->inode_alloc.block_count;
 	buf->f_ffree = sbi->inode_alloc.free_count;
 	buf->f_namelen = BRIEFS_NAME_LEN;

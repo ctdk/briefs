@@ -375,6 +375,7 @@ struct btree_conv_ctx {
 	struct briefs_extent suffix;
 	bool have_prefix;
 	bool have_suffix;
+	u64 converted;		/* blocks flipped unwritten->written (the middle) */
 };
 
 /* Leaf callback: find the unwritten extent covering start_blk and convert the
@@ -419,6 +420,9 @@ static int btree_convert_unwritten_leaf(struct briefs_extent_btree_node *node,
 		cend = c->end_blk;
 		if (cend > eend)
 			cend = eend;
+
+		/* Record the converted count for the caller's reservation release. */
+		c->converted = cend - cstart;
 
 		if (cstart == off && cend == eend) {
 			/* Whole extent is written: clear the flag in place. */
@@ -465,12 +469,15 @@ int briefs_btree_convert_unwritten_range(struct super_block *sb,
 					  struct briefs_inode *di,
 					  u64 start_blk, u64 end_blk)
 {
+	struct briefs_inode_info *binfo =
+		container_of(di, struct briefs_inode_info, disk_inode);
 	struct btree_conv_ctx c = {
 		.sb = sb,
 		.start_blk = start_blk,
 		.end_blk = end_blk,
 		.have_prefix = false,
 		.have_suffix = false,
+		.converted = 0,
 	};
 	int ret;
 
@@ -499,6 +506,10 @@ int briefs_btree_convert_unwritten_range(struct super_block *sb,
 		if (ret)
 			return ret;
 	}
+
+	/* Release the reservation for the converted middle (the wings stay
+	 * unwritten and remain counted).  No-op if nothing was converted. */
+	briefs_release_unwritten_reserve(&binfo->vfs_inode, c.converted);
 	return 0;
 }
 
@@ -578,7 +589,7 @@ static int btree_maybe_split_child(struct super_block *sb,
 	/* Full: split. Allocate the sibling first; on failure nothing is
 	 * modified (clean ENOSPC). */
 	briefs_stat_inc(bsi, btree_splits);
-	rel = briefs_alloc_block(&bsi->alloc);
+	rel = briefs_alloc_block_meta(&bsi->alloc);
 	if (rel == 0) {
 		brelse(child_bh);
 		return -ENOSPC;
@@ -856,14 +867,14 @@ static int btree_ensure_root_room(struct super_block *sb, struct briefs_inode *d
 
 	/* Full root: split into left (in place) + right (sib) + a new internal
 	 * root. Two allocations; both must succeed before we modify anything. */
-	rel = briefs_alloc_block(&bsi->alloc);
+	rel = briefs_alloc_block_meta(&bsi->alloc);
 	if (rel == 0) {
 		brelse(root_bh);
 		return -ENOSPC;
 	}
 	sib_block = data_to_abs(bsi->sb, rel);
 
-	rel2 = briefs_alloc_block(&bsi->alloc);
+	rel2 = briefs_alloc_block_meta(&bsi->alloc);
 	if (rel2 == 0) {
 		briefs_free_block(&bsi->alloc, rel);
 		brelse(root_bh);
@@ -1018,7 +1029,7 @@ static int btree_spill_inline(struct super_block *sb, struct briefs_inode *di,
 		}
 	}
 
-	rel = briefs_alloc_block(&bsi->alloc);
+	rel = briefs_alloc_block_meta(&bsi->alloc);
 	if (rel == 0)
 		return -ENOSPC;
 	root_block = data_to_abs(bsi->sb, rel);

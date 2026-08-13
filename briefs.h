@@ -1146,6 +1146,16 @@ struct briefs_inode_info {
 	 */
 	u64 cached_max_end;
 	/*
+	 * Unwritten-extent metadata reservation (in-memory only, ext4-style count
+	 * shield; see briefs_raise_unwritten_reserve in alloc.c).  Protected by
+	 * bsi->alloc.lock.  unwritten_res_blocks counts the unwritten data blocks
+	 * this reserve covers; meta_reserve is the count currently held in the
+	 * global bsi->alloc.meta_shield for this inode.  Both 0 on a normal file
+	 * with no outstanding fallocated unwritten extents.
+	 */
+	u64 unwritten_res_blocks;
+	u64 meta_reserve;
+	/*
 	 * Set once the directory's partial-page pool has been seeded from the
 	 * on-disk trie during journal replay, so we walk each dir's trie at most
 	 * once. Only consulted while the journal's in_replay flag is set; ignored
@@ -1448,6 +1458,18 @@ int briefs_btree_drain(struct super_block *sb, u64 root_block, u64 max_nodes);
 int briefs_btree_convert_unwritten_range(struct super_block *sb,
 					  struct briefs_inode *di,
 					  u64 start_blk, u64 end_blk);
+
+/*
+ * Unwritten-extent metadata reservation (ext4-style count-shield; alloc.c).
+ * briefs_fallocate raises a worst-case metadata reserve for the unwritten
+ * blocks it creates; the conversion path releases it as blocks convert; evict
+ * drops it.  The reserve is a count held in bsi->alloc.meta_shield, never bitmap
+ * bits, so fsck sees no allocated-but-unreferenced blocks.  See alloc.c.
+ */
+u64 briefs_meta_reserve_size(u64 n);
+void briefs_raise_unwritten_reserve(struct inode *inode, u64 u_new);
+void briefs_release_unwritten_reserve(struct inode *inode, u64 L);
+void briefs_drop_unwritten_reserve(struct inode *inode);
 
 /* Disk inode I/O helpers (briefs_inode.c) */
 struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,

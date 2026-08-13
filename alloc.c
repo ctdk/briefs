@@ -8,6 +8,7 @@
 #include <linux/stddef.h>
 #include <linux/types.h>
 #include <linux/buffer_head.h>
+#include <linux/math64.h>
 
 #include "briefs.h"
 #include "briefs_alloc.h"
@@ -188,10 +189,11 @@ int briefs_alloc_init_at(struct briefs_alloc *alloc, struct super_block *sb,
  * Allocate a single free block.
  * Returns data-relative block number, or 0 if no space.
  */
-u64 briefs_alloc_block(struct briefs_alloc *alloc)
+static u64 __briefs_alloc_block(struct briefs_alloc *alloc, bool for_meta)
 {
 	u64 w0, b0, w1_idx, l1_word, b1, w2_idx, l2_word, b2, block, i;
 	struct briefs_sb_info *bsi = briefs_sb(alloc->sb);
+	u64 avail;
 
 	/* Count only data-block allocs here, not inode-number allocs (which also
 	 * flow through this function via bsi->inode_alloc and are counted in
@@ -201,7 +203,20 @@ u64 briefs_alloc_block(struct briefs_alloc *alloc)
 		atomic64_inc(&bsi->stats.data_alloc_calls);
 
 	mutex_lock(&alloc->lock);
-	if (!alloc || alloc->free_count == 0 || !alloc->l0) {
+	/*
+	 * Data allocations must respect the metadata shield: the effective free
+	 * count is free_count - meta_shield, so a fs filled to 100% stops at
+	 * free_count == meta_shield, leaving the shielded blocks for metadata.
+	 * Metadata allocations (for_meta) bypass the shield and draw from the
+	 * full free_count (ENOSPC only at true exhaustion).  The inode allocator
+	 * (bsi->inode_alloc) has meta_shield == 0, so this is a no-op for it.
+	 */
+	avail = alloc->free_count;
+	if (!for_meta && avail > alloc->meta_shield)
+		avail -= alloc->meta_shield;
+	else if (!for_meta)
+		avail = 0;
+	if (!alloc || avail == 0 || !alloc->l0) {
 		mutex_unlock(&alloc->lock);
 		return 0;
 	}
@@ -290,6 +305,18 @@ u64 briefs_alloc_block(struct briefs_alloc *alloc)
 	return 0;
 }
 
+/* Data allocation: respects meta_shield (ENOSPC at free_count == meta_shield). */
+u64 briefs_alloc_block(struct briefs_alloc *alloc)
+{
+	return __briefs_alloc_block(alloc, false);
+}
+
+/* Metadata allocation: ignores meta_shield, draws from the full free_count. */
+u64 briefs_alloc_block_meta(struct briefs_alloc *alloc)
+{
+	return __briefs_alloc_block(alloc, true);
+}
+
 /*
  * Clear the L1/L0 summary bits for a single L2 word that just became all-zero.
  * Caller holds alloc->lock and has already verified alloc->l2[w2] == 0.
@@ -333,9 +360,18 @@ u64 briefs_alloc_blocks(struct briefs_alloc *alloc, u64 n)
 	}
 
 	mutex_lock(&alloc->lock);
-	if (n > alloc->free_count || n > alloc->block_count) {
-		mutex_unlock(&alloc->lock);
-		return 0;
+	/*
+	 * Data run allocation respects meta_shield like briefs_alloc_block: a run
+	 * is a data allocation, so it must leave the shielded blocks for metadata.
+	 * (briefs_alloc_blocks is only ever used for data, never metadata.)
+	 */
+	{
+		u64 data_avail = alloc->free_count > alloc->meta_shield
+			? alloc->free_count - alloc->meta_shield : 0;
+		if (n > data_avail || n > alloc->block_count) {
+			mutex_unlock(&alloc->lock);
+			return 0;
+		}
 	}
 
 	/* Reserve the data-relative block-0 sentinel so a contiguous run never
@@ -640,6 +676,103 @@ void briefs_free_blocks(struct briefs_alloc *alloc, u64 rel_start, u64 n)
 					   data_to_abs(bsi->sb, rel_start),
 					   end - rel_start);
 	}
+}
+
+/*
+ * Unwritten-extent metadata reservation (ext4-style count-shield).
+ *
+ * briefs_fallocate reserves, for the unwritten blocks it creates, a worst-case
+ * count of B+tree metadata blocks the eventual fragmentation of those blocks
+ * could require (one extent per block -> leaves + internal nodes + spill).  The
+ * reserve is held purely as a count in alloc->meta_shield, NOT as allocated
+ * bitmap bits, so a fs later filled to 100% stops at free_count == meta_shield,
+ * leaving the shielded blocks free for the metadata allocations the splits need
+ * (briefs_alloc_block_meta bypasses the shield).  Reserved blocks are marked
+ * allocated only when they become referenced B+tree nodes, so fsck never sees
+ * allocated-but-unreferenced blocks (crossref.go's leaked-block check).
+ *
+ * Per-inode state (in-memory only): unwritten_res_blocks counts the unwritten
+ * data blocks the reserve covers; meta_reserve is the count currently held in
+ * the global shield for this inode.  Invariant: meta_shield == sum over inodes
+ * of meta_reserve, and meta_reserve == briefs_meta_reserve_size(unwritten_res_blocks).
+ * All three fields are protected by alloc->lock; raise/release/drop take it
+ * internally.  raise is called from fallocate (no extent_lock held); release
+ * from the conversion paths (extent_lock held -> alloc->lock, established order);
+ * drop from evict/full-free (extent_lock held -> alloc->lock).
+ */
+
+/* Worst-case B+tree metadata blocks for @n unwritten data blocks: one extent
+ * per block (every block written individually with gaps).  Over-reserves for
+ * coarser write patterns; the surplus returns as the unwritten region converts.
+ * +1 is safety slop. */
+u64 briefs_meta_reserve_size(u64 n)
+{
+	u64 leaves, internals;
+
+	if (n == 0)
+		return 0;
+	leaves = div_u64(n + BRIEFS_BTREE_LEAF_FANOUT - 1, BRIEFS_BTREE_LEAF_FANOUT);
+	internals = div_u64(leaves + BRIEFS_BTREE_IDX_KEYS - 1, BRIEFS_BTREE_IDX_KEYS);
+	return leaves + internals + 1;
+}
+
+/* Add @u_new unwritten blocks to @inode's reservation and raise the shield to
+ * the new worst case.  No-op for @u_new == 0 (e.g. re-fallocate over already-
+ * unwritten blocks).  Caller need not hold a lock. */
+void briefs_raise_unwritten_reserve(struct inode *inode, u64 u_new)
+{
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct briefs_sb_info *bsi = briefs_sb(inode->i_sb);
+	u64 new_r, delta;
+
+	if (u_new == 0)
+		return;
+	mutex_lock(&bsi->alloc.lock);
+	binfo->unwritten_res_blocks += u_new;
+	new_r = briefs_meta_reserve_size(binfo->unwritten_res_blocks);
+	delta = new_r - binfo->meta_reserve;	/* >= 0: reserve only grows here */
+	bsi->alloc.meta_shield += delta;
+	binfo->meta_reserve = new_r;
+	mutex_unlock(&bsi->alloc.lock);
+}
+
+/* Account for @L blocks of @inode's unwritten region having been converted to
+ * written: shrink the reservation to the new worst case and return the surplus
+ * shield to the data pool.  @L is clamped to the tracked count so stale tracking
+ * (e.g. after a punch that did not adjust the count) can never underflow. */
+void briefs_release_unwritten_reserve(struct inode *inode, u64 L)
+{
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct briefs_sb_info *bsi = briefs_sb(inode->i_sb);
+	u64 new_r, delta;
+
+	if (L == 0 || binfo->meta_reserve == 0)
+		return;
+	mutex_lock(&bsi->alloc.lock);
+	if (L > binfo->unwritten_res_blocks)
+		L = binfo->unwritten_res_blocks;
+	binfo->unwritten_res_blocks -= L;
+	new_r = briefs_meta_reserve_size(binfo->unwritten_res_blocks);
+	delta = binfo->meta_reserve - new_r;	/* >= 0: reserve only shrinks */
+	bsi->alloc.meta_shield -= delta;
+	binfo->meta_reserve = new_r;
+	mutex_unlock(&bsi->alloc.lock);
+}
+
+/* Drop the entire reservation (evict / full extent free).  Caller need not hold
+ * a lock. */
+void briefs_drop_unwritten_reserve(struct inode *inode)
+{
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct briefs_sb_info *bsi = briefs_sb(inode->i_sb);
+
+	if (binfo->meta_reserve == 0)
+		return;
+	mutex_lock(&bsi->alloc.lock);
+	bsi->alloc.meta_shield -= binfo->meta_reserve;
+	binfo->meta_reserve = 0;
+	binfo->unwritten_res_blocks = 0;
+	mutex_unlock(&bsi->alloc.lock);
 }
 
 /*

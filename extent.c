@@ -261,12 +261,21 @@ int briefs_convert_unwritten_range(struct inode *inode, u64 start_blk,
 			if (cend > eend)
 				cend = eend;
 
+			/*
+			 * @converted is the count of blocks flipped unwritten->written
+			 * (the written middle [cstart,cend); the wings stay unwritten).
+			 * Release that many from the inode's metadata reservation: the
+			 * unwritten region just shrank, so its worst-case metadata
+			 * reserve shrinks too and the surplus shield returns to the data
+			 * pool.  Skipped on the already-written path (converted == 0).
+			 */
 			if (cstart == off && cend == eend) {
 				/* Whole extent written: clear the flag in place. */
 				briefs_extent_write_begin(binfo);
 				e->flags &= ~BRIEFS_EXT_UNWRITTEN;
 				briefs_extent_write_end(binfo);
 				mark_inode_dirty(inode);
+				briefs_release_unwritten_reserve(inode, eend - off);
 				return 0;
 			}
 
@@ -307,6 +316,7 @@ int briefs_convert_unwritten_range(struct inode *inode, u64 start_blk,
 				if (ret)
 					return ret;
 			}
+			briefs_release_unwritten_reserve(inode, cend - cstart);
 			return 0;
 		}
 		return -ENOENT;
@@ -437,6 +447,15 @@ void briefs_free_inode_data(struct inode *inode)
 	 */
 	mutex_lock(&binfo->extent_lock);
 	briefs_btree_free_all(inode->i_sb, &binfo->disk_inode);
+
+	/*
+	 * Drop any outstanding unwritten-metadata reservation: the inode is
+	 * losing all its extents (evict / create-abort), so its unwritten blocks
+	 * are gone and the shielded count must return to the global pool.  Takes
+	 * alloc->lock inside extent_lock (the established order).  No-op for a
+	 * normal file with no reservation.
+	 */
+	briefs_drop_unwritten_reserve(inode);
 
 	briefs_extent_write_begin(binfo);
 	binfo->disk_inode.flags &= ~InodeFlagIndexed;

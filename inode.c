@@ -826,6 +826,17 @@ struct inode *briefs_alloc_vfs_inode(struct super_block *sb) {
 	 */
 	binfo->cached_max_end = 0;
 	/*
+	 * Same slab-reuse hazard: the unwritten-extent metadata reservation
+	 * fields must start at 0 (no outstanding fallocated unwritten extents).
+	 * A stale non-zero meta_reserve would make briefs_drop_unwritten_reserve
+	 * (called from briefs_free_inode_data on evict) subtract garbage from
+	 * the global bsi->alloc.meta_shield, underflowing it to ~U64_MAX so every
+	 * data allocation sees free_count <= meta_shield -> ENOSPC (generic/011,
+	 * 032, 092, 521, 616).  See briefs_raise_unwritten_reserve in alloc.c.
+	 */
+	binfo->unwritten_res_blocks = 0;
+	binfo->meta_reserve = 0;
+	/*
 	 * Same slab-reuse hazard: trie_pool_seeded must start false so the first
 	 * replay_dir_update() for this dir seeds its partial-page pool.  A stale
 	 * true value (left by a prior dir that was seeded) would skip seeding,

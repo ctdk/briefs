@@ -1869,6 +1869,7 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	u64 start_blk, end_blk, blk;
 	u64 rel, phys, run_len, rel_run, phys_run;
 	u64 i, j;
+	u64 added_unwritten = 0;	/* unwritten data blocks added this call */
 	struct briefs_extent ext;
 	bool changed = false;
 	bool grew_size = false;
@@ -2054,6 +2055,7 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 						goto falloc_loop_done;
 					}
 					changed = true;
+					added_unwritten += run_len;
 					blk += run_len;
 					continue;
 				}
@@ -2097,10 +2099,26 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 				goto falloc_loop_done;
 			}
 			changed = true;
+			added_unwritten++;
 		}
 		blk += run_len;
 	}
 falloc_loop_done:
+
+	/*
+	 * Reserve worst-case B+tree metadata for the unwritten blocks this
+	 * fallocate added (ext4-style).  The reserve is a count held in
+	 * bsi->alloc.meta_shield (not bitmap bits), so a later fill to 100%
+	 * stops at free_count == meta_shield, leaving those blocks free for the
+	 * splits that fragmenting this prealloc will need
+	 * (briefs_alloc_block_meta bypasses the shield).  Raised after the loop
+	 * so it covers exactly the blocks actually inserted as unwritten (a
+	 * re-fallocate over already-unwritten blocks adds 0 -> no double-count).
+	 * Raised even on partial/EINTR: the inserted unwritten blocks persist
+	 * (journaled) and could be fragmented later, so they need the reserve.
+	 */
+	if (added_unwritten)
+		briefs_raise_unwritten_reserve(inode, added_unwritten);
 
 	if (!(mode & FALLOC_FL_KEEP_SIZE) && end > inode->i_size) {
 		/* Zero the tail of the old-EOF block before growing i_size past

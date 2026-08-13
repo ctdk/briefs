@@ -39,7 +39,19 @@ struct briefs_alloc {
 	u64 rover_w0;                   /* next-fit hint: L0 word to start the next
 					 * single-block scan at (in-memory only,
 					 * not persisted; wraps around) */
-	struct mutex lock;               /* protects bitmaps and free_count */
+	/*
+	 * meta_shield: count of data blocks reserved for future B+tree metadata
+	 * (unwritten-extent fragmentation reserves, ext4-style).  In-memory only
+	 * (not persisted, like rover_w0).  Data allocations treat the effective
+	 * free count as free_count - meta_shield, so a fs filled to 100% stops
+	 * at free_count == meta_shield, leaving those blocks genuinely free for
+	 * metadata allocations (which bypass the shield and can consume them).
+	 * Reserved blocks are never marked allocated in the bitmap until they
+	 * become referenced B+tree nodes, so fsck sees no allocated-but-
+	 * unreferenced blocks.  Protected by lock (same as free_count).
+	 */
+	u64 meta_shield;
+	struct mutex lock;               /* protects bitmaps, free_count, meta_shield */
 };
 
 /* Initialize data block allocator from superblock */
@@ -52,6 +64,14 @@ int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb,
 
 /* Allocate a single free block (returns data-relative block number, or 0 on ENOSPC) */
 u64 briefs_alloc_block(struct briefs_alloc *alloc);
+
+/*
+ * Allocate a single free block for B+tree metadata (node splits / inline->btree
+ * spill).  Identical to briefs_alloc_block except it draws from the full
+ * free_count, ignoring meta_shield, so a split can consume the blocks a data
+ * allocation left behind at the shield floor.  Returns 0 on true ENOSPC.
+ */
+u64 briefs_alloc_block_meta(struct briefs_alloc *alloc);
 
 /*
  * Allocate a contiguous run of @n free data blocks under one alloc->lock
