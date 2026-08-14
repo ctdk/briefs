@@ -24,6 +24,7 @@ const struct inode_operations briefs_dir_inode_ops = {
 	.mkdir = briefs_mkdir,
 	.symlink = briefs_symlink,
 	.mknod = briefs_mknod,
+	.tmpfile = briefs_tmpfile,
 	.unlink = briefs_unlink,
 	.rmdir = briefs_rmdir,
 	.rename = briefs_rename,

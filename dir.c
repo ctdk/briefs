@@ -424,6 +424,48 @@ int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dent
 }
 
 /*
+ * briefs_tmpfile - create an unlinked (O_TMPFILE) inode.
+ *
+ * briefs_new_inode() allocates and persists the inode with nlink=1 (and
+ * inherits the parent's default ACL via briefs_init_acl, which generic/389
+ * checks).  d_tmpfile() then drops the VFS i_nlink to 0 and instantiates the
+ * tmpfile dentry; we mirror that into the on-disk inode and journal a full
+ * snapshot so a crash leaves a recoverable nlink=0 unlinked inode.  There is
+ * no on-disk orphan list: a tmpfile dropped without being linked is freed by
+ * briefs_evict_inode() on last close (i_count->0, nlink==0), and a tmpfile
+ * fsync'd then crashed (generic/509) is left for fsck.briefs to reclaim --
+ * the test only checks the post-crash mount succeeds.  flink (linkat with
+ * AT_EMPTY_PATH) later hard-links it through the existing briefs_link(), which
+ * inc_nlink()s 0->1; the VFS marks the inode I_LINKABLE in vfs_tmpfile() so
+ * may_linkat() permits that.
+ */
+int briefs_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
+		   struct file *file, umode_t mode)
+{
+	struct super_block *sb = dir->i_sb;
+	struct briefs_inode_info *binfo;
+	struct inode *inode;
+	int ret;
+
+	inode = briefs_new_inode(idmap, dir, NULL, mode, 0);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+
+	binfo = briefs_i(inode);
+
+	d_tmpfile(file, inode);
+	binfo->disk_inode.nlinks = 0;
+	mark_inode_dirty(inode);
+
+	ret = briefs_persist_and_journal_inode(sb, inode, &binfo->disk_inode, false);
+	if (ret)
+		pr_warn_ratelimited("briefs: tmpfile persist failed ino %lu: %d\n",
+				    inode->i_ino, ret);
+
+	return finish_open_simple(file, 0);
+}
+
+/*
  * briefs_link - create a hard link.
  *
  * Creates a new directory entry pointing at the same inode as old_dentry.

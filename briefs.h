@@ -1349,6 +1349,7 @@ int briefs_append_extent(struct super_block *sb, struct briefs_inode *di, struct
 int briefs_append_extent_nojournal(struct super_block *sb, struct briefs_inode *di,
                                     struct briefs_extent *ext);
 void briefs_free_blocks_range(struct briefs_sb_info *bsi, u64 phys_start, u64 len);
+int briefs_trim_fs(struct super_block *sb, struct fstrim_range *range);
 int briefs_write_inode(struct inode *inode, struct writeback_control *wbc);
 int briefs_inode_sync(struct inode *inode);
 
@@ -1657,6 +1658,7 @@ int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry 
 int briefs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *new_dentry);
 int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, const char *symname);
 int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, dev_t rdev);
+int briefs_tmpfile(struct mnt_idmap *idmap, struct inode *dir, struct file *file, umode_t mode);
 const char *briefs_get_link(struct dentry *dentry, struct inode *inode, struct delayed_call *done);
 
 /* File operations */

@@ -187,8 +187,10 @@ int briefs_release(struct inode *inode, struct file *file) {
  * xfs_io prints the (stdout, filtered) fsx fields and emits no error line.
  *
  * FS_IOC_{GET,SET}FLAGS and FS_IOC_FS{GET,SET}XATTR are now handled by the VFS
- * through inode_operations::fileattr_get / fileattr_set, so this handler only
- * needs to answer BRIEFS_IOC_GOINGDOWN and reject everything else with -ENOTTY.
+ * through inode_operations::fileattr_get / fileattr_set, so this handler also
+ * answers BRIEFS_IOC_GOINGDOWN, FITRIM (no super_op trim hook; handled here),
+ * and FS_IOC_{GET,SET}FSLABEL (the on-disk label lives in the superblock),
+ * rejecting anything else with -ENOTTY.
  */
 long briefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
@@ -212,6 +214,80 @@ long briefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (ret != -EROFS)
 			mnt_drop_write_file(file);
 		return ret;
+
+	case FITRIM:
+	{
+		struct super_block *sb = inode->i_sb;
+		struct briefs_sb_info *bsi = sb->s_fs_info;
+		struct fstrim_range range;
+
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		if (!bdev_max_discard_sectors(sb->s_bdev))
+			return -EOPNOTSUPP;
+		/*
+		 * norecovery mounts skip journal replay and present possibly
+		 * stale free-space metadata; discarding from that would free
+		 * blocks still referenced by the unreplayed journal.  Refuse,
+		 * mirroring ext4/xfs (generic/537).
+		 */
+		if (bsi->mount_flags & BRIEFS_MF_NORECOVERY)
+			return -EROFS;
+		if (copy_from_user(&range, (struct fstrim_range __user *)arg,
+				   sizeof(range)))
+			return -EFAULT;
+		ret = briefs_trim_fs(sb, &range);
+		if (ret)
+			return ret;
+		if (copy_to_user((struct fstrim_range __user *)arg, &range,
+				 sizeof(range)))
+			return -EFAULT;
+		return 0;
+	}
+
+	case FS_IOC_GETFSLABEL:
+	{
+		struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
+		char label[FSLABEL_MAX] = {};
+
+		lock_buffer(bsi->sb_bh);
+		memcpy(label, bsi->sb->label, sizeof(bsi->sb->label));
+		unlock_buffer(bsi->sb_bh);
+		/* label[64] is null-padded, not terminated; the zeroed 256-byte
+		 * buffer guarantees termination for userspace. */
+		if (copy_to_user((char __user *)arg, label, sizeof(label)))
+			return -EFAULT;
+		return 0;
+	}
+
+	case FS_IOC_SETFSLABEL:
+	{
+		struct super_block *sb = inode->i_sb;
+		struct briefs_sb_info *bsi = sb->s_fs_info;
+		char label[FSLABEL_MAX];
+		size_t len;
+
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		if (copy_from_user(label, (char __user *)arg, sizeof(label)))
+			return -EFAULT;
+		len = strnlen(label, sizeof(label));
+		/* BrieFS stores the label in a fixed 64-byte, null-padded field
+		 * (not null-terminated), so 64 chars is the most it can hold. */
+		if (len > sizeof(bsi->sb->label))
+			return -EINVAL;
+		ret = mnt_want_write_file(file);
+		if (ret)
+			return ret;
+		memset(label + len, 0, sizeof(label) - len);
+		lock_buffer(bsi->sb_bh);
+		memcpy(bsi->sb->label, label, sizeof(bsi->sb->label));
+		unlock_buffer(bsi->sb_bh);
+		mark_buffer_dirty(bsi->sb_bh);
+		sync_dirty_buffer(bsi->sb_bh);
+		mnt_drop_write_file(file);
+		return 0;
+	}
 
 	default:
 		return -ENOTTY;

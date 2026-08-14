@@ -8,6 +8,7 @@
 #include <linux/stddef.h>
 #include <linux/types.h>
 #include <linux/buffer_head.h>
+#include <linux/blkdev.h>
 #include <linux/math64.h>
 
 #include "briefs.h"
@@ -459,6 +460,142 @@ found:
 	alloc->rover_w0 = run_start / (64 * 64 * 64);
 	mutex_unlock(&alloc->lock);
 	return run_start;
+}
+
+/*
+ * Discard (TRIM) one maximal free run, clamped to the caller's request range
+ * [start, end) (data-relative blocks).  Only the portion of the run that is
+ * both free (it is -- the caller only passes free runs) and inside [start, end)
+ * is discarded, and only if that clamped slice is at least @minlen blocks long.
+ * FSTRIM must never touch in-use blocks; the bitmap walk that produces these
+ * runs only visits set (free) bits, so this is safe.  Returns the sb_issue_discard
+ * error (0 on success); the discarded byte count is added to *trimmed.
+ */
+static int briefs_trim_flush(struct super_block *sb,
+			     struct briefs_superblock *bsb,
+			     u64 run_start, u64 run_len,
+			     u64 start, u64 end, u64 minlen, u64 *trimmed)
+{
+	u64 ds, de, len;
+	int ret;
+
+	if (run_len < minlen)
+		return 0;
+	ds = max(run_start, start);
+	de = min(run_start + run_len, end);
+	if (de <= ds)
+		return 0;
+	len = de - ds;
+	if (len < minlen)
+		return 0;
+
+	ret = sb_issue_discard(sb, data_to_abs(bsb, ds), len, GFP_NOFS, 0);
+	if (ret)
+		return ret;
+	*trimmed += len << sb->s_blocksize_bits;
+	return 0;
+}
+
+/*
+ * briefs_trim_fs - FITRIM handler over the data-block allocator.
+ *
+ * Walks the L2 leaf bitmap (read-only) for maximal free runs and issues
+ * sb_issue_discard for each run (or the in-range slice of it) at least @minlen
+ * blocks long.  range->start/len are byte offsets over the data region; they
+ * are clamped to [0, block_count).  Validation mirrors ext4_trim_fs:
+ *   - range->len < block_size, or start beyond EOF, or minlen absurd -> -EINVAL
+ * The bitmap is not modified.  alloc->lock is held across the walk + discards
+ * so a concurrent allocator cannot free a block we are about to discard (and
+ * vice versa); FSTRIM is an admin-rate operation, not a hot path.  The actual
+ * number of bytes discarded is returned in range->len.
+ */
+int briefs_trim_fs(struct super_block *sb, struct fstrim_range *range)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct briefs_alloc *alloc = &bsi->alloc;
+	u64 max_blks = alloc->block_count;
+	u64 start, end, minlen, trimmed = 0;
+	u64 w2;
+	int ret = 0;
+
+	start = range->start >> sb->s_blocksize_bits;
+	end = start + (range->len >> sb->s_blocksize_bits);
+	minlen = range->minlen >> sb->s_blocksize_bits;
+
+	if (range->len < sb->s_blocksize || start >= max_blks || minlen > max_blks)
+		return -EINVAL;
+	if (end > max_blks)
+		end = max_blks;
+	if (minlen == 0)
+		minlen = 1;
+	if (end <= start)
+		goto out;
+
+	mutex_lock(&alloc->lock);
+	{
+		u64 run_start = 0, run_len = 0;
+
+		for (w2 = 0; w2 < alloc->l2_words; w2++) {
+			u64 word = alloc->l2[w2];
+			u64 base = w2 * 64;
+			u64 bits, b, s, cnt;
+
+			/* mask trailing bits beyond block_count in the last word */
+			if (w2 == alloc->l2_words - 1) {
+				u64 rem = alloc->block_count % 64;
+
+				if (rem != 0)
+					word &= (1ULL << rem) - 1;
+			}
+
+			if (word == 0) {
+				ret = briefs_trim_flush(sb, bsi->sb, run_start,
+							run_len, start, end,
+							minlen, &trimmed);
+				if (ret)
+					goto unlock;
+				run_len = 0;
+				continue;
+			}
+
+			/* walk each maximal run of set bits within this word */
+			bits = word;
+			while (bits) {
+				u64 shifted, inv;
+
+				b = __builtin_ctzll(bits);
+				s = base + b;
+				shifted = bits >> b;
+				inv = ~shifted;
+				cnt = inv ? __builtin_ctzll(inv) : (64 - b);
+
+				if (run_len > 0 && s == run_start + run_len)
+					run_len += cnt;	/* contiguous with prev */
+				else {
+					ret = briefs_trim_flush(sb, bsi->sb,
+							run_start, run_len,
+							start, end, minlen,
+							&trimmed);
+					if (ret)
+						goto unlock;
+					run_start = s;
+					run_len = cnt;
+				}
+
+				if (cnt >= 64)
+					bits = 0;
+				else
+					bits &= ~(((1ULL << cnt) - 1) << b);
+			}
+		}
+		ret = briefs_trim_flush(sb, bsi->sb, run_start, run_len, start,
+					end, minlen, &trimmed);
+	}
+unlock:
+	mutex_unlock(&alloc->lock);
+out:
+	range->len = trimmed;
+	return ret;
 }
 
 /*
