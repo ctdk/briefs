@@ -4,6 +4,8 @@
 
 #include <linux/module.h>
 #include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/fsnotify.h>
 #include <linux/falloc.h>
 #include <linux/fiemap.h>
 #include <linux/statfs.h>
@@ -17,6 +19,7 @@
 #include <linux/bio.h>
 #include <linux/mm.h>
 #include <linux/uaccess.h>
+#include <linux/string.h>
 #include <linux/migrate.h>
 #include <linux/fileattr.h>
 #include <linux/posix_acl.h>
@@ -25,9 +28,25 @@
 #include "briefs_journal.h"
 #include "briefs_debug.h"
 #include "briefs_iomap.h"
+#include "briefs_exchange.h"
 
 /* Not declared in the headers on 6.12. */
 extern void generic_fill_statx_attr(struct inode *inode, struct kstat *stat);
+
+/*
+ * File-range exchange engine (defined later in this file; briefs_ioctl at the
+ * top of the file dispatches to these entry points).  They mirror the XFS
+ * XFS_IOC_EXCHANGE_RANGE / START_COMMIT / COMMIT_RANGE / SWAPEXT ioctls using
+ * the copied UAPI layouts in briefs_exchange.h.
+ */
+static long briefs_ioc_exchange_range(struct file *file,
+				      struct briefs_exchange_range __user *argp);
+static long briefs_ioc_start_commit(struct file *file,
+				     struct briefs_commit_range __user *argp);
+static long briefs_ioc_commit_range(struct file *file,
+				    struct briefs_commit_range __user *argp);
+static long briefs_ioc_swapext(struct file *file,
+			       struct briefs_swapext __user *argp);
 
 /* address_space_operations wrappers (kernel 6.12 folio-based APIs). */
 
@@ -288,6 +307,22 @@ long briefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		mnt_drop_write_file(file);
 		return 0;
 	}
+
+	case BRIEFS_IOC_EXCHANGE_RANGE:
+		return briefs_ioc_exchange_range(file,
+				(struct briefs_exchange_range __user *)arg);
+
+	case BRIEFS_IOC_START_COMMIT:
+		return briefs_ioc_start_commit(file,
+				(struct briefs_commit_range __user *)arg);
+
+	case BRIEFS_IOC_COMMIT_RANGE:
+		return briefs_ioc_commit_range(file,
+				(struct briefs_commit_range __user *)arg);
+
+	case BRIEFS_IOC_SWAPEXT:
+		return briefs_ioc_swapext(file,
+				(struct briefs_swapext __user *)arg);
 
 	default:
 		return -ENOTTY;
@@ -1943,6 +1978,783 @@ out_free:
 	if (ret == 0)
 		ret = briefs_inode_sync(inode);
 	return ret;
+}
+
+/*
+ * File-range exchange engine.
+ *
+ * BrieFS has no reflink: every data block has exactly one owning inode and an
+ * extent record IS that ownership.  Exchanging two file ranges is therefore a
+ * pure remapping -- no data is copied and no data block is freed or allocated;
+ * only the extent metadata (and, for TO_EOF, the on-disk sizes) move between
+ * the two inodes.  The B+ tree merge path is gated on physical contiguity, so
+ * segments that merely meet at a range boundary after rebasing cannot wrongly
+ * coalesce with a kept neighbour unless the physical blocks actually abut.
+ *
+ * The engine mirrors xfs_exchange_range_checks / xfs_exchrange_contents but
+ * uses BrieFS's collect/clip/rebuild primitives instead of a logged
+ * transaction.  Atomicity is the per-record journal model every other BrieFS
+ * op uses: two JRN_INODE_FULL records, one journal sync.  A crash between the
+ * two records can leave a duplicate extent reference that fsck.briefs
+ * reconciles; no data is lost and no block is orphaned.
+ *
+ * Locking (new in BrieFS): both inode_lock (i_rwsem) and extent_lock are taken
+ * in inode-pointer order so two concurrent exchanges cannot deadlock.  The
+ * same-inode case takes each lock once.
+ */
+
+struct briefs_exch {
+	struct file		*file1;		/* donor */
+	struct file		*file2;		/* open file (target) */
+	loff_t			file1_offset;	/* o1, bytes */
+	loff_t			file2_offset;	/* o2, bytes */
+	u64			length;		/* bytes; recomputed for TO_EOF */
+	u64			flags;
+	const struct briefs_commit_range_fresh *fresh;	/* NULL unless commit */
+};
+
+/*
+ * briefs_emit_clipped - append the part of each extent in @src that overlaps
+ * [lo, hi), rebased by @rebase (a signed block delta), to @out.  Extent
+ * offsets/lengths are in blocks; @lo/@hi/@rebase are in block units.
+ */
+static void briefs_emit_clipped(struct briefs_extent *out, int *n,
+				const struct briefs_extent *src, int nsrc,
+				u64 lo, u64 hi, s64 rebase)
+{
+	int i;
+
+	for (i = 0; i < nsrc; i++) {
+		const struct briefs_extent *e = &src[i];
+		u64 s = max(e->offset, lo);
+		u64 en = min(e->offset + e->len, hi);
+
+		if (s >= en)
+			continue;
+		out[*n].offset = (u64)((s64)s + rebase);
+		out[*n].phys = e->phys + (s - e->offset);
+		out[*n].len = en - s;
+		out[*n].flags = e->flags;
+		out[*n].pad = 0;
+		(*n)++;
+	}
+}
+
+/*
+ * briefs_emit_subtract - append the part of each extent in @src that overlaps
+ * [lo, hi) but does NOT overlap any range in @mask (sorted, non-overlapping,
+ * in the same block coordinate space as @src), rebased by @rebase, to @out.
+ * Used to keep the ranges of a file that are NOT being exchanged (the complement
+ * of the exchange mask).
+ */
+static void briefs_emit_subtract(struct briefs_extent *out, int *n,
+				 const struct briefs_extent *src, int nsrc,
+				 u64 lo, u64 hi,
+				 const struct briefs_extent *mask, int nmask,
+				 s64 rebase)
+{
+	int i, j;
+
+	for (i = 0; i < nsrc; i++) {
+		const struct briefs_extent *e = &src[i];
+		u64 s = max(e->offset, lo);
+		u64 en = min(e->offset + e->len, hi);
+		u64 cur;
+
+		if (s >= en)
+			continue;
+		cur = s;
+		for (j = 0; j < nmask && cur < en; j++) {
+			u64 ms = mask[j].offset;
+			u64 me = mask[j].offset + mask[j].len;
+			u64 a, b;
+
+			if (me <= cur)
+				continue;
+			if (ms >= en)
+				break;
+			a = max(ms, cur);
+			b = min(me, en);
+			if (a > cur) {
+				out[*n].offset = (u64)((s64)cur + rebase);
+				out[*n].phys = e->phys + (cur - e->offset);
+				out[*n].len = a - cur;
+				out[*n].flags = e->flags;
+				out[*n].pad = 0;
+				(*n)++;
+			}
+			cur = b;
+		}
+		if (cur < en) {
+			out[*n].offset = (u64)((s64)cur + rebase);
+			out[*n].phys = e->phys + (cur - e->offset);
+			out[*n].len = en - cur;
+			out[*n].flags = e->flags;
+			out[*n].pad = 0;
+			(*n)++;
+		}
+	}
+}
+
+static void briefs_lock_two_inodes(struct inode *inode1, struct inode *inode2)
+{
+	if (inode1 == inode2) {
+		inode_lock(inode1);
+		return;
+	}
+	if (inode1 < inode2) {
+		inode_lock(inode1);
+		inode_lock(inode2);
+	} else {
+		inode_lock(inode2);
+		inode_lock(inode1);
+	}
+}
+
+static void briefs_unlock_two_inodes(struct inode *inode1, struct inode *inode2)
+{
+	if (inode1 == inode2) {
+		inode_unlock(inode1);
+		return;
+	}
+	inode_unlock(inode1);
+	inode_unlock(inode2);
+}
+
+static void briefs_lock_two_extents(struct briefs_inode_info *b1,
+				     struct briefs_inode_info *b2)
+{
+	if (b1 == b2) {
+		mutex_lock(&b1->extent_lock);
+		return;
+	}
+	if (b1 < b2) {
+		mutex_lock(&b1->extent_lock);
+		mutex_lock(&b2->extent_lock);
+	} else {
+		mutex_lock(&b2->extent_lock);
+		mutex_lock(&b1->extent_lock);
+	}
+}
+
+static void briefs_unlock_two_extents(struct briefs_inode_info *b1,
+				      struct briefs_inode_info *b2)
+{
+	if (b1 == b2) {
+		mutex_unlock(&b1->extent_lock);
+		return;
+	}
+	mutex_unlock(&b1->extent_lock);
+	mutex_unlock(&b2->extent_lock);
+}
+
+/*
+ * Exchange two non-overlapping sub-ranges of a single inode.  The two ranges
+ * [lo, lo+len) and [hi, hi+len) (lo < hi) are rotated: the hi range's contents
+ * move to the lo position, the lo range's contents move to the hi position, and
+ * everything outside both ranges is unchanged.  The five clipped emits below
+ * produce the new list already sorted by offset.  Caller holds extent_lock.
+ */
+static int briefs_exch_engine_same(struct super_block *sb,
+				   struct briefs_inode_info *b,
+				   u64 o1, u64 o2, u64 len)
+{
+	struct briefs_extent *old = NULL, *new = NULL;
+	int n = 0, nn = 0, ret;
+	u64 lo = min(o1, o2);
+	u64 hi = max(o1, o2);
+	s64 r_lo_hi = (s64)lo - (s64)hi;	/* hi range -> lo position */
+	s64 r_hi_lo = (s64)hi - (s64)lo;	/* lo range -> hi position */
+
+	ret = briefs_collect_all_extents(sb, &b->disk_inode, &old, &n);
+	if (ret)
+		return ret;
+
+	new = kvmalloc_array(6 * n + 8, sizeof(*new), GFP_KERNEL);
+	if (!new) {
+		kvfree(old);
+		return -ENOMEM;
+	}
+
+	briefs_emit_clipped(new, &nn, old, n, 0, lo, 0);
+	briefs_emit_clipped(new, &nn, old, n, hi, hi + len, r_lo_hi);
+	briefs_emit_clipped(new, &nn, old, n, lo + len, hi, 0);
+	briefs_emit_clipped(new, &nn, old, n, lo, lo + len, r_hi_lo);
+	briefs_emit_clipped(new, &nn, old, n, hi + len, U64_MAX, 0);
+
+	ret = briefs_rebuild_extent_list(sb, b, new, nn);
+	kvfree(old);
+	kvfree(new);
+	return ret;
+}
+
+/*
+ * Exchange [o1, o1+len) of file1 with [o2, o2+len) of file2 (two distinct
+ * inodes), or to EOF when @to_eof.  With FILE1_WRITTEN, only file1's WRITTEN
+ * extents within the range are exchanged; everywhere else each file keeps its
+ * own extents (holes/unwritten do not move).  Caller holds both extent_locks.
+ */
+static int briefs_exch_engine_diff(struct super_block *sb,
+				   struct briefs_inode_info *b1,
+				   struct briefs_inode_info *b2,
+				   u64 o1, u64 o2, u64 len, bool to_eof,
+				   u64 flags)
+{
+	struct briefs_extent *old1 = NULL, *old2 = NULL;
+	struct briefs_extent *mask = NULL, *mask2 = NULL;
+	struct briefs_extent *new1 = NULL, *new2 = NULL;
+	int n1 = 0, n2 = 0, nmask = 0, nn1 = 0, nn2 = 0;
+	u64 cend1, cend2;
+	s64 d12, d21;
+	int ret = 0, i;
+
+	cend1 = to_eof ? U64_MAX : o1 + len;
+	cend2 = to_eof ? U64_MAX : o2 + len;
+	d12 = (s64)o1 - (s64)o2;		/* rebase file2 -> file1 coords */
+	d21 = (s64)o2 - (s64)o1;		/* rebase file1 -> file2 coords */
+
+	ret = briefs_collect_all_extents(sb, &b1->disk_inode, &old1, &n1);
+	if (ret)
+		goto out;
+	ret = briefs_collect_all_extents(sb, &b2->disk_inode, &old2, &n2);
+	if (ret)
+		goto out;
+
+	/*
+	 * Exchange mask M, in file1 block coords: the sub-ranges of [o1, cend1)
+	 * that actually participate in the exchange.  Without FILE1_WRITTEN the
+	 * whole range exchanges; with it, only file1's written extents (unwritten
+	 * extents and holes exchange nothing, so file2 keeps its own contents
+	 * there).
+	 */
+	mask = kvmalloc_array(n1 + 2, sizeof(*mask), GFP_KERNEL);
+	mask2 = kvmalloc_array(n1 + 2, sizeof(*mask2), GFP_KERNEL);
+	new1 = kvmalloc_array(2 * (n1 + n2) + 8, sizeof(*new1), GFP_KERNEL);
+	new2 = kvmalloc_array(2 * (n1 + n2) + 8, sizeof(*new2), GFP_KERNEL);
+	if (!mask || !mask2 || !new1 || !new2) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	if (flags & BRIEFS_EXCHANGE_RANGE_FILE1_WRITTEN) {
+		for (i = 0; i < n1; i++) {
+			u64 s, en;
+
+			if (old1[i].flags & BRIEFS_EXT_UNWRITTEN)
+				continue;
+			s = max(old1[i].offset, o1);
+			en = min(old1[i].offset + old1[i].len, cend1);
+			if (s >= en)
+				continue;
+			mask[nmask].offset = s;
+			mask[nmask].len = en - s;
+			mask[nmask].phys = 0;
+			mask[nmask].flags = 0;
+			mask[nmask].pad = 0;
+			mask2[nmask].offset = (u64)((s64)s + d21);
+			mask2[nmask].len = en - s;
+			mask2[nmask].phys = 0;
+			mask2[nmask].flags = 0;
+			mask2[nmask].pad = 0;
+			nmask++;
+		}
+	} else {
+		mask[0].offset = o1;
+		mask[0].len = cend1 - o1;
+		mask[0].phys = 0;
+		mask[0].flags = 0;
+		mask[0].pad = 0;
+		mask2[0].offset = o2;
+		mask2[0].len = cend2 - o2;
+		mask2[0].phys = 0;
+		mask2[0].flags = 0;
+		mask2[0].pad = 0;
+		nmask = 1;
+	}
+
+	/*
+	 * new1 = old1[0,o1) ++ old1[o1,cend1)\M (kept) ++
+	 *        (old2's M-corresponding pieces, rebased d12) ++ old1[cend1,EOF).
+	 * new2 = old2[0,o2) ++ old2[o2,cend2)\M2 (kept) ++
+	 *        (old1's M pieces, rebased d21) ++ old2[cend2,EOF).
+	 */
+	briefs_emit_clipped(new1, &nn1, old1, n1, 0, o1, 0);
+	briefs_emit_subtract(new1, &nn1, old1, n1, o1, cend1, mask, nmask, 0);
+	for (i = 0; i < nmask; i++) {
+		u64 ms = (u64)((s64)mask[i].offset + d21);
+		u64 me = (u64)((s64)(mask[i].offset + mask[i].len) + d21);
+
+		briefs_emit_clipped(new1, &nn1, old2, n2, ms, me, d12);
+	}
+	briefs_emit_clipped(new1, &nn1, old1, n1, cend1, U64_MAX, 0);
+
+	briefs_emit_clipped(new2, &nn2, old2, n2, 0, o2, 0);
+	briefs_emit_subtract(new2, &nn2, old2, n2, o2, cend2, mask2, nmask, 0);
+	for (i = 0; i < nmask; i++)
+		briefs_emit_clipped(new2, &nn2, old1, n1,
+				    mask[i].offset, mask[i].offset + mask[i].len,
+				    d21);
+	briefs_emit_clipped(new2, &nn2, old2, n2, cend2, U64_MAX, 0);
+
+	ret = briefs_rebuild_extent_list(sb, b1, new1, nn1);
+	if (ret)
+		goto out;
+	ret = briefs_rebuild_extent_list(sb, b2, new2, nn2);
+out:
+	kvfree(old1);
+	kvfree(old2);
+	kvfree(mask);
+	kvfree(mask2);
+	kvfree(new1);
+	kvfree(new2);
+	return ret;
+}
+
+/*
+ * Range validation, mirroring xfs_exchange_range_checks (xfs_exchrange.c
+ * 337-446) so the generic/717 error matrix matches exactly.  Recomputes
+ * @fx->length for TO_EOF.  Returns 0 or -errno.
+ */
+static int briefs_exch_checks(struct briefs_exch *fx)
+{
+	struct inode *inode1 = file_inode(fx->file1);
+	struct inode *inode2 = file_inode(fx->file2);
+	loff_t size1 = i_size_read(inode1);
+	loff_t size2 = i_size_read(inode2);
+	unsigned int alloc_unit = inode1->i_sb->s_blocksize;
+	uint64_t allocmask = alloc_unit - 1;
+	int64_t test_len;
+	uint64_t blen;
+	loff_t tmp;
+	int error;
+
+	if (IS_IMMUTABLE(inode1) || IS_IMMUTABLE(inode2))
+		return -EPERM;
+	if (IS_SWAPFILE(inode1) || IS_SWAPFILE(inode2))
+		return -ETXTBSY;
+
+	if (fx->file1_offset > size1 || fx->file2_offset > size2)
+		return -EINVAL;
+
+	if (fx->flags & BRIEFS_EXCHANGE_RANGE_TO_EOF) {
+		fx->length = max_t(int64_t, size1 - fx->file1_offset,
+				   size2 - fx->file2_offset);
+	} else {
+		if (fx->file1_offset + fx->length > size1 ||
+		    fx->file2_offset + fx->length > size2)
+			return -EINVAL;
+	}
+
+	if (!IS_ALIGNED(fx->file1_offset, alloc_unit) ||
+	    !IS_ALIGNED(fx->file2_offset, alloc_unit))
+		return -EINVAL;
+
+	if (check_add_overflow(fx->file1_offset, fx->length, &tmp) ||
+	    check_add_overflow(fx->file2_offset, fx->length, &tmp))
+		return -EINVAL;
+
+	test_len = fx->length;
+	error = generic_write_check_limits(fx->file2, fx->file2_offset, &test_len);
+	if (error)
+		return error;
+	error = generic_write_check_limits(fx->file1, fx->file1_offset, &test_len);
+	if (error)
+		return error;
+	if (test_len != fx->length)
+		return -EINVAL;
+
+	blen = fx->length;
+	if (fx->file1_offset + fx->length == size1)
+		blen = ALIGN(size1, alloc_unit) - fx->file1_offset;
+	else if (fx->file2_offset + fx->length == size2)
+		blen = ALIGN(size2, alloc_unit) - fx->file2_offset;
+	else if (!IS_ALIGNED(fx->length, alloc_unit))
+		return -EINVAL;
+
+	if (inode1 == inode2 &&
+	    fx->file2_offset + blen > fx->file1_offset &&
+	    fx->file1_offset + blen > fx->file2_offset)
+		return -EINVAL;
+
+	if ((fx->length & allocmask) == 0)
+		return 0;
+
+	blen = fx->length;
+	if (fx->file2_offset + blen < size2)
+		blen &= ~allocmask;
+	if (fx->file1_offset + blen < size1)
+		blen &= ~allocmask;
+
+	return blen == fx->length ? 0 : -EINVAL;
+}
+
+/* Verify file2 has not changed since START_COMMIT sampled its freshness. */
+static int briefs_check_freshness(struct inode *inode2,
+				  const struct briefs_commit_range_fresh *f)
+{
+	struct timespec64 ctime = inode_get_ctime(inode2);
+	struct timespec64 mtime = inode_get_mtime(inode2);
+
+	if (f->file2_ino != inode2->i_ino ||
+	    f->file2_gen != inode2->i_generation ||
+	    (s64)f->file2_ctime != ctime.tv_sec ||
+	    (s32)f->file2_ctime_nsec != ctime.tv_nsec ||
+	    (s64)f->file2_mtime != mtime.tv_sec ||
+	    (s32)f->file2_mtime_nsec != mtime.tv_nsec)
+		return -EBUSY;
+	return 0;
+}
+
+/*
+ * briefs_exch_contents - the locked body of a range exchange.  Mirrors
+ * xfs_exchange_range_prep + xfs_exchrange_contents + xfs_exchange_range_finish.
+ * Caller has already done the no-lock checks and file_start_write(file2).
+ */
+static int briefs_exch_contents(struct briefs_exch *fx)
+{
+	struct inode *inode1 = file_inode(fx->file1);
+	struct inode *inode2 = file_inode(fx->file2);
+	struct briefs_inode_info *b1 = briefs_i(inode1);
+	struct briefs_inode_info *b2 = briefs_i(inode2);
+	struct super_block *sb = inode1->i_sb;
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	bool same_inode = (inode1 == inode2);
+	int ret;
+
+	briefs_lock_two_inodes(inode1, inode2);
+
+	if (fx->fresh) {
+		ret = briefs_check_freshness(inode2, fx->fresh);
+		if (ret)
+			goto out_unlock_inodes;
+	}
+
+	ret = briefs_exch_checks(fx);
+	if (ret || fx->length == 0)
+		goto out_unlock_inodes;
+
+	inode_dio_wait(inode1);
+	if (!same_inode)
+		inode_dio_wait(inode2);
+
+	ret = filemap_write_and_wait_range(inode1->i_mapping,
+			fx->file1_offset, fx->file1_offset + fx->length - 1);
+	if (ret)
+		goto out_unlock_inodes;
+	ret = filemap_write_and_wait_range(inode2->i_mapping,
+			fx->file2_offset, fx->file2_offset + fx->length - 1);
+	if (ret)
+		goto out_unlock_inodes;
+
+	if (((fx->file1->f_flags | fx->file2->f_flags) & O_SYNC) ||
+	    IS_SYNC(inode1) || IS_SYNC(inode2))
+		fx->flags |= BRIEFS_EXCHANGE_RANGE_DSYNC;
+
+	if (fx->flags & BRIEFS_EXCHANGE_RANGE_DRY_RUN)
+		goto out_unlock_inodes;
+
+	/* Strip setuid/caps before the exchange so the persist captures it. */
+	ret = file_remove_privs(fx->file1);
+	if (ret)
+		goto out_unlock_inodes;
+	if (!same_inode) {
+		ret = file_remove_privs(fx->file2);
+		if (ret)
+			goto out_unlock_inodes;
+	}
+
+	if (b1->disk_inode.flags & InodeFlagInlineData) {
+		ret = briefs_promote_inline_data(inode1);
+		if (ret)
+			goto out_unlock_inodes;
+	}
+	if (!same_inode && (b2->disk_inode.flags & InodeFlagInlineData)) {
+		ret = briefs_promote_inline_data(inode2);
+		if (ret)
+			goto out_unlock_inodes;
+	}
+
+	/*
+	 * Drop any cached pages in the exchanged ranges so that post-exchange
+	 * reads re-fault through iomap against the new mappings.  Pages are
+	 * clean (writeback waited above) so this just removes them; doing it
+	 * before the swap closes the stale-cache window.
+	 *
+	 * For TO_EOF the invalidated tail must reach the end of the file: a
+	 * byte-exact end (file_offset + length - 1) lands inside the last
+	 * (unaligned) page, and truncate_inode_pages_range() would *partially*
+	 * zero that folio instead of removing it, leaving stale cached bytes
+	 * for the swapped tail block (generic/713 unalignedeof).  Pass
+	 * LLONG_MAX so the final folio is removed wholesale and the re-fault
+	 * sees the new mapping.  For a same-file exchange the two ranges live in
+	 * one address_space, so invalidate each range separately.
+	 */
+	{
+		loff_t lend1, lend2;
+
+		lend1 = (fx->flags & BRIEFS_EXCHANGE_RANGE_TO_EOF)
+			? LLONG_MAX : fx->file1_offset + fx->length - 1;
+		lend2 = (fx->flags & BRIEFS_EXCHANGE_RANGE_TO_EOF)
+			? LLONG_MAX : fx->file2_offset + fx->length - 1;
+		truncate_inode_pages_range(inode1->i_mapping,
+					   fx->file1_offset, lend1);
+		if (!same_inode)
+			truncate_inode_pages_range(inode2->i_mapping,
+						   fx->file2_offset, lend2);
+		else
+			truncate_inode_pages_range(inode1->i_mapping,
+						   fx->file2_offset, lend2);
+	}
+
+	briefs_lock_two_extents(b1, b2);
+
+	if (same_inode) {
+		ret = briefs_exch_engine_same(sb, b1,
+				fx->file1_offset >> BRIEFS_BLOCK_SHIFT,
+				fx->file2_offset >> BRIEFS_BLOCK_SHIFT,
+				fx->length >> BRIEFS_BLOCK_SHIFT);
+	} else {
+		ret = briefs_exch_engine_diff(sb, b1, b2,
+				fx->file1_offset >> BRIEFS_BLOCK_SHIFT,
+				fx->file2_offset >> BRIEFS_BLOCK_SHIFT,
+				fx->length >> BRIEFS_BLOCK_SHIFT,
+				fx->flags & BRIEFS_EXCHANGE_RANGE_TO_EOF,
+				fx->flags);
+	}
+	if (ret)
+		goto out_unlock_extents;
+
+	if (fx->flags & BRIEFS_EXCHANGE_RANGE_TO_EOF) {
+		u64 t = i_size_read(inode1);
+
+		i_size_write(inode1, i_size_read(inode2));
+		i_size_write(inode2, t);
+		briefs_extent_write_begin(b1);
+		b1->disk_inode.filesize = i_size_read(inode1);
+		briefs_extent_write_end(b1);
+		if (!same_inode) {
+			briefs_extent_write_begin(b2);
+			b2->disk_inode.filesize = i_size_read(inode2);
+			briefs_extent_write_end(b2);
+		}
+	}
+
+	inode1->i_blocks = briefs_compute_i_blocks(sb, &b1->disk_inode);
+	if (!same_inode)
+		inode2->i_blocks = briefs_compute_i_blocks(sb, &b2->disk_inode);
+
+	{
+		struct timespec64 now = current_time(inode1);
+
+		inode_set_mtime_to_ts(inode1, now);
+		inode_set_ctime_to_ts(inode1, now);
+		if (!same_inode) {
+			inode_set_mtime_to_ts(inode2, now);
+			inode_set_ctime_to_ts(inode2, now);
+		}
+	}
+	briefs_sync_inode_times(inode1, &b1->disk_inode);
+	if (!same_inode)
+		briefs_sync_inode_times(inode2, &b2->disk_inode);
+
+	briefs_persist_and_journal_inode_warn(sb, inode1, &b1->disk_inode);
+	if (!same_inode)
+		briefs_persist_and_journal_inode_warn(sb, inode2, &b2->disk_inode);
+
+	mark_inode_dirty(inode1);
+	if (!same_inode)
+		mark_inode_dirty(inode2);
+
+out_unlock_extents:
+	briefs_unlock_two_extents(b1, b2);
+out_unlock_inodes:
+	briefs_unlock_two_inodes(inode1, inode2);
+
+	if (ret == 0 && (fx->flags & BRIEFS_EXCHANGE_RANGE_DSYNC)) {
+		int r2 = briefs_flush_pending_journal_snapshots(bsi->journal, sb);
+
+		if (!r2)
+			r2 = briefs_journal_sync(bsi->journal);
+		if (!r2)
+			r2 = blkdev_issue_flush(sb->s_bdev);
+		if (r2 && ret == 0)
+			ret = r2;
+	}
+
+	return ret;
+}
+
+/*
+ * briefs_do_exchange - resolve and validate the two files, run the exchange.
+ * Mirrors xfs_exchange_range (the no-lock checks, file_start_write, fsnotify).
+ * @fresh is non-NULL for COMMIT_RANGE (verify file2 unchanged before exchange).
+ */
+static long briefs_do_exchange(struct file *file1, struct file *file2,
+			       u64 o1, u64 o2, u64 length, u64 flags,
+			       const struct briefs_commit_range_fresh *fresh)
+{
+	struct inode *inode1 = file_inode(file1);
+	struct inode *inode2 = file_inode(file2);
+	struct briefs_exch fx = {
+		.file1 = file1,
+		.file2 = file2,
+		.file1_offset = o1,
+		.file2_offset = o2,
+		.length = length,
+		.flags = flags,
+		.fresh = fresh,
+	};
+	loff_t check_len;
+	int ret;
+
+	if (file1->f_path.mnt != file2->f_path.mnt)
+		return -EXDEV;
+	if (flags & ~BRIEFS_EXCHANGE_RANGE_ALL_FLAGS)
+		return -EINVAL;
+	if (S_ISDIR(inode1->i_mode) || S_ISDIR(inode2->i_mode))
+		return -EISDIR;
+	if (!S_ISREG(inode1->i_mode) || !S_ISREG(inode2->i_mode))
+		return -EINVAL;
+	if (!(file1->f_mode & FMODE_READ) || !(file1->f_mode & FMODE_WRITE) ||
+	    !(file2->f_mode & FMODE_READ) || !(file2->f_mode & FMODE_WRITE))
+		return -EBADF;
+	if ((file1->f_flags & O_APPEND) || (file2->f_flags & O_APPEND))
+		return -EBADF;
+
+	check_len = (flags & BRIEFS_EXCHANGE_RANGE_TO_EOF) ? 0 : length;
+	ret = remap_verify_area(file1, o1, check_len, true);
+	if (ret)
+		return ret;
+	ret = remap_verify_area(file2, o2, check_len, true);
+	if (ret)
+		return ret;
+
+	file_start_write(file2);
+	ret = briefs_exch_contents(&fx);
+	file_end_write(file2);
+	if (ret)
+		return ret;
+
+	fsnotify_modify(file1);
+	if (file2 != file1)
+		fsnotify_modify(file2);
+	return 0;
+}
+
+/*
+ * XFS_IOC_EXCHANGE_RANGE: exchange [o1,o1+len) of file1 with [o2,o2+len) of
+ * the open file (file2).  file1 is the donor fd passed in the arg.
+ */
+static long briefs_ioc_exchange_range(struct file *file,
+				      struct briefs_exchange_range __user *argp)
+{
+	struct briefs_exchange_range args;
+
+	if (copy_from_user(&args, argp, sizeof(args)))
+		return -EFAULT;
+	if (memchr_inv(&args.pad, 0, sizeof(args.pad)))
+		return -EINVAL;
+	if (args.flags & ~BRIEFS_EXCHANGE_RANGE_ALL_FLAGS)
+		return -EINVAL;
+
+	CLASS(fd, file1)(args.file1_fd);
+	if (fd_empty(file1))
+		return -EBADF;
+
+	return briefs_do_exchange(fd_file(file1), file, args.file1_offset,
+				  args.file2_offset, args.length, args.flags,
+				  NULL);
+}
+
+/* XFS_IOC_START_COMMIT: sample file2's freshness into the user blob. */
+static long briefs_ioc_start_commit(struct file *file,
+				    struct briefs_commit_range __user *argp)
+{
+	struct briefs_commit_range_fresh kf = { };
+	struct inode *inode2 = file_inode(file);
+	struct timespec64 ctime, mtime;
+
+	inode_lock(inode2);
+	ctime = inode_get_ctime(inode2);
+	mtime = inode_get_mtime(inode2);
+	kf.file2_ino = inode2->i_ino;
+	kf.file2_gen = inode2->i_generation;
+	kf.file2_ctime = ctime.tv_sec;
+	kf.file2_ctime_nsec = ctime.tv_nsec;
+	kf.file2_mtime = mtime.tv_sec;
+	kf.file2_mtime_nsec = mtime.tv_nsec;
+	kf.magic = BRIEFS_XCR_FRESH_MAGIC;
+	inode_unlock(inode2);
+
+	if (copy_to_user((struct briefs_commit_range_fresh __user *)
+			 &argp->file2_freshness, &kf, sizeof(kf)))
+		return -EFAULT;
+	return 0;
+}
+
+/* XFS_IOC_COMMIT_RANGE: verify file2 unchanged, then exchange. */
+static long briefs_ioc_commit_range(struct file *file,
+				   struct briefs_commit_range __user *argp)
+{
+	struct briefs_commit_range args;
+	struct briefs_commit_range_fresh *kf;
+
+	if (copy_from_user(&args, argp, sizeof(args)))
+		return -EFAULT;
+	if (args.flags & ~BRIEFS_EXCHANGE_RANGE_ALL_FLAGS)
+		return -EINVAL;
+	kf = (struct briefs_commit_range_fresh *)&args.file2_freshness;
+	if (kf->magic != BRIEFS_XCR_FRESH_MAGIC)
+		return -EBUSY;
+
+	CLASS(fd, file1)(args.file1_fd);
+	if (fd_empty(file1))
+		return -EBADF;
+
+	return briefs_do_exchange(fd_file(file1), file, args.file1_offset,
+				  args.file2_offset, args.length, args.flags,
+				  kf);
+}
+
+/*
+ * XFS_IOC_SWAPEXT: whole-file extent swap (the historical precursor to
+ * EXCHANGE_RANGE).  The open file is the target (file2); sx_fdtmp is the donor
+ * (file1).  It is a TO_EOF exchange at offset 0 of both files.  The swapfile
+ * check (generic/711) returns ETXTBSY.
+ */
+static long briefs_ioc_swapext(struct file *file,
+			      struct briefs_swapext __user *argp)
+{
+	struct briefs_swapext args;
+
+	if (copy_from_user(&args, argp, sizeof(args)))
+		return -EFAULT;
+
+	CLASS(fd, target)(args.sx_fdtarget);
+	if (fd_empty(target))
+		return -EINVAL;
+	if (!(fd_file(target)->f_mode & FMODE_WRITE) ||
+	    !(fd_file(target)->f_mode & FMODE_READ) ||
+	    (fd_file(target)->f_flags & O_APPEND))
+		return -EBADF;
+
+	CLASS(fd, tmp)(args.sx_fdtmp);
+	if (fd_empty(tmp))
+		return -EINVAL;
+	if (!(fd_file(tmp)->f_mode & FMODE_WRITE) ||
+	    !(fd_file(tmp)->f_mode & FMODE_READ) ||
+	    (fd_file(tmp)->f_flags & O_APPEND))
+		return -EBADF;
+
+	if (IS_SWAPFILE(file_inode(fd_file(target))) ||
+	    IS_SWAPFILE(file_inode(fd_file(tmp))))
+		return -ETXTBSY;
+	if (file_inode(fd_file(target)) == file_inode(fd_file(tmp)))
+		return -EINVAL;
+
+	/* whole-file, to EOF, offset 0 */
+	return briefs_do_exchange(fd_file(tmp), fd_file(target), 0, 0, 0,
+				  BRIEFS_EXCHANGE_RANGE_TO_EOF, NULL);
 }
 
 /*
