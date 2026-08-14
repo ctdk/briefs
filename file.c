@@ -3216,6 +3216,28 @@ static long briefs_do_collapse_range(struct file *file, loff_t offset, loff_t le
 	u64 unwritten_freed = 0;
 	int ret;
 
+	/*
+	 * Collapse range requires block-aligned offset/len and a range that
+	 * lies strictly within EOF (offset+len < i_size); reaching or exceeding
+	 * EOF is -EINVAL (a tail removal is a truncate, not a collapse).  The
+	 * VFS fallocate path does not enforce either condition, so -- as
+	 * ext4_collapse_range does -- we must.  Without these checks a request
+	 * with len > i_size (or offset+len > i_size) underflows the
+	 * `inode->i_size -= len` below to a huge negative value; a later
+	 * buffered write then trips pagecache_isize_extended's WARN_ON, because
+	 * iomap's `pos + written > old_size` comparison is unsigned (the huge
+	 * i_size suppresses i_size_write) while its `old_size < pos` gate is
+	 * signed (negative < positive fires the call) -- generic/070.
+	 */
+	if (!IS_ALIGNED(offset | len, BRIEFS_BLOCK_SIZE)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (offset + len >= i_size_read(inode)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
 	if (binfo->disk_inode.flags & InodeFlagInlineData) {
 		ret = -EOPNOTSUPP;
 		goto out;
@@ -3273,6 +3295,25 @@ static long briefs_do_insert_range(struct file *file, loff_t offset, loff_t len)
 	u64 S = offset >> BRIEFS_BLOCK_SHIFT;
 	u64 L = len >> BRIEFS_BLOCK_SHIFT;
 	int ret;
+
+	/*
+	 * Insert range requires block-aligned offset/len and an offset that
+	 * lies within the file (offset < i_size); inserting at or beyond EOF is
+	 * -EINVAL.  The VFS does not enforce either, so -- as
+	 * ext4_insert_range does -- we must.  Without the alignment check a
+	 * non-block-aligned request (fsstress sends one half the time) would
+	 * shift extents by a sub-block count and corrupt the index; without
+	 * the offset check a request past EOF would grow i_size by len over a
+	 * region the shift never touched.
+	 */
+	if (!IS_ALIGNED(offset | len, BRIEFS_BLOCK_SIZE)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (offset >= i_size_read(inode)) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	if (binfo->disk_inode.flags & InodeFlagInlineData) {
 		ret = -EOPNOTSUPP;
