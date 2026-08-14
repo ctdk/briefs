@@ -2674,6 +2674,9 @@ static long briefs_ioc_start_commit(struct file *file,
 	struct inode *inode2 = file_inode(file);
 	struct timespec64 ctime, mtime;
 
+	BUILD_BUG_ON(sizeof(struct briefs_commit_range_fresh) !=
+		     sizeof_field(struct briefs_commit_range, file2_freshness));
+
 	inode_lock(inode2);
 	ctime = inode_get_ctime(inode2);
 	mtime = inode_get_mtime(inode2);

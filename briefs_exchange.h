@@ -115,7 +115,7 @@ struct briefs_commit_range {
  * verifies them at commit time, returning -EBUSY on any mismatch.
  */
 struct briefs_commit_range_fresh {
-	__u64		fsid_val[2];		/* opaque (unused by BrieFS) */
+	__s32		fsid_val[2];		/* opaque (unused by BrieFS); xfs_fsid_t */
 	__u64		file2_ino;
 	__s64		file2_mtime;
 	__s64		file2_ctime;
