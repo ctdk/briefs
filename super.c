@@ -695,10 +695,33 @@ void briefs_put_super(struct super_block *sb) {
 		 * needs defer-trie-free-until-checkpoint.
 		 */
 		if (bsi->journal) {
-			int ckret = briefs_journal_checkpoint(bsi->journal);
-			if (ckret)
-				pr_err("briefs: unmount checkpoint failed (err=%d); journal may replay on next mount\n",
-				       ckret);
+			/*
+			 * Skip the unmount checkpoint when the filesystem was
+			 * shut down (XFS_IOC_GOINGDOWN).  A forced shutdown
+			 * deliberately leaves the journal dirty -- log_start <
+			 * log_end after the LOGFLUSH path flushed its records
+			 * without retiring them -- so the next mount replays it
+			 * (generic/052: shutdown -> dirty log -> mount with
+			 * replay -> clean log).  Checkpointing here would advance
+			 * log_start to log_end and discard the exact records
+			 * replay is meant to consume.  Clean unmounts do not set
+			 * BRIEFS_MF_SHUTDOWN, so they still checkpoint; that is
+			 * the f8ef293 fix for the generic/029/030/032
+			 * clean-unmount replay clobber, unaffected here.  The
+			 * metadata-buffer flush above (briefs_journal_flush_owned)
+			 * and the superblock sync below still run, so on-disk
+			 * metadata stays current (generic/417) and the dirty
+			 * log_start/log_end are persisted for the next mount.
+			 * Replay is idempotent, so re-applying records over
+			 * already-flushed metadata is safe.
+			 */
+			if (!(bsi->mount_flags & BRIEFS_MF_SHUTDOWN)) {
+				int ckret = briefs_journal_checkpoint(bsi->journal);
+
+				if (ckret)
+					pr_err("briefs: unmount checkpoint failed (err=%d); journal may replay on next mount\n",
+					       ckret);
+			}
 		}
 
 		/* Sync allocation trie to disk */
