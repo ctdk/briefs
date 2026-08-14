@@ -223,16 +223,23 @@ long briefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EPERM;
 		if (get_user(flags, (__u32 __user *)arg))
 			return -EFAULT;
+		/*
+		 * mnt_want_write_file() returns -EROFS on a read-only mount
+		 * WITHOUT taking a writer ref.  Pair mnt_drop_write_file() only
+		 * with a successful want_write -- an unbalanced drop corrupts
+		 * the mount writer count and triggers WARN_ON(mnt_get_writers)
+		 * at umount (generic/599).  Allow an idempotent shutdown on an
+		 * already read-only filesystem by proceeding past the -EROFS.
+		 */
 		ret = mnt_want_write_file(file);
-		if (ret) {
-			if (ret != -EROFS)
-				return ret;
-			/* allow idempotent shutdown on already-read-only fs */
-		}
-		ret = briefs_shutdown(inode->i_sb, flags);
-		if (ret != -EROFS)
+		if (ret && ret != -EROFS)
+			return ret;
+		if (!ret) {
+			int r2 = briefs_shutdown(inode->i_sb, flags);
 			mnt_drop_write_file(file);
-		return ret;
+			return r2;
+		}
+		return briefs_shutdown(inode->i_sb, flags);
 
 	case FITRIM:
 	{
