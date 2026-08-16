@@ -170,6 +170,7 @@ struct jrn_inode_update {
 	__le64 ctime_nsec;
 	__le32 flags;
 	__le32 reserved;
+	__le64 generation;     /* inode generation; guard against replay on a reused inode slot */
 };
 
 /* JRN_INODE_ALLOC */
@@ -1721,7 +1722,7 @@ static inline void briefs_build_bug_on_sizes(void)
 	BUILD_BUG_ON(sizeof(struct journal_record_hdr) != 16);
 	BUILD_BUG_ON(sizeof(struct jrn_checkpoint) != 56);
 	BUILD_BUG_ON(sizeof(struct jrn_dir_update) != 280);
-	BUILD_BUG_ON(sizeof(struct jrn_inode_update) != 88);
+	BUILD_BUG_ON(sizeof(struct jrn_inode_update) != 96);
 	BUILD_BUG_ON(sizeof(struct jrn_extent_alloc) != 80);
 	BUILD_BUG_ON(sizeof(struct jrn_extent_free) != 80);
 	BUILD_BUG_ON(sizeof(struct jrn_inode_alloc) != 40);

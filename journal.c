@@ -813,7 +813,8 @@ static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
  * Writes the recorded inode state back to the on-disk inode block.
  * Returns 0 on success, -EIO on I/O error.
  */
-static int replay_inode_update(struct super_block *sb, struct jrn_inode_update *rec)
+static int replay_inode_update(struct super_block *sb, struct jrn_inode_update *rec,
+				u32 rec_data_len)
 {
 	struct briefs_disk_inode *di;
 	struct buffer_head *bh;
@@ -844,6 +845,20 @@ static int replay_inode_update(struct super_block *sb, struct jrn_inode_update *
 		pr_err("briefs: replay failed to read inode block for %llu (err=%d)\n",
 			ino, err);
 		return err;
+	}
+
+	/* The on-disk slot is in use (magic INOD).  If this record carries a
+	 * generation (newer journals) and it does not match the slot's, the slot
+	 * has been freed and reallocated since this record was written; applying
+	 * the stale metadata would clobber the new owner (generic/536).  Legacy
+	 * records without the generation field are applied unchanged.
+	 */
+	if (rec_data_len >= offsetofend(struct jrn_inode_update, generation) &&
+	    le64_to_cpu(rec->generation) != le64_to_cpu(di->generation)) {
+		pr_debug("briefs: replay skipping stale inode_update %llu (rec gen %llu != slot gen %llu)\n",
+			 ino, le64_to_cpu(rec->generation), le64_to_cpu(di->generation));
+		brelse(bh);
+		return 0;
 	}
 
 	di->inode_number = cpu_to_le64(ino);
@@ -1033,6 +1048,24 @@ static int replay_inode_full(struct super_block *sb, struct jrn_inode_full *rec)
 		pr_err("briefs: replay failed to read inode block for %llu (err=%d)\n",
 			ino, err);
 		return err;
+	}
+
+	/* The on-disk slot is in use (magic INOD).  If the snapshot's inode
+	 * generation does not match the slot's, the slot has been freed and
+	 * reallocated to a different inode since this record was written, and
+	 * applying the stale snapshot would clobber the new owner (generic/536).
+	 */
+	{
+		const struct briefs_disk_inode *snap =
+			(const struct briefs_disk_inode *)rec->inode_data;
+		u64 snap_gen = le64_to_cpu(snap->generation);
+
+		if (snap_gen != le64_to_cpu(di->generation)) {
+			pr_debug("briefs: replay skipping stale inode_full %llu (snap gen %llu != slot gen %llu)\n",
+				 ino, snap_gen, le64_to_cpu(di->generation));
+			brelse(bh);
+			return 0;
+		}
 	}
 
 	memcpy(di, rec->inode_data, sizeof(struct briefs_disk_inode));
@@ -1399,7 +1432,7 @@ static int replay_xattr_data(struct super_block *sb, struct jrn_xattr_data *rec)
  * record is applied as before.
  */
 static int apply_record(struct super_block *sb, u32 rec_type, void *rec_data,
-			bool reserve_only)
+			u32 rec_data_len, bool reserve_only)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
 	int ret = 0;
@@ -1425,7 +1458,7 @@ static int apply_record(struct super_block *sb, u32 rec_type, void *rec_data,
 	}
 	case JRN_INODE_UPDATE:
 		if (!reserve_only)
-			ret = replay_inode_update(sb, rec_data);
+			ret = replay_inode_update(sb, rec_data, rec_data_len);
 		break;
 	case JRN_EXTENT_ALLOC:
 		/* reserves data blocks only; safe and idempotent in both passes */
@@ -1595,7 +1628,8 @@ static int walk_journal(struct briefs_journal *j, struct super_block *sb,
 				continue;
 			}
 
-			int apply_ret = apply_record(sb, rec_type, rec_data, reserve_only);
+			int apply_ret = apply_record(sb, rec_type, rec_data,
+						     rec_data_len, reserve_only);
 			if (apply_ret) {
 				/* -EINVAL/-ENOENT means freed inode - skippable, don't count as error.
 				 * -EIO or other errors mean real I/O failure - should fail mount. */
@@ -2176,6 +2210,7 @@ int briefs_journal_inode_update(struct briefs_journal *j,
 	rec.ctime_sec = cpu_to_le64(inode->i_ctime_sec);
 	rec.ctime_nsec = cpu_to_le64(inode->i_ctime_nsec);
 	rec.flags = cpu_to_le32(le32_to_cpu(binfo->disk_inode.flags));
+	rec.generation = cpu_to_le64(binfo->disk_inode.generation);
 
 	return briefs_journal_write_record(j, JRN_INODE_UPDATE, &rec, sizeof(rec));
 }
