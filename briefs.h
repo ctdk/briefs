@@ -1346,6 +1346,14 @@ int briefs_next_extent(struct super_block *sb, struct briefs_inode_info *binfo,
 int briefs_convert_unwritten_range(struct inode *inode, u64 start_blk,
 				   u64 end_blk);
 
+/* Convert every unwritten extent in [start_blk, end_blk) to written (splitting
+ * each so un-written wings stay unwritten).  Takes binfo->extent_lock
+ * internally.  Use when only the overall range is known (e.g. DIO end_io);
+ * briefs_convert_unwritten_range converts only the single covering extent.
+ * Returns 0 or -EIO. */
+int briefs_convert_unwritten_range_iter(struct inode *inode, u64 start_blk,
+					u64 end_blk);
+
 int briefs_append_extent(struct super_block *sb, struct briefs_inode *di, struct briefs_extent *ext);
 int briefs_append_extent_nojournal(struct super_block *sb, struct briefs_inode *di,
                                     struct briefs_extent *ext);

@@ -192,9 +192,23 @@ static int briefs_iomap_begin_common(struct inode *inode, loff_t pos,
 		/* A write into an unwritten extent converts it to written
 		 * (deferred to the locked path, which re-looks-up under
 		 * extent_lock and clears BRIEFS_EXT_UNWRITTEN, exactly as
-		 * briefs_get_block does).  Reads/fiemap see it as unwritten. */
-		if (write && (ext.flags & BRIEFS_EXT_UNWRITTEN))
+		 * briefs_get_block does).  Reads/fiemap see it as unwritten.
+		 *
+		 * A DIRECT write, however, must NOT convert here: iomap would
+		 * submit the write bio only after begin returns, so converting
+		 * in begin flips the extent to written before the data lands,
+		 * and a failed bio (e.g. dm-error EIO) then leaves a "written"
+		 * extent whose blocks still hold stale on-disk contents, which
+		 * reads return instead of zeros (generic/250/252).  Map the
+		 * extent as IOMAP_UNWRITTEN and let briefs_dio_write_end_io
+		 * convert the successfully-written range on completion. */
+		if (write && (ext.flags & BRIEFS_EXT_UNWRITTEN)) {
+			if (flags & IOMAP_DIRECT) {
+				briefs_iomap_fill_mapped(inode, &ext, 0, iomap);
+				return 0;
+			}
 			goto locked_create;
+		}
 		briefs_iomap_fill_mapped(inode, &ext, 0, iomap);
 		return 0;
 	}
@@ -224,19 +238,33 @@ locked_create:
 	ret = briefs_inode_lookup_iblock(inode->i_sb, binfo, iblock, &ext, true);
 	if (ret == 0) {
 		if (ext.flags & BRIEFS_EXT_UNWRITTEN) {
+			/* A direct write defers conversion to end_io so a
+			 * failed DIO leaves the extent unwritten (reads zero),
+			 * not exposing stale on-disk contents (generic/250/252).
+			 * Buffered writes still convert in place here.  This
+			 * locked path is reached via the unlocked -EIO torn-read
+			 * retry; the common DIO-unwritten case returns above. */
+			if (flags & IOMAP_DIRECT) {
+				briefs_iomap_fill_mapped(inode, &ext, 0, iomap);
+				mutex_unlock(&binfo->extent_lock);
+				return 0;
+			}
 			/* Convert only the blocks this write actually covers,
 			 * clamped to the extent, so a partial write splits the
 			 * extent and the un-written wings stay IOMAP_UNWRITTEN
 			 * (read as zeros) instead of being flipped to written
 			 * and exposing un-zeroed stale data.
 			 */
-			u64 end_blk = (u64)(pos + length +
-					    BRIEFS_BLOCK_SIZE - 1) >>
-				      BRIEFS_BLOCK_SHIFT;
+			{
+				u64 end_blk = (u64)(pos + length +
+						    BRIEFS_BLOCK_SIZE - 1) >>
+					      BRIEFS_BLOCK_SHIFT;
 
-			if (end_blk > ext.offset + ext.len)
-				end_blk = ext.offset + ext.len;
-			briefs_convert_unwritten_range(inode, iblock, end_blk);
+				if (end_blk > ext.offset + ext.len)
+					end_blk = ext.offset + ext.len;
+				briefs_convert_unwritten_range(inode, iblock,
+							       end_blk);
+			}
 		}
 		briefs_iomap_fill_mapped(inode, &ext, 0, iomap);
 		mutex_unlock(&binfo->extent_lock);
@@ -457,10 +485,22 @@ const struct iomap_writeback_ops briefs_writeback_ops = {
  * without it a DIO write that only extends EOF into a pre-existing block would
  * not have its i_size persisted.
  *
- * BrieFS allocates blocks WRITTEN at begin time and iomap_dio zeroes the
- * head/tail of IOMAP_F_NEW blocks, so there are no unwritten extents to convert
- * here and IOMAP_DIO_UNWRITTEN is never raised.  On error, propagate it so the
- * caller (and generic_write_sync for O_SYNC) sees it.
+ * A DIO write into a previously-fallocated (unwritten) extent is mapped as
+ * IOMAP_UNWRITTEN in begin and NOT converted there, so a failed DIO leaves the
+ * extent unwritten and reads return zeros instead of the stale on-disk contents
+ * (generic/250/252).  iomap sets IOMAP_DIO_UNWRITTEN when any mapping was
+ * unwritten; convert the written range [ki_pos, ki_pos+size) here.
+ *
+ * Propagate the error BEFORE converting: iomap's @size counts bytes SUBMITTED,
+ * not confirmed-landed, so when a later bio fails @error is set even though
+ * earlier bios were already accounted in @size.  Converting those blocks would
+ * flip them to written while their data never landed, exposing the stale
+ * on-disk contents the test guards against -- the very bug begin-time
+ * conversion had.  On error, leave the extents unwritten so reads return zeros
+ * (ext4's ext4_dio_write_end_io does the same: it returns the error first and
+ * only converts on success).  A fully-failed DIO has size == 0 anyway.  This
+ * runs in process context (iomap completes unwritten DIO via a workqueue), so
+ * taking the extent lock is safe.
  */
 static int briefs_dio_write_end_io(struct kiocb *iocb, ssize_t size,
 				   int error, unsigned int flags)
@@ -469,6 +509,13 @@ static int briefs_dio_write_end_io(struct kiocb *iocb, ssize_t size,
 
 	if (error)
 		return error;
+	if (size > 0 && (flags & IOMAP_DIO_UNWRITTEN)) {
+		u64 start_blk = iocb->ki_pos >> BRIEFS_BLOCK_SHIFT;
+		u64 end_blk = (u64)(iocb->ki_pos + size +
+				    BRIEFS_BLOCK_SIZE - 1) >> BRIEFS_BLOCK_SHIFT;
+
+		briefs_convert_unwritten_range_iter(inode, start_blk, end_blk);
+	}
 	if (size > 0 && iocb->ki_pos + size > i_size_read(inode)) {
 		i_size_write(inode, iocb->ki_pos + size);
 		mark_inode_dirty(inode);

@@ -324,6 +324,87 @@ int briefs_convert_unwritten_range(struct inode *inode, u64 start_blk,
 }
 
 /*
+ * briefs_convert_unwritten_range_iter - convert every unwritten extent in
+ * [start_blk, end_blk) to written, splitting each so un-written wings (and any
+ * blocks past end_blk) stay unwritten and keep reading as zeros.
+ *
+ * briefs_convert_unwritten_range() converts only the single extent covering
+ * @start_blk; the iomap write begin callback relies on the iomap iterator
+ * calling it once per extent.  A direct-I/O write, however, completes with a
+ * single end_io call for the whole DIO, so it knows only the overall range, not
+ * the per-extent mappings.  This helper walks the whole range so end_io can
+ * convert after a batched DIO write: it takes binfo->extent_lock internally and
+ * advances block-by-block, skipping already-written extents and holes, and
+ * converting each unwritten extent it finds (re-looking-up after each split to
+ * discover where the converted middle ends, so an unwritten suffix within the
+ * range is converted on the next iteration).
+ *
+ * Returns 0 on success, -EIO on a corrupt extent-tree read.
+ */
+int briefs_convert_unwritten_range_iter(struct inode *inode, u64 start_blk,
+					 u64 end_blk)
+{
+	struct briefs_inode_info *binfo = briefs_i(inode);
+	struct super_block *sb = inode->i_sb;
+	int ret = 0;
+
+	if (start_blk >= end_blk)
+		return 0;
+
+	mutex_lock(&binfo->extent_lock);
+	while (start_blk < end_blk) {
+		struct briefs_extent ext;
+		int lr;
+
+		lr = briefs_inode_lookup_iblock(sb, binfo, start_blk, &ext, true);
+		if (lr == -ENOENT) {
+			struct briefs_extent next;
+
+			/* Hole in the range: jump to the next extent, if any. */
+			lr = briefs_next_extent(sb, binfo, start_blk, &next, true);
+			if (lr == 0) {
+				start_blk = next.offset;
+				continue;
+			}
+			if (lr != -ENOENT)
+				ret = lr;	/* -EIO */
+			break;
+		}
+		if (lr) {
+			ret = lr;		/* -EIO */
+			break;
+		}
+		if (!(ext.flags & BRIEFS_EXT_UNWRITTEN)) {
+			/* Already written: skip past it. */
+			start_blk = ext.offset + ext.len;
+			continue;
+		}
+		/* Unwritten: convert the [start_blk, end_blk) portion of this
+		 * extent (split, wings stay unwritten). */
+		lr = briefs_convert_unwritten_range(inode, start_blk, end_blk);
+		if (lr && lr != -ENOENT) {
+			ret = lr;		/* -EIO */
+			break;
+		}
+		/* The extent covering start_blk is now a written middle
+		 * [cstart, cend); re-lookup to find cend and advance past it.
+		 * An unwritten suffix [cend, off+len) still inside the range is
+		 * converted on the next iteration; one past end_blk is left
+		 * unwritten (the DIO did not write it). */
+		lr = briefs_inode_lookup_iblock(sb, binfo, start_blk, &ext, true);
+		if (lr == 0)
+			start_blk = ext.offset + ext.len;
+		else {
+			if (lr != -ENOENT)
+				ret = lr;	/* -EIO */
+			break;
+		}
+	}
+	mutex_unlock(&binfo->extent_lock);
+	return ret;
+}
+
+/*
  * briefs_append_extent - insert an extent into the index and journal it.  This
  * is the entry point for callers that are not already holding the extent lock.
  * Returns 0 or -errno; on success logs a full inode snapshot so replay
