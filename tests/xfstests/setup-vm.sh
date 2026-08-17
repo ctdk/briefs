@@ -76,6 +76,22 @@ for t in mkfs.briefs fsck.briefs; do
 	fi
 done
 
+# Provision the xfstests QA users.  ~26 generic tests gate on _require_user /
+# _require_group (common/rc), which need a "fsgqa" user (and some need a second
+# "fsgqa2") that can run a command via su.  useradd -m creates the user plus a
+# matching primary group, satisfying both _require_user and _require_group.
+# Tests run ./check as root and chown a subdir/file to fsgqa before invoking it,
+# so the mount points need no special ownership.  No fixed uid: xfstests derives
+# high-offset uids from id -u fsgqa for idmapped/quota tests, so any uid works.
+for qa_user in fsgqa fsgqa2; do
+	if id "$qa_user" >/dev/null 2>&1; then
+		echo "  $qa_user already exists ($(id -u "$qa_user"))"
+	else
+		useradd -m "$qa_user"
+		echo "  created $qa_user ($(id -u "$qa_user"))"
+	fi
+done
+
 if [ "$USE_DEDICATED" = true ]; then
 	# Use dedicated devices with partitions.
 	mkdir -p "$TEST_MNT" "$SCRATCH_MNT"
