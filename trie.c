@@ -524,6 +524,7 @@ static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
 	struct briefs_trie_page *lpage, *ipage, *gpage;
 	struct briefs_trie_node *lnode, *inode, *gnode;
 	int old_name_len;
+	int ret;
 	u64 internal, old_sibling;
 
 	if (trie_read_node(sb, child, &lbh, &lpage, &lnode) != 0)
@@ -586,10 +587,27 @@ static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
 	/* If split at last byte, store new name on internal. */
 	if (pos == name_len - 1) {
 		if (trie_get_node(sb, internal, &ibh, &ipage, &inode) == 0) {
+			/*
+			 * Store the name before committing the LEAF bit + inode.
+			 * trie_store_name() can fail (-ENOSPC if the page's name
+			 * heap is full, -EIO on a bad page).  Setting the LEAF bit
+			 * and inode first and ignoring that error would leave a
+			 * nameless leaf (LEAF + inode, name_len/name_offset == 0)
+			 * that trie_lookup() can never match (elen == name_len-2
+			 * == -2 != name_len), making the entry unfindable and
+			 * orphaning its inode (generic/089).  On failure the split's
+			 * structural change -- a new INTERM reparenting the old
+			 * leaf -- is valid trie state, so just return the error and
+			 * let the caller unwind the directory op.
+			 */
+			ret = trie_store_name(sb, internal, name, name_len);
+			if (ret != 0) {
+				brelse(ibh);
+				return ret;
+			}
 			inode->node_type |= NODE_STATUS_LEAF;
 			TRIE_SET_FTYPE(inode, type);
 			trie_node_set_inode(inode, ino);
-			trie_store_name(sb, internal, name, name_len);
 			briefs_mark_buffer_dirty(ibh, sb);
 			brelse(ibh);
 		}
@@ -644,10 +662,30 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 						}
 					}
 
+					/*
+					 * Store the name before committing the
+					 * LEAF bit + inode.  This existing INTERM
+					 * node may have been freed and re-allocated
+					 * (memset, name_len/name_offset == 0)
+					 * since it last held a leaf, so
+					 * trie_store_name() may need a fresh
+					 * name-heap allocation that can fail
+					 * (-ENOSPC, -EIO).  Ignoring the error
+					 * would leave a nameless leaf (LEAF +
+					 * inode set, name_len == 0) that
+					 * trie_lookup() can never match,
+					 * orphaning the linked inode
+					 * (generic/089).  Propagate the error so
+					 * the link fails cleanly instead.
+					 */
+					ret = trie_store_name(sb, existing, name, name_len);
+					if (ret != 0) {
+						brelse(cbh);
+						return ret;
+					}
 					cnode->node_type |= NODE_STATUS_LEAF;
 					TRIE_SET_FTYPE(cnode, type);
 					trie_node_set_inode(cnode, ino);
-					trie_store_name(sb, existing, name, name_len);
 					briefs_mark_buffer_dirty(cbh, sb);
 					brelse(cbh);
 					return 0;
@@ -682,10 +720,24 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 				briefs_trie_free_node(sb, new_leaf);
 				return -EIO;
 			}
+			/*
+			 * Store the name before committing the leaf.  create_child()
+			 * pre-reserved name-heap space for this node, so the store
+			 * normally reuses that slot; but it can still fail (-EIO on a
+			 * bad page).  Ignoring the error would leave a nameless leaf
+			 * (LEAF + inode set, name_len == 0) that trie_lookup() can
+			 * never match, orphaning the inode (generic/089).  Free the
+			 * freshly created node and propagate the error.
+			 */
+			ret = trie_store_name(sb, new_leaf, name, name_len);
+			if (ret != 0) {
+				brelse(bh);
+				briefs_trie_free_node(sb, new_leaf);
+				return ret;
+			}
 			node->node_type = 0;
 			TRIE_SET_FTYPE(node, type);
 			trie_node_set_inode(node, ino);
-			trie_store_name(sb, new_leaf, name, name_len);
 			briefs_mark_buffer_dirty(bh, sb);
 			brelse(bh);
 			return 0;

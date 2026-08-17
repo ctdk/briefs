@@ -402,13 +402,115 @@ static int trie_page_alloc_slot(struct briefs_trie_page *page, u64 *out_slot)
 }
 
 /*
+ * trie_page_compact_names - reclaim dead name-heap space on a trie page.
+ *
+ * The name heap is a bump allocator whose high-water mark (free_name_off) grows
+ * from the end of the block toward the slot array and is never decremented when
+ * a node is freed: briefs_trie_free_node() memsets the freed node (clearing its
+ * name_len/name_offset) but leaves its name bytes orphaned above the live
+ * names.  Under create/delete-heavy directories (e.g. generic/089's concurrent
+ * link/unlink churn) the heap therefore fills with dead space from freed nodes
+ * while only a handful of names stay live, until a fresh allocation fails
+ * -ENOSPC even though most of the heap is unused.
+ *
+ * Compaction rewrites every live node's name compactly from the end of the
+ * block, reclaiming all dead space, and resets free_name_off to the live total.
+ * Only the name heap is repacked; node references (block, slot) and trie
+ * structure are untouched, so this is safe under the per-directory trie_lock
+ * that serializes all trie access.  The page buffer is marked dirty so the
+ * compacted layout is persisted regardless of whether the triggering allocation
+ * ultimately succeeds (the compacted heap is a valid state either way).
+ *
+ * Called lazily from trie_page_alloc_name() only when a fresh allocation would
+ * otherwise fail -ENOSPC, so directories with little churn never pay for it.
+ */
+static void trie_page_compact_names(struct buffer_head *bh, struct super_block *sb)
+{
+	struct briefs_trie_page *page = (struct briefs_trie_page *)bh->b_data;
+	char *base = (char *)page;
+	u16 old_off = trie_page_free_name_off(page);
+	u64 live_slots = ~trie_page_free_slots(page);
+	char *tmp;
+	u16 tmp_used = 0;
+	u16 new_off = 0;
+	int slot;
+
+	if (old_off == 0)
+		return;
+
+	tmp = kmalloc(old_off, GFP_NOFS);
+	if (!tmp)
+		return;	/* OOM: leave the heap untouched; caller fails -ENOSPC */
+
+	/*
+	 * Pass 1: copy each live node's name into the scratch buffer, in slot
+	 * order.  A freed slot (bit set in free_slots) was memset and has
+	 * name_offset == 0; its orphaned name bytes are the dead space skipped
+	 * here and reclaimed below.  A live INTERM-only node also has
+	 * name_offset == 0 (it stores no name) and is skipped.  Validate each
+	 * name against the heap bounds; on any anomaly (corrupt node) abort
+	 * without modifying the page so the caller's -ENOSPC surfaces a real
+	 * error rather than scrambling the heap.
+	 */
+	for (slot = 0; slot < TRIE_SLOTS_PER_BLOCK; slot++) {
+		struct briefs_trie_node *n;
+		u16 noff, nlen;
+
+		if (!(live_slots & (1ULL << slot)))
+			continue;		/* free slot */
+		n = trie_slot_at(base, slot);
+		noff = trie_node_name_offset(n);
+		nlen = trie_node_name_len(n);
+		if (noff == 0 || nlen == 0)
+			continue;		/* live node without a stored name */
+		if (noff > old_off || nlen > noff || tmp_used + nlen > old_off) {
+			kfree(tmp);
+			return;		/* corrupt heap; leave untouched */
+		}
+		memcpy(tmp + tmp_used, base + BRIEFS_BLOCK_SIZE - noff, nlen);
+		tmp_used += nlen;
+	}
+
+	/*
+	 * Pass 2: rewrite the names compactly from the end of the block,
+	 * re-iterating in the same slot order so each name is read from its
+	 * scratch-buffer position.  The compact region lies within the old
+	 * heap, but writes draw from the scratch buffer, so no live name is
+	 * clobbered before it is copied.
+	 */
+	tmp_used = 0;
+	for (slot = 0; slot < TRIE_SLOTS_PER_BLOCK; slot++) {
+		struct briefs_trie_node *n;
+		u16 noff, nlen;
+
+		if (!(live_slots & (1ULL << slot)))
+			continue;
+		n = trie_slot_at(base, slot);
+		noff = trie_node_name_offset(n);
+		nlen = trie_node_name_len(n);
+		if (noff == 0 || nlen == 0)
+			continue;
+		new_off += nlen;
+		trie_node_set_name_offset(n, new_off);
+		memcpy(base + BRIEFS_BLOCK_SIZE - new_off, tmp + tmp_used, nlen);
+		tmp_used += nlen;
+	}
+
+	trie_page_set_free_name_off(page, new_off);
+	briefs_mark_buffer_dirty(bh, sb);
+	kfree(tmp);
+}
+
+/*
  * Allocate name-heap space for a node.  The slot must already be allocated.
  * If the node already has a name allocation that is large enough, reuse it;
- * otherwise grow the heap.  Returns 0 on success, negative on error.
+ * otherwise grow the heap.  On a full heap, compact dead name space first and
+ * retry before returning -ENOSPC.  Returns 0 on success, negative on error.
  */
-static int trie_page_alloc_name(struct briefs_trie_page *page,
-                                struct briefs_trie_node *node,
-                                size_t name_len)
+static int trie_page_alloc_name(struct buffer_head *bh, struct super_block *sb,
+				struct briefs_trie_page *page,
+				struct briefs_trie_node *node,
+				size_t name_len)
 {
 	u16 data_end = trie_page_data_end();
 	u16 name_size = name_len + 2;   /* 2-byte length prefix + name bytes */
@@ -425,8 +527,19 @@ static int trie_page_alloc_name(struct briefs_trie_page *page,
 		return 0;
 
 	name_base = BRIEFS_BLOCK_SIZE - trie_page_free_name_off(page);
-	if (name_base - name_size < data_end)
-		return -ENOSPC;
+	if (name_base - name_size < data_end) {
+		/*
+		 * Heap full against the slot array.  free_name_off is a monotonic
+		 * high-water mark never decremented on free, so freed nodes'
+		 * name bytes accumulate as dead space.  Compact the heap to
+		 * reclaim it, then recheck; if still no room, the heap is
+		 * genuinely full of live names.
+		 */
+		trie_page_compact_names(bh, sb);
+		name_base = BRIEFS_BLOCK_SIZE - trie_page_free_name_off(page);
+		if (name_base - name_size < data_end)
+			return -ENOSPC;
+	}
 
 	trie_page_set_free_name_off(page, trie_page_free_name_off(page) + name_size);
 	trie_node_set_name_offset(node, trie_page_free_name_off(page));
@@ -681,7 +794,7 @@ int briefs_trie_node_store_name(struct super_block *sb, u64 node_ref,
 	if (IS_ERR(bh))
 		return PTR_ERR(bh);
 
-	ret = trie_page_alloc_name(page, node, name_len);
+	ret = trie_page_alloc_name(bh, sb, page, node, name_len);
 	if (ret != 0) {
 		brelse(bh);
 		return ret;
