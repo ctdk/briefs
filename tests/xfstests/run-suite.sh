@@ -281,10 +281,12 @@ write_archive() {
 # generic/070, generic/224, generic/619: previously skipped for intermittent
 # hangs (notes from 2026-08-02/08-04, before Phase 1). Re-verified 2026-08-13
 # on current (Phase 1, 134d4a4) code: 40x/20x/20x loop iterations on both the
-# stock and lockdep kernels, zero hangs - un-skipped. 068/074/464/476 are
-# documented as fixed in memory but were not loop-verified this session, so
-# they stay skipped pending re-verification.
-# generic/464: trie_iter_grow double-free (fixed 4ef6ccb) - kept skipped, see above.
+# stock and lockdep kernels, zero hangs - un-skipped.
+# generic/068/074/464/476: documented as fixed in memory and re-verified
+# 2026-08-18 at full-suite scale (4/4 PASS, 0 hang, TIMEOUT_SECS=900) -
+# un-skipped. 068 = xfs_freeze hang (FIFREEZE/FITHAW c274292); 074 = mmap
+# writeback extent leak + AB-BA deadlock (fb649e8 + truncate_setsize fix);
+# 464 = trie_iter_grow double-free (4ef6ccb); 476 = all-writes fsstress.
 # generic/051: requires shutdown support (FS_IOC_FIFREEZE) - hangs on mount.
 # generic/410: mount namespace / propagation test - PASSES (pure VFS shared-
 # subtree machinery; BrieFS needs no special support). Un-skipped after
@@ -313,8 +315,8 @@ write_archive() {
 # subset, which includes generic/475, in full).  Use the "+set" test so an
 # explicitly empty SKIP_TESTS is honored (a plain := would re-apply this default
 # to an empty value).
-[ -n "${SKIP_TESTS+set}" ] || SKIP_TESTS="generic/051 generic/068 generic/074 \
-generic/461 generic/464 generic/475 generic/476 generic/720 generic/753"
+[ -n "${SKIP_TESTS+set}" ] || SKIP_TESTS="generic/051 generic/461 \
+generic/475 generic/720 generic/753"
 
 should_skip() {
     local test="$1"
