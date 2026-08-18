@@ -224,6 +224,15 @@ gated); 051/068 re-skipped during the Phase-1 re-verification churn. (`619` is
 **not** in the skip list — it passes; the historical "619 hung" note is
 stale.)
 
+> **Post-run update (2026-08-18, `88de097`):** `068`/`074`/`464`/`476` were
+> re-verified at full-suite scale (4/4 PASS, 0 hang, `TIMEOUT_SECS=900`;
+> archive `run-20260818-162028`) and **un-skipped** from the default
+> `SKIP_TESTS`. The default skip list is now `051 461 475 720 753`, so the
+> next fresh full run should show **5 skipped** (and ~450 pass). Their fixes:
+> 068 (FIFREEZE/FITHAW `c274292`), 074 (mmap writeback leak `fb649e8` +
+> truncate_setsize AB-BA), 464 (trie_iter_grow double-free `4ef6ccb`), 476
+> (all-writes fsstress).
+
 **Moved into PASS since 2026-08-13** (key ones): `089` (`8780683`), `536`
 (`33e4019`), `250`/`252` (`19ba019`), `050`, `274` (was the split regression,
 fixed `141be8c`), `346`, `599`; plus the fallocate zero_range/collapse/
