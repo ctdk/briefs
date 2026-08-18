@@ -287,7 +287,11 @@ write_archive() {
 # un-skipped. 068 = xfs_freeze hang (FIFREEZE/FITHAW c274292); 074 = mmap
 # writeback extent leak + AB-BA deadlock (fb649e8 + truncate_setsize fix);
 # 464 = trie_iter_grow double-free (4ef6ccb); 476 = all-writes fsstress.
-# generic/051: requires shutdown support (FS_IOC_FIFREEZE) - hangs on mount.
+# generic/051/461/753: previously skipped for hangs (notes from 2026-08-04,
+# pre-Phase-1). Re-verified 2026-08-18 on current code (3x iterations each,
+# SKIP_TESTS="" TIMEOUT_SECS=1800): 051 3/3, 461 3/3, 753 3/3 PASS, zero
+# hangs - un-skipped. 051 = xfs_fsr/fsstress + shutdown (FIFREEZE);
+# 461 = fsstress + shutdown; 753 = dm-error writeback WARN (fixed 73a0d1d).
 # generic/410: mount namespace / propagation test - PASSES (pure VFS shared-
 # subtree machinery; BrieFS needs no special support). Un-skipped after
 # isolated reproduction confirmed PASS.
@@ -302,8 +306,6 @@ write_archive() {
 # umount died holding s_umount -> every later mount wedged. Fixed by
 # re-validating the record bounds after the lock-releasing checkpoint; see
 # briefs_journal_flush_cur_block_locked() and the re-check loop in journal.c.
-# generic/461: hung on 2026-08-04 run - add to skip list.
-# generic/753: hung on 2026-08-04 run - add to skip list.
 # generic/720: stress-exchange test whose SETUP is the blocker, not the
 # exchange.  punch-alternating punches every other block of a 100000-block file
 # (50000 holes); BrieFS punch is collect+rebuild_extent_list, so the setup is
@@ -315,8 +317,7 @@ write_archive() {
 # subset, which includes generic/475, in full).  Use the "+set" test so an
 # explicitly empty SKIP_TESTS is honored (a plain := would re-apply this default
 # to an empty value).
-[ -n "${SKIP_TESTS+set}" ] || SKIP_TESTS="generic/051 generic/461 \
-generic/475 generic/720 generic/753"
+[ -n "${SKIP_TESTS+set}" ] || SKIP_TESTS="generic/475 generic/720"
 
 should_skip() {
     local test="$1"
