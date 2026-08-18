@@ -93,6 +93,22 @@ const struct file_operations briefs_file_operations = {
 	.splice_write = iter_file_splice_write,
 };
 
+/* briefs_shutdown_superop - surprise block-device removal callback.
+ *
+ * Invoked by the kernel via fs_bdev_mark_dead() (the bdev holder_ops
+ * .mark_dead hook, wired by get_tree_bdev -> setup_bdev_super) when the
+ * underlying device is removed while still mounted.  Set the forced-shutdown
+ * flag so subsequent reads/fsyncs return -EIO instead of serving stale cached
+ * data (generic/730).  No I/O: briefs_force_shutdown only flips flags, so it
+ * is safe to run on an already-dead device.  The existing put_super unmount
+ * checkpoint-skip keys on this same flag, so a later unmount won't try to
+ * checkpoint a dead journal.
+ */
+static void briefs_shutdown_superop(struct super_block *sb)
+{
+	briefs_force_shutdown(sb, "block device removed");
+}
+
 /* Superblock operations */
 const struct super_operations briefs_super_ops = {
 	.put_super = briefs_put_super,
@@ -104,6 +120,7 @@ const struct super_operations briefs_super_ops = {
 	.write_inode = briefs_write_inode,
 	.evict_inode = briefs_evict_inode,
 	.umount_begin = briefs_umount_begin,
+	.shutdown = briefs_shutdown_superop,
 	.alloc_inode = briefs_alloc_vfs_inode,
 	.free_inode = briefs_free_inode,
 };

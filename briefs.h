@@ -1534,6 +1534,7 @@ static inline void briefs_mark_buffer_dirty(struct buffer_head *bh,
 		briefs_journal_track(bsi->journal, bh->b_blocknr);
 }
 
+void briefs_force_shutdown(struct super_block *sb, const char *why);
 bool briefs_sb_shutdown(struct super_block *sb);
 int briefs_shutdown(struct super_block *sb, u32 flags);
 const char *briefs_error_policy_name(struct super_block *sb);

@@ -108,6 +108,14 @@ int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
 	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
 	int ret;
 
+	/* A forced shutdown (XFS_IOC_GOINGDOWN, metadata write error, or block
+	 * device removal) is a terminal error state, not a deliberate read-only
+	 * transition.  fsync must return -EIO, matching XFS's xfs_file_fsync; the
+	 * SB_RDONLY bit that briefs_force_shutdown also sets would otherwise let
+	 * the journal-write path surface -EROFS (generic/623). */
+	if (briefs_sb_shutdown(inode->i_sb))
+		return -EIO;
+
 	ret = file_write_and_wait_range(file, start, end);
 	if (ret)
 		return ret;
@@ -551,6 +559,13 @@ ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct briefs_inode_info *binfo = briefs_i(inode);
+
+	/* After a forced shutdown (e.g. the block device was removed under the
+	 * mount) reads must return -EIO even when the page is still cached,
+	 * mirroring ext4_file_read_iter; the SB_RDONLY bit alone would let the
+	 * cached page be served (generic/730). */
+	if (unlikely(briefs_sb_shutdown(inode->i_sb)))
+		return -EIO;
 
 	if (binfo->disk_inode.flags & InodeFlagInlineData) {
 		size_t count = iov_iter_count(to);

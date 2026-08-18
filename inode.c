@@ -121,7 +121,7 @@ bool briefs_sb_shutdown(struct super_block *sb)
  * Caller must ensure it is safe to touch sb->s_flags (process context, not
  * inside a transaction-spinlock region).
  */
-static void briefs_force_shutdown(struct super_block *sb, const char *why)
+void briefs_force_shutdown(struct super_block *sb, const char *why)
 {
 	struct briefs_sb_info *bsi = briefs_sb(sb);
 
