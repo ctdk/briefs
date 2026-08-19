@@ -306,12 +306,16 @@ write_archive() {
 # umount died holding s_umount -> every later mount wedged. Fixed by
 # re-validating the record bounds after the lock-releasing checkpoint; see
 # briefs_journal_flush_cur_block_locked() and the re-check loop in journal.c.
-# generic/720: stress-exchange test whose SETUP is the blocker, not the
+# generic/720: stress-exchange test whose SETUP was the blocker, not the
 # exchange.  punch-alternating punches every other block of a 100000-block file
-# (50000 holes); BrieFS punch is collect+rebuild_extent_list, so the setup is
-# O(E^2) (~2e13 ops, hours) - see briefs-large-file-write-perf.  The exchange
-# core itself is O(E log E) and verified on smaller extent counts; skip 720 until
-# the punch O(E^2) is fixed, not because of a file-range-exchange defect.
+# (50000 holes); BrieFS punch recomputed i_blocks with a full O(E) tree walk on
+# every punch, making the setup O(E^2) (~2e13 ops, hours).  Fixed by threading
+# the exact blocks-freed count out of briefs_btree_delete_range and decrementing
+# i_blocks in O(1).  That exposed a second bug: the internal-node split paths
+# (btree_maybe_split_child and btree_ensure_root_room) read idx[mid].high_key
+# AFTER zeroing the tail, pushing a 0 separator up and corrupting the tree
+# (fsck "separator high_key not strictly ascending" + exchange -EEXIST).  Both
+# fixed; 720 now passes (58s) and is un-skipped.
 # generic/492: online filesystem label set/get ioctls.  BrieFS implements
 # FS_IOC_{GET,SET}FSLABEL correctly - every xfs_io label operation in the test
 # passes (set/get/clear/persist-after-remount/max-length/too-long).  The ONLY
@@ -328,7 +332,7 @@ write_archive() {
 # subset, which includes generic/475, in full).  Use the "+set" test so an
 # explicitly empty SKIP_TESTS is honored (a plain := would re-apply this default
 # to an empty value).
-[ -n "${SKIP_TESTS+set}" ] || SKIP_TESTS="generic/475 generic/492 generic/720"
+[ -n "${SKIP_TESTS+set}" ] || SKIP_TESTS="generic/475 generic/492"
 
 should_skip() {
     local test="$1"

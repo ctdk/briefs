@@ -563,7 +563,7 @@ static int btree_maybe_split_child(struct super_block *sb,
 	u64 child_block;
 	struct buffer_head *child_bh, *sib_bh;
 	struct briefs_extent_btree_node *child, *sib;
-	u64 sib_block, rel;
+	u64 sib_block, rel, sep;
 	bool is_leaf;
 	int child_n, mid, move;
 
@@ -666,6 +666,8 @@ static int btree_maybe_split_child(struct super_block *sb,
 		/* Left half: truncate to idx[0..mid-1], trailing = old idx[mid].child. */
 		child->u.internal.trailing_child =
 			child->u.internal.idx[mid].child;
+		/* Save the median separator before the tail is zeroed below. */
+		sep = le64_to_cpu(child->u.internal.idx[mid].high_key);
 		child->hdr.num_keys = cpu_to_le16(mid);
 		/* Zero the unused tail of the child (indices mid to BRIEFS_BTREE_IDX_KEYS-1) */
 		if (mid < BRIEFS_BTREE_IDX_KEYS) {
@@ -679,9 +681,7 @@ static int btree_maybe_split_child(struct super_block *sb,
 		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
 					    0, sib_block, 1, -1);
 
-		btree_absorb_split(parent, parent_bh, p, sib_block,
-				   le64_to_cpu(child->u.internal.idx[mid].high_key),
-				   sb);
+		btree_absorb_split(parent, parent_bh, p, sib_block, sep, sb);
 	}
 
 	brelse(sib_bh);
@@ -942,14 +942,14 @@ static int btree_ensure_root_room(struct super_block *sb, struct briefs_inode *d
 		}
 
 		root->u.internal.trailing_child = root->u.internal.idx[mid].child;
+		/* Save the median separator before the tail is zeroed below. */
+		separator = le64_to_cpu(root->u.internal.idx[mid].high_key);
 		root->hdr.num_keys = cpu_to_le16(mid);
 		/* Zero the unused tail of the root */
 		if (mid < BRIEFS_BTREE_IDX_KEYS) {
 			memset(&root->u.internal.idx[mid], 0,
 			       (BRIEFS_BTREE_IDX_KEYS - mid) * sizeof(root->u.internal.idx[0]));
 		}
-
-		separator = le64_to_cpu(root->u.internal.idx[mid].high_key);
 	}
 
 	btree_commit_node(root_bh, sb);
@@ -1436,7 +1436,8 @@ static int btree_leaf_delete_range(struct briefs_extent_btree_node *node,
 				   u64 start, u64 end, struct briefs_inode *di,
 				   struct briefs_sb_info *bsi,
 				   struct briefs_extent *right, int *nright,
-				   bool *modified, u64 *unwritten_freed)
+				   bool *modified, u64 *unwritten_freed,
+				   s64 *count_delta, u64 *blocks_freed)
 {
 	int n = le16_to_cpu(node->hdr.num_keys);
 	int i, out = 0;
@@ -1459,6 +1460,11 @@ static int btree_leaf_delete_range(struct briefs_extent_btree_node *node,
 
 		/* Overlap: free the data blocks in [max(offset,start), min(end,ext_end)). */
 		*modified = true;
+		/* Net extent-count change from this walk: the original extent is
+		 * removed (-1); a left straddler keeps its head in place (+1).  A
+		 * right straddler tail is re-inserted later by the caller via
+		 * briefs_btree_insert_locked, which increments the count itself. */
+		*count_delta += (ext.offset < start ? 1 : 0) - 1;
 		if (ext.phys > 0 && ext.len > 0) {
 			u64 free_start = max(ext.offset, start);
 			u64 free_end = min(ext_end, end);
@@ -1467,6 +1473,7 @@ static int btree_leaf_delete_range(struct briefs_extent_btree_node *node,
 			if (free_len > 0) {
 				u64 free_phys = ext.phys + (free_start - ext.offset);
 
+				*blocks_freed += free_len;
 				/* Count unwritten blocks returned to the allocator so
 				 * briefs_btree_delete_range can release the metadata
 				 * reservation held for them.  The left/right straddlers
@@ -1526,7 +1533,8 @@ static bool btree_delete_range_subtree(struct super_block *sb,
 				       u64 start, u64 end,
 				       struct briefs_extent *right, int *nright,
 				       u64 *cap, bool *modified,
-				       u64 *unwritten_freed)
+				       u64 *unwritten_freed, s64 *count_delta,
+				       u64 *blocks_freed)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
 	struct buffer_head *bh;
@@ -1550,7 +1558,8 @@ static bool btree_delete_range_subtree(struct super_block *sb,
 	if (btree_node_is_leaf(node)) {
 		new_n = btree_leaf_delete_range(node, start, end, di, bsi,
 						right, nright, modified,
-						unwritten_freed);
+						unwritten_freed, count_delta,
+						blocks_freed);
 		if (new_n == 0) {
 			/* Leaf emptied: free it; caller drops the pointer. */
 			brelse(bh);
@@ -1581,7 +1590,8 @@ static bool btree_delete_range_subtree(struct super_block *sb,
 		if (child != 0 && low < end && high > start) {
 			if (btree_delete_range_subtree(sb, di, child, start, end,
 						       right, nright, cap,
-						       modified, unwritten_freed))
+						       modified, unwritten_freed,
+						       count_delta, blocks_freed))
 				set_bit(i, child_empty);
 		}
 	}
@@ -1665,7 +1675,8 @@ static int btree_max_cb(const struct briefs_extent *ext, void *ctx)
  * the inode is not tree-backed.
  */
 int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
-			      u64 start, u64 end, bool *modified)
+			      u64 start, u64 end, bool *modified,
+			      u64 *blocks_freed)
 {
 	struct briefs_inode_info *binfo =
 		container_of(di, struct briefs_inode_info, disk_inode);
@@ -1674,9 +1685,11 @@ int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
 	u64 cap;
 	bool root_empty;
 	u64 unwritten_freed = 0;
+	s64 count_delta = 0;
 	struct btree_max_ctx mc = { .max_end = 0, .count = 0 };
 
 	*modified = false;
+	*blocks_freed = 0;
 
 	if (!(di->flags & InodeFlagIndexed) || di->extent_inline_base == 0)
 		return 0;
@@ -1691,7 +1704,8 @@ int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
 
 	root_empty = btree_delete_range_subtree(sb, di, di->extent_inline_base,
 						start, end, right, &nright, &cap,
-						modified, &unwritten_freed);
+						modified, &unwritten_freed,
+						&count_delta, blocks_freed);
 
 	/* Release the metadata reservation held for the unwritten blocks just
 	 * freed (punch hole / truncate-down over a preallocated region).  No-op
@@ -1736,14 +1750,32 @@ int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
 			return ret;	/* delete applied; remainders lost — consistent */
 	}
 
-	/* Recompute the tail cache and the extent count: a tail delete may have
-	 * lowered the max, and removed extents lower num_extents_total (used by
-	 * the journal drain cap and fsck's count check). */
-	briefs_btree_for_each_extent(sb, di, btree_max_cb, &mc);
-	briefs_extent_write_begin(binfo);
-	binfo->cached_max_end = mc.max_end;
-	di->num_extents_total = mc.count;
-	briefs_extent_write_end(binfo);
+	/* Update the tail cache and the extent count.
+	 *
+	 * cached_max_end is the end of the last (highest-offset) extent.  It only
+	 * decreases when that extent is fully removed, i.e. when the delete range
+	 * reaches it (end >= cached_max_end).  Otherwise the last extent survives
+	 * (untouched, or split at @end whose tail keeps the same end), so the max
+	 * is unchanged -- and leaving it overstated is safe (the fast path just
+	 * fires less; understating would make a mapped block read as a hole).
+	 *
+	 * num_extents_total is maintained incrementally: the subtree walk recorded
+	 * its net change in count_delta (the straddler re-inserts above already
+	 * added their own +1 each via briefs_btree_insert_locked).  Only the rare
+	 * tail-delete case needs the full walk, which recomputes both exactly.
+	 */
+	if (end >= binfo->cached_max_end) {
+		briefs_btree_for_each_extent(sb, di, btree_max_cb, &mc);
+		briefs_extent_write_begin(binfo);
+		binfo->cached_max_end = mc.max_end;
+		di->num_extents_total = mc.count;
+		briefs_extent_write_end(binfo);
+	} else if (!root_empty) {
+		briefs_extent_write_begin(binfo);
+		di->num_extents_total =
+			(u64)((s64)di->num_extents_total + count_delta);
+		briefs_extent_write_end(binfo);
+	}
 	return 0;
 }
 

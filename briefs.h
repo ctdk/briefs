@@ -1437,9 +1437,12 @@ static inline u64 briefs_compute_i_blocks(struct super_block *sb,
  * Caller holds extent_lock. No-op (returns 0) for inline-only inodes.
  * @modified is set true iff any extent overlapped [start,end) (a block was
  * freed or an extent split) -- the mapping changed even when num_extents_total
- * is unchanged (e.g. an interior split keeps the count). Must be non-NULL. */
+ * is unchanged (e.g. an interior split keeps the count). Must be non-NULL.
+ * @blocks_freed (non-NULL) receives the total number of data blocks freed, so
+ * the caller can decrement i_blocks in O(1) instead of a full O(E) recompute. */
 int briefs_btree_delete_range(struct super_block *sb, struct briefs_inode *di,
-			      u64 start, u64 end, bool *modified);
+			      u64 start, u64 end, bool *modified,
+			      u64 *blocks_freed);
 
 /* Free every data block referenced by the inode's extents AND every tree node
  * block (leaves + internal levels). Caller holds extent_lock. */

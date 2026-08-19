@@ -1272,11 +1272,13 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 */
 		if (binfo->disk_inode.flags & InodeFlagIndexed) {
 			bool trunc_modified;
+			u64 trunc_freed;
 
 			ret = briefs_btree_delete_range(inode->i_sb,
 							&binfo->disk_inode,
 							trunc_block, U64_MAX,
-							&trunc_modified);
+							&trunc_modified,
+							&trunc_freed);
 			if (ret)
 				goto out_unlock;
 		} else {
@@ -1587,7 +1589,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 	u32 partial_start_off, partial_end_off;
 	int ret = 0;
 	int i;
-
+	u64 blocks_freed = 0;
 
 	need_partial_start = (offset & (BRIEFS_BLOCK_SIZE - 1)) != 0;
 	need_partial_end = (end & (BRIEFS_BLOCK_SIZE - 1)) != 0;
@@ -1685,8 +1687,8 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 				ret = briefs_btree_delete_range(inode->i_sb,
 								&binfo->disk_inode,
 								del_start, del_end,
-								&del_modified);
-				pr_debug("briefs: btree_delete_range returned %d del_modified=%d\n", ret, del_modified);
+								&del_modified,
+								&blocks_freed);
 				if (ret)
 					goto out_unlock;
 			}
@@ -1947,6 +1949,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 			u64 free_phys = ext.phys + (free_start - ext.offset);
 			u64 free_len = free_end - free_start;
 
+			blocks_freed += free_len;
 			if (ext.flags & BRIEFS_EXT_UNWRITTEN)
 				unwritten_freed += free_len;
 			briefs_journal_extent_free(bsi->journal, inode->i_ino,
@@ -1961,8 +1964,12 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 	briefs_release_unwritten_reserve(inode, unwritten_freed);
 	} /* end inline-only punch */
 
-	inode->i_blocks = briefs_compute_i_blocks(inode->i_sb,
-						 &binfo->disk_inode);
+	/* i_blocks is the sum of extent lengths in 512-byte sectors.  The punch
+	 * only ever frees data blocks (never allocates), and blocks_freed is the
+	 * exact count freed by the tree delete / inline rebuild above, so decrement
+	 * in O(1) instead of a full O(E) briefs_compute_i_blocks walk.  A punch
+	 * loop over a large file (generic/720) would otherwise be O(E^2). */
+	inode->i_blocks -= blocks_freed * (BRIEFS_BLOCK_SIZE / 512);
 
 	/*
 	 * Update mtime/ctime BEFORE persisting+journaling the inode snapshot,
