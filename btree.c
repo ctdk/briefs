@@ -64,7 +64,7 @@ struct btree_split {
  */
 static struct briefs_extent_btree_node *
 btree_read_node(struct super_block *sb, u64 block, bool trust_verified,
-		 struct buffer_head **bhp)
+		 bool will_modify, struct buffer_head **bhp)
 {
 	struct buffer_head *bh;
 	struct briefs_extent_btree_node *node;
@@ -86,6 +86,40 @@ btree_read_node(struct super_block *sb, u64 block, bool trust_verified,
 		pr_warn_ratelimited("briefs: btree: failed to read node %llu\n", block);
 		return NULL;
 	}
+
+	/* Wait for any in-flight writeback of this buffer to settle before the
+	 * caller touches b_data -- but only on modify paths.  BrieFS edits
+	 * extent-btree node buffers in place (no lock_buffer), so a modification
+	 * made while the buffer's *previous* writeback is still in flight races
+	 * the DMA: the device reads the page after the b_data edit but before
+	 * btree_commit_node() updates the checksum, leaving disk with
+	 * new-content/old-checksum -- a transient node that btree_read_node()
+	 * later rejects as -EIO (generic/299: btree checksum mismatches and DIO
+	 * stalls under memory-pressure writeback churn).  sb_bread() returns a
+	 * cached uptodate buffer without waiting, so the wait belongs here, on
+	 * the read that precedes a modify+commit.  After it the buffer is clean
+	 * (the dirty bit was cleared at writeback submit), so no further
+	 * writeback can be submitted before the caller's modify+commit, and the
+	 * next writeback carries the new content + new checksum atomically.
+	 *
+	 * Read-only callers pass will_modify=false and skip the wait: the
+	 * dominant such caller is fallocate's briefs_block_mapped(), which does
+	 * one unlocked lookup per block (16M lookups for a 64 GiB fallocate in
+	 * generic/299); waiting on every one, under writeback pressure, makes
+	 * the fallocate/truncate loop unable to keep up with fio and the test
+	 * times out.  A torn read on a read-only path is harmless by design: an
+	 * unlocked scanner passes trust_verified=false, so btree_read_node()
+	 * verifies the checksum and a mid-modification snapshot fails the check
+	 * and returns -EIO, which the caller treats conservatively
+	 * (briefs_block_mapped -> "not mapped" -> fallocate re-allocates and
+	 * recovers; the iomap write path re-checks under extent_lock).  No fs
+	 * lock is held across the wait: this is a plain metadata buffer sync
+	 * (no get_block, no extent_lock), so it cannot trip the mmap/writeback
+	 * AB-BA of generic/074.
+	 */
+	if (will_modify)
+		wait_on_buffer(bh);
+
 	node = (struct briefs_extent_btree_node *)bh->b_data;
 
 	if (!trust_verified || !buffer_verified(bh)) {
@@ -222,7 +256,7 @@ static int btree_descend_to_leaf(struct super_block *sb, u64 block, u64 iblock,
 	int p;
 	u64 child;
 
-	node = btree_read_node(sb, block, trust_verified, &bh);
+	node = btree_read_node(sb, block, trust_verified, false, &bh);
 	if (!node)
 		return -EIO;
 
@@ -275,7 +309,7 @@ static int btree_lower_bound_block(struct super_block *sb, u64 block, u64 iblock
 	struct briefs_extent_btree_node *node;
 	int ret;
 
-	node = btree_read_node(sb, block, trust_verified, &bh);
+	node = btree_read_node(sb, block, trust_verified, false, &bh);
 	if (!node)
 		return -EIO;
 
@@ -300,7 +334,7 @@ static int btree_lower_bound_block(struct super_block *sb, u64 block, u64 iblock
 			brelse(bh);
 			if (next == 0)
 				return -ENOENT;
-			node = btree_read_node(sb, next, trust_verified, &bh);
+			node = btree_read_node(sb, next, trust_verified, false, &bh);
 			if (!node)
 				return -EIO;
 			/* Scan the next leaf for the first extent > @iblock rather
@@ -395,6 +429,14 @@ static int btree_convert_unwritten_leaf(struct briefs_extent_btree_node *node,
 	struct btree_conv_ctx *c = ctx;
 	struct super_block *sb = c->sb;
 	int i, num_keys = le16_to_cpu(node->hdr.num_keys);
+
+	/* This callback edits the leaf in place then btree_commit_node()s it.
+	 * btree_descend_to_leaf() read the leaf with will_modify=false (it is a
+	 * shared read/modify descent), so wait for any in-flight writeback of
+	 * this leaf to settle before we touch b_data -- same commit-under-
+	 * writeback race as the direct modify paths (generic/299).
+	 */
+	wait_on_buffer(bh);
 
 	for (i = 0; i < num_keys; i++) {
 		struct briefs_disk_extent *de = &node->u.leaf.extents[i];
@@ -571,7 +613,7 @@ static int btree_maybe_split_child(struct super_block *sb,
 		? le64_to_cpu(parent->u.internal.idx[p].child)
 		: le64_to_cpu(parent->u.internal.trailing_child);
 
-	child = btree_read_node(sb, child_block, true, &child_bh);
+	child = btree_read_node(sb, child_block, true, true, &child_bh);
 	if (!child)
 		return -EIO;
 
@@ -805,7 +847,7 @@ static int btree_descend_insert(struct super_block *sb, struct briefs_inode *di,
 	int ret, p, num_keys;
 	u64 child_block;
 
-	node = btree_read_node(sb, block, true, &bh);
+	node = btree_read_node(sb, block, true, true, &bh);
 	if (!node)
 		return -EIO;
 
@@ -853,7 +895,7 @@ static int btree_ensure_root_room(struct super_block *sb, struct briefs_inode *d
 	bool is_leaf;
 	int n, mid, move;
 
-	root = btree_read_node(sb, root_block, true, &root_bh);
+	root = btree_read_node(sb, root_block, true, true, &root_bh);
 	if (!root)
 		return -EIO;
 
@@ -1224,7 +1266,7 @@ static int btree_walk_descend(struct super_block *sb, u64 block, int depth,
 	if (depth > 16)
 		return -EIO;
 
-	node = btree_read_node(sb, block, false, &bh);
+	node = btree_read_node(sb, block, false, false, &bh);
 	if (!node)
 		return -EIO;
 
@@ -1305,7 +1347,7 @@ static void btree_free_subtree(struct super_block *sb, struct briefs_inode *di,
 		return;
 	(*cap)--;
 
-	node = btree_read_node(sb, block, false, &bh);
+	node = btree_read_node(sb, block, false, false, &bh);
 	if (!node)
 		return;
 
@@ -1386,7 +1428,7 @@ static void btree_free_nodes_only_subtree(struct super_block *sb,
 		return;
 	(*cap)--;
 
-	node = btree_read_node(sb, block, false, &bh);
+	node = btree_read_node(sb, block, false, false, &bh);
 	if (!node)
 		return;
 
@@ -1551,7 +1593,8 @@ static bool btree_delete_range_subtree(struct super_block *sb,
 		return false;
 	(*cap)--;
 
-	node = btree_read_node(sb, block, true, &bh);	/* trust_verified: extent_lock held */
+	/* trust_verified: extent_lock held; will_modify: we edit this node */
+	node = btree_read_node(sb, block, true, true, &bh);
 	if (!node)
 		return false;	/* unreadable: don't drop, stay conservative */
 

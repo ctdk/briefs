@@ -328,6 +328,28 @@ struct buffer_head *briefs_get_zero_block(struct super_block *sb, u64 block)
 		set_buffer_mapped(bh);
 	}
 
+	/* A block reused here may still carry a dirty buffer_head in the
+	 * block-device buffer cache from its former life -- e.g. an extent-btree
+	 * node freed moments ago by a concurrent truncate/punch/split-rollback.
+	 * briefs_free_block() drops that alias with clean_bdev_aliases(), but it
+	 * does so *after* releasing the allocator mutex, so a concurrent allocator
+	 * can hand the block to us first.  Without this wait, memset(bh->b_data)
+	 * races the stale buffer's in-flight writeback bio (which references the
+	 * same page) and produces a torn write to disk: a transient on-disk node
+	 * with a bad checksum that btree_read_node() rejects as -EIO.  The correct
+	 * content overwrites it on the next writeback (fsck after umount is clean),
+	 * but a live read in the torn window fails -- observed under generic/299's
+	 * heavy falloc/truncate/DIO churn as btree checksum mismatches and DIO
+	 * stalls.  Waiting for writeback to settle, then discarding any remaining
+	 * stale dirty state, closes the race at the single reuse chokepoint shared
+	 * by every metadata-block allocation (btree, trie, xattr).  No fs lock is
+	 * held across the wait: the buffer's writeback completion is a plain
+	 * metadata buffer sync (no get_block, no extent_lock), so it cannot trip
+	 * the mmap/writeback AB-BA of generic/074.
+	 */
+	wait_on_buffer(bh);
+	clear_buffer_dirty(bh);
+
 	memset(bh->b_data, 0, sb->s_blocksize);
 	set_buffer_uptodate(bh);
 	briefs_mark_buffer_dirty(bh, sb);
