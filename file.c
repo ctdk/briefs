@@ -3387,6 +3387,73 @@ out:
 }
 
 /*
+ * briefs_falloc_one - allocate one data block and record it as an unwritten
+ * extent at logical block @iblock.  Returns 0 on success, -EEXIST if @iblock
+ * is already mapped (concurrent mmap writer raced our unlocked check), or
+ * another -errno.  The block is freed on every non-zero return.  Used by the
+ * per-block retry path in briefs_fallocate() when a contiguous run insert
+ * hit -EEXIST.  The caller holds inode_lock.
+ */
+static int briefs_falloc_one(struct inode *inode, struct briefs_inode_info *binfo,
+			     struct briefs_sb_info *bsi, u64 iblock)
+{
+	struct briefs_extent ext;
+	u64 rel, phys;
+	int ret;
+
+	rel = briefs_alloc_block(&bsi->alloc);
+	if (rel == 0)
+		return -ENOSPC;
+	phys = data_to_abs(bsi->sb, rel);
+	/* No zeroing: the block is recorded unwritten (reads as zero). */
+	mutex_lock(&binfo->extent_lock);
+	ext.offset = iblock;
+	ext.phys = phys;
+	ext.len = 1;
+	ext.flags = BRIEFS_EXT_UNWRITTEN;
+	ret = briefs_btree_insert_locked(inode->i_sb, &binfo->disk_inode, &ext);
+	mutex_unlock(&binfo->extent_lock);
+	if (ret) {
+		briefs_free_block(&bsi->alloc, rel);
+		return ret;	/* -EEXIST or other -errno; block freed */
+	}
+	return 0;
+}
+
+/*
+ * briefs_falloc_retry_blockwise - a contiguous-run insert hit -EEXIST because
+ * a concurrent mmap writer mapped part of the run after our unlocked
+ * briefs_block_mapped() check (mmap faults don't take inode_lock).  Free the
+ * run and retry the slice one block at a time via briefs_falloc_one(), which
+ * skips offsets that are now mapped on their own -EEXIST.  Returns the number
+ * of blocks newly recorded (>= 0) or -errno.  The caller holds inode_lock.
+ */
+static long briefs_falloc_retry_blockwise(struct inode *inode,
+					  struct briefs_inode_info *binfo,
+					  struct briefs_sb_info *bsi,
+					  u64 rel_run, u64 want, u64 ibase)
+{
+	u64 j;
+	long added = 0;
+
+	for (j = 0; j < want; j++)
+		briefs_free_block(&bsi->alloc, rel_run + j);
+	for (j = 0; j < want; j++) {
+		int r;
+
+		if (fatal_signal_pending(current))
+			return -EINTR;
+		r = briefs_falloc_one(inode, binfo, bsi, ibase + j);
+		if (r == -EEXIST)
+			continue;
+		if (r)
+			return r;
+		added++;
+	}
+	return added;
+}
+
+/*
  * briefs_fallocate - VFS fallocate implementation.
  *
  * Supports plain pre-allocation (mode == 0), FALLOC_FL_KEEP_SIZE,
@@ -3401,8 +3468,8 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	struct timespec64 now;
 	loff_t end;
 	u64 start_blk, end_blk, blk;
-	u64 rel, phys, run_len, rel_run, phys_run;
-	u64 i, j;
+	u64 run_len, rel_run, phys_run;
+	u64 j;
 	u64 added_unwritten = 0;	/* unwritten data blocks added this call */
 	struct briefs_extent ext;
 	bool changed = false;
@@ -3571,107 +3638,121 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 			blk++;
 			continue;
 		}
-		run_len = 1;
-		while (blk + run_len < end_blk &&
-		       !briefs_block_mapped(inode, blk + run_len))
-			run_len++;
+		/*
+		 * Bound the hole at @blk in O(1) via the extent tree, not by scanning
+		 * every block.  briefs_block_mapped() above already proved @blk is
+		 * unmapped, so the hole runs from @blk to the next mapped extent's
+		 * offset (or end_blk).  The old per-block scan did one unlocked
+		 * briefs_block_mapped() lookup per block -- 16M lookups for a
+		 * device-sized fallocate on an empty file (generic/299).
+		 */
+		{
+			struct briefs_extent next_ext;
+			u64 hole_end;
 
-		if (run_len > 1) {
-			/* Allocate the run (takes alloc->lock). */
-			rel_run = briefs_alloc_blocks(&bsi->alloc, run_len);
-			if (rel_run != 0) {
-				phys_run = data_to_abs(bsi->sb, rel_run);
-				/*
-				 * The run is recorded as BRIEFS_EXT_UNWRITTEN, so
-				 * the iomap read path maps it to IOMAP_UNWRITTEN and
-				 * returns zeros without reading these data blocks; a
-				 * later write converts just the written blocks,
-				 * splitting the extent so the un-written wings stay
-				 * unwritten (briefs_convert_unwritten_range).  Do
-				 * NOT zero the blocks here: zeroing would do a
-				 * synchronous sync_dirty_buffer per block, so a large
-				 * fallocate issued millions of sync writes and ran
-				 * for hours (generic/103: 100 GB fill), and the loop
-				 * never checked fatal_signal_pending() so it could
-				 * not be interrupted (SIGKILL would not land).  The
-				 * per-block fallback below likewise stores unwritten
-				 * extents and skips the zeroing.
-				 */
-				/* Take extent_lock BEFORE insert to maintain lock order. */
-				mutex_lock(&binfo->extent_lock);
-				ext.offset = blk;
-				ext.phys = phys_run;
-				ext.len = run_len;
-				ext.flags = BRIEFS_EXT_UNWRITTEN;
-				ret = briefs_btree_insert_locked(inode->i_sb,
-								 &binfo->disk_inode, &ext);
-				mutex_unlock(&binfo->extent_lock);
-				if (ret == -EEXIST) {
-					/*
-					 * A concurrent writer mapped part of this
-					 * run after our unlocked briefs_block_mapped
-					 * check.  Free the run and retry block-by-
-					 * block via the per-block fallback below,
-					 * which skips the now-mapped block(s) on
-					 * their own -EEXIST.
-					 */
-					for (j = 0; j < run_len; j++)
-						briefs_free_block(&bsi->alloc,
-								  rel_run + j);
-					/* fall through to per-block fallback */
-				} else {
-					if (ret) {
-						for (j = 0; j < run_len; j++)
-							briefs_free_block(&bsi->alloc,
-									  rel_run + j);
-						goto falloc_loop_done;
-					}
-					changed = true;
-					added_unwritten += run_len;
-					blk += run_len;
-					continue;
-				}
-			}
+			if (briefs_next_extent(inode->i_sb, binfo, blk,
+					      &next_ext, false) == 0)
+				hole_end = next_ext.offset;
+			else
+				hole_end = end_blk;
+			if (hole_end > end_blk)
+				hole_end = end_blk;
+			run_len = hole_end - blk;
 		}
 
-		/* per-block fallback: run_len == 1, or no contiguous run fit */
-		for (i = 0; i < run_len; i++) {
-			if (fatal_signal_pending(current)) {
-				ret = -EINTR;
-				goto falloc_loop_done;
-			}
-			/* Allocate single block (takes alloc->lock). */
-			rel = briefs_alloc_block(&bsi->alloc);
-			if (rel == 0) {
-				ret = -ENOSPC;
-				goto falloc_loop_done;
-			}
-			phys = data_to_abs(bsi->sb, rel);
+		/*
+		 * Fill the hole with unwritten extents.  Try the whole run
+		 * contiguously first; if it doesn't fit (fragmentation or a
+		 * near-full device), halve the request and retry so we still
+		 * allocate the largest contiguous runs that fit -- a few large
+		 * extents, not run_len single-block extents.  The old
+		 * one-block-at-a-time fallback built run_len single-block extents:
+		 * for a device-sized fallocate that was 16M alloc+insert cycles
+		 * under inode_lock (~77s), stalling concurrent DIO (generic/299).
+		 *
+		 * Recorded BRIEFS_EXT_UNWRITTEN so the iomap read path maps it to
+		 * IOMAP_UNWRITTEN and returns zeros without reading these data
+		 * blocks; a later write converts just the written blocks, splitting
+		 * the extent so the un-written wings stay unwritten
+		 * (briefs_convert_unwritten_range).  Do NOT zero the blocks here:
+		 * zeroing does a synchronous sync_dirty_buffer per block, so a
+		 * large fallocate issued millions of sync writes and ran for hours
+		 * (generic/103: 100 GB fill), and the loop never checked
+		 * fatal_signal_pending() so SIGKILL would not land.
+		 */
+		{
+			u64 fill = 0;
 
-			/* No zeroing: the block is recorded unwritten (see above). */
+			while (fill < run_len) {
+				u64 want = run_len - fill;
+				int r2;
 
-			/* Take extent_lock BEFORE insert to maintain lock order. */
-			mutex_lock(&binfo->extent_lock);
-			ext.offset = blk + i;
-			ext.phys = phys;
-			ext.len = 1;
-			ext.flags = BRIEFS_EXT_UNWRITTEN;
-			ret = briefs_btree_insert_locked(inode->i_sb,
-							 &binfo->disk_inode, &ext);
-			mutex_unlock(&binfo->extent_lock);
-			if (ret == -EEXIST) {
-				/* Block mapped by a concurrent writer after our
-				 * unlocked check; skip it (already allocated by
-				 * the racer). */
-				briefs_free_block(&bsi->alloc, rel);
-				continue;
+				if (fatal_signal_pending(current)) {
+					ret = -EINTR;
+					goto falloc_loop_done;
+				}
+				/*
+				 * Shrink want to the largest contiguous run
+				 * that fits, halving on each failure.
+				 */
+				rel_run = 0;
+				while (want >= 1) {
+					rel_run = briefs_alloc_blocks(&bsi->alloc,
+								want);
+					if (rel_run != 0)
+						break;
+					if (want == 1)
+						break;	/* ENOSPC: even 1 won't fit */
+					want /= 2;
+					if (want == 0)
+						want = 1;
+				}
+				if (rel_run == 0) {
+					ret = -ENOSPC;
+					goto falloc_loop_done;
+				}
+				phys_run = data_to_abs(bsi->sb, rel_run);
+
+				/* Take extent_lock BEFORE insert (lock order). */
+				mutex_lock(&binfo->extent_lock);
+				ext.offset = blk + fill;
+				ext.phys = phys_run;
+				ext.len = want;
+				ext.flags = BRIEFS_EXT_UNWRITTEN;
+				r2 = briefs_btree_insert_locked(inode->i_sb,
+							&binfo->disk_inode, &ext);
+				mutex_unlock(&binfo->extent_lock);
+				if (r2 == -EEXIST) {
+					/*
+					 * Concurrent mmap writer mapped part of
+					 * this run.  Free it and retry this slice
+					 * one block at a time, skipping offsets
+					 * that are now mapped.  See
+					 * briefs_falloc_retry_blockwise().
+					 */
+					long got = briefs_falloc_retry_blockwise(
+						inode, binfo, bsi,
+						rel_run, want, blk + fill);
+
+					if (got < 0) {
+						ret = got;
+						goto falloc_loop_done;
+					}
+					added_unwritten += got;
+					if (got)
+						changed = true;
+				} else if (r2) {
+					for (j = 0; j < want; j++)
+						briefs_free_block(&bsi->alloc,
+								  rel_run + j);
+					ret = r2;
+					goto falloc_loop_done;
+				} else {
+					changed = true;
+					added_unwritten += want;
+				}
+				fill += want;
 			}
-			if (ret) {
-				briefs_free_block(&bsi->alloc, rel);
-				goto falloc_loop_done;
-			}
-			changed = true;
-			added_unwritten++;
 		}
 		blk += run_len;
 	}
