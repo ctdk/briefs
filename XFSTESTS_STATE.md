@@ -7,48 +7,46 @@ measured by fresh full-suite and targeted runs on the VM.
 
 **Latest per-test full-suite run:** 2026-08-18, `tests/xfstests/run-suite.sh`
 over every generic test on the VM, kernel `6.12.101-lockdep`, branch
-`refactor-round-3` (merged to `master` by fast-forward), commit `6f225f7`.
-Archive: `tests/xfstests/runs/run-20260817-233017-kernel.txt`.
+`master`, commit `c4082e7`.
+Archive: `tests/xfstests/runs/run-20260818-181855-kernel.txt`.
 
 | Bucket           | Count | Notes                                                    |
 |------------------|------:|----------------------------------------------------------|
 | Selected         |   793 | all generic tests                                        |
-| Pass             |   446 | per-test runner reported PASS                            |
-| Fail             |     6 | 299 311 492 563 623 730 (see below)                       |
+| Pass             |   455 | per-test runner reported PASS                            |
+| Fail             |     4 | 299 311 492 563 (see below)                              |
 | Not run          |   332 | `_require_*` gate or unsupported feature                 |
-| Skipped          |     9 | 051 068 074 461 464 475 476 720 753 (known hangs/deferred)|
-| Hang             |     0 | former timeout hangs now skipped (461/753) or passing (619) |
+| Skipped          |     2 | 475 720 (known hangs/deferred)                           |
+| Hang             |     0 | former timeout hangs now skipped or passing              |
 | Mount fail       |     0 | runner tears down DM targets before each test            |
 
-**The 6 fails are all known / pre-existing / deferred — zero new regressions**
+**The 4 fails are all known / pre-existing / deferred — zero new regressions**
 vs the 2026-08-13 full run (`3835ac5`: 378 pass / 10 fail / 397 not-run / 8
 skipped):
 
 - `generic/311` — pre-existing baseline flake (dm-flakey + fsync timing).
 - `generic/563` — cgroup writeback accounting; expected after `SB_I_CGROUPWB`
   was disabled on 6.12 (`9385fc8`, iput CVE-2026-31703 workaround).
-- `generic/623` — shutdown cluster: fsync after shutdown returns `EROFS`
-  instead of the expected `EIO`.
-- `generic/730` — shutdown cluster: read after device delete returns no error
-  instead of the expected `EIO` (same error-propagation gap as 623).
 - `generic/299` — **deferred** ERTB / block-reuse DIO family: durable btree
   extent-index corruption under fallocate/DIO/truncate churn; robust fix
   needs a journal-format / sync-model change. See
   `briefs-dio-stress-cluster-250-252-299-triage`.
 - `generic/492` — harness gap: the kernel `FS_IOC_GET/SETFSLABEL` ioctls work
   (label set + read back); only the two `blkid` lines fail because libblkid
-  has no BrieFS probe — a separate userspace (`briefs-utils`) task.
+  has no BrieFS probe — a separate userspace (`briefs-utils`) task. **Skipped
+  since `991faac`** (see below).
 
 **Resolved since the 2026-08-13 run** (now PASS; were FAIL in 0813 or 0814):
 `089` (`8780683`, trie name-store errors + lazy name-heap compaction),
 `536` (`33e4019`, stale inode-snapshot replay on inode-slot reuse — the earlier
 "data=ordered" framing was wrong), `250`/`252` (`19ba019`, defer
 unwritten→written conversion to DIO end_io and convert only on `!error`),
-and `050`/`274`/`346`/`599` (now pass). Net: pass 378→446 (+68), not-run
-397→332 (−65, more tests runnable). PASS now includes the fallocate
-zero_range/collapse_range/insert_range suite (`e2f023c`), the file-range
-exchange suite (`56d1aa7` + Tier-3 `7fa96e5`), POSIX ACLs (`a113c76`), and the
-iomap DIO/bmap/swapfile tests.
+`623`/`730` (`29f4572`, shutdown error propagation: fsync/read_iter early
+`-EIO` + `.shutdown` super_op), and `050`/`274`/`346`/`599` (now pass). Net:
+pass 378→455 (+77), not-run 397→332 (−65, more tests runnable). PASS now
+includes the fallocate zero_range/collapse_range/insert_range suite
+(`e2f023c`), the file-range exchange suite (`56d1aa7` + Tier-3 `7fa96e5`),
+POSIX ACLs (`a113c76`), and the iomap DIO/bmap/swapfile tests.
 
 **Provisioning note:** `fsgqa`/`fsgqa2` QA users are now created by
 `tests/xfstests/setup-vm.sh` (`3144a46`), so the ~26 `_require_user`-gated
@@ -191,12 +189,12 @@ bulk `./check` invocation.
 
 ## Failing tests (2026-08-18 per-test run)
 
-The 2026-08-18 full-suite run reported **6 failures**, **0 hangs** (the
-former 461/753 timeout hangs are in the skip list; 619 was un-skipped and
-passes). All six are pre-existing / deferred — there are **no new regressions**
-vs the 2026-08-13 run.
+The 2026-08-18 full-suite run (commit `c4082e7`, archive
+`run-20260818-181855`) reported **4 failures**, **0 hangs**. All four are
+pre-existing / deferred — there are **no new regressions** vs the 2026-08-13
+run.
 
-**6 FAIL tests:**
+**4 FAIL tests:**
 - `generic/299` — **deferred** ERTB / block-reuse DIO family: durable btree
   extent-index corruption under fallocate/DIO/truncate churn (fio AIO/DIO
   verifier reads zeros for DIO-written blocks; fsck reports "unrecoverable
@@ -207,38 +205,36 @@ vs the 2026-08-13 run.
   reproduces on a known-good baseline.
 - `generic/492` — harness gap: kernel `FS_IOC_GET/SETFSLABEL` works (label
   set + read back); only the two `blkid` lines fail (libblkid has no BrieFS
-  probe — a `briefs-utils` task, not a kernel bug).
+  probe — a `briefs-utils` task, not a kernel bug). **Skipped since `991faac`.**
 - `generic/563` — cgroup writeback accounting mismatch; expected after
   `SB_I_CGROUPWB` was disabled on 6.12 (`9385fc8`, iput CVE-2026-31703
   workaround).
-- `generic/623` — shutdown cluster: fsync after shutdown returns `EROFS`
-  instead of the expected `EIO`.
-- `generic/730` — shutdown cluster: read after device delete returns no error
-  instead of the expected `EIO` (same error-propagation gap as 623).
 
-**Skipped (9, in the skip list — not counted as fail):** `051 068 074 461 464
-475 476 720 753`. Known hangs / deferred re-verifications: 461/753 former
-timeout hangs; 074/464/476 skipped pending re-verification; 475 the flaky /
-deferred dm-error crash-replay bug; 720 punch O(E²) cost (exchange-range
-gated); 051/068 re-skipped during the Phase-1 re-verification churn. (`619` is
-**not** in the skip list — it passes; the historical "619 hung" note is
-stale.)
+**Skipped (2, in the skip list — not counted as fail):** `475 720`. `475` is
+the flaky / deferred dm-error crash-replay bug (needs a journal-format
+change); `720` is the exchange-range swapext loop, gated for its O(E²) extent
+walk cost (correctness passes, but it exceeds the per-test timeout).
 
-> **Post-run update (2026-08-18, `88de097`):** `068`/`074`/`464`/`476` were
-> re-verified at full-suite scale (4/4 PASS, 0 hang, `TIMEOUT_SECS=900`;
-> archive `run-20260818-162028`) and **un-skipped** from the default
-> `SKIP_TESTS`. The default skip list is now `051 461 475 720 753`, so the
-> next fresh full run should show **5 skipped** (and ~450 pass). Their fixes:
-> 068 (FIFREEZE/FITHAW `c274292`), 074 (mmap writeback leak `fb649e8` +
-> truncate_setsize AB-BA), 464 (trie_iter_grow double-free `4ef6ccb`), 476
-> (all-writes fsstress).
+> **Post-run updates (2026-08-18):**
+> - `88de097` — `068`/`074`/`464`/`476` re-verified at full-suite scale (4/4
+>   PASS, 0 hang, `TIMEOUT_SECS=900`; archive `run-20260818-162028`) and
+>   **un-skipped**. Fixes: 068 (FIFREEZE/FITHAW `c274292`), 074 (mmap
+>   writeback leak `fb649e8` + truncate_setsize AB-BA), 464 (trie_iter_grow
+>   double-free `4ef6ccb`), 476 (all-writes fsstress).
+> - `c4082e7` — `051`/`461`/`753` re-verified (3× each, 9/9 PASS, 0 hang) and
+>   **un-skipped**. BrieFS now has shutdown support (`.shutdown` super_op from
+>   `29f4572`), which is why 051/461 pass; 753's dm-error WARN was fixed
+>   `73a0d1d`. Default skip list dropped to `475 720`.
+> - `991faac` — `492` **skipped** (libblkid has no BrieFS probe; kernel label
+>   ioctls work). Default skip list is now `475 492 720`.
 
 **Moved into PASS since 2026-08-13** (key ones): `089` (`8780683`), `536`
 (`33e4019`), `250`/`252` (`19ba019`), `050`, `274` (was the split regression,
-fixed `141be8c`), `346`, `599`; plus the fallocate zero_range/collapse/
-insert_range suite (`e2f023c`), the file-range exchange suite (`56d1aa7` +
-Tier-3 `7fa96e5`), and `050`/`274`/`346`/`599`. `250`/`252`/`274`/`346`/`599`
-moved out of the FAIL set into PASS; net FAIL count dropped 10→6.
+fixed `141be8c`), `346`, `599`, `623`/`730` (`29f4572`); plus the fallocate
+zero_range/collapse/insert_range suite (`e2f023c`), the file-range exchange
+suite (`56d1aa7` + Tier-3 `7fa96e5`), and `050`/`274`/`346`/`599`.
+`250`/`252`/`274`/`346`/`599`/`623`/`730` moved out of the FAIL set into PASS;
+net FAIL count dropped 10→4.
 
 **Note on `127`/`521`/`522`.** These pass in the full suite but are flaky
 mmap+fsx flush-deadlock candidates. `521` was confirmed via bisect
@@ -418,19 +414,19 @@ were read and grouped; all gates are legitimate.
 | Reflink not supported (test)                              | 39 | 110 111 115 116 118 119 134 137 138 139 140 142 143 144 145 146 147 148 149 150 151 152 153 154 155 156 157 159 178 179 180 181 303 407 463 578 612 649 734 |
 | disk quotas not supported                                 | 31 | 082 219 230 231 232 233 234 235 244 270 280 379 380 381 382 383 384 385 386 400 506 566 587 594 600 601 603 681 682 691 762 |
 | No encryption support (fscrypt)                           | 28 | 368 369 395 396 397 398 399 419 421 429 435 440 548 549 550 580 581 582 583 584 592 593 595 602 613 621 693 739 |
-| xfs_io exchangerange not supported                        | 16 | 709 710 712 714 716 717 718 719 720 722 723 724 725 726 727 752 |
+| xfs_io exchangerange not supported ~~(now supported `56d1aa7`)~~ | 16 | 709 710 712 714 716 717 718 719 ~~720~~ 722 723 724 725 726 727 752 — exchange-range landed; 720 now SKIPPED (O(E²) swapext loop), row kept for history |
 | ACLs not supported ~~(now PASSING via `a113c76`)~~          | ~~14~~ | ~~026 053 077 099 105 237 307 318 319 375 444 449 529 697~~ — all 14 now PASS in 2026-08-13 (POSIX ACLs landed); row kept for history |
-| xfs_io fcollapse failed (no COLLAPSE_RANGE)               | 12 | 012 016 017 021 022 031 072 497 499 503 641 687 |
+| xfs_io fcollapse failed ~~(COLLAPSE_RANGE landed `e2f023c`)~~ | 12 | 012 016 017 021 022 031 072 497 499 503 641 687 — collapse_range now implemented; most now PASS, row kept for history |
 | fsverity utility required (no fsverity)                   | 11 | 572 573 574 575 576 577 579 624 625 692 788 |
-| xfs_io fzero failed (no ZERO_RANGE)                       | 11 | 008 009 033 042 096 456 469 511 610 685 758 |
+| xfs_io fzero failed ~~(ZERO_RANGE landed `e2f023c`)~~ | 11 | 008 009 033 042 096 456 469 511 610 685 758 — zero_range now implemented; most now PASS, row kept for history |
 | Dedupe not supported (test)                               | 9 | 121 122 136 158 160 182 304 408 516 |
-| xfs_io finsert failed (no INSERT_RANGE)                   | 9 | 058 060 061 063 064 404 485 686 735 |
+| xfs_io finsert failed ~~(INSERT_RANGE landed `e2f023c`)~~ | 9 | 058 060 061 063 064 404 485 686 735 — insert_range now implemented; most now PASS, row kept for history |
 | Dedupe not supported (scratch)                            | 7 | 162 163 374 493 517 630 674 |
 | idmapped mounts not supported                             | 6 | 644 645 656 689 698 699 |
-| FITRIM not supported                                      | 5 | 038 251 260 288 500 |
+| FITRIM not supported ~~(now PASS)~~ | 5 | 038 251 260 288 500 — all five now PASS, row kept for history |
 | O_TMPFILE not supported                                   | 4 | 004 389 509 531 |
 | DAX not supported                                         | 3 | 413 462 605 606 608 |
-| log state probing not supported                           | 3 | 052 054 055 |
+| log state probing not supported ~~(052 now PASS)~~ | 3 | ~~052~~ 054 055 — 052 now PASS (shutdown support), row kept for history |
 | duperemove utility required                               | 3 | 559 560 561 |
 | multi-block atomic writes not supported                   | 3 | 774 775 778 |
 | write atomic not supported (block device)                 | 3 | 765 773 776 |
@@ -444,10 +440,10 @@ were read and grouped; all gates are legitimate.
 | xfs_io fsmap missing                                      | 1 | 365 |
 | filesystem timestamp bounds unknown                       | 1 | 402 |
 | xfs_io fiemap -a failed (no attr-fork fiemap)             | 1 | 425 |
-| xfs_io label failed (no label ioctl)                      | 1 | 492 |
+| xfs_io label failed ~~(label ioctl landed)~~ | 1 | ~~492~~ — 492 now runs and fails on blkid (libblkid no BrieFS probe); SKIPPED since `991faac`, row kept for history |
 | cross-device copy_file_range not supported                  | 1 | 565 |
 | requires delayed allocation buffered writes                | 1 | 614 |
-| xfs_io swapext not supported                              | 1 | 711 |
+| xfs_io swapext not supported ~~(now PASS)~~ | 1 | ~~711~~ — 711 now PASS, row kept for history |
 | xfs_io startupdate not supported                          | 1 | 721 |
 | briefs does not support duplicate fsid                      | 1 | 744 |
 | requires > 1000 xattrs (4K xattr block limit)               | 1 | 745 |
@@ -488,10 +484,10 @@ were read and grouped; all gates are legitimate.
 
 ---
 
-## Passing tests (446)
+## Passing tests (455)
 
-From the 2026-08-18 run archive (`run-20260817-233017-kernel.txt`, commit
-`6f225f7`, refactor-round-3 merged to master).
+From the 2026-08-18 run archive (`run-20260818-181855-kernel.txt`, commit
+`c4082e7`, master).
 
 ```
 001 002 003 004 005 006 007 008
@@ -499,57 +495,58 @@ From the 2026-08-18 run archive (`run-20260817-233017-kernel.txt`, commit
 020 021 022 023 024 025 026 027
 028 029 030 031 032 033 034 035
 036 037 038 039 040 041 042 043
-044 045 046 047 048 049 050 052
-053 056 057 058 059 060 061 062
-063 064 065 066 067 069 070 071
-072 073 075 076 077 078 079 080
-081 083 084 085 086 087 088 089
-090 091 092 093 094 095 096 097
-098 099 100 101 102 103 104 105
-106 107 108 109 112 113 114 117
-120 123 124 125 126 127 128 129
-130 131 132 133 135 141 169 177
-184 192 193 198 204 207 208 209
-210 211 212 213 214 215 221 224
-225 226 228 236 237 239 240 245
-246 247 248 249 250 251 252 255
-256 257 258 260 263 269 273 274
-275 277 285 286 288 294 300 306
-307 308 309 310 312 313 314 315
-316 317 318 319 320 321 322 323
-325 335 336 337 338 339 340 341
-342 343 344 345 346 347 348 349
-350 351 354 355 360 361 362 363
-364 366 371 375 376 377 378 388
-389 390 391 392 393 394 401 402
-403 404 405 406 409 410 411 412
-416 417 418 420 422 423 424 426
-427 428 430 431 432 433 434 436
-437 438 439 441 442 443 444 445
-446 448 449 450 451 452 453 454
-456 459 460 465 466 467 468 469
-471 472 473 474 477 478 479 480
-481 483 484 485 486 488 489 490
-491 494 495 496 497 498 499 500
-502 503 504 505 507 508 509 510
-511 512 519 520 521 522 523 524
-525 526 527 528 529 530 531 532
-533 534 535 536 537 538 539 545
-547 551 552 553 554 555 557 558
-564 567 568 569 571 585 586 589
-590 591 597 598 599 604 609 610
-611 615 616 617 618 619 620 622
-626 627 629 631 632 633 634 635
-636 637 638 639 640 642 643 646
-647 650 676 677 678 679 680 683
-684 685 686 687 688 690 694 695
-696 697 701 703 704 705 706 707
-708 711 712 713 715 718 719 722
-723 724 725 728 729 731 732 735
+044 045 046 047 048 049 050 051
+052 053 056 057 058 059 060 061
+062 063 064 065 066 067 068 069
+070 071 072 073 074 075 076 077
+078 079 080 081 083 084 085 086
+087 088 089 090 091 092 093 094
+095 096 097 098 099 100 101 102
+103 104 105 106 107 108 109 112
+113 114 117 120 123 124 125 126
+127 128 129 130 131 132 133 135
+141 169 177 184 192 193 198 204
+207 208 209 210 211 212 213 214
+215 221 224 225 226 228 236 237
+239 240 245 246 247 248 249 250
+251 252 255 256 257 258 260 263
+269 273 274 275 277 285 286 288
+294 300 306 307 308 309 310 312
+313 314 315 316 317 318 319 320
+321 322 323 325 335 336 337 338
+339 340 341 342 343 344 345 346
+347 348 349 350 351 354 355 360
+361 362 363 364 366 371 375 376
+377 378 388 389 390 391 392 393
+394 401 402 403 404 405 406 409
+410 411 412 416 417 418 420 422
+423 424 426 427 428 430 431 432
+433 434 436 437 438 439 441 442
+443 444 445 446 448 449 450 451
+452 453 454 456 459 460 461 464
+465 466 467 468 469 471 472 473
+474 476 477 478 479 480 481 483
+484 485 486 488 489 490 491 494
+495 496 497 498 499 500 502 503
+504 505 507 508 509 510 511 512
+519 520 521 522 523 524 525 526
+527 528 529 530 531 532 533 534
+535 536 537 538 539 545 547 551
+552 553 554 555 557 558 564 567
+568 569 571 585 586 589 590 591
+597 598 599 604 609 610 611 615
+616 617 618 619 620 622 623 626
+627 629 631 632 633 634 635 636
+637 638 639 640 642 643 646 647
+650 676 677 678 679 680 683 684
+685 686 687 688 690 694 695 696
+697 701 703 704 705 706 707 708
+711 712 713 715 718 719 722 723
+724 725 728 729 730 731 732 735
 736 737 738 740 741 742 743 747
-748 749 750 751 752 754 755 756
-758 759 760 761 763 764 771 779
-782 784 785 789 790 792
+748 749 750 751 752 753 754 755
+756 758 759 760 761 763 764 771
+779 782 784 785 789 790 792
 ```
 
 ### xfstests xattr cluster (13/13, 2026-07-02)
@@ -627,17 +624,17 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | 048                           | 62167fa  | sync+shutdown file size bug (inode dirty on i_size growth + inode-block RMW lock) |
 | 737                           | 8f4a27b  | O_DIRECT+shutdown file lost (directory sync durability + journal ring back-pressure) |
 
-> Open BrieFS code bugs as of the 2026-07-06 run (status updated to 2026-08-13):
+> Open BrieFS code bugs as of the 2026-07-06 run (status updated to 2026-08-18):
 > - `299` — btree checksum mismatch under stress; still needs investigation
->   (not in the 2026-08-13 fail set — not run or passing there; treat as
->   deferred).
+>   (deferred ERTB/block-reuse DIO family; see
+>   `briefs-dio-stress-cluster-250-252-299-triage`).
 > - `341`, `510`, `771` — replay duplicate directory entries: **now PASS** in
 >   2026-08-13 (idempotency/replay work resolved them).
 > - `547` — fsstress metadata mismatch: **now PASS** in 2026-08-13 (crash-replay
 >   durability work; still watched as flaky).
-> - `599` — VFS `cleanup_mnt` WARN after shutdown: still FAIL (shutdown cluster).
-> - `623` — fsync after shutdown does not return `EIO`: still FAIL (shutdown cluster).
-> - `730` — read after device delete missing `EIO`: still FAIL (shutdown cluster).
+> - `599` — VFS `cleanup_mnt` WARN after shutdown: **now PASS** (`bce12e6`).
+> - `623` — fsync after shutdown does not return `EIO`: **now PASS** (`29f4572`).
+> - `730` — read after device delete missing `EIO`: **now PASS** (`29f4572`).
 > - `388` — was an excluded shutdown/replay wedge: **now PASS** in 2026-08-13.
 >
 > `generic/127`, `521`, `522` **pass** in 2026-08-13 (no longer hangs) but are
