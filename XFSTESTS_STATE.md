@@ -5,6 +5,38 @@ measured by fresh full-suite and targeted runs on the VM.
 
 ## Overview
 
+**Current state (2026-08-19, master `0fd1448`):** two post-snapshot changes make
+the 2026-08-18 table below stale on two points — `720` has since been un-skipped
+and passes, and `299` is partially fixed.
+
+- **Hard FAIL (2):** `311` (dm-flakey + fsync durability baseline, deferred),
+  `563` (cgroup writeback intentionally disabled — `9385fc8`, 6.12 iput
+  CVE-2026-31703 workaround; not a BrieFS defect).
+- **Skipped (2, default `SKIP_TESTS="generic/475 generic/492"` in
+  `run-suite.sh`):** `475` (dm-error crash-replay trie-realloc, deferred — needs
+  a journal-format change), `492` (libblkid has no BrieFS probe; the kernel
+  `FS_IOC_*FSLABEL` ioctls work — a userspace `util-linux` task, skipped
+  `991faac`).
+- **`720` — un-skipped and PASSING** (`3666a3e`: punch O(E²)→O(1) via threaded
+  blocks-freed count + btree internal-split separator read-after-memset fix;
+  ~58 s).
+- **`299` — PARTIALLY FIXED** (`1005b2e` btree modify-path `wait_on_buffer` +
+  `briefs_get_zero_block` reuse wait; `0fd1448` fallocate O(extents) + halving
+  alloc): ~70-80% pass (was 0% — always HANG/FAIL on master). Residual ~20-30%
+  = **problem-2**, the lockless read-vs-writeback btree race (a
+  `trust_verified=false` reader racing writeback's mid-edit btree insert, which
+  takes `extent_lock` but not `inode_lock`; ~169 `btree: node N checksum
+  mismatch`/boot, transient `-EIO`, occasional timeout). Deferred — needs
+  read-path serialization / CoW btree nodes / per-buffer seqlock. See
+  `briefs-dio-stress-cluster-250-252-299-triage`.
+- **Flaky tier (not deterministic):** `127`/`521` (455/127-class
+  `msync → blkdev_issue_flush → submit_bio_wait` deadlock, pre-existing,
+  VM-reboot-only), `617` (~6% io_uring DIO soak flake, deferred), `547`
+  (475-family flake), `011`/`475`.
+
+The 2026-08-18 full-suite snapshot below is the last complete run and predates
+the `720` un-skip and the `299` partial fix; read it as a historical point-in-time.
+
 **Latest per-test full-suite run:** 2026-08-18, `tests/xfstests/run-suite.sh`
 over every generic test on the VM, kernel `6.12.101-lockdep`, branch
 `master`, commit `c4082e7`.
@@ -27,9 +59,11 @@ skipped):
 - `generic/311` — pre-existing baseline flake (dm-flakey + fsync timing).
 - `generic/563` — cgroup writeback accounting; expected after `SB_I_CGROUPWB`
   was disabled on 6.12 (`9385fc8`, iput CVE-2026-31703 workaround).
-- `generic/299` — **deferred** ERTB / block-reuse DIO family: durable btree
-  extent-index corruption under fallocate/DIO/truncate churn; robust fix
-  needs a journal-format / sync-model change. See
+- `generic/299` — **partially fixed** (`1005b2e` + `0fd1448`, 2026-08-19): the
+  fallocate O(blocks) HANG and the commit-under-writeback / reuse-torn-write
+  btree checksum races are fixed; 299 now passes ~70-80% of runs (was 0% hard
+  HANG/FAIL). Residual = the deferred **problem-2** lockless read-vs-writeback
+  btree race (see "Current state" above). See
   `briefs-dio-stress-cluster-250-252-299-triage`.
 - `generic/492` — harness gap: the kernel `FS_IOC_GET/SETFSLABEL` ioctls work
   (label set + read back); only the two `blkid` lines fail because libblkid
@@ -195,12 +229,16 @@ pre-existing / deferred — there are **no new regressions** vs the 2026-08-13
 run.
 
 **4 FAIL tests:**
-- `generic/299` — **deferred** ERTB / block-reuse DIO family: durable btree
-  extent-index corruption under fallocate/DIO/truncate churn (fio AIO/DIO
-  verifier reads zeros for DIO-written blocks; fsck reports "unrecoverable
-  B-tree extent-index errors"). Robust fix needs a journal-format / sync-model
-  change (wait-on-writeback or page-cache alias cleaning on metadata-block
-  reuse). See `briefs-dio-stress-cluster-250-252-299-triage`.
+- `generic/299` — **partially fixed** (`1005b2e` + `0fd1448`, 2026-08-19): the
+  fallocate O(blocks) HANG and the commit-under-writeback / reuse-torn-write
+  btree checksum races are fixed (the ERTB/block-reuse angle is addressed at
+  the `briefs_get_zero_block` reuse chokepoint); 299 now passes ~70-80% of runs
+  (was 0% hard HANG/FAIL). Residual = the deferred **problem-2** lockless
+  read-vs-writeback btree race (`trust_verified=false` reader racing
+  writeback's mid-edit btree insert, which takes `extent_lock` but not
+  `inode_lock`; ~169 `btree: node N checksum mismatch`/boot, transient `-EIO`,
+  occasional timeout). Needs read-path serialization / CoW btree nodes /
+  per-buffer seqlock. See `briefs-dio-stress-cluster-250-252-299-triage`.
 - `generic/311` — pre-existing baseline flake (dm-flakey + fsync timing);
   reproduces on a known-good baseline.
 - `generic/492` — harness gap: kernel `FS_IOC_GET/SETFSLABEL` works (label
@@ -210,10 +248,11 @@ run.
   `SB_I_CGROUPWB` was disabled on 6.12 (`9385fc8`, iput CVE-2026-31703
   workaround).
 
-**Skipped (2, in the skip list — not counted as fail):** `475 720`. `475` is
+**Skipped (2, in the skip list — not counted as fail):** `475 492`. `475` is
 the flaky / deferred dm-error crash-replay bug (needs a journal-format
-change); `720` is the exchange-range swapext loop, gated for its O(E²) extent
-walk cost (correctness passes, but it exceeds the per-test timeout).
+change); `492` is the libblkid-probe gap (kernel label ioctls work; a
+`util-linux` task, skipped `991faac`). `720` was in this list at the time of
+the 0818 run but is **no longer skipped** — see the post-run updates below.
 
 > **Post-run updates (2026-08-18):**
 > - `88de097` — `068`/`074`/`464`/`476` re-verified at full-suite scale (4/4
@@ -226,7 +265,17 @@ walk cost (correctness passes, but it exceeds the per-test timeout).
 >   `29f4572`), which is why 051/461 pass; 753's dm-error WARN was fixed
 >   `73a0d1d`. Default skip list dropped to `475 720`.
 > - `991faac` — `492` **skipped** (libblkid has no BrieFS probe; kernel label
->   ioctls work). Default skip list is now `475 492 720`.
+>   ioctls work). Default skip list became `475 492 720`.
+> - `3666a3e` (2026-08-19) — `720` **un-skipped and PASSING** (~58 s): the
+>   O(E²) punch-alternating setup cost was fixed by threading the exact
+>   blocks-freed count out of `briefs_btree_delete_range` (O(1) `i_blocks`
+>   update), and the btree internal-split separator read-after-memset bug that
+>   then surfaced was fixed in the same commit. **Default skip list is now
+>   `generic/475 generic/492`** (`run-suite.sh`).
+> - `1005b2e` + `0fd1448` (2026-08-19) — `299` **partially fixed** (see the
+>   `299` entry above and "Current state" at the top): btree modify-path
+>   `wait_on_buffer` + `briefs_get_zero_block` reuse wait + fallocate
+>   O(extents)/halving. 299: 0% → ~70-80% pass; residual problem-2 deferred.
 
 **Moved into PASS since 2026-08-13** (key ones): `089` (`8780683`), `536`
 (`33e4019`), `250`/`252` (`19ba019`), `050`, `274` (was the split regression,
@@ -414,7 +463,7 @@ were read and grouped; all gates are legitimate.
 | Reflink not supported (test)                              | 39 | 110 111 115 116 118 119 134 137 138 139 140 142 143 144 145 146 147 148 149 150 151 152 153 154 155 156 157 159 178 179 180 181 303 407 463 578 612 649 734 |
 | disk quotas not supported                                 | 31 | 082 219 230 231 232 233 234 235 244 270 280 379 380 381 382 383 384 385 386 400 506 566 587 594 600 601 603 681 682 691 762 |
 | No encryption support (fscrypt)                           | 28 | 368 369 395 396 397 398 399 419 421 429 435 440 548 549 550 580 581 582 583 584 592 593 595 602 613 621 693 739 |
-| xfs_io exchangerange not supported ~~(now supported `56d1aa7`)~~ | 16 | 709 710 712 714 716 717 718 719 ~~720~~ 722 723 724 725 726 727 752 — exchange-range landed; 720 now SKIPPED (O(E²) swapext loop), row kept for history |
+| xfs_io exchangerange not supported ~~(now supported `56d1aa7`)~~ | 16 | 709 710 712 714 716 717 718 719 ~~720~~ 722 723 724 725 726 727 752 — exchange-range landed; 720 now PASSING (`3666a3e`, un-skipped), row kept for history |
 | ACLs not supported ~~(now PASSING via `a113c76`)~~          | ~~14~~ | ~~026 053 077 099 105 237 307 318 319 375 444 449 529 697~~ — all 14 now PASS in 2026-08-13 (POSIX ACLs landed); row kept for history |
 | xfs_io fcollapse failed ~~(COLLAPSE_RANGE landed `e2f023c`)~~ | 12 | 012 016 017 021 022 031 072 497 499 503 641 687 — collapse_range now implemented; most now PASS, row kept for history |
 | fsverity utility required (no fsverity)                   | 11 | 572 573 574 575 576 577 579 624 625 692 788 |
@@ -625,9 +674,12 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | 737                           | 8f4a27b  | O_DIRECT+shutdown file lost (directory sync durability + journal ring back-pressure) |
 
 > Open BrieFS code bugs as of the 2026-07-06 run (status updated to 2026-08-18):
-> - `299` — btree checksum mismatch under stress; still needs investigation
->   (deferred ERTB/block-reuse DIO family; see
->   `briefs-dio-stress-cluster-250-252-299-triage`).
+> - `299` — btree checksum mismatch under stress; **partially fixed**
+>   (`1005b2e` + `0fd1448`, 2026-08-19): the fallocate O(blocks) HANG and the
+>   commit-under-writeback / reuse-torn-write races are fixed; 299 passes
+>   ~70-80% of runs. Residual = deferred **problem-2** lockless read-vs-
+>   writeback btree race; see
+>   `briefs-dio-stress-cluster-250-252-299-triage`.
 > - `341`, `510`, `771` — replay duplicate directory entries: **now PASS** in
 >   2026-08-13 (idempotency/replay work resolved them).
 > - `547` — fsstress metadata mismatch: **now PASS** in 2026-08-13 (crash-replay
