@@ -1022,6 +1022,10 @@ struct trie_iter {
 				* of the next real entry the iterator will yield.
 				* Used to detect a telldir/seekdir to a non-linear
 				* ctx->pos and re-position the iterator. */
+	u64 visited;           /* nodes read so far this iteration (cyclic-trie
+				* backstop; see briefs_trie_iter_next)
+				*/
+	u64 visit_cap;         /* 0 = unset; lazily computed on first _next call */
 };
 
 struct trie_iter *briefs_trie_iter_alloc(void);

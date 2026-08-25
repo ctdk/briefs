@@ -1339,6 +1339,8 @@ void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di, u64 
 	iter->pending = false;
 	iter->gen = gen;
 	iter->emit_idx = 0;
+	iter->visited = 0;
+	iter->visit_cap = 0;
 	if (!TRIE_REF_IS_NULL(di->dir_trie_root)) {
 		if (iter->cap > 0) {
 			iter->stack[0] = di->dir_trie_root;
@@ -1363,6 +1365,19 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 	if (iter->gen != current_gen)
 		return -ESTALE;
 
+	/* Lazily compute the cyclic-trie backstop cap (mirrors seed_pool):
+	 * a healthy trie visits far fewer than this many nodes; a stale
+	 * on-disk trie with a back-edge in first_child/next_sibling would
+	 * otherwise re-push forever and wedge the mount (generic/475).
+	 * Hitting the cap aborts the walk with -EIO instead of hanging.
+	 */
+	if (!iter->visit_cap) {
+		struct briefs_sb_info *bsi = sb->s_fs_info;
+
+		iter->visit_cap = bsi->alloc.block_count *
+				  TRIE_SLOTS_PER_BLOCK + 1024;
+	}
+
 	if (iter->pending) {
 		iter->pending = false;
 		if (ino) *ino = iter->pending_ino;
@@ -1378,12 +1393,19 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 		u64 ref;
 		u8 emitted;
 
+		if (iter->visited > iter->visit_cap) {
+			pr_warn("briefs: trie iter exceeded %llu visited nodes (corrupt/cyclic trie), aborting\n",
+				iter->visit_cap);
+			return -EIO;
+		}
+
 		ref = iter->stack[iter->sp - 1];
 		emitted = iter->leaf_emitted[iter->sp - 1];
 		iter->sp--;
 
 		if (trie_read_node(sb, ref, &bh, &page, &node) != 0)
 			continue;
+		iter->visited++;
 
 		if (emitted) {
 			goto push_children;
@@ -1433,6 +1455,7 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 					struct briefs_trie_node *cn;
 					if (trie_read_node(sb, child, &cbh, &cpage, &cn) != 0)
 						break;
+					iter->visited++;
 					child = trie_node_next_sibling(cn);
 					brelse(cbh);
 				}
