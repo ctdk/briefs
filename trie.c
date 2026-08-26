@@ -131,6 +131,15 @@ static int trie_find_child_with_prev(struct super_block *sb, u64 parent_ref,
 	struct buffer_head *pbh, *cbh;
 	struct briefs_trie_page *ppage, *cpage;
 	struct briefs_trie_node *pnode, *cnode;
+	/* Per-call cap mirroring seed_pool/trie_iter_next: a healthy sibling
+	 * chain (children of one node, at most 256 by byte_val) is far shorter
+	 * than the whole-trie slot count, but a stale on-disk trie with a
+	 * back-edge in next_sibling would otherwise loop here forever reading
+	 * cached pages with no cond_resched, wedging the box unkillably at
+	 * 100% CPU (generic/475 live-path under dm-error).  Abort with -EIO.
+	 */
+	u64 cap = briefs_sb(sb)->alloc.block_count * TRIE_SLOTS_PER_BLOCK + 1024;
+	u64 visited = 0;
 	u64 prev = 0;
 	u64 child;
 
@@ -139,6 +148,12 @@ static int trie_find_child_with_prev(struct super_block *sb, u64 parent_ref,
 
 	child = trie_node_first_child(pnode);
 	while (!TRIE_REF_IS_NULL(child)) {
+		if (++visited > cap) {
+			pr_warn("briefs: trie sibling walk exceeded %llu nodes (corrupt/cyclic trie), aborting\n",
+				cap);
+			brelse(pbh);
+			return -EIO;
+		}
 		cbh = briefs_trie_read_page(sb, child, &cpage, &cnode);
 		if (IS_ERR(cbh))
 			break;
@@ -193,22 +208,36 @@ static int trie_link_child(struct super_block *sb, u64 parent_ref, u64 child_ref
 	}
 
 	/* Walk to the last sibling. */
-	last = trie_node_first_child(pnode);
-	lbh = briefs_trie_get_page(sb, last, &lpage, &last_node);
-	if (IS_ERR(lbh)) {
-		brelse(pbh);
-		return -EIO;
-	}
+	{
+		u64 cap = briefs_sb(sb)->alloc.block_count *
+			  TRIE_SLOTS_PER_BLOCK + 1024;
+		u64 visited = 0;
 
-	while (!TRIE_REF_IS_NULL(trie_node_next_sibling(last_node))) {
-		u64 next = trie_node_next_sibling(last_node);
-		brelse(lbh);
-		lbh = briefs_trie_get_page(sb, next, &lpage, &last_node);
+		last = trie_node_first_child(pnode);
+		lbh = briefs_trie_get_page(sb, last, &lpage, &last_node);
 		if (IS_ERR(lbh)) {
 			brelse(pbh);
 			return -EIO;
 		}
-		last = next;
+
+		while (!TRIE_REF_IS_NULL(trie_node_next_sibling(last_node))) {
+			u64 next = trie_node_next_sibling(last_node);
+
+			if (++visited > cap) {
+				pr_warn("briefs: trie link sibling walk exceeded %llu nodes (corrupt/cyclic trie), aborting\n",
+					cap);
+				brelse(lbh);
+				brelse(pbh);
+				return -EIO;
+			}
+			brelse(lbh);
+			lbh = briefs_trie_get_page(sb, next, &lpage, &last_node);
+			if (IS_ERR(lbh)) {
+				brelse(pbh);
+				return -EIO;
+			}
+			last = next;
+		}
 	}
 
 	trie_node_set_next_sibling(last_node, child_ref);
@@ -556,10 +585,18 @@ static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
 		trie_node_set_first_child(gnode, internal);
 	} else {
 		u64 prev = trie_node_first_child(gnode);
+		u64 cap = briefs_sb(sb)->alloc.block_count *
+			  TRIE_SLOTS_PER_BLOCK + 1024;
+		u64 visited = 0;
 		while (!TRIE_REF_IS_NULL(prev)) {
 			struct buffer_head *tbh;
 			struct briefs_trie_page *tpage;
 			struct briefs_trie_node *tmp;
+			if (++visited > cap) {
+				pr_warn("briefs: trie split relink exceeded %llu nodes (corrupt/cyclic trie), aborting\n",
+					cap);
+				break;
+			}
 			if (trie_get_node(sb, prev, &tbh, &tpage, &tmp) != 0)
 				break;
 			if (trie_node_next_sibling(tmp) == child) {
@@ -994,10 +1031,18 @@ collapse:
 				trie_node_set_first_child(pn2, trie_node_next_sibling(cn2));
 			} else {
 				u64 w = trie_node_first_child(pn2);
+				u64 cap = briefs_sb(sb)->alloc.block_count *
+					  TRIE_SLOTS_PER_BLOCK + 1024;
+				u64 visited = 0;
 				while (!TRIE_REF_IS_NULL(w)) {
 					struct buffer_head *wbh;
 					struct briefs_trie_page *wpage;
 					struct briefs_trie_node *wn;
+					if (++visited > cap) {
+						pr_warn("briefs: trie remove relink exceeded %llu nodes (corrupt/cyclic trie), aborting\n",
+							cap);
+						break;
+					}
 					if (trie_get_node(sb, w, &wbh, &wpage, &wn) != 0)
 						break;
 					if (trie_node_next_sibling(wn) == check) {
@@ -1456,6 +1501,13 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 					if (trie_read_node(sb, child, &cbh, &cpage, &cn) != 0)
 						break;
 					iter->visited++;
+					if (iter->visited > iter->visit_cap) {
+						pr_warn("briefs: trie iter push exceeded %llu visited nodes (corrupt/cyclic trie), aborting\n",
+							iter->visit_cap);
+						brelse(cbh);
+						brelse(bh);
+						return -EIO;
+					}
 					child = trie_node_next_sibling(cn);
 					brelse(cbh);
 				}
