@@ -123,17 +123,23 @@ struct briefs_journal {
 	DECLARE_HASHTABLE(replay_nlink_hash, 16);
 
 	/*
-	 * Journal-owned dirty metadata block set (Phase 1 of the journal-owned
-	 * buffer-lifetimes work).  briefs_mark_buffer_dirty() records each dirty
-	 * metadata block NUMBER here under owned_lock; briefs_journal_flush_owned()
-	 * swaps the table out and writes each block back per-buffer via
-	 * briefs_sync_dirty_buffer (one write + wait, quiesce-on-EIO) instead of
-	 * the looping sync_blockdev().  Numbers -- not buffer_head pointers --
-	 * are tracked because BrieFS metadata lives in the generic bdev buffer
-	 * cache with no BrieFS address_space/release_folio, so a held bh pointer
-	 * could be dangled by eviction; a block number is eviction-safe.  The
-	 * full GFS2 gfs2_bufdata + BH_Pinned pin/unpin port (Phase 2) needs a
-	 * BrieFS metadata address_space first and is deferred.
+	 * Journal-owned pinned metadata block set (Phase 2 of the journal-owned
+	 * buffer-lifetimes work).  briefs_mark_buffer_dirty() pins each deferred
+	 * metadata buffer_head here under owned_lock: get_bh() raises b_count so
+	 * buffer_busy() makes try_to_free_buffers() refuse to evict it, and the
+	 * wrapper does NOT call mark_buffer_dirty(), so the folio is never
+	 * dirty-tagged on the bdev address_space and pdflush never writes it
+	 * between commits (metadata drift eliminated).  briefs_journal_flush_owned()
+	 * drains the set at checkpoint, writes each pinned bh in place
+	 * (mark_buffer_dirty + briefs_sync_dirty_buffer) and brelse()s the pin.
+	 *
+	 * Phase 1 tracked block NUMBERS (an unpinned bh pointer could dangle on
+	 * eviction); Phase 2 pins (get_bh) the bh, so the pointer is stable and
+	 * stored here directly -- flush_owned() needs no sb_bread re-resolve.  The
+	 * get_bh pin on the existing bdev cache is a sufficient eviction control;
+	 * no BrieFS metadata address_space is required (the earlier "needs an
+	 * address_space first" note was over-conservative -- buffer_busy() is the
+	 * only eviction gate for def_blk_aops, which has no release_folio).
 	 */
 	spinlock_t owned_lock;
 	DECLARE_HASHTABLE(owned_blocks, 9);
@@ -189,12 +195,16 @@ struct briefs_replay_nlink {
 };
 
 /*
- * One entry in the journal-owned dirty metadata block set (above).  Freed by
- * briefs_journal_flush_owned() after the per-buffer writeback.
+ * One entry in the journal-owned pinned metadata block set (above).  The bh
+ * is pinned via get_bh() at track time and unpinned (brelse) by
+ * briefs_journal_flush_owned() after the in-place writeback, or by
+ * briefs_journal_cleanup() on the no-checkpoint unmount path.  @block is kept
+ * as the hash key (== bh->b_blocknr).
  */
 struct briefs_owned_block {
 	struct hlist_node node;
 	u64 block;
+	struct buffer_head *bh;	/* pinned via get_bh; stable until brelse */
 };
 
 /*
@@ -377,12 +387,13 @@ int briefs_journal_xattr_data(struct briefs_journal *j, u64 ino,
 int briefs_journal_sync_superblock(struct briefs_journal *j);
 
 /*
- * Record @block in the journal-owned dirty metadata set.  Cheap, non-sleeping
- * (owned_lock is a leaf spinlock).  Dedups: a block already present is skipped.
- * Declared here (not in briefs.h) because it takes the journal directly; the
- * briefs_mark_buffer_dirty() inline in briefs.h forward-declares it too.
+ * Pin @bh in the journal-owned pinned metadata set (get_bh + store the bh).
+ * Cheap, non-sleeping (owned_lock is a leaf spinlock).  Dedups by block number:
+ * a block already pinned is skipped (no double get_bh).  Declared here (not in
+ * briefs.h) because it takes the journal directly; the briefs_mark_buffer_dirty()
+ * inline in briefs.h forward-declares it too.
  */
-void briefs_journal_track(struct briefs_journal *j, u64 block);
+void briefs_journal_track_bh(struct briefs_journal *j, struct buffer_head *bh);
 
 /*
  * Write back every block in the owned set per-buffer via

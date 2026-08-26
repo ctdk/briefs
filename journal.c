@@ -29,58 +29,95 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j);
 static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoint);
 
 /*
- * briefs_journal_track - record a dirty metadata block in the owned set.
+ * briefs_journal_track_bh - pin a deferred metadata buffer_head in the owned set.
  *
- * Called from briefs_mark_buffer_dirty() at dirty time.  Non-sleeping
- * (owned_lock is a leaf spinlock; GFP_ATOMIC preserves mark_buffer_dirty's
- * "may run in any context" contract, even though all current BrieFS callers
- * hold a sleeping mutex).  Dedups: a block already present is skipped.  On
- * kmalloc failure the block is simply not tracked -- it stays dirty in the
- * page cache; the only consequence is that briefs_journal_flush_owned() will
- * not write it back per-buffer, so under the (vanishingly rare for a 16-byte
- * GFP_ATOMIC alloc) failure a metadata block could miss the targeted flush.
- * We accept that gap rather than keep a looping sync_blockdev() backstop,
- * which would re-introduce the generic/475 umount-redirty-EIO hang this
- * machinery exists to close.
+ * Called from briefs_mark_buffer_dirty() at dirty time (the deferred path).
+ * Non-sleeping (owned_lock is a leaf spinlock; GFP_ATOMIC preserves the
+ * "may run in any context" contract).  Dedups by block number: a block already
+ * pinned is skipped (no double get_bh).  On a NEW block: get_bh(bh) raises
+ * b_count so buffer_busy() makes try_to_free_buffers() refuse to evict the
+ * folio (the buffer is modified but NOT BH_Dirty -- pdflush ignores it -- so
+ * without the pin the VM could drop it and lose the un-committed change); the
+ * pinned bh pointer is stored (safe because it cannot be evicted) so
+ * briefs_journal_flush_owned() writes it in place at checkpoint without an
+ * sb_bread re-resolve.  The pin is dropped by briefs_journal_flush_owned() (or
+ * briefs_journal_cleanup()) via brelse().  On kmalloc failure the buffer is
+ * not pinned -- it stays uptodate in the page cache but is evictable; the
+ * consequence is a possible drift gap if it is evicted before checkpoint, so
+ * we mark it dirty as a fallback (pdflush will write it, no worse than today).
  */
-void briefs_journal_track(struct briefs_journal *j, u64 block)
+void briefs_journal_track_bh(struct briefs_journal *j, struct buffer_head *bh)
 {
 	struct briefs_owned_block *ob;
+	u64 block;
 
-	if (!j)
+	if (!j || !bh)
 		return;
+
+	block = bh->b_blocknr;
 
 	spin_lock(&j->owned_lock);
 	hash_for_each_possible(j->owned_blocks, ob, node, block) {
 		if (ob->block == block)
-			goto out;		/* already tracked */
+			goto out;		/* already pinned -- no double get_bh */
 	}
 	ob = kmalloc(sizeof(*ob), GFP_ATOMIC);
 	if (ob) {
+		get_bh(bh);			/* pin: prevent eviction of the not-dirty buffer */
 		ob->block = block;
+		ob->bh = bh;
 		hash_add(j->owned_blocks, &ob->node, block);
+	} else {
+		/* ENOMEM: fall back to plain dirty so pdflush eventually writes it. */
+		mark_buffer_dirty(bh);
 	}
 out:
 	spin_unlock(&j->owned_lock);
 }
 
 /*
- * briefs_journal_flush_owned - write back every tracked dirty metadata block
- * per-buffer, loop-free, and free the tracking entries.
+ * briefs_mark_buffer_dirty - the deferred-metadata dirty-time attach point.
+ *
+ * In normal operation this PINS @bh (briefs_journal_track_bh -> get_bh) instead
+ * of marking it dirty, so pdflush cannot write it between journal commits (no
+ * metadata drift -- the generic/475 root cause).  During journal replay and on
+ * journaless mounts there is no checkpoint cycle that would ever call
+ * briefs_journal_flush_owned(), so a pinned buffer would never reach disk; fall
+ * back to plain mark_buffer_dirty() there (replay persists via the end-of-replay
+ * sync_blockdev).  Defined here rather than as a briefs.h inline because it
+ * dereferences j->in_replay, and struct briefs_journal is opaque in briefs.h.
+ */
+void briefs_mark_buffer_dirty(struct buffer_head *bh, struct super_block *sb)
+{
+	struct briefs_sb_info *bsi = briefs_sb(sb);
+	struct briefs_journal *j = bsi->journal;
+
+	if (!j || j->in_replay) {
+		mark_buffer_dirty(bh);	/* replay/journaless: normal write-through */
+		return;
+	}
+	briefs_journal_track_bh(j, bh);	/* get_bh pin + record; NO mark_buffer_dirty */
+}
+
+/*
+ * briefs_journal_flush_owned - write back every pinned metadata buffer in
+ * place, drop its pin, and free the tracking entries.
  *
  * Replaces the coarse looping sync_blockdev() at BrieFS's sync points.  The
  * owned set is DRAINED under owned_lock (concurrent dirtiers attach to the
- * now-empty table), then each block is read back from the buffer cache and
- * written once via briefs_sync_dirty_buffer(): on a write error that helper
+ * now-empty table), then each pinned buffer_head is written in place via
+ * briefs_sync_write_buffer() (mark_buffer_dirty + sync_dirty_buffer): the
+ * buffer was pinned (get_bh) and kept NOT BH_Dirty between commits so pdflush
+ * could not drift it; now, at the commit point, it is marked dirty and
+ * written synchronously.  On a write error briefs_sync_dirty_buffer()
  * quiesces the buffer (clearing BH_Dirty/BH_Write_EIO so it is not
  * re-submitted and redirtied) and applies the errors= policy.  This is the
  * generic/475 fix -- unlike sync_blockdev(), which re-submits and redirties
  * an EIO buffer forever (umount hang), each buffer gets exactly one write
- * and is then quiesced.  sb_bread() of an in-cache buffer is a cheap lookup
- * (no I/O); of an evicted clean block is one read (rare, and those are not
- * the EIO-wedged buffers).  Eviction is safe because the set holds block
- * NUMBERS, not buffer_head pointers.  Returns 0 on success, -EIO if any
- * metadata write failed.
+ * and is then quiesced.  The stored bh is uptodate in the cache (pinned, so
+ * it was never evicted); no sb_bread re-resolve is needed.  brelse() drops
+ * the track-time get_bh pin.  Returns 0 on success, -EIO if any metadata
+ * write failed.
  */
 int briefs_journal_flush_owned(struct briefs_journal *j)
 {
@@ -95,8 +132,8 @@ int briefs_journal_flush_owned(struct briefs_journal *j)
 
 	/*
 	 * Drain the owned set into a local list under owned_lock.  Concurrent
-	 * briefs_journal_track() callers now insert into the emptied table, so
-	 * the drained batch is exactly the pre-flush set -- the equivalent of
+	 * briefs_journal_track_bh() callers now insert into the emptied table,
+	 * so the drained batch is exactly the pre-flush set -- the equivalent of
 	 * a table swap for an embedded DECLARE_HASHTABLE.
 	 */
 	spin_lock(&j->owned_lock);
@@ -106,15 +143,46 @@ int briefs_journal_flush_owned(struct briefs_journal *j)
 	}
 	spin_unlock(&j->owned_lock);
 
+	/*
+	 * Write each pinned bh in place and drop its pin.  The bh was pinned
+	 * (get_bh) at track time and is uptodate in the cache with the committed
+	 * content but NOT BH_Dirty (so pdflush left it alone between commits -- no
+	 * drift).  Now, at the checkpoint/commit point, mark it dirty and sync it
+	 * to disk.  There is no buffer_dirty() guard: pinned buffers are not
+	 * BH_Dirty, so guarding would skip the write; we write unconditionally.
+	 * brelse() drops the track-time get_bh pin (unpin).  A buffer written
+	 * through earlier by a synchronous site is clean here -- the mark+sync is
+	 * a redundant but harmless re-write of the same content.
+	 */
 	hlist_for_each_entry_safe(ob, tmp, &batch, node) {
-		struct buffer_head *bh = sb_bread(j->vfs_sb, ob->block);
+		struct buffer_head *bh = ob->bh;
 
 		if (bh) {
-			if (buffer_dirty(bh) &&
-			    briefs_sync_dirty_buffer(bh, j->vfs_sb,
-						     "owned flush"))
+			/*
+			 * A prior flush_owned (or a synchronous site) may have
+			 * already tried to write this buffer and hit a failing
+			 * device: end_buffer_write_sync() clears BH_Uptodate on a
+			 * lost write.  Calling mark_buffer_dirty() on a
+			 * !uptodate buffer trips WARN_ON_ONCE(!buffer_uptodate)
+			 * (fs/buffer.c) -- the new non-allowlisted message that
+			 * fails generic/475's _check_dmesg.  The buffer's write
+			 * already failed once, so re-submitting would only fail
+			 * again; record the error and skip the re-write.  The
+			 * pinned content stays in cache (the b_data is intact;
+			 * only the flag was cleared) but is not on disk -- which
+			 * is already the case after the first failed write, and
+			 * the journal records that reference it are either still
+			 * live (checkpoint aborted, see below) or were discarded
+			 * only after a *successful* flush_owned wrote them.
+			 */
+			if (buffer_uptodate(bh)) {
+				if (briefs_sync_write_buffer(bh, j->vfs_sb,
+							     "owned flush"))
+					ret = -EIO;
+			} else {
 				ret = -EIO;
-			brelse(bh);
+			}
+			brelse(bh);		/* drop the track-time get_bh pin */
 		}
 		hlist_del(&ob->node);
 		kfree(ob);
@@ -876,8 +944,7 @@ static int replay_inode_update(struct super_block *sb, struct jrn_inode_update *
 	di->ctime_nsec = cpu_to_le64(ctime_nsec);
 	di->flags = cpu_to_le32(flags);
 
-	briefs_mark_buffer_dirty(bh, sb);
-	err = briefs_sync_dirty_buffer(bh, sb, "replay inode update");
+	err = briefs_sync_write_buffer(bh, sb, "replay inode update");
 	brelse(bh);
 	if (err)
 		return err;
@@ -1018,8 +1085,7 @@ int briefs_journal_sync_superblock(struct briefs_journal *j)
 	disk_sb->free_data_blocks = j->sb->free_data_blocks;
 	disk_sb->free_inodes = j->sb->free_inodes;
 
-	briefs_mark_buffer_dirty(bh, vfs_sb);
-	err = briefs_sync_dirty_buffer(bh, vfs_sb, "superblock sync");
+	err = briefs_sync_write_buffer(bh, vfs_sb, "superblock sync");
 	brelse(bh);
 	return err;
 }
@@ -1069,8 +1135,7 @@ static int replay_inode_full(struct super_block *sb, struct jrn_inode_full *rec)
 	}
 
 	memcpy(di, rec->inode_data, sizeof(struct briefs_disk_inode));
-	briefs_mark_buffer_dirty(bh, sb);
-	err = briefs_sync_dirty_buffer(bh, sb, "replay inode full");
+	err = briefs_sync_write_buffer(bh, sb, "replay inode full");
 	brelse(bh);
 	if (err)
 		return err;
@@ -1128,8 +1193,7 @@ static int replay_symlink_data(struct super_block *sb, struct jrn_symlink_data *
 
 	memset(bh->b_data, 0, sb->s_blocksize);
 	memcpy(bh->b_data, rec->target, len);
-	briefs_mark_buffer_dirty(bh, sb);
-	err = briefs_sync_dirty_buffer(bh, sb, "replay symlink data");
+	err = briefs_sync_write_buffer(bh, sb, "replay symlink data");
 	brelse(bh);
 	iput(inode);
 	if (err)
@@ -1408,8 +1472,7 @@ static int replay_xattr_data(struct super_block *sb, struct jrn_xattr_data *rec)
 	/* Recompute the CRC at offset 4080 over [0, 4080). */
 	*(__le64 *)(bh->b_data + BRIEFS_BLOCK_SIZE - 2 * sizeof(__u64)) =
 		cpu_to_le64(briefs_chain_checksum(bh->b_data));
-	briefs_mark_buffer_dirty(bh, sb);
-	err = briefs_sync_dirty_buffer(bh, sb, "replay xattr data");
+	err = briefs_sync_write_buffer(bh, sb, "replay xattr data");
 	brelse(bh);
 	if (err)
 		return err;
@@ -1831,8 +1894,7 @@ static int replay_reconcile_nlinks(struct super_block *sb)
 		old = le32_to_cpu(di->nlinks);
 		if (old != expected) {
 			di->nlinks = cpu_to_le32(expected);
-			briefs_mark_buffer_dirty(bh, sb);
-			err = briefs_sync_dirty_buffer(bh, sb,
+			err = briefs_sync_write_buffer(bh, sb,
 						      "replay nlink reconcile");
 			if (!err) {
 				patched++;
@@ -2225,13 +2287,17 @@ void briefs_journal_cleanup(struct briefs_journal *j) {
 
 	if (!j) return;
 
-	/* Free any tracked dirty blocks left behind (e.g. error-path unmount
-	 * that never reached a flush_owned).  The buffers themselves stay in
-	 * the page cache; only the tracking entries are reclaimed.
+	/* Free any tracked pinned blocks left behind (e.g. error-path unmount
+	 * that never reached a flush_owned).  Drop the get_bh pin taken at track
+	 * time before reclaiming the entry, or the buffer_head refcount leaks.
+	 * The buffers themselves stay in the page cache; only the pins and the
+	 * tracking entries are reclaimed.
 	 */
 	spin_lock(&j->owned_lock);
 	hash_for_each_safe(j->owned_blocks, bkt, tmp, ob, node) {
 		hash_del(&ob->node);
+		if (ob->bh)
+			brelse(ob->bh);
 		kfree(ob);
 	}
 	spin_unlock(&j->owned_lock);

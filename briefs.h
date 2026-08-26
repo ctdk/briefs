@@ -754,6 +754,21 @@ static inline u32 briefs_xattr_hdr_size(u32 version)
 enum { BH_Verified = BH_PrivateStart };
 BUFFER_FNS(Verified, verified)
 
+/*
+ * Per-buffer_head "pinned by the journal-owned set" bit (Phase 2 of the
+ * journal-owned buffer-lifetimes work).  Set when briefs_mark_buffer_dirty()
+ * pins a deferred metadata buffer (get_bh + briefs_journal_track_bh) instead
+ * of marking it dirty, so pdflush cannot write it between commits.  Cleared
+ * by briefs_journal_flush_owned() after the in-place writeback (or never set
+ * on replay/journaless paths, which use plain mark_buffer_dirty).  Like
+ * BH_Verified it lives in b_state, which is zeroed on a fresh buffer_head, so
+ * it auto-clears if the (pinned, non-evictable) buffer is ever recreated.  The
+ * actual eviction control is the get_bh refcount (buffer_busy -> refcount);
+ * this bit is bookkeeping for assertions/debug only.
+ */
+enum { BH_BriefsPinned = BH_PrivateStart + 1 };
+BUFFER_FNS(BriefsPinned, briefs_pinned)
+
 /* Function headers and the like */
 
 /* Trie root block - first block in trie node pool */
@@ -1517,28 +1532,57 @@ static inline int briefs_sync_dirty_buffer(struct buffer_head *bh,
 	return 0;
 }
 
-/* briefs_journal_track() is defined in journal.c; see briefs_journal.h. */
+/* briefs_journal_track_bh() is defined in journal.c; see briefs_journal.h. */
 struct briefs_journal;
-void briefs_journal_track(struct briefs_journal *j, u64 block);
+void briefs_journal_track_bh(struct briefs_journal *j, struct buffer_head *bh);
 
 /*
- * Mark @bh dirty and record its block number in the journal-owned dirty
- * metadata set, so briefs_journal_flush_owned() can write it back per-buffer
- * (loop-free, quiesce-on-EIO) at BrieFS's sync points instead of relying on
- * the coarse looping sync_blockdev().  This is the dirty-time attach point
- * for the journal-owned buffer-lifetimes work; every BrieFS metadata
- * mark_buffer_dirty() should route through here so the owned set is complete
- * (a missed site is a durability gap -- the owned-walk replaces sync_blockdev
- * coverage).  Cheap and non-sleeping: a spinlock + hashtable insert.
+ * Pin a deferred metadata buffer_head instead of marking it dirty, so pdflush
+ * cannot write it between journal commits (metadata drift eliminated).
+ *
+ * This is the dirty-time attach point for the journal-owned buffer-lifetimes
+ * work (Phase 2).  Deferred metadata -- trie pages, btree nodes, directory
+ * blocks, and new metadata born in briefs_get_zero_block() -- is modified
+ * during an uncommitted op and must NOT reach disk until the checkpoint that
+ * commits that op.  Calling mark_buffer_dirty() would folio-dirty the bdev
+ * address_space (PAGECACHE_TAG_DIRTY + the bdev inode on the b_dirty list),
+ * exposing the folio to pdflush; there is no kernel API to leave BH_Dirty but
+ * hide the folio (A' was defeated by exactly this).  So this wrapper does NOT
+ * mark the buffer dirty: it pins it via briefs_journal_track_bh() (get_bh ->
+ * buffer_busy -> try_to_free_buffers refuses eviction) and records the pinned
+ * bh in the owned set.  The buffer stays uptodate with the new content, not
+ * BH_Dirty, and un-evictable; briefs_journal_flush_owned() writes it in place
+ * at checkpoint.  Every BrieFS deferred metadata dirty site must route through
+ * here; a missed site is a drift gap.
+ *
+ * Replay and journaless mounts have no checkpoint cycle (replay persists
+ * synchronously via the end-of-replay sync_blockdev), so they fall back to
+ * plain mark_buffer_dirty().  Non-sleeping: a spinlock + hashtable insert.
+ *
+ * Defined out-of-line rather than as an inline here: it dereferences
+ * j->in_replay, and the journal struct is opaque from this header (the
+ * journal header includes this one, so the full definition is not visible).
  */
-static inline void briefs_mark_buffer_dirty(struct buffer_head *bh,
-					    struct super_block *sb)
-{
-	struct briefs_sb_info *bsi = briefs_sb(sb);
+void briefs_mark_buffer_dirty(struct buffer_head *bh, struct super_block *sb);
 
+/*
+ * Synchronous metadata write-through: mark @bh dirty and write it to disk
+ * immediately (mark_buffer_dirty + briefs_sync_dirty_buffer), with NO pin and
+ * NO journal-owned tracking.  Use this for metadata that must be on disk
+ * before a pointer is published or before the journal tail advances (bitmap
+ * alloc_sync, persist_disk_inode sync=true, promote-inline, xattr chain,
+ * replay paths, the superblock, the trie-free empty page).  Such a buffer is
+ * BH_Dirty only for the mark->sync window (synchronous, no pdflush drift
+ * window); if the metadata's drift is tolerated by replay (inodes/xattrs are
+ * re-derived from JRN_INODE_FULL/JRN_XATTR_DATA) this is correct and cheaper
+ * than pinning.  Returns 0 on success, -EIO on a write error.
+ */
+static inline int briefs_sync_write_buffer(struct buffer_head *bh,
+					    struct super_block *sb,
+					    const char *ctx)
+{
 	mark_buffer_dirty(bh);
-	if (bsi->journal)
-		briefs_journal_track(bsi->journal, bh->b_blocknr);
+	return briefs_sync_dirty_buffer(bh, sb, ctx);
 }
 
 void briefs_force_shutdown(struct super_block *sb, const char *why);

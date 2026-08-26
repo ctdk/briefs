@@ -903,14 +903,15 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 		 * block to the allocator.  This prevents a later allocation from
 		 * seeing stale trie metadata in the on-disk block.  A failing
 		 * device (dm-error/dm-thin) can fail this write; route it through
-		 * briefs_sync_dirty_buffer() so the dirty+EIO flags are quiesced
-		 * (the block is being freed, and its next allocation memset +
+		 * briefs_sync_write_buffer() (mark+sync) so the now-empty page is
+		 * written before the block is freed and the dirty+EIO flags are
+		 * quiesced (the block is being freed, and its next allocation memset +
 		 * re-dirties via briefs_get_zero_block(), so a stale on-disk
 		 * header is overwritten before any reader sees it) and the error
 		 * is handled per the errors= policy.  Warn rather than abort the
 		 * directory op: discard the returned -EIO and continue.
 		 */
-		briefs_sync_dirty_buffer(bh, sb, "trie free");
+		briefs_sync_write_buffer(bh, sb, "trie free");
 		brelse(bh);
 
 		/*

@@ -1128,12 +1128,15 @@ int briefs_xattr_set(struct inode *inode, const char *name,
 		memset(bh->b_data + used, 0, BRIEFS_BLOCK_SIZE - used);
 		*xattr_crc_slot(bh->b_data) =
 			cpu_to_le64(briefs_chain_checksum(bh->b_data));
-		briefs_mark_buffer_dirty(bh, sb);
 	}
 
-	/* Make the chain durable before publishing the inode pointer. */
+	/* Make the chain durable before publishing the inode pointer.  Each
+	 * bhs[i] was born pinned by briefs_get_zero_block() above; write it
+	 * through here (mark + sync) so the on-disk chain precedes the inode
+	 * pointer.  The pin survives and briefs_journal_flush_owned() brelse()s
+	 * it at the next checkpoint. */
 	for (i = 0; i < nblocks; i++) {
-		if (briefs_sync_dirty_buffer(bhs[i], sb, "xattr chain sync")) {
+		if (briefs_sync_write_buffer(bhs[i], sb, "xattr chain sync")) {
 			ret = -EIO;
 			goto out_chain;
 		}

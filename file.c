@@ -317,8 +317,7 @@ long briefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		lock_buffer(bsi->sb_bh);
 		memcpy(bsi->sb->label, label, sizeof(bsi->sb->label));
 		unlock_buffer(bsi->sb_bh);
-		mark_buffer_dirty(bsi->sb_bh);
-		sync_dirty_buffer(bsi->sb_bh);
+		briefs_sync_write_buffer(bsi->sb_bh, sb, "setlabel");
 		mnt_drop_write_file(file);
 		return 0;
 	}
@@ -509,8 +508,7 @@ static int briefs_promote_inline_data(struct inode *inode)
 	}
 	memset(bh->b_data, 0, inode->i_sb->s_blocksize);
 	memcpy(bh->b_data, binfo->disk_inode.inline_data, old_size);
-	briefs_mark_buffer_dirty(bh, inode->i_sb);
-	err = briefs_sync_dirty_buffer(bh, inode->i_sb, "promote inline data");
+	err = briefs_sync_write_buffer(bh, inode->i_sb, "promote inline data");
 	brelse(bh);
 	if (err) {
 		briefs_free_block(&bsi->alloc, rel);

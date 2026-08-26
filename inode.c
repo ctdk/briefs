@@ -288,18 +288,25 @@ int briefs_persist_disk_inode(struct super_block *sb, u64 ino,
 		goto out_release;
 	}
 	briefs_cpu_inode_to_disk(src, di);
-	briefs_mark_buffer_dirty(bh, sb);
-	unlock_buffer(bh);
-
 	if (sync) {
-		if (briefs_sync_dirty_buffer(bh, sb, "persist disk inode")) {
+		/* synchronous write-through: mark + sync after unlocking the buffer
+		 * (sync_dirty_buffer locks internally).  No pin/track -- the content
+		 * is on disk before the caller publishes a pointer to it. */
+		unlock_buffer(bh);
+		if (briefs_sync_write_buffer(bh, sb, "persist disk inode")) {
 			ret = -EIO;
 			goto out_release;
 		}
-	} else if (briefs_check_meta_write_error(bh)) {
-		briefs_handle_meta_write_error(sb, "persist disk inode");
-		ret = -EIO;
-		goto out_release;
+	} else {
+		/* deferred: pin the buffer (no BH_Dirty -> no pdflush drift); the
+		 * journal-owned flush writes it at the next checkpoint. */
+		briefs_mark_buffer_dirty(bh, sb);
+		unlock_buffer(bh);
+		if (briefs_check_meta_write_error(bh)) {
+			briefs_handle_meta_write_error(sb, "persist disk inode");
+			ret = -EIO;
+			goto out_release;
+		}
 	}
 
 out_release:
@@ -312,7 +319,12 @@ out_unlock:
 /*
  * Allocate a writable buffer_head for an on-disk block and zero it.
  * Returns the buffer head on success (caller must brelse), or NULL on error.
- * The buffer is marked uptodate and dirty so callers can fill it and release.
+ * The buffer is made uptodate and pinned (not BH_Dirty, so pdflush cannot
+ * write it before the checkpoint that commits the op using it); callers
+ * fill it and brelse, dropping their own ref -- the pin survives until
+ * briefs_journal_flush_owned().  During replay (no checkpoint cycle) the
+ * pin wrapper falls back to mark_buffer_dirty so the end-of-replay
+ * sync_blockdev persists it.
  */
 struct buffer_head *briefs_get_zero_block(struct super_block *sb, u64 block)
 {
