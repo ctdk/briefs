@@ -662,9 +662,21 @@ static void briefs_discard_data_buffer(struct briefs_alloc *alloc, u64 rel_block
 	 * teardown (generic/052 crash when inodes are evicted after
 	 * briefs_put_super sets bsi->sb = NULL).
 	 */
-	if (bsi && bsi->sb && alloc == &bsi->alloc)
+	if (bsi && bsi->sb && alloc == &bsi->alloc) {
+		/*
+		 * Drop any Phase-2 journal-owned pin on this block before
+		 * invalidating the alias.  A pinned deferred-metadata buffer is
+		 * NOT BH_Dirty, so clean_bdev_aliases() alone is a no-op against
+		 * it; without untrack the pin (and the freed block's obsolete
+		 * trie/btree content) survives the free and flush_owned() later
+		 * writes it onto the block after it is reused as file data
+		 * (TRNP/BTRE/ERTB magic in file data).  Keyed by absolute block.
+		 */
+		briefs_journal_untrack_bh(bsi->journal,
+					   data_to_abs(bsi->sb, rel_block));
 		clean_bdev_aliases(alloc->sb->s_bdev,
 				   data_to_abs(bsi->sb, rel_block), 1);
+	}
 }
 
 void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block)
@@ -808,10 +820,24 @@ void briefs_free_blocks(struct briefs_alloc *alloc, u64 rel_start, u64 n)
 	{
 		struct briefs_sb_info *bsi = briefs_sb(alloc->sb);
 
-		if (bsi && alloc == &bsi->alloc)
-			clean_bdev_aliases(alloc->sb->s_bdev,
-					   data_to_abs(bsi->sb, rel_start),
+		if (bsi && alloc == &bsi->alloc) {
+			u64 abs_start = data_to_abs(bsi->sb, rel_start);
+			u64 i;
+
+			/*
+			 * Drop Phase-2 pins on any block in this run before
+			 * invalidating the aliases, mirroring the single-block path
+			 * in briefs_discard_data_buffer().  Pure data runs are not
+			 * pinned (Phase 2 pins deferred metadata only), so the
+			 * untrack is usually a no-op; it covers a stale metadata
+			 * alias that happens to lie in the range.
+			 */
+			for (i = 0; i < end - rel_start; i++)
+				briefs_journal_untrack_bh(bsi->journal,
+							  abs_start + i);
+			clean_bdev_aliases(alloc->sb->s_bdev, abs_start,
 					   end - rel_start);
+		}
 	}
 }
 

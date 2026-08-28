@@ -395,6 +395,8 @@ int briefs_journal_sync_superblock(struct briefs_journal *j);
  */
 void briefs_journal_track_bh(struct briefs_journal *j, struct buffer_head *bh);
 
+void briefs_journal_untrack_bh(struct briefs_journal *j, u64 block);
+
 /*
  * Write back every block in the owned set per-buffer via
  * briefs_sync_dirty_buffer (loop-free, quiesce-on-EIO) and free the entries.

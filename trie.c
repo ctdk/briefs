@@ -138,7 +138,7 @@ static int trie_find_child_with_prev(struct super_block *sb, u64 parent_ref,
 	 * cached pages with no cond_resched, wedging the box unkillably at
 	 * 100% CPU (generic/475 live-path under dm-error).  Abort with -EIO.
 	 */
-	u64 cap = briefs_sb(sb)->alloc.block_count * TRIE_SLOTS_PER_BLOCK + 1024;
+	u64 cap = BRIEFS_TRIE_SIBLING_MAX;
 	u64 visited = 0;
 	u64 prev = 0;
 	u64 child;
@@ -209,8 +209,7 @@ static int trie_link_child(struct super_block *sb, u64 parent_ref, u64 child_ref
 
 	/* Walk to the last sibling. */
 	{
-		u64 cap = briefs_sb(sb)->alloc.block_count *
-			  TRIE_SLOTS_PER_BLOCK + 1024;
+		u64 cap = BRIEFS_TRIE_SIBLING_MAX;
 		u64 visited = 0;
 
 		last = trie_node_first_child(pnode);
@@ -585,8 +584,7 @@ static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
 		trie_node_set_first_child(gnode, internal);
 	} else {
 		u64 prev = trie_node_first_child(gnode);
-		u64 cap = briefs_sb(sb)->alloc.block_count *
-			  TRIE_SLOTS_PER_BLOCK + 1024;
+		u64 cap = BRIEFS_TRIE_SIBLING_MAX;
 		u64 visited = 0;
 		while (!TRIE_REF_IS_NULL(prev)) {
 			struct buffer_head *tbh;
@@ -1031,8 +1029,7 @@ collapse:
 				trie_node_set_first_child(pn2, trie_node_next_sibling(cn2));
 			} else {
 				u64 w = trie_node_first_child(pn2);
-				u64 cap = briefs_sb(sb)->alloc.block_count *
-					  TRIE_SLOTS_PER_BLOCK + 1024;
+				u64 cap = BRIEFS_TRIE_SIBLING_MAX;
 				u64 visited = 0;
 				while (!TRIE_REF_IS_NULL(w)) {
 					struct buffer_head *wbh;

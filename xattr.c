@@ -190,6 +190,7 @@ briefs_xattr_find(struct inode *inode, const char *name, size_t name_len,
 {
 	struct super_block *sb = inode->i_sb;
 	struct buffer_head *bh;
+	u32 visited = 0;
 
 	bh = briefs_xattr_block_read(inode);
 	if (IS_ERR(bh)) {
@@ -199,6 +200,18 @@ briefs_xattr_find(struct inode *inode, const char *name, size_t name_len,
 
 	while (bh) {
 		struct briefs_xattr_entry *e;
+
+		/*
+		 * Bound the chain walk: a cyclic or over-long chain (e.g. left
+		 * inconsistent by a metadata write error under a failing device)
+		 * would otherwise loop forever here.  BRIEFS_XATTR_MAX_CHAIN is
+		 * the same bound the write path enforces.
+		 */
+		if (++visited > BRIEFS_XATTR_MAX_CHAIN) {
+			brelse(bh);
+			*out_bh = ERR_PTR(-EIO);
+			return NULL;
+		}
 
 		if (!xattr_block_is_cont(bh->b_data))
 			e = briefs_xattr_find_in_block(bh, name, name_len);
@@ -372,6 +385,7 @@ ssize_t briefs_xattr_list(struct dentry *dentry, char *buffer, size_t size)
 	struct buffer_head *bh;
 	ssize_t ret = 0;
 	size_t rest = size;
+	u32 visited = 0;
 
 	down_read(&binfo->xattr_sem);
 	bh = briefs_xattr_block_read(inode);
@@ -389,6 +403,20 @@ ssize_t briefs_xattr_list(struct dentry *dentry, char *buffer, size_t size)
 		struct briefs_xattr_header *hdr;
 		struct briefs_xattr_entry *entries;
 		u32 count, i, hdr_size;
+
+		/*
+		 * Bound the chain walk against a cyclic/over-long chain that a
+		 * metadata write error under a failing device may have left
+		 * inconsistent; without this an mkdir reading the parent's
+		 * default-ACL xattr chain can loop forever in an unkillable
+		 * kernel busy-loop (observed under generic/753).
+		 */
+		if (++visited > BRIEFS_XATTR_MAX_CHAIN) {
+			ret = -EIO;
+			brelse(bh);
+			bh = NULL;
+			goto out;
+		}
 
 		if (xattr_block_is_cont(bh->b_data)) {
 			struct buffer_head *next;

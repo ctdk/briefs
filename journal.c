@@ -76,6 +76,51 @@ out:
 }
 
 /*
+ * briefs_journal_untrack_bh - drop the Phase-2 pin on @block, if any.
+ *
+ * Counterpart to briefs_journal_track_bh(): removes the owned-set entry for the
+ * given absolute block and brelse()s the track-time get_bh pin.  Called from
+ * the allocator free path (briefs_discard_data_buffer) BEFORE a freed metadata
+ * block returns to the free pool.  Without this the pin -- and the obsolete
+ * trie/btree content the pinned buffer still carries -- survives the free, and
+ * the next briefs_journal_flush_owned() writes that stale content onto the
+ * block after it has been reused as a data extent, so file data reads back as
+ * metadata magic (TRNP/BTRE/ERTB).  clean_bdev_aliases() alone cannot help: a
+ * Phase-2 pinned buffer is NOT BH_Dirty, so clearing the dirty bit and waiting
+ * on writeback is a no-op against it.  Pre-Phase-2 the buffer was BH_Dirty and
+ * clean_bdev_aliases quiesced it; Phase 2 broke that precondition, and this
+ * untrack restores it.
+ *
+ * brelse() under owned_lock mirrors the teardown drain in
+ * briefs_journal_cleanup().  The pinned buffer is also held by the bdev page
+ * cache, so dropping our pin does not free the buffer_head (it stays cached
+ * until evicted, which the clean_bdev_aliases() call that follows in the free
+ * path arranges).  No-op if the block was not pinned (a data block, an
+ * already-flushed block, or a journaless mount with j == NULL).
+ */
+void briefs_journal_untrack_bh(struct briefs_journal *j, u64 block)
+{
+	struct briefs_owned_block *ob;
+	struct hlist_node *tmp;
+
+	if (!j)
+		return;
+
+	spin_lock(&j->owned_lock);
+	hash_for_each_possible_safe(j->owned_blocks, ob, tmp, node, block) {
+		if (ob->block == block) {
+			hash_del(&ob->node);
+			if (ob->bh)
+				brelse(ob->bh);	/* drop the track-time get_bh pin */
+			kfree(ob);
+			break;
+		}
+	}
+	spin_unlock(&j->owned_lock);
+}
+
+
+/*
  * briefs_mark_buffer_dirty - the deferred-metadata dirty-time attach point.
  *
  * In normal operation this PINS @bh (briefs_journal_track_bh -> get_bh) instead

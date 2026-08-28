@@ -719,6 +719,16 @@ struct briefs_extent_btree_node {
 /* Don't let a single inode hold an unbounded xattr chain. */
 #define BRIEFS_XATTR_MAX_CHAIN 1024u
 
+/* A trie node's children are keyed by distinct byte values (0..255), so a
+ * healthy sibling (first_child/next_sibling) chain is at most 256 nodes.  Cap
+ * sibling-chain read walks at this small bound (4x headroom) so a stale
+ * on-disk trie whose sibling graph has a back-edge (dm-error partial sync can
+ * leave one) aborts with -EIO in microseconds instead of looping for minutes
+ * under a device-scale cap (block_count * TRIE_SLOTS_PER_BLOCK, which is
+ * billions on a large volume).  Never false-trips on a healthy trie.
+ */
+#define BRIEFS_TRIE_SIBLING_MAX 1024u
+
 struct briefs_xattr_header {               /* v2: [0,32); v1: [0,16) */
 	__le32 magic;                        /* BRIEFS_XATTR_MAGIC */
 	__le32 version;                      /* BRIEFS_XATTR_VERSION */
@@ -1535,6 +1545,7 @@ static inline int briefs_sync_dirty_buffer(struct buffer_head *bh,
 /* briefs_journal_track_bh() is defined in journal.c; see briefs_journal.h. */
 struct briefs_journal;
 void briefs_journal_track_bh(struct briefs_journal *j, struct buffer_head *bh);
+void briefs_journal_untrack_bh(struct briefs_journal *j, u64 block);
 
 /*
  * Pin a deferred metadata buffer_head instead of marking it dirty, so pdflush
