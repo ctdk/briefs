@@ -38,13 +38,19 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
  * b_count so buffer_busy() makes try_to_free_buffers() refuse to evict the
  * folio (the buffer is modified but NOT BH_Dirty -- pdflush ignores it -- so
  * without the pin the VM could drop it and lose the un-committed change); the
- * pinned bh pointer is stored (safe because it cannot be evicted) so
- * briefs_journal_flush_owned() writes it in place at checkpoint without an
- * sb_bread re-resolve.  The pin is dropped by briefs_journal_flush_owned() (or
- * briefs_journal_cleanup()) via brelse().  On kmalloc failure the buffer is
- * not pinned -- it stays uptodate in the page cache but is evictable; the
- * consequence is a possible drift gap if it is evicted before checkpoint, so
- * we mark it dirty as a fallback (pdflush will write it, no worse than today).
+ * pinned bh pointer is stored so the drain and PASS 1 of flush_owned can
+ * mark+unpin it without a re-resolve.  The pointer is stable only WHILE
+ * PINNED: flush_owned drops the pin in PASS 1 (before the sync write) so
+ * pdflush can clean+reclaim the now-BH_Dirty buffer concurrently during the
+ * sync (without this, the pin is held across the sync wait -- the
+ * Phase-2 delta that hangs generic/676 under the full-suite loaded-cache
+ * condition); PASS 2 then re-resolves via sb_bread(ob->block), since the
+ * stored pointer can dangle once the unpinned buffer is evicted.  The pin is
+ * dropped by briefs_journal_flush_owned() (or briefs_journal_cleanup()) via
+ * brelse().  On kmalloc failure the buffer is not pinned -- it stays
+ * uptodate in the page cache but is evictable; the consequence is a possible
+ * drift gap if it is evicted before checkpoint, so we mark it dirty as a
+ * fallback (pdflush will write it, no worse than today).
  */
 void briefs_journal_track_bh(struct briefs_journal *j, struct buffer_head *bh)
 {
@@ -145,24 +151,35 @@ void briefs_mark_buffer_dirty(struct buffer_head *bh, struct super_block *sb)
 }
 
 /*
- * briefs_journal_flush_owned - write back every pinned metadata buffer in
- * place, drop its pin, and free the tracking entries.
+ * briefs_journal_flush_owned - write back every pinned metadata buffer, drop
+ * its pin, and free the tracking entries.
  *
  * Replaces the coarse looping sync_blockdev() at BrieFS's sync points.  The
  * owned set is DRAINED under owned_lock (concurrent dirtiers attach to the
- * now-empty table), then each pinned buffer_head is written in place via
- * briefs_sync_write_buffer() (mark_buffer_dirty + sync_dirty_buffer): the
- * buffer was pinned (get_bh) and kept NOT BH_Dirty between commits so pdflush
- * could not drift it; now, at the commit point, it is marked dirty and
- * written synchronously.  On a write error briefs_sync_dirty_buffer()
- * quiesces the buffer (clearing BH_Dirty/BH_Write_EIO so it is not
- * re-submitted and redirtied) and applies the errors= policy.  This is the
- * generic/475 fix -- unlike sync_blockdev(), which re-submits and redirties
- * an EIO buffer forever (umount hang), each buffer gets exactly one write
- * and is then quiesced.  The stored bh is uptodate in the cache (pinned, so
- * it was never evicted); no sb_bread re-resolve is needed.  brelse() drops
- * the track-time get_bh pin.  Returns 0 on success, -EIO if any metadata
- * write failed.
+ * now-empty table), then written in TWO passes.  The Phase-2 pin (get_bh, NOT
+ * BH_Dirty) is held dirty-time->commit so pdflush cannot drift metadata
+ * between journal commits (the generic/475 drift fix).  PASS 1 marks every
+ * batch buffer dirty and DROPS its pin (brelse) BEFORE any sync wait, so the
+ * buffers become BH_Dirty (pdflush-eligible -> cleaned+reclaimable
+ * concurrently) and unpinned (reclaimable once clean).  This is the
+ * generic/676 fix: Phase 2 is the only version that holds the get_bh pin
+ * across the sync_dirty_buffer wait -- Phase 1 held no pin across the wait
+ * and re-resolved each buffer via sb_bread(), and passed 676.  Holding the
+ * pin across the wait keeps the owned buffers buffer_busy (so
+ * try_to_free_buffers refuses to reclaim them) and NOT BH_Dirty (so pdflush
+ * cannot clean them either) for the whole wait; under the full-suite
+ * loaded-cache condition generic/676 (a 4000-file single-dir create) then
+ * deadlocks -- silently and lockdep-quiet (a resource/reclaim stall, not a
+ * lock inversion).  Dropping all pins before any sync wait restores the
+ * Phase-1 discipline that passed 676.  PASS 2 re-resolves each buffer via
+ * sb_bread() (the pin is gone, so the stored bh pointer can dangle once
+ * pdflush cleans+evicts it -- exactly why Phase 1 tracked block numbers and
+ * re-resolved) and syncs+quiesces each still-dirty buffer.  On a write error
+ * briefs_sync_dirty_buffer() quiesces the buffer (clearing BH_Dirty/
+ * BH_Write_EIO so it is not re-submitted and redirtied) and applies the
+ * errors= policy.  This is the generic/475 umount-redirty-EIO fix -- unlike
+ * sync_blockdev(), each buffer gets exactly one write and is then quiesced.
+ * Returns 0 on success, -EIO if any metadata write failed.
  */
 int briefs_journal_flush_owned(struct briefs_journal *j)
 {
@@ -189,16 +206,58 @@ int briefs_journal_flush_owned(struct briefs_journal *j)
 	spin_unlock(&j->owned_lock);
 
 	/*
-	 * Write each pinned bh in place and drop its pin.  The bh was pinned
-	 * (get_bh) at track time and is uptodate in the cache with the committed
-	 * content but NOT BH_Dirty (so pdflush left it alone between commits -- no
-	 * drift).  Now, at the checkpoint/commit point, mark it dirty and sync it
-	 * to disk.  There is no buffer_dirty() guard: pinned buffers are not
-	 * BH_Dirty, so guarding would skip the write; we write unconditionally.
-	 * brelse() drops the track-time get_bh pin (unpin).  A buffer written
-	 * through earlier by a synchronous site is clean here -- the mark+sync is
-	 * a redundant but harmless re-write of the same content.
+	 * Two-pass writeback of the drained batch.  The Phase-2 pin (get_bh +
+	 * deliberately NOT BH_Dirty) is retained from dirty-time to THIS commit
+	 * point so pdflush cannot drift metadata between journal commits (the
+	 * generic/475 drift fix).  At the commit the journal records covering these
+	 * buffers are already durable -- log_end is advanced BEFORE flush_owned in
+	 * both callers (__briefs_journal_checkpoint_locked syncs records via
+	 * __briefs_journal_sync_locked first; the fsync path advances
+	 * journal_log_end at the call site before the flush_owned) -- so a pdflush
+	 * write of this metadata now reflects state covered by committed records
+	 * and replay re-derives it consistently: drift-safe.  The pin's job ends
+	 * at the commit; holding it through the sync write is what caused
+	 * generic/676 to hang.
+	 *
+	 * PASS 1 marks every batch buffer dirty and DROPS its track-time pin.
+	 * Dropping ALL pins before any sync wait is the fix for the generic/676
+	 * hang.  Phase 2 is the only version that holds the get_bh pin across the
+	 * sync_dirty_buffer wait: the old single-pass held get_bh pins on
+	 * buffers #2..#N while sync-writing #1.  A pinned buffer is buffer_busy()
+	 * so try_to_free_buffers() refuses to reclaim it, and it is NOT BH_Dirty
+	 * so pdflush cannot clean it either -- for the whole duration of the
+	 * wait the owned batch is unreclaimable and pdflush-ineligible.  Under
+	 * the full-suite loaded-cache condition generic/676 (a 4000-file
+	 * single-dir create) then deadlocks: sync_dirty_buffer stalls (D-state,
+	 * trie_lock held) and nothing on the owned batch can be reclaimed or
+	 * cleaned to relieve the stall -- silently and lockdep-quiet (a
+	 * resource/reclaim stall, not a lock inversion).  Phase 1 held no pin
+	 * across the wait and re-resolved via sb_bread, and passed 676; dropping
+	 * all pins before any sync wait restores that discipline.  After pass 1
+	 * every batch buffer is BH_Dirty (pdflush-eligible -> cleaned+reclaimable
+	 * concurrently) and unpinned (reclaimable once clean), so memory reclaims
+	 * while one buffer sync-writes and the stall cannot take hold.
+	 *
+	 * PASS 2 re-resolves each buffer via sb_bread().  The pin is gone, so
+	 * between the passes pdflush may clean a buffer and the VM may evict it;
+	 * the stored ob->bh pointer can then dangle -- exactly why Phase 1
+	 * tracked block NUMBERS and re-resolved with sb_bread.  A dirty buffer
+	 * cannot be evicted unwritten (try_to_free_buffers refuses a
+	 * dirty/buffer_busy folio), so pdflush must mark it clean (write
+	 * complete) before the VM evicts: sb_bread either returns the
+	 * still-cached buffer (dirty or clean, in both cases carrying our
+	 * committed content) or re-reads the pdflush-written content from disk
+	 * -- the change is preserved in every case.  A clean buffer is skipped
+	 * via the buffer_dirty() guard; an in-flight write (BH_Dirty cleared,
+	 * BH_Lock set) is also clean to the guard, but its durability is
+	 * guaranteed by the committed journal records (replay re-derives the
+	 * metadata) and, at unmount, by the blkdev_issue_flush() in
+	 * briefs_put_super.  The buffer_uptodate() guard + EIO quiesce is
+	 * preserved so the generic/475 umount-redirty-EIO hang stays fixed: each
+	 * buffer gets exactly one sync write and is then quiesced.
 	 */
+
+	/* PASS 1: mark dirty + drop pin (make all pdflush-eligible, unpin all). */
 	hlist_for_each_entry_safe(ob, tmp, &batch, node) {
 		struct buffer_head *bh = ob->bh;
 
@@ -209,25 +268,39 @@ int briefs_journal_flush_owned(struct briefs_journal *j)
 			 * device: end_buffer_write_sync() clears BH_Uptodate on a
 			 * lost write.  Calling mark_buffer_dirty() on a
 			 * !uptodate buffer trips WARN_ON_ONCE(!buffer_uptodate)
-			 * (fs/buffer.c) -- the new non-allowlisted message that
-			 * fails generic/475's _check_dmesg.  The buffer's write
-			 * already failed once, so re-submitting would only fail
-			 * again; record the error and skip the re-write.  The
-			 * pinned content stays in cache (the b_data is intact;
-			 * only the flag was cleared) but is not on disk -- which
-			 * is already the case after the first failed write, and
-			 * the journal records that reference it are either still
-			 * live (checkpoint aborted, see below) or were discarded
-			 * only after a *successful* flush_owned wrote them.
+			 * (fs/buffer.c) -- the non-allowlisted message that
+			 * fails generic/475's _check_dmesg.  Record the error and
+			 * leave it clean; pass 2's sb_bread re-reads the (stale)
+			 * on-disk content and the buffer_dirty() guard skips the
+			 * re-write.
 			 */
+			if (buffer_uptodate(bh))
+				mark_buffer_dirty(bh);
+			else
+				ret = -EIO;
+			brelse(bh);		/* drop the track-time get_bh pin */
+			ob->bh = NULL;		/* dangles after brelse; pass 2 re-resolves */
+		}
+	}
+
+	/* PASS 2: re-resolve via sb_bread (pin gone -> bh may be evicted) and
+	 * sync+quiesce each still-dirty buffer.
+	 */
+	hlist_for_each_entry_safe(ob, tmp, &batch, node) {
+		struct buffer_head *bh = sb_bread(j->vfs_sb, ob->block);
+
+		if (bh) {
 			if (buffer_uptodate(bh)) {
-				if (briefs_sync_write_buffer(bh, j->vfs_sb,
+				if (buffer_dirty(bh) &&
+				    briefs_sync_dirty_buffer(bh, j->vfs_sb,
 							     "owned flush"))
 					ret = -EIO;
 			} else {
-				ret = -EIO;
+				ret = -EIO;	/* sb_bread read failure (expected on dm-error) */
 			}
-			brelse(bh);		/* drop the track-time get_bh pin */
+			brelse(bh);
+		} else {
+			ret = -EIO;
 		}
 		hlist_del(&ob->node);
 		kfree(ob);
@@ -659,7 +732,12 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	 * (loop-free, quiesce-on-EIO) instead of the coarse looping sync_blockdev()
 	 * -- the targeted flush the old comment asked for, and the generic/475 fix:
 	 * a deferred-dirty buffer that hits a write error is quiesced once rather
-	 * than re-submitted and redirtied forever (umount hang).
+	 * than re-submitted and redirtied forever (umount hang).  It runs in two
+	 * passes (mark+unpin all, then sb_bread+sync+quiesce each) so the Phase-2
+	 * pin is dropped before the sync wait -- the Phase-2 delta that hangs
+	 * generic/676 under the full-suite loaded-cache condition (holding the pin
+	 * across the sync wait keeps the owned batch unreclaimable and
+	 * pdflush-ineligible for the whole wait).
 	 *
 	 * We also release before briefs_alloc_sync() to avoid the AB-BA deadlock
 	 * with alloc->lock (LOCK ORDER FIX).

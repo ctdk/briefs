@@ -1562,9 +1562,15 @@ void briefs_journal_untrack_bh(struct briefs_journal *j, u64 block);
  * mark the buffer dirty: it pins it via briefs_journal_track_bh() (get_bh ->
  * buffer_busy -> try_to_free_buffers refuses eviction) and records the pinned
  * bh in the owned set.  The buffer stays uptodate with the new content, not
- * BH_Dirty, and un-evictable; briefs_journal_flush_owned() writes it in place
- * at checkpoint.  Every BrieFS deferred metadata dirty site must route through
- * here; a missed site is a drift gap.
+ * BH_Dirty, and un-evictable for the dirty-time->commit window;
+ * briefs_journal_flush_owned() drops the pin at the commit (marking the
+ * buffer dirty so pdflush can clean+reclaim it concurrently during the sync
+ * write -- the generic/676 fix; Phase 2 is the only version that holds the
+ * pin across the sync write, keeping the owned batch unreclaimable and
+ * pdflush-ineligible for the whole wait, which deadlocks 676 under the
+ * full-suite loaded-cache condition) and then writes+quiesces it.  Every
+ * BrieFS deferred metadata dirty site must route
+ * through here; a missed site is a drift gap.
  *
  * Replay and journaless mounts have no checkpoint cycle (replay persists
  * synchronously via the end-of-replay sync_blockdev), so they fall back to

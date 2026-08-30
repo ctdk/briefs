@@ -130,16 +130,25 @@ struct briefs_journal {
 	 * wrapper does NOT call mark_buffer_dirty(), so the folio is never
 	 * dirty-tagged on the bdev address_space and pdflush never writes it
 	 * between commits (metadata drift eliminated).  briefs_journal_flush_owned()
-	 * drains the set at checkpoint, writes each pinned bh in place
-	 * (mark_buffer_dirty + briefs_sync_dirty_buffer) and brelse()s the pin.
+	 * drains the set at checkpoint and writes the batch in TWO passes: PASS 1
+	 * marks each buffer dirty + brelse()s the pin (so the now-BH_Dirty buffer
+	 * is pdflush-eligible and reclaimable once cleaned -- the generic/676 fix;
+	 * Phase 2 is the only version that holds the pin across the sync write,
+	 * keeping the owned batch unreclaimable and pdflush-ineligible for the
+	 * whole wait, which deadlocks 676 under the full-suite loaded-cache
+	 * condition), and PASS 2 re-resolves each block via sb_bread() and
+	 * syncs+quiesces it.
 	 *
-	 * Phase 1 tracked block NUMBERS (an unpinned bh pointer could dangle on
-	 * eviction); Phase 2 pins (get_bh) the bh, so the pointer is stable and
-	 * stored here directly -- flush_owned() needs no sb_bread re-resolve.  The
-	 * get_bh pin on the existing bdev cache is a sufficient eviction control;
-	 * no BrieFS metadata address_space is required (the earlier "needs an
-	 * address_space first" note was over-conservative -- buffer_busy() is the
-	 * only eviction gate for def_blk_aops, which has no release_folio).
+	 * The pin's lifetime is dirty-time->commit only.  Phase 1 tracked block
+	 * NUMBERS (an unpinned bh pointer could dangle on eviction); Phase 2 pins
+	 * (get_bh) the bh so the pointer is stable for the drain + PASS 1, but
+	 * PASS 1 drops the pin before the sync write and PASS 2 re-resolves via
+	 * sb_bread(ob->block) -- the stored bh can dangle once unpinned, as in
+	 * Phase 1.  The get_bh pin on the existing bdev cache is a sufficient
+	 * eviction control for the dirty-time->commit window; no BrieFS metadata
+	 * address_space is required (the earlier "needs an address_space first"
+	 * note was over-conservative -- buffer_busy() is the only eviction gate
+	 * for def_blk_aops, which has no release_folio).
 	 */
 	spinlock_t owned_lock;
 	DECLARE_HASHTABLE(owned_blocks, 9);
