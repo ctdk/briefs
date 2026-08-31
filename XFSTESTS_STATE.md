@@ -5,41 +5,109 @@ measured by fresh full-suite and targeted runs on the VM.
 
 ## Overview
 
-**Current state (2026-08-19, master `0fd1448`):** two post-snapshot changes make
-the 2026-08-18 table below stale on two points — `720` has since been un-skipped
-and passes, and `299` is partially fixed.
+**Current state (2026-08-31, master `ddcb7ef`):** the Phase-2 journal-owned-pin
+regression cycle is complete and the suite is at its best baseline yet —
+**456 pass / 5 fail / 0 hang** (2026-08-30 full run). All 5 fails are accepted
+non-PASS; there are **no open BrieFS regressions** from the Phase-2 work.
 
-- **Hard FAIL (2):** `311` (dm-flakey + fsync durability baseline, deferred),
-  `563` (cgroup writeback intentionally disabled — `9385fc8`, 6.12 iput
-  CVE-2026-31703 workaround; not a BrieFS defect).
-- **Skipped (2, default `SKIP_TESTS="generic/475 generic/492"` in
-  `run-suite.sh`):** `475` (dm-error crash-replay trie-realloc, deferred — needs
-  a journal-format change), `492` (libblkid has no BrieFS probe; the kernel
-  `FS_IOC_*FSLABEL` ioctls work — a userspace `util-linux` task, skipped
-  `991faac`).
-- **`720` — un-skipped and PASSING** (`3666a3e`: punch O(E²)→O(1) via threaded
-  blocks-freed count + btree internal-split separator read-after-memset fix;
-  ~58 s).
-- **`299` — PARTIALLY FIXED** (`1005b2e` btree modify-path `wait_on_buffer` +
-  `briefs_get_zero_block` reuse wait; `0fd1448` fallocate O(extents) + halving
-  alloc): ~70-80% pass (was 0% — always HANG/FAIL on master). Residual ~20-30%
-  = **problem-2**, the lockless read-vs-writeback btree race (a
-  `trust_verified=false` reader racing writeback's mid-edit btree insert, which
-  takes `extent_lock` but not `inode_lock`; ~169 `btree: node N checksum
-  mismatch`/boot, transient `-EIO`, occasional timeout). Deferred — needs
-  read-path serialization / CoW btree nodes / per-buffer seqlock. See
+- **Hard FAIL (5, all accepted non-PASS):**
+  - `311` — pre-existing baseline flake (dm-flakey + fsync timing); reproduces
+    on a known-good baseline.
+  - `475` — dm-error crash-replay, **accepted ~50%**: the residual is the C2
+    block-layer-capped mode, not BrieFS-addressable. The Phase-2 pin design
+    (`5524267`) fixed the pdflush-drift mode that motivated the old "needs a
+    journal-format change" framing — that framing is superseded.
+  - `492` — libblkid has no BrieFS probe; the kernel `FS_IOC_*FSLABEL` ioctls
+    work — a `util-linux` task (skip-list entry since `991faac`).
+  - `538` — DIO unaligned-AIO flake (0x5a data pattern, not metadata); was
+    PASS at `ca4478b`, fired in the 08-30 run.
+  - `563` — cgroup writeback intentionally disabled (`9385fc8`, 6.12 iput
+    CVE-2026-31703 workaround; not a BrieFS defect).
+- **Run-config note (08-30 run):** `SKIP_TESTS="475 492"` is recorded in the
+  archive but was **not honored** by that run config — both ran and FAILed, so
+  the run reports 0 skipped instead of 2. A category shift only; both are
+  accepted non-PASS either way.
+- **Flaky tier (not deterministic):** `127`/`340` (the deferred **problem-2**
+  lockless read-vs-writeback btree race — the `299` residual; `340` confirmed
+  flake via isolated x8 = 8/8 PASS, 2026-08-29; both passed the 08-30 full
+  run), `388` (crash-recovery soak flake, isolated x8 = 8/8 PASS), `617`
+  (~6% io_uring DIO soak flake), `547` (475-family), `521`
+  (455/127-class `msync → blkdev_issue_flush → submit_bio_wait` deadlock,
+  pre-existing, VM-reboot-only).
+- **`299` — PARTIALLY FIXED, passes ~70-80%** (`1005b2e` + `0fd1448`; it
+  passed the 08-30 full run). Residual = problem-2 above. See
   `briefs-dio-stress-cluster-250-252-299-triage`.
-- **Flaky tier (not deterministic):** `127`/`521` (455/127-class
-  `msync → blkdev_issue_flush → submit_bio_wait` deadlock, pre-existing,
-  VM-reboot-only), `617` (~6% io_uring DIO soak flake, deferred), `547`
-  (475-family flake), `011`/`475`.
+- **`720` — un-skipped and PASSING** since `3666a3e` (~58 s).
 
-The 2026-08-18 full-suite snapshot below is the last complete run and predates
-the `720` un-skip and the `299` partial fix; read it as a historical point-in-time.
+### The Phase-2 pin cycle (2026-08-27 → 08-30, closed)
 
-**Latest per-test full-suite run:** 2026-08-18, `tests/xfstests/run-suite.sh`
-over every generic test on the VM, kernel `6.12.101-lockdep`, branch
-`master`, commit `c4082e7`.
+Phase 2 of the journal-owned-bh lifetimes work (`5524267`) changed deferred
+metadata writeback to **pin** buffers (`get_bh`, deliberately not `BH_Dirty`)
+from dirty-time until commit, so pdflush can never write drifted metadata
+between journal commits (the `generic/475` root cause). It introduced a
+19-test regression, fixed in two steps:
+
+1. **Pin-survives-free data aliasing** — the pin survived `briefs_free_block`'s
+   `clean_bdev_aliases` (a no-op against a pinned, not-dirty buffer), so
+   checkpoint's `flush_owned` wrote stale trie/btree content (TRNP/BTRE/ERTB
+   magic + stored filenames) onto blocks already reused as data extents.
+   **Fixed `ca4478b`**: `briefs_journal_untrack_bh` before
+   `clean_bdev_aliases` in the allocator free paths (`alloc.c`). 16/19
+   recovered in the next full suite; the aliasing magic is gone from every
+   dmesg since.
+2. **`generic/676` full-suite-only flush deadlock** — the pin was held across
+   the `sync_dirty_buffer` wait, leaving the whole owned batch unreclaimable
+   and pdflush-ineligible; under the full-suite loaded cache the sync write
+   could never obtain memory (silent D-state freeze, both CPUs, lockdep-silent;
+   passes isolated, so only a full suite can confirm a fix).
+   **Fixed `ddcb7ef`**: two-pass `briefs_journal_flush_owned` — pass 1 drops
+   ALL pins at commit (`mark_buffer_dirty` + `brelse`) before any sync wait;
+   pass 2 re-resolves each block via `sb_bread` (the stored bh can dangle once
+   unpinned) and syncs + quiesces per-buffer.
+
+Cycle result: **17/19 recovered**; the remaining two (`127`/`340`) are the
+pre-existing problem-2 flakes above, not Phase-2 residuals.
+
+**Latest full-suite run:** 2026-08-30, `tests/xfstests/run-suite.sh` over every
+generic test on the VM, kernel `6.12.101-lockdep`, branch `master`, at the
+`ddcb7ef` fix content (the archive's `commit:` field records `f99b741` — the
+runner captured HEAD before the fix commit landed; the code under test was the
+two-pass flush in the working tree).
+Archive: `tests/xfstests/runs/run-20260830-161504-kernel.txt`.
+
+| Bucket           | Count | Notes                                                    |
+|------------------|------:|----------------------------------------------------------|
+| Selected         |   793 | all generic tests                                        |
+| Pass             |   456 | per-test runner reported PASS                            |
+| Fail             |     5 | 311 475 492 538 563 (all accepted non-PASS, see above)   |
+| Not run          |   332 | `_require_*` gate or unsupported feature                 |
+| Skipped          |     0 | skip list not honored this run (see run-config note)     |
+| Hang             |     0 | 676 fixed (`ddcb7ef`)                                    |
+| Mount fail       |     0 | runner tears down DM targets before each test            |
+
+**Phase-2 regression bracket** (three clean-tree full suites, same kernel and
+runner; archives committed in `f99b741` and `caa4196`):
+
+| Baseline                          | Commit     | Pass | Fail | Hang | Skip | Archive |
+|-----------------------------------|------------|-----:|------|-----:|-----:|---------|
+| Phase-2 landing (the regression)  | `5524267`  |  437 | 21   | 1 (676) | 2 | `run-20260827-225818` |
+| untrack-before-free fix           | `ca4478b`  |  452 | 6 (127 299 311 340 388 563) | 1 (676) | 2 (475 492) | `run-20260828-193729` |
+| two-pass flush fix (current)      | `ddcb7ef`  |  456 | 5 (311 475 492 538 563)    | 0 | 0* | `run-20260830-161504` |
+
+\* skip list not honored (475/492 ran); the skip entries themselves are
+unchanged.
+
+vs the pre-Phase-2 reference `c4082e7` (2026-08-18, 455/4/0): net **+1 pass**
+with `299` now in PASS and `720` un-skipped, at the cost of `538` (known DIO
+flake) firing this run. vs `ca4478b`: `676` HANG→PASS plus the flaky tier
+(`127`/`299`/`340`/`388`) all landing PASS this run; `538` went the other way.
+
+### Pre-Phase-2 reference run: 2026-08-18 (`c4082e7`)
+
+The last full suite before the Phase-2 pin work (and the reference the Phase-2
+regression was measured against): `tests/xfstests/run-suite.sh` over every
+generic test on the VM, kernel `6.12.101-lockdep`, branch `master`, commit
+`c4082e7`. Read the table and notes below as a historical point-in-time.
 Archive: `tests/xfstests/runs/run-20260818-181855-kernel.txt`.
 
 | Bucket           | Count | Notes                                                    |
@@ -215,13 +283,46 @@ bulk `./check` invocation.
   `briefs_dir_open` D-state has since been resolved by the shutdown/replay
   durability work (always-checkpoint-at-unmount `f8ef293`, journal-replay
   write_pos `321/322`, and the journal-owned-bh / sync-model changes).
+  388 FAILed once in the 2026-08-28 (`ca4478b`) full suite ("can't read
+  superblock", empty dmesg — the RANDOM soak flake firing under contention),
+  which was **confirmed a flake via isolated x8 = 8/8 PASS** (2026-08-29); it
+  passed the 2026-08-30 full suite. Not a regression.
 - **History:** was expunged via `/xfstests/tests/generic/.exclude` in the
   2026-07-06 run because it wedged the suite. Re-added and green in
   refactor-round-3.
 
 ---
 
-## Failing tests (2026-08-18 per-test run)
+## Failing tests (2026-08-30 full-suite run — current)
+
+The 2026-08-30 run at the `ddcb7ef` fix content (archive
+`run-20260830-161504`) reported **5 failures, 0 hangs**. All five are accepted
+non-PASS — there are **no open BrieFS regressions**:
+
+- `generic/311` — pre-existing baseline flake (dm-flakey + fsync timing);
+  reproduces on a known-good baseline.
+- `generic/475` — dm-error crash-replay, **accepted ~50%** (`ca4478b`-era
+  triage): the residual is the C2 block-layer-capped mode. The Phase-2 pin
+  design (`5524267`) fixed the pdflush-drift mode; the earlier "needs a
+  journal-format change" framing is superseded. Ran this run only because the
+  skip directive wasn't honored.
+- `generic/492` — libblkid-probe gap (kernel `FS_IOC_*FSLABEL` ioctls work; a
+  `util-linux` task). Skip-list entry since `991faac`; ran for the same
+  config reason.
+- `generic/538` — DIO unaligned-AIO flake (0x5a data pattern, not metadata);
+  PASS at `ca4478b`, fired under this run's contention.
+- `generic/563` — cgroup writeback accounting; expected after
+  `SB_I_CGROUPWB` was disabled on 6.12 (`9385fc8`, iput CVE-2026-31703
+  workaround).
+
+**Watched but not failing this run (the flaky tier):** `127`/`299`/`340`/`388`
+all passed — their race windows don't reliably fire even under full-suite
+contention (`340` and `388` confirmed flakes via isolated x8 = 8/8 PASS,
+2026-08-29). See the Overview flaky-tier notes.
+
+---
+
+## Failing tests (2026-08-18 per-test run — pre-Phase-2 reference)
 
 The 2026-08-18 full-suite run (commit `c4082e7`, archive
 `run-20260818-181855`) reported **4 failures**, **0 hangs**. All four are
@@ -249,8 +350,10 @@ run.
   workaround).
 
 **Skipped (2, in the skip list — not counted as fail):** `475 492`. `475` is
-the flaky / deferred dm-error crash-replay bug (needs a journal-format
-change); `492` is the libblkid-probe gap (kernel label ioctls work; a
+the dm-error crash-replay residual, **accepted ~50%** since the `ca4478b`-era
+triage (C2 block-layer-capped; the Phase-2 pin design `5524267` fixed the
+pdflush-drift mode that the old "needs a journal-format change" framing
+targeted); `492` is the libblkid-probe gap (kernel label ioctls work; a
 `util-linux` task, skipped `991faac`). `720` was in this list at the time of
 the 0818 run but is **no longer skipped** — see the post-run updates below.
 
@@ -533,10 +636,11 @@ were read and grouped; all gates are legitimate.
 
 ---
 
-## Passing tests (455)
+## Passing tests (456)
 
-From the 2026-08-18 run archive (`run-20260818-181855-kernel.txt`, commit
-`c4082e7`, master).
+From the 2026-08-30 run archive (`run-20260830-161504-kernel.txt`, the
+`ddcb7ef` fix content, master). Delta vs the 2026-08-18 list: `299` (partial
+fix holding) and `720` (un-skipped) moved in; `538` (DIO flake) moved out.
 
 ```
 001 002 003 004 005 006 007 008
@@ -560,27 +664,27 @@ From the 2026-08-18 run archive (`run-20260818-181855-kernel.txt`, commit
 239 240 245 246 247 248 249 250
 251 252 255 256 257 258 260 263
 269 273 274 275 277 285 286 288
-294 300 306 307 308 309 310 312
-313 314 315 316 317 318 319 320
-321 322 323 325 335 336 337 338
-339 340 341 342 343 344 345 346
-347 348 349 350 351 354 355 360
-361 362 363 364 366 371 375 376
-377 378 388 389 390 391 392 393
-394 401 402 403 404 405 406 409
-410 411 412 416 417 418 420 422
-423 424 426 427 428 430 431 432
-433 434 436 437 438 439 441 442
-443 444 445 446 448 449 450 451
-452 453 454 456 459 460 461 464
-465 466 467 468 469 471 472 473
-474 476 477 478 479 480 481 483
-484 485 486 488 489 490 491 494
-495 496 497 498 499 500 502 503
-504 505 507 508 509 510 511 512
-519 520 521 522 523 524 525 526
-527 528 529 530 531 532 533 534
-535 536 537 538 539 545 547 551
+294 299 300 306 307 308 309 310
+312 313 314 315 316 317 318 319
+320 321 322 323 325 335 336 337
+338 339 340 341 342 343 344 345
+346 347 348 349 350 351 354 355
+360 361 362 363 364 366 371 375
+376 377 378 388 389 390 391 392
+393 394 401 402 403 404 405 406
+409 410 411 412 416 417 418 420
+422 423 424 426 427 428 430 431
+432 433 434 436 437 438 439 441
+442 443 444 445 446 448 449 450
+451 452 453 454 456 459 460 461
+464 465 466 467 468 469 471 472
+473 474 476 477 478 479 480 481
+483 484 485 486 488 489 490 491
+494 495 496 497 498 499 500 502
+503 504 505 507 508 509 510 511
+512 519 520 521 522 523 524 525
+526 527 528 529 530 531 532 533
+534 535 536 537 539 545 547 551
 552 553 554 555 557 558 564 567
 568 569 571 585 586 589 590 591
 597 598 599 604 609 610 611 615
@@ -590,12 +694,12 @@ From the 2026-08-18 run archive (`run-20260818-181855-kernel.txt`, commit
 650 676 677 678 679 680 683 684
 685 686 687 688 690 694 695 696
 697 701 703 704 705 706 707 708
-711 712 713 715 718 719 722 723
-724 725 728 729 730 731 732 735
-736 737 738 740 741 742 743 747
-748 749 750 751 752 753 754 755
-756 758 759 760 761 763 764 771
-779 782 784 785 789 790 792
+711 712 713 715 718 719 720 722
+723 724 725 728 729 730 731 732
+735 736 737 738 740 741 742 743
+747 748 749 750 751 752 753 754
+755 756 758 759 760 761 763 764
+771 779 782 784 785 789 790 792
 ```
 
 ### xfstests xattr cluster (13/13, 2026-07-02)
@@ -648,7 +752,7 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | 417                           | —        | xattr/unlink NOLOGFLUSH durability (dir inode sync, trie collapse, block-0 sentinel) |
 | 464                           | 4ef6ccb  | trie_iter_grow double-free (suite wedge)                      |
 | 023 025 078                   | —        | renameat2 EXCHANGE/WHITEOUT + emptiness check                 |
-| 257 637 676                   | —        | readdir seek/resume (simple_offset)                           |
+| 257 637 676                   | —        | readdir seek/resume (simple_offset) — 676 later regressed under Phase 2 (full-suite-only flush HANG) and was re-fixed by `ddcb7ef` |
 | 471 736                       | —        | readdir rewinddir + trie_gen staleness                        |
 | 313 423 755                   | —        | timestamp cluster (current_time at all sites)                 |
 | 322 321                       | —        | journal-replay write_pos + stale-cached-parent evict          |
@@ -669,9 +773,13 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | 704                           | —        | O_DIRECT (iomap DIO landed; sub-sector DIO accepted)          |
 | 177                           | —        | env (gawk installed)                                          |
 | 079 277 424 545 553 555 596 629 | 38d57d0  | chattr/lsattr inode flags (+S/+D/+i/+a/+d/+A)                |
-| 475                           | —        | dm-error crash-replay: passed this run, still flaky/deferred   |
+| 475                           | —        | dm-error crash-replay: passed this run; since triaged to **accepted ~50%** (C2 block-layer-capped; drift mode fixed by `5524267`) |
 | 048                           | 62167fa  | sync+shutdown file size bug (inode dirty on i_size growth + inode-block RMW lock) |
 | 737                           | 8f4a27b  | O_DIRECT+shutdown file lost (directory sync durability + journal ring back-pressure) |
+| 475 drift mode                | 5524267  | Phase-2 pin: deferred metadata held get_bh + not-BH_Dirty until checkpoint (pdflush can't write drifted metadata) |
+| 19-test aliasing cluster      | ca4478b  | untrack owned bh before clean_bdev_aliases on free (pin-survives-free wrote stale TRNP/BTRE/ERTB onto reused data blocks) |
+| 753 unkillable wedge          | ca4478b  | trie sibling-walk + xattr-chain caps (BRIEFS_TRIE_SIBLING_MAX / BRIEFS_XATTR_MAX_CHAIN = 1024) |
+| 676                           | ddcb7ef  | two-pass flush_owned: drop all pins at commit before the sync wait + sb_bread re-resolve (full-suite-only deadlock) |
 
 > Open BrieFS code bugs as of the 2026-07-06 run (status updated to 2026-08-18):
 > - `299` — btree checksum mismatch under stress; **partially fixed**
