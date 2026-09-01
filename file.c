@@ -1168,7 +1168,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	 * with concurrent appends (briefs_append_extent) and with writeback
 	 * that maps blocks through the extent list.
 	 */
-	mutex_lock(&binfo->extent_lock);
+	down_write(&binfo->extent_lock);
 
 	/*
 	 * Growing an inline-data inode: zero-fill the gap and, if the new
@@ -1198,7 +1198,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
 					&binfo->disk_inode);
 		}
-		mutex_unlock(&binfo->extent_lock);
+		up_write(&binfo->extent_lock);
 		ret = briefs_inode_sync(inode);
 		return ret;
 	}
@@ -1224,7 +1224,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		binfo->disk_inode.filesize = new_size;
 		briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
 				&binfo->disk_inode);
-		mutex_unlock(&binfo->extent_lock);
+		up_write(&binfo->extent_lock);
 		mark_inode_dirty(inode);
 		ret = briefs_inode_sync(inode);
 		return ret;
@@ -1251,7 +1251,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 		briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
 				&binfo->disk_inode);
-		mutex_unlock(&binfo->extent_lock);
+		up_write(&binfo->extent_lock);
 		ret = briefs_inode_sync(inode);
 		return ret;
 	}
@@ -1374,12 +1374,12 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
 			&binfo->disk_inode);
 
-	mutex_unlock(&binfo->extent_lock);
+	up_write(&binfo->extent_lock);
 	ret = briefs_inode_sync(inode);
 	return ret;
 
 out_unlock:
-	mutex_unlock(&binfo->extent_lock);
+	up_write(&binfo->extent_lock);
 out_copy:
 	/* For non-size changes (chown/chmod/etc), copy attributes into the VFS
 	 * inode AND mirror the VFS-derived fields into the in-memory disk inode.
@@ -1659,7 +1659,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 	 * the lock (writeback calls get_block, which takes extent_lock -> would
 	 * self-deadlock if we held it here).
 	 */
-	mutex_lock(&binfo->extent_lock);
+	down_write(&binfo->extent_lock);
 
 	if (binfo->disk_inode.flags & InodeFlagIndexed) {
 		/*
@@ -1719,11 +1719,11 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 				}
 
 				if (ab != 0) {
-					mutex_unlock(&binfo->extent_lock);
+					up_write(&binfo->extent_lock);
 					ret = briefs_zero_block_range(inode->i_sb, ab,
 								      partial_start_off,
 								      partial_end_off);
-					mutex_lock(&binfo->extent_lock);
+					down_write(&binfo->extent_lock);
 					if (ret)
 						goto out_unlock;
 				}
@@ -1746,11 +1746,11 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 				}
 
 				if (ab != 0) {
-					mutex_unlock(&binfo->extent_lock);
+					up_write(&binfo->extent_lock);
 					ret = briefs_zero_block_range(inode->i_sb, ab,
 								      partial_start_off,
 								      BRIEFS_BLOCK_SIZE);
-					mutex_lock(&binfo->extent_lock);
+					down_write(&binfo->extent_lock);
 					if (ret)
 						goto out_unlock;
 				}
@@ -1774,10 +1774,10 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 				}
 
 				if (ab != 0) {
-					mutex_unlock(&binfo->extent_lock);
+					up_write(&binfo->extent_lock);
 					ret = briefs_zero_block_range(inode->i_sb, ab,
 								      0, partial_end_off);
-					mutex_lock(&binfo->extent_lock);
+					down_write(&binfo->extent_lock);
 					if (ret)
 						goto out_unlock;
 				}
@@ -1849,11 +1849,11 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 			if (start_blk >= ext.offset && start_blk < ext_end) {
 				u64 abs_block = ext.phys + (start_blk - ext.offset);
 
-				mutex_unlock(&binfo->extent_lock);
+				up_write(&binfo->extent_lock);
 				ret = briefs_zero_block_range(inode->i_sb, abs_block,
 							      partial_start_off,
 							      partial_end_off);
-				mutex_lock(&binfo->extent_lock);
+				down_write(&binfo->extent_lock);
 				if (ret)
 					goto out_unlock;
 				changed = true;
@@ -1863,11 +1863,11 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 		    start_blk < ext_end) {
 			u64 abs_block = ext.phys + (start_blk - ext.offset);
 
-			mutex_unlock(&binfo->extent_lock);
+			up_write(&binfo->extent_lock);
 			ret = briefs_zero_block_range(inode->i_sb, abs_block,
 						      partial_start_off,
 						      BRIEFS_BLOCK_SIZE);
-			mutex_lock(&binfo->extent_lock);
+			down_write(&binfo->extent_lock);
 			if (ret)
 				goto out_unlock;
 			changed = true;
@@ -1877,11 +1877,11 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 		    (end_blk - 1) < ext_end) {
 			u64 abs_block = ext.phys + ((end_blk - 1) - ext.offset);
 
-			mutex_unlock(&binfo->extent_lock);
+			up_write(&binfo->extent_lock);
 			ret = briefs_zero_block_range(inode->i_sb, abs_block,
 						      0,
 						      partial_end_off);
-			mutex_lock(&binfo->extent_lock);
+			down_write(&binfo->extent_lock);
 			if (ret)
 				goto out_unlock;
 			changed = true;
@@ -1990,7 +1990,7 @@ static long briefs_do_punch_hole(struct file *file, loff_t offset, loff_t len)
 			&binfo->disk_inode);
 
 out_unlock:
-	mutex_unlock(&binfo->extent_lock);
+	up_write(&binfo->extent_lock);
 
 out_update:
 	if (changed) {
@@ -2152,15 +2152,15 @@ static void briefs_lock_two_extents(struct briefs_inode_info *b1,
 				     struct briefs_inode_info *b2)
 {
 	if (b1 == b2) {
-		mutex_lock(&b1->extent_lock);
+		down_write(&b1->extent_lock);
 		return;
 	}
 	if (b1 < b2) {
-		mutex_lock(&b1->extent_lock);
-		mutex_lock(&b2->extent_lock);
+		down_write(&b1->extent_lock);
+		down_write(&b2->extent_lock);
 	} else {
-		mutex_lock(&b2->extent_lock);
-		mutex_lock(&b1->extent_lock);
+		down_write(&b2->extent_lock);
+		down_write(&b1->extent_lock);
 	}
 }
 
@@ -2168,11 +2168,11 @@ static void briefs_unlock_two_extents(struct briefs_inode_info *b1,
 				      struct briefs_inode_info *b2)
 {
 	if (b1 == b2) {
-		mutex_unlock(&b1->extent_lock);
+		up_write(&b1->extent_lock);
 		return;
 	}
-	mutex_unlock(&b1->extent_lock);
-	mutex_unlock(&b2->extent_lock);
+	up_write(&b1->extent_lock);
+	up_write(&b2->extent_lock);
 }
 
 /*
@@ -2948,11 +2948,11 @@ static long briefs_do_zero_range(struct file *file, int mode, loff_t offset,
 		int n_ext = 0, n_new = 0, n_allocd = 0, i;
 		u64 cursor, added = 0;
 
-		mutex_lock(&binfo->extent_lock);
+		down_write(&binfo->extent_lock);
 		ret = briefs_collect_all_extents(sb, &binfo->disk_inode,
 						 &old, &n_ext);
 		if (ret) {
-			mutex_unlock(&binfo->extent_lock);
+			up_write(&binfo->extent_lock);
 			goto out;
 		}
 		/* Upper bound: kept/flipped extents (<= 2 each from straddle
@@ -3050,7 +3050,7 @@ static long briefs_do_zero_range(struct file *file, int mode, loff_t offset,
 		kvfree(new);
 		kvfree(old);
 		kvfree(allocd);
-		mutex_unlock(&binfo->extent_lock);
+		up_write(&binfo->extent_lock);
 
 		/* Drop the pagecache for the converted middle: the in-range
 		 * blocks are now unwritten (read as zero), so the stale on-disk
@@ -3069,7 +3069,7 @@ conv_fail:
 		kvfree(new);
 		kvfree(old);
 		kvfree(allocd);
-		mutex_unlock(&binfo->extent_lock);
+		up_write(&binfo->extent_lock);
 		goto out;
 	}
 converted:
@@ -3278,14 +3278,14 @@ static long briefs_do_collapse_range(struct file *file, loff_t offset, loff_t le
 	if (ret)
 		goto out;
 
-	mutex_lock(&binfo->extent_lock);
+	down_write(&binfo->extent_lock);
 	ret = briefs_shift_extents(inode, S, L, -1, &unwritten_freed);
 	if (ret) {
-		mutex_unlock(&binfo->extent_lock);
+		up_write(&binfo->extent_lock);
 		goto out;
 	}
 	briefs_release_unwritten_reserve(inode, unwritten_freed);
-	mutex_unlock(&binfo->extent_lock);
+	up_write(&binfo->extent_lock);
 
 	/* Pages at/after @offset now map to shifted/removed extents: drop them
 	 * so reads repopulate from the new mapping. */
@@ -3355,13 +3355,13 @@ static long briefs_do_insert_range(struct file *file, loff_t offset, loff_t len)
 	if (ret)
 		goto out;
 
-	mutex_lock(&binfo->extent_lock);
+	down_write(&binfo->extent_lock);
 	ret = briefs_shift_extents(inode, S, L, 1, NULL);
 	if (ret) {
-		mutex_unlock(&binfo->extent_lock);
+		up_write(&binfo->extent_lock);
 		goto out;
 	}
-	mutex_unlock(&binfo->extent_lock);
+	up_write(&binfo->extent_lock);
 
 	truncate_inode_pages_range(inode->i_mapping, offset, (loff_t)-1);
 
@@ -3404,13 +3404,13 @@ static int briefs_falloc_one(struct inode *inode, struct briefs_inode_info *binf
 		return -ENOSPC;
 	phys = data_to_abs(bsi->sb, rel);
 	/* No zeroing: the block is recorded unwritten (reads as zero). */
-	mutex_lock(&binfo->extent_lock);
+	down_write(&binfo->extent_lock);
 	ext.offset = iblock;
 	ext.phys = phys;
 	ext.len = 1;
 	ext.flags = BRIEFS_EXT_UNWRITTEN;
 	ret = briefs_btree_insert_locked(inode->i_sb, &binfo->disk_inode, &ext);
-	mutex_unlock(&binfo->extent_lock);
+	up_write(&binfo->extent_lock);
 	if (ret) {
 		briefs_free_block(&bsi->alloc, rel);
 		return ret;	/* -EEXIST or other -errno; block freed */
@@ -3712,14 +3712,14 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 				phys_run = data_to_abs(bsi->sb, rel_run);
 
 				/* Take extent_lock BEFORE insert (lock order). */
-				mutex_lock(&binfo->extent_lock);
+				down_write(&binfo->extent_lock);
 				ext.offset = blk + fill;
 				ext.phys = phys_run;
 				ext.len = want;
 				ext.flags = BRIEFS_EXT_UNWRITTEN;
 				r2 = briefs_btree_insert_locked(inode->i_sb,
 							&binfo->disk_inode, &ext);
-				mutex_unlock(&binfo->extent_lock);
+				up_write(&binfo->extent_lock);
 				if (r2 == -EEXIST) {
 					/*
 					 * Concurrent mmap writer mapped part of

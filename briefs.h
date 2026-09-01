@@ -1163,7 +1163,12 @@ struct briefs_inode_info {
 	u64 inode_number;
 	seqcount_t extent_seq;   /* protects disk_inode extent fields */
 	struct mutex trie_lock;    /* protects directory trie structure */
-	struct mutex extent_lock;  /* serializes extent list appends */
+	/* Serializes extent-tree mutation (all mutators hold it exclusive) and,
+	 * since it became an rwsem, also bounds lockless tree reads: the extent.c
+	 * dispatch layer holds it shared around every trust_verified=false
+	 * descent.
+	 */
+	struct rw_semaphore extent_lock;
 	struct rw_semaphore xattr_sem;  /* serializes xattr block read/modify/free */
 	u64 trie_gen;            /* generation counter for trie modifications */
 	/*

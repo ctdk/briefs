@@ -225,7 +225,7 @@ locked_create:
 	 * thread may have inserted the block while we did the unlocked lookup
 	 * above (without the re-check two threads can both insert an extent for
 	 * the same iblock, leaking the first block). */
-	mutex_lock(&binfo->extent_lock);
+	down_write(&binfo->extent_lock);
 
 	/* Under extent_lock the tail cache is authoritative (every insert that
 	 * can raise cached_max_end runs under this mutex).  If iblock is still
@@ -246,7 +246,7 @@ locked_create:
 			 * retry; the common DIO-unwritten case returns above. */
 			if (flags & IOMAP_DIRECT) {
 				briefs_iomap_fill_mapped(inode, &ext, 0, iomap);
-				mutex_unlock(&binfo->extent_lock);
+				up_write(&binfo->extent_lock);
 				return 0;
 			}
 			/* Convert only the blocks this write actually covers,
@@ -267,11 +267,11 @@ locked_create:
 			}
 		}
 		briefs_iomap_fill_mapped(inode, &ext, 0, iomap);
-		mutex_unlock(&binfo->extent_lock);
+		up_write(&binfo->extent_lock);
 		return 0;
 	}
 	if (ret != -ENOENT) {
-		mutex_unlock(&binfo->extent_lock);
+		up_write(&binfo->extent_lock);
 		return ret;		/* -EIO */
 	}
 
@@ -315,7 +315,7 @@ do_alloc:
 			mark_inode_dirty(inode);
 			briefs_iomap_fill_mapped(inode, &new_ext,
 						 IOMAP_F_NEW, iomap);
-			mutex_unlock(&binfo->extent_lock);
+			up_write(&binfo->extent_lock);
 			return 0;
 		}
 		/* Run insert failed (tree-grow ENOSPC, or a race -EEXIST the
@@ -333,7 +333,7 @@ do_alloc:
 	 */
 	rel = briefs_alloc_block(&bsi->alloc);
 	if (rel == 0) {
-		mutex_unlock(&binfo->extent_lock);
+		up_write(&binfo->extent_lock);
 		return -ENOSPC;
 	}
 	phys = data_to_abs(bsi->sb, rel);
@@ -354,15 +354,15 @@ do_alloc:
 						 &ext, true);
 		if (ret == 0) {
 			briefs_iomap_fill_mapped(inode, &ext, 0, iomap);
-			mutex_unlock(&binfo->extent_lock);
+			up_write(&binfo->extent_lock);
 			return 0;
 		}
-		mutex_unlock(&binfo->extent_lock);
+		up_write(&binfo->extent_lock);
 		return ret;
 	}
 	if (ret != 0) {
 		briefs_free_block(&bsi->alloc, rel);
-		mutex_unlock(&binfo->extent_lock);
+		up_write(&binfo->extent_lock);
 		return ret;
 	}
 
@@ -372,7 +372,7 @@ do_alloc:
 	mark_inode_dirty(inode);
 
 	briefs_iomap_fill_mapped(inode, &new_ext, IOMAP_F_NEW, iomap);
-	mutex_unlock(&binfo->extent_lock);
+	up_write(&binfo->extent_lock);
 	return 0;
 }
 

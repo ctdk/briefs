@@ -351,7 +351,7 @@ int briefs_convert_unwritten_range_iter(struct inode *inode, u64 start_blk,
 	if (start_blk >= end_blk)
 		return 0;
 
-	mutex_lock(&binfo->extent_lock);
+	down_write(&binfo->extent_lock);
 	while (start_blk < end_blk) {
 		struct briefs_extent ext;
 		int lr;
@@ -400,7 +400,7 @@ int briefs_convert_unwritten_range_iter(struct inode *inode, u64 start_blk,
 			break;
 		}
 	}
-	mutex_unlock(&binfo->extent_lock);
+	up_write(&binfo->extent_lock);
 	return ret;
 }
 
@@ -444,9 +444,9 @@ int briefs_append_extent_nojournal(struct super_block *sb, struct briefs_inode *
 	int ret;
 
 	binfo = container_of(di, struct briefs_inode_info, disk_inode);
-	mutex_lock(&binfo->extent_lock);
+	down_write(&binfo->extent_lock);
 	ret = briefs_btree_insert_locked(sb, di, ext);
-	mutex_unlock(&binfo->extent_lock);
+	up_write(&binfo->extent_lock);
 	return ret;
 }
 
@@ -526,7 +526,7 @@ void briefs_free_inode_data(struct inode *inode)
 	 * concurrent get_block can race the free; take extent_lock anyway to honor
 	 * the tree mutators' lock contract.
 	 */
-	mutex_lock(&binfo->extent_lock);
+	down_write(&binfo->extent_lock);
 	briefs_btree_free_all(inode->i_sb, &binfo->disk_inode);
 
 	/*
@@ -547,7 +547,7 @@ void briefs_free_inode_data(struct inode *inode)
 	/* All extents freed -> invalidate the tail cache (0 = unknown). */
 	binfo->cached_max_end = 0;
 	briefs_extent_write_end(binfo);
-	mutex_unlock(&binfo->extent_lock);
+	up_write(&binfo->extent_lock);
 
 	/* Log the cleared inode so replay does not resurrect old extent pointers. */
 	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
