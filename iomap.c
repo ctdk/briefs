@@ -21,10 +21,10 @@
  *                                            an unwritten extent in place.
  *
  * Both mirror briefs_get_block (briefs_extent.c) exactly: the cached_max_end
- * tail-cache fast path, the unlocked lookup with a locked re-check on a write
- * miss, in-place unwritten conversion, run-coalesced allocation under
- * extent_lock (one len<=256 extent per write_begin, with a single-block
- * fallback), and the -EEXIST race adoption.
+ * tail-cache fast path, the read-locked trust_verified=false lookup with a
+ * locked re-check on a write miss, in-place unwritten conversion,
+ * run-coalesced allocation under extent_lock (one len<=256 extent per
+ * write_begin, with a single-block fallback), and the -EEXIST race adoption.
  */
 #include <linux/iomap.h>
 #include <linux/fs.h>
@@ -186,7 +186,9 @@ static int briefs_iomap_begin_common(struct inode *inode, loff_t pos,
 		goto locked_create;
 	}
 
-	/* Unlocked extent lookup (verifies CRCs). */
+	/* Read-locked extent lookup: the dispatcher takes extent_lock shared
+	 * (this caller holds nothing) and still verifies CRCs.
+	 */
 	ret = briefs_inode_lookup_iblock(inode->i_sb, binfo, iblock, &ext, false);
 	if (ret == 0) {
 		/* A write into an unwritten extent converts it to written
@@ -201,7 +203,8 @@ static int briefs_iomap_begin_common(struct inode *inode, loff_t pos,
 		 * extent whose blocks still hold stale on-disk contents, which
 		 * reads return instead of zeros (generic/250/252).  Map the
 		 * extent as IOMAP_UNWRITTEN and let briefs_dio_write_end_io
-		 * convert the successfully-written range on completion. */
+		 * convert the successfully-written range on completion.
+		 */
 		if (write && (ext.flags & BRIEFS_EXT_UNWRITTEN)) {
 			if (flags & IOMAP_DIRECT) {
 				briefs_iomap_fill_mapped(inode, &ext, 0, iomap);
@@ -212,9 +215,11 @@ static int briefs_iomap_begin_common(struct inode *inode, loff_t pos,
 		briefs_iomap_fill_mapped(inode, &ext, 0, iomap);
 		return 0;
 	}
-	/* -ENOENT: not mapped.  -EIO: torn/corrupt read -> fall through to the
-	 * locked re-check, which re-reads under the lock and recovers if the
-	 * tear is gone, or returns the error. */
+	/* -ENOENT: not mapped.  -EIO: on-disk corruption (a torn node can no
+	 * longer be observed: the read held the lock shared) -> drop to the
+	 * locked re-check, which re-reads under the lock and returns the
+	 * error if it persists.
+	 */
 
 	if (!write)
 		return briefs_iomap_fill_hole(inode, pos, length, iblock,

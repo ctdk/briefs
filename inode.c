@@ -362,6 +362,13 @@ struct buffer_head *briefs_get_zero_block(struct super_block *sb, u64 block)
 	wait_on_buffer(bh);
 	clear_buffer_dirty(bh);
 
+	/* The reused block's buffer may still carry BH_Verified from its former
+	 * occupant; the memset below invalidates that content, so drop the bit
+	 * too -- otherwise a trust_verified=true reader could skip the CRC on a
+	 * node image that no longer matches the on-disk checksum.
+	 */
+	clear_buffer_verified(bh);
+
 	memset(bh->b_data, 0, sb->s_blocksize);
 	set_buffer_uptodate(bh);
 	briefs_mark_buffer_dirty(bh, sb);
@@ -498,7 +505,7 @@ struct inode *briefs_new_inode(struct mnt_idmap *idmap, struct inode *dir,
 	 */
 	inode_init_owner(idmap, inode, dir, mode);
 	inode->i_size = 0;
-	inode->i_blocks = briefs_compute_i_blocks(dir->i_sb, &binfo->disk_inode);
+	inode->i_blocks = briefs_compute_i_blocks_unlocked(dir->i_sb, binfo);
 	set_nlink(inode, is_dir ? 2 : 1);
 
 	now = current_time(inode);
@@ -930,7 +937,7 @@ static int briefs_read_and_fill_inode(struct inode *inode)
 	inode->i_uid = make_kuid(&init_user_ns, cpu_di.uid);
 	inode->i_gid = make_kgid(&init_user_ns, cpu_di.gid);
 	inode->i_size = cpu_di.filesize;
-	inode->i_blocks = briefs_compute_i_blocks(sb, &cpu_di);
+	inode->i_blocks = briefs_compute_i_blocks_unlocked(sb, binfo);
 
 	set_nlink(inode, cpu_di.nlinks);
 

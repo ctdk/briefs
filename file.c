@@ -1433,7 +1433,7 @@ int briefs_getattr(struct mnt_idmap *idmap, const struct path *path,
 		i_blocks = 0;
 	} else {
 		/* Recompute i_blocks from all extents in a single in-order walk. */
-		i_blocks = briefs_compute_i_blocks(inode->i_sb, &binfo->disk_inode);
+		i_blocks = briefs_compute_i_blocks_unlocked(inode->i_sb, binfo);
 	}
 	inode->i_blocks = i_blocks;
 	stat->blocks = i_blocks;
@@ -1478,10 +1478,12 @@ int briefs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 /*
  * briefs_block_mapped - return true if logical block @iblock already has a
  * physical mapping in the inode's extent index. O(log E) tree lookup (or inline
- * scan for inline-only inodes); verifies CRCs since this runs unlocked under
- * fallocate's inode_lock (not extent_lock). A torn read surfaces as "not
- * mapped", which is conservative (fallocate may re-zero an already-mapped
- * block — harmless) rather than a false positive.
+ * scan for inline-only inodes). Runs under fallocate's inode_lock but NOT
+ * extent_lock, so trust_verified=false: the dispatcher takes extent_lock
+ * shared around the whole descent and still verifies CRCs. A torn node can
+ * no longer be observed; -EIO here means genuine on-disk corruption, which
+ * surfaces as "not mapped" — conservative (fallocate may re-zero an
+ * already-mapped block — harmless) rather than a false positive.
  */
 static bool briefs_block_mapped(struct inode *inode, u64 iblock)
 {
@@ -3091,7 +3093,7 @@ converted:
 		grew_size = true;
 	}
 
-	inode->i_blocks = briefs_compute_i_blocks(sb, &binfo->disk_inode);
+	inode->i_blocks = briefs_compute_i_blocks_unlocked(sb, binfo);
 	now = current_time(inode);
 	inode->i_ctime_sec = now.tv_sec;
 	inode->i_ctime_nsec = now.tv_nsec;
@@ -3293,7 +3295,7 @@ static long briefs_do_collapse_range(struct file *file, loff_t offset, loff_t le
 
 	inode->i_size -= len;
 	binfo->disk_inode.filesize = inode->i_size;
-	inode->i_blocks = briefs_compute_i_blocks(sb, &binfo->disk_inode);
+	inode->i_blocks = briefs_compute_i_blocks_unlocked(sb, binfo);
 	now = current_time(inode);
 	inode->i_mtime_sec = now.tv_sec;
 	inode->i_mtime_nsec = now.tv_nsec;
@@ -3367,7 +3369,7 @@ static long briefs_do_insert_range(struct file *file, loff_t offset, loff_t len)
 
 	inode->i_size += len;
 	binfo->disk_inode.filesize = inode->i_size;
-	inode->i_blocks = briefs_compute_i_blocks(sb, &binfo->disk_inode);
+	inode->i_blocks = briefs_compute_i_blocks_unlocked(sb, binfo);
 	now = current_time(inode);
 	inode->i_mtime_sec = now.tv_sec;
 	inode->i_mtime_nsec = now.tv_nsec;
@@ -3789,7 +3791,7 @@ falloc_loop_done:
 		grew_size = true;
 	}
 
-	inode->i_blocks = briefs_compute_i_blocks(inode->i_sb, &binfo->disk_inode);
+	inode->i_blocks = briefs_compute_i_blocks_unlocked(inode->i_sb, binfo);
 
 	briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
 			&binfo->disk_inode);

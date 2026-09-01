@@ -78,11 +78,15 @@ int briefs_read_extent(struct super_block *sb, struct briefs_inode *di,
  *
  * Dispatches on InodeFlagIndexed: tree-backed inodes descend the B+ tree from a
  * freshly-snapped root (O(log E)); inline-only inodes snapshot the inline array
- * under extent_seq and scan it (<=8 entries). @trust_verified is forwarded to
- * the tree read: a caller holding extent_lock may skip the CRC on cached,
- * already-verified buffers (no concurrent modifier can have torn them); an
- * unlocked scanner passes false to verify each read (a torn read surfaces as
- * -EIO, which the get_block locked re-check recovers from).
+ * under extent_seq and scan it (<=8 entries). @trust_verified selects the
+ * locking contract: true means the caller holds extent_lock exclusive and may
+ * skip the CRC on cached, already-verified buffers (no concurrent modifier can
+ * have torn them); false means this function takes extent_lock shared around
+ * the whole read, root snapshot included, so the tree cannot change underneath
+ * -- CRCs are still verified as defense-in-depth (and must now always pass).
+ *
+ * Do not pass false while holding extent_lock: the rwsem is not
+ * reader-recursive and would self-deadlock.
  *
  * Returns 0 and fills *ext, -ENOENT if no extent covers @iblock, -EIO on a
  * read/checksum failure.
@@ -97,14 +101,24 @@ int briefs_inode_lookup_iblock(struct super_block *sb,
 	if (di->flags & InodeFlagIndexed) {
 		u64 base;
 		unsigned seq;
+		int ret;
+
+		if (!trust_verified)
+			briefs_extent_read_lock(binfo);
 
 		do {
 			seq = read_seqcount_begin(&binfo->extent_seq);
 			base = di->extent_inline_base;
 		} while (read_seqcount_retry(&binfo->extent_seq, seq));
 		if (base == 0)
-			return -ENOENT;
-		return briefs_btree_lookup(sb, base, iblock, ext, trust_verified);
+			ret = -ENOENT;
+		else
+			ret = briefs_btree_lookup(sb, base, iblock, ext,
+						  trust_verified);
+
+		if (!trust_verified)
+			briefs_extent_read_unlock(binfo);
+		return ret;
 	}
 
 	{
@@ -140,8 +154,10 @@ int briefs_inode_lookup_iblock(struct super_block *sb,
  * lockup). Dispatches on InodeFlagIndexed: tree-backed inodes use
  * briefs_btree_next_extent (O(log E)); inline-only inodes scan the <=8-entry
  * inline array. Returns 0 + *ext, -ENOENT if no extent has offset > @iblock (the
- * hole runs to EOF / the query end), or -EIO. @trust_verified is forwarded like
- * briefs_inode_lookup_iblock.
+ * hole runs to EOF / the query end), or -EIO. @trust_verified selects the
+ * locking contract exactly like briefs_inode_lookup_iblock: true = caller
+ * holds extent_lock exclusive; false = this function takes it shared around
+ * the whole read, root snapshot included.
  */
 int briefs_next_extent(struct super_block *sb, struct briefs_inode_info *binfo,
 		       u64 iblock, struct briefs_extent *ext, bool trust_verified)
@@ -151,13 +167,24 @@ int briefs_next_extent(struct super_block *sb, struct briefs_inode_info *binfo,
 	if (di->flags & InodeFlagIndexed) {
 		u64 base;
 		unsigned seq;
+		int ret;
+
+		if (!trust_verified)
+			briefs_extent_read_lock(binfo);
 
 		do {
 			seq = read_seqcount_begin(&binfo->extent_seq);
 			base = di->extent_inline_base;
 		} while (read_seqcount_retry(&binfo->extent_seq, seq));
-		return briefs_btree_next_extent(sb, base, iblock, ext,
-						trust_verified);
+		if (base == 0)
+			ret = -ENOENT;
+		else
+			ret = briefs_btree_next_extent(sb, base, iblock, ext,
+							trust_verified);
+
+		if (!trust_verified)
+			briefs_extent_read_unlock(binfo);
+		return ret;
 	}
 
 	{

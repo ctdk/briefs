@@ -46,10 +46,24 @@
  *
  *   1. inode_block_lock (per-inode-block RMW mutex array)
  *   2. trie_lock (per-directory trie mutation lock)
- *   3. extent_lock (per-inode extent tree lock)
+ *   3. extent_lock (per-inode extent tree rwsem: exclusive for all mutators,
+ *      shared for the unlocked tree reads the extent.c dispatch layer issues
+ *      with trust_verified=false)
  *   4. alloc->lock (global allocator bitmap lock)
  *   5. xattr_sem (per-inode xattr chain semaphore)
  *   6. j->write_lock (global journal write lock)
+ *
+ * Related ordering facts outside the chain:
+ * - inode_lock / inode_lock_shared (VFS) is always OUTER to extent_lock
+ *   (fallocate, truncate, punch, buffered write hold it around the exclusive
+ *   takes); writeback and mmap write faults take extent_lock without it.
+ * - filemap_invalidate_lock_shared (page_mkwrite) is outer to extent_lock.
+ * - extent_lock is NOT reader-recursive: never issue a trust_verified=false
+ *   tree read (which takes it shared) while holding it.
+ * - The journal's btree drain (briefs_btree_drain) must stay lock-free: it
+ *   runs under j->write_lock, and taking any per-inode extent_lock there
+ *   would invert the extent_lock -> j->write_lock order above.  It reads
+ *   nodes without CRC verification, so it is not a torn-read surface.
  *
  * Violations create deadlock risks:
  * - alloc->lock -> extent_lock: briefs_fallocate used to do this (FIXED)
@@ -1244,6 +1258,26 @@ static inline void briefs_extent_write_end(struct briefs_inode_info *binfo)
 }
 
 /*
+ * Take extent_lock shared around a btree tree read. All node mutators hold the
+ * lock exclusive, so a reader holding it shared can never observe a node
+ * between the in-place b_data edit and btree_commit_node()'s checksum store,
+ * and the root block cannot be freed and reused mid-descent. Do NOT call
+ * while already holding the lock (shared or exclusive): the rwsem is not
+ * reader-recursive and this self-deadlocks. trust_verified=false at the
+ * extent.c dispatch layer is exactly the discriminator -- callers holding
+ * extent_lock pass true and must not use these.
+ */
+static inline void briefs_extent_read_lock(struct briefs_inode_info *binfo)
+{
+	down_read(&binfo->extent_lock);
+}
+
+static inline void briefs_extent_read_unlock(struct briefs_inode_info *binfo)
+{
+	up_read(&binfo->extent_lock);
+}
+
+/*
  * Return the mutex that serializes read-modify-write cycles on the inode block
  * holding @ino.  BrieFS packs 8 inodes per 4K block; concurrent writeback of
  * different inodes in the same block must not interleave or the copy-back can
@@ -1405,17 +1439,23 @@ int briefs_inode_sync(struct inode *inode);
  * the leaves of a B+ tree keyed by briefs_disk_extent.offset). The 9th extent
  * spills inline->tree.
  *
- * All mutators require the caller to hold binfo->extent_lock; the tree's root
- * pointer (extent_inline_base) and the inline array are published under
- * binfo->extent_seq. Every split marks all affected node buffers dirty BEFORE
- * publishing a new root pointer, so the lock-free drain (briefs_btree_drain)
- * that runs before the JRN_INODE_FULL snapshot syncs a complete, consistent tree.
+ * All mutators require the caller to hold binfo->extent_lock exclusive; the
+ * tree's root pointer (extent_inline_base) and the inline array are published
+ * under binfo->extent_seq. Every split marks all affected node buffers dirty
+ * BEFORE publishing a new root pointer, so the lock-free drain
+ * (briefs_btree_drain) that runs before the JRN_INODE_FULL snapshot syncs a
+ * complete, consistent tree.  Every tree READ is serialized against
+ * mutators too: callers holding extent_lock pass trust_verified=true to the
+ * extent.c dispatch layer; unlocked callers pass false and the dispatcher
+ * takes the lock shared around the whole descent (root snapshot included).
  */
 
 /* Lookup the extent covering logical block @iblock. Returns 0 and fills *ext,
  * -ENOENT if no extent covers it, -EIO on read/checksum failure. trust_verified
- * is forwarded to the node read (locked callers may skip CRC on cached buffers,
- * unlocked scanners verify every time). */
+ * selects the locking contract: true = caller holds extent_lock and may skip
+ * the CRC on cached verified buffers; false = the extent.c dispatcher holds
+ * the lock shared and CRCs are verified (defense-in-depth).
+ */
 int briefs_btree_lookup(struct super_block *sb, u64 root_block, u64 iblock,
 			struct briefs_extent *ext, bool trust_verified);
 
@@ -1433,11 +1473,26 @@ int briefs_btree_insert_locked(struct super_block *sb, struct briefs_inode *di,
 
 /* Visit every extent in ascending offset order. For inline-only inodes walks the
  * inline array; for tree-backed inodes descends to the leftmost leaf and follows
- * next_leaf. Stops early if @cb returns negative. Returns 0 or -errno. */
+ * next_leaf. Stops early if @cb returns negative. Returns 0 or -errno.
+ * Caller holds extent_lock exclusive.
+ */
 int briefs_btree_for_each_extent(struct super_block *sb, struct briefs_inode *di,
 				 int (*cb)(const struct briefs_extent *ext,
 					   void *ctx),
 				 void *ctx);
+
+/* Same walk for callers NOT holding extent_lock (getattr, post-unlock i_blocks
+ * recompute): takes the lock shared around the whole descent so the tree
+ * cannot be mutated -- and no node freed and reused -- mid-walk. Callers
+ * holding the lock use briefs_btree_for_each_extent directly (down_read on a
+ * lock already held self-deadlocks). Takes the briefs_inode_info, not the
+ * embedded disk inode, so the locked object and the walked image always match.
+ */
+int briefs_btree_walk_extents_unlocked(struct super_block *sb,
+				       struct briefs_inode_info *binfo,
+				       int (*cb)(const struct briefs_extent *ext,
+						 void *ctx),
+				       void *ctx);
 
 /* briefs_sum_len_cb - for_each callback accumulating extent length (in blocks)
  * into the u64 @ctx points at. */
@@ -1454,6 +1509,7 @@ static inline int briefs_sum_len_cb(const struct briefs_extent *ext, void *ctx)
  * single in-order walk of the B+ tree (or the inline array for inline-only
  * inodes): O(E), no per-extent chain re-walk.  A static inline in the header so
  * the i_blocks recompute at every write/truncate/setattr site can be inlined.
+ * Caller holds extent_lock exclusive.
  */
 static inline u64 briefs_compute_i_blocks(struct super_block *sb,
                                            struct briefs_inode *di)
@@ -1461,6 +1517,19 @@ static inline u64 briefs_compute_i_blocks(struct super_block *sb,
 	struct { u64 blocks; } acc = { .blocks = 0 };
 
 	briefs_btree_for_each_extent(sb, di, briefs_sum_len_cb, &acc);
+	return acc.blocks * (BRIEFS_BLOCK_SIZE / 512);
+}
+
+/* Same, for callers NOT holding extent_lock (getattr, the i_blocks recompute
+ * at sites that already dropped the lock, inode read paths): the walk takes
+ * the lock shared.
+ */
+static inline u64 briefs_compute_i_blocks_unlocked(struct super_block *sb,
+						   struct briefs_inode_info *binfo)
+{
+	struct { u64 blocks; } acc = { .blocks = 0 };
+
+	briefs_btree_walk_extents_unlocked(sb, binfo, briefs_sum_len_cb, &acc);
 	return acc.blocks * (BRIEFS_BLOCK_SIZE / 512);
 }
 
@@ -1487,8 +1556,11 @@ void briefs_btree_free_all(struct super_block *sb, struct briefs_inode *di);
  * extents. No-op for inline-only inodes. Caller holds extent_lock. */
 void briefs_btree_free_nodes_only(struct super_block *sb, struct briefs_inode *di);
 
-/* Lock-free: sync every dirty B-tree node reachable from @root_block. Used by
- * the journal snapshot ordering (must run before JRN_INODE_FULL). Bounded by
+/* Lock-free (by necessity: runs under j->write_lock, where taking the
+ * per-inode extent_lock would invert the extent_lock -> j->write_lock order):
+ * sync every dirty B-tree node reachable from @root_block. Used by the
+ * journal snapshot ordering (must run before JRN_INODE_FULL). Reads node
+ * headers without CRC verification (not a torn-read surface). Bounded by
  * @max_nodes as a guard against corrupt/cyclic trees.
  * Returns 0 on success, -EIO if any node write failed. */
 int briefs_btree_drain(struct super_block *sb, u64 root_block, u64 max_nodes);

@@ -103,19 +103,22 @@ btree_read_node(struct super_block *sb, u64 block, bool trust_verified,
 	 * next writeback carries the new content + new checksum atomically.
 	 *
 	 * Read-only callers pass will_modify=false and skip the wait: the
-	 * dominant such caller is fallocate's briefs_block_mapped(), which does
-	 * one unlocked lookup per block (16M lookups for a 64 GiB fallocate in
-	 * generic/299); waiting on every one, under writeback pressure, makes
+	 * dominant such caller is fallocate's briefs_block_mapped(), which
+	 * probes per run (16M per-block probes were eliminated by bounding the
+	 * hole in O(1)); waiting on every probe, under writeback pressure, made
 	 * the fallocate/truncate loop unable to keep up with fio and the test
-	 * times out.  A torn read on a read-only path is harmless by design: an
-	 * unlocked scanner passes trust_verified=false, so btree_read_node()
-	 * verifies the checksum and a mid-modification snapshot fails the check
-	 * and returns -EIO, which the caller treats conservatively
-	 * (briefs_block_mapped -> "not mapped" -> fallocate re-allocates and
-	 * recovers; the iomap write path re-checks under extent_lock).  No fs
-	 * lock is held across the wait: this is a plain metadata buffer sync
-	 * (no get_block, no extent_lock), so it cannot trip the mmap/writeback
-	 * AB-BA of generic/074.
+	 * timed out.  A trust_verified=false reader used to rely on the CRC as
+	 * a torn-read detector (a mid-modification snapshot failed the check
+	 * and returned -EIO, which callers treated conservatively) -- but that
+	 * left a real race: the read side never retries, and every mismatch
+	 * ticks btree_error_count toward the 100-error forced-read-only
+	 * circuit breaker.  Unlocked tree reads now hold extent_lock shared
+	 * (taken by the extent.c dispatch layer), which excludes every
+	 * in-place editor outright: a torn node cannot be observed at all, and
+	 * the CRC check is pure defense-in-depth that must now always pass.
+	 * No fs lock is held across the will_modify wait itself: this is a
+	 * plain metadata buffer sync (no get_block, no extent_lock), so it
+	 * cannot trip the mmap/writeback AB-BA of generic/074.
 	 */
 	if (will_modify)
 		wait_on_buffer(bh);
@@ -338,13 +341,15 @@ static int btree_lower_bound_block(struct super_block *sb, u64 block, u64 iblock
 			if (!node)
 				return -EIO;
 			/* Scan the next leaf for the first extent > @iblock rather
-			 * than trusting extents[0]: the read path (briefs_iomap_fill_hole)
-			 * calls briefs_next_extent without extent_lock, so a concurrent
-			 * leaf split/merge can repoint next_leaf at a leaf whose first
-			 * extent is at or below @iblock (stale linkage).  Returning that
-			 * would yield a hole mapping ending at or before its start (zero
-			 * length) and trip iomap_iter_done's WARN_ON_ONCE.  Fall back to
-			 * -ENOENT (hole to query end) if the next leaf has no such extent.
+			 * than trusting extents[0]: a leaf split/merge can repoint
+			 * next_leaf at a leaf whose first extent is at or below
+			 * @iblock.  Trust_verified=false readers now hold
+			 * extent_lock shared, which excludes concurrent splitters,
+			 * so this is defense-in-depth -- but returning extents[0]
+			 * blindly here previously yielded a hole mapping ending at
+			 * or before its start (zero length) and tripped
+			 * iomap_iter_done's WARN_ON_ONCE.  Fall back to -ENOENT
+			 * (hole to query end) if the next leaf has no such extent.
 			 */
 			nk = le16_to_cpu(node->hdr.num_keys);
 			for (j = 0; j < nk; j++) {
@@ -1330,6 +1335,27 @@ int briefs_btree_for_each_extent(struct super_block *sb, struct briefs_inode *di
 	return btree_walk_descend(sb, di->extent_inline_base, 0, cb, ctx);
 }
 
+/* Locking wrapper for callers NOT holding extent_lock: takes it shared around
+ * the walk (root snapshot included) so no node can be observed mid-edit and
+ * the root block cannot be freed and reused mid-descent. Callers holding the
+ * lock must use briefs_btree_for_each_extent directly -- down_read on a lock
+ * already held self-deadlocks. Takes the briefs_inode_info (not the embedded
+ * disk inode) so the locked object and the walked image always match; a caller
+ * holding a stack-local copy of the disk inode must copy it into binfo first.
+ */
+int briefs_btree_walk_extents_unlocked(struct super_block *sb,
+				       struct briefs_inode_info *binfo,
+				       int (*cb)(const struct briefs_extent *, void *),
+				       void *ctx)
+{
+	int ret;
+
+	briefs_extent_read_lock(binfo);
+	ret = briefs_btree_for_each_extent(sb, &binfo->disk_inode, cb, ctx);
+	briefs_extent_read_unlock(binfo);
+	return ret;
+}
+
 /* ---------- free + drain ---------- */
 
 /* Recursive free of a subtree: free data blocks of leaf extents, then free all
@@ -1891,6 +1917,15 @@ static int btree_drain_subtree(struct super_block *sb, u64 block, u64 *cap)
  * briefs_btree_drain - sync all dirty btree nodes in a subtree.
  * Returns 0 on success, -EIO if any node write failed.
  * Used before journaling an inode snapshot to ensure btree nodes are on disk.
+ *
+ * Deliberately lock-free: this runs from the journal checkpoint path under
+ * j->write_lock (and from fsync), where taking the per-inode extent_lock
+ * would invert the established extent_lock -> j->write_lock order (mutators
+ * journal extent records under extent_lock).  Safe because it reads node
+ * headers via raw sb_bread() with NO CRC verification, so it is not exposed
+ * to the torn-read -EIO surface; the split ordering (all affected buffers
+ * dirty before a new root is published) is what keeps the drained set
+ * complete.
  */
 int briefs_btree_drain(struct super_block *sb, u64 root_block, u64 max_nodes)
 {
