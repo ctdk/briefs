@@ -5,6 +5,69 @@ measured by fresh full-suite and targeted runs on the VM.
 
 ## Overview
 
+**Current state (2026-09-02, master `c356c9f`):** the deferred **problem-2**
+lockless read-vs-writeback btree race is fixed (`5ccf40a` + `d03e776`:
+per-inode `extent_lock` converted mutex→rwsem; every `trust_verified=false`
+tree read — root-pointer snapshot included — now holds it shared; mutators
+exclusive as before; `briefs_btree_drain` stays lock-free by design under
+`j->write_lock`). The flaky tier collapsed: **zero btree checksum mismatches
+across the whole cycle** (baseline was ~169/boot under 299 stress), zero
+lockdep splats after the exchange follow-up below, and the previously-flaky
+stress tests are now deterministic:
+
+- **Stochastic verification (one boot):** `299` 10/10, `340` 8/8, `127` 5/5,
+  `074` PASS, 1005b2e 18-test regression cluster **18/18**.
+- **`generic/720` lockdep splat — pre-existing, fixed `aeca44e`:**
+  `briefs_lock_two_inodes` took two plain `inode_lock()`s (same i_rwsem
+  lockdep class, no nesting notation). Reproduces on the ddcb7ef baseline
+  on a fresh lockdep boot (the splat pattern predates the rwsem work; it
+  was never seen before because full-suite boots don't reset lockdep
+  state, which self-disables after the first report). Fix: exchange
+  guarantees S_ISREG on both inodes, so the open-coded pair became the
+  exported `lock_two_nondirectories()`/`unlock_two_nondirectories()`
+  (second lock taken with the I_MUTEX_NONDIR2 subclass), plus
+  `down_write_nested` for the second `extent_lock` of
+  `briefs_lock_two_extents` — the same-class pair lockdep would trip
+  next. Verified: 720 PASS, zero dmesg findings, fresh boot.
+- **`generic/676` HANG in the 09-01 full run — timeout marginality, not a
+  regression:** `t_readdir_3` seeks to 4000 random positions per ops-mode;
+  `briefs_readdir` implements seekdir as iterator re-init + linear skip, so
+  the test is quadratic (~604s measured, vs the 300s default). Reproduces
+  on the ddcb7ef baseline module isolated; the binary terminates cleanly
+  ("All tests passed"). Harness fix `c356c9f`: 676 timeout → 1200s.
+  Underlying quadratic seekdir recorded as a follow-up perf item
+  (offset-indexed directory entries).
+- **Hard FAIL (accepted non-PASS):** `311` (dm-flakey + fsync timing,
+  reproduces on known-good baselines), `563` (cgroup writeback disabled on
+  6.12, iput CVE workaround). `475`/`492` stay on the skip list (see
+  below); `538` (DIO unaligned-AIO flake) passed this run.
+
+**Latest full-suite run:** 2026-09-01, every generic test on the VM, kernel
+`6.12.101-lockdep`, at the rwsem fix content (`5ccf40a` + `d03e776`, plus
+working-tree `aeca44e` for 720 — the archive's commit field records the
+pre-commit tree state).
+Archive: `tests/xfstests/runs/run-20260902-001517-kernel.txt`.
+
+| Bucket           | Count | Notes                                                    |
+|------------------|------:|----------------------------------------------------------|
+| Selected         |   793 | all generic tests                                        |
+| Pass             |   456 | flaky tier all PASS: 074 127 299 340 388 538 617 720     |
+| Fail             |     2 | 311 563 (both accepted non-PASS)                          |
+| Not run          |   332 | `_require_*` gate or unsupported feature                 |
+| Skipped          |     2 | 475 492 (skip list honored this run)                     |
+| Hang             |     1 | 676 — timeout marginality; fixed in harness (`c356c9f`)   |
+| Mount fail       |     0 | runner tears down DM targets before each test            |
+
+vs the `ddcb7ef` baseline (456/5/0 with 475+492 unhonored-skips): identical
+pass count, `538` FAIL→PASS, `676` PASS→HANG resolved as harness
+marginality, and the problem-2 flakes (`127`/`340`/`299` residuals) are
+gone — 0 checksum mismatches for the entire run+boot.
+
+**Historical baseline (2026-08-31, master `ddcb7ef`):** the Phase-2 journal-owned-pin
+regression cycle is complete and the suite is at its best baseline yet —
+**456 pass / 5 fail / 0 hang** (2026-08-30 full run). All 5 fails are accepted
+non-PASS; there are **no open BrieFS regressions** from the Phase-2 work.
+
 **Current state (2026-08-31, master `ddcb7ef`):** the Phase-2 journal-owned-pin
 regression cycle is complete and the suite is at its best baseline yet —
 **456 pass / 5 fail / 0 hang** (2026-08-30 full run). All 5 fails are accepted
