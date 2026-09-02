@@ -2125,30 +2125,18 @@ static void briefs_emit_subtract(struct briefs_extent *out, int *n,
 	}
 }
 
-static void briefs_lock_two_inodes(struct inode *inode1, struct inode *inode2)
-{
-	if (inode1 == inode2) {
-		inode_lock(inode1);
-		return;
-	}
-	if (inode1 < inode2) {
-		inode_lock(inode1);
-		inode_lock(inode2);
-	} else {
-		inode_lock(inode2);
-		inode_lock(inode1);
-	}
-}
-
-static void briefs_unlock_two_inodes(struct inode *inode1, struct inode *inode2)
-{
-	if (inode1 == inode2) {
-		inode_unlock(inode1);
-		return;
-	}
-	inode_unlock(inode1);
-	inode_unlock(inode2);
-}
+/*
+ * Lockdep subclass for the second extent_lock of a two-inode pair.  Both
+ * locks share one class (per-inode rwsems keyed on the init_rwsem call
+ * site), so the second acquire must carry a distinct subclass or lockdep
+ * reports a same-class recursion ("missing lock nesting notation").  This
+ * mirrors what lock_two_nondirectories() does for i_rwsem.  The pair is
+ * always taken in pointer order, so the two instances are never acquired
+ * in conflicting orders.
+ */
+enum {
+	BRIEFS_EXTENT_PAIR_SUBCLASS = 1,
+};
 
 static void briefs_lock_two_extents(struct briefs_inode_info *b1,
 				     struct briefs_inode_info *b2)
@@ -2159,10 +2147,12 @@ static void briefs_lock_two_extents(struct briefs_inode_info *b1,
 	}
 	if (b1 < b2) {
 		down_write(&b1->extent_lock);
-		down_write(&b2->extent_lock);
+		down_write_nested(&b2->extent_lock,
+				  BRIEFS_EXTENT_PAIR_SUBCLASS);
 	} else {
 		down_write(&b2->extent_lock);
-		down_write(&b1->extent_lock);
+		down_write_nested(&b1->extent_lock,
+				  BRIEFS_EXTENT_PAIR_SUBCLASS);
 	}
 }
 
@@ -2450,7 +2440,12 @@ static int briefs_exch_contents(struct briefs_exch *fx)
 	bool same_inode = (inode1 == inode2);
 	int ret;
 
-	briefs_lock_two_inodes(inode1, inode2);
+	/*
+	 * lock_two_nondirectories() pointer-orders the pair and takes the
+	 * second with a lockdep nesting subclass; briefs_do_exchange()
+	 * guarantees both are regular files.
+	 */
+	lock_two_nondirectories(inode1, inode2);
 
 	if (fx->fresh) {
 		ret = briefs_check_freshness(inode2, fx->fresh);
@@ -2597,7 +2592,7 @@ static int briefs_exch_contents(struct briefs_exch *fx)
 out_unlock_extents:
 	briefs_unlock_two_extents(b1, b2);
 out_unlock_inodes:
-	briefs_unlock_two_inodes(inode1, inode2);
+	unlock_two_nondirectories(inode1, inode2);
 
 	if (ret == 0 && (fx->flags & BRIEFS_EXCHANGE_RANGE_DSYNC)) {
 		int r2 = briefs_flush_pending_journal_snapshots(bsi->journal, sb);
