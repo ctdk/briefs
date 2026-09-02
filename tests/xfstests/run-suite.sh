@@ -130,6 +130,16 @@ get_timeout() {
                                     # ENOSPC-full scratch fs adds ~170s; 300s
                                     # was marginal (intermittent HANGs on the
                                     # ddcb7ef baseline too, 2026-09-01)
+        generic/676) echo 1200 ;;   # t_readdir_3 over 4000 files: briefs_readdir
+                                    # implements seekdir as re-init + linear
+                                    # skip, so the test's 4000 random seeks per
+                                    # ops-mode are quadratic (~300-350s CPU on
+                                    # this VM); passed the 08-30 full suite just
+                                    # under the 300s default, HANGs just over
+                                    # it since (reproduces on the ddcb7ef
+                                    # baseline, 2026-09-01).  Proper fix =
+                                    # offset-indexed seek (see
+                                    # briefs-large-file-write-perf follow-up)
         *)           echo "$TIMEOUT_SECS" ;;
     esac
 }
