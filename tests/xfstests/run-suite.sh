@@ -125,6 +125,11 @@ get_timeout() {
         generic/017) echo 900 ;;    # 10k nested fcollapse ops (collect/rebuild O(E)/op)
         generic/011) echo 900 ;;    # dirstress (concurrent dir ops)
         generic/475) echo 900 ;;    # dm-error crash-replay
+        generic/299) echo 900 ;;    # fio AIO/DIO + falloc stress: test ~114s
+                                    # but post-test unmount checkpoint of the
+                                    # ENOSPC-full scratch fs adds ~170s; 300s
+                                    # was marginal (intermittent HANGs on the
+                                    # ddcb7ef baseline too, 2026-09-01)
         *)           echo "$TIMEOUT_SECS" ;;
     esac
 }
