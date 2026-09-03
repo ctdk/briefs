@@ -50,13 +50,20 @@ static int briefs_dir_sync(struct inode *dir)
  *
  * Offset scheme (mirrors libfs simple_offset so telldir/seekdir round-trip):
  *   offset 0 -> ".", offset 1 -> "..", offset 2+k -> real (k-th) entry.
- * ctx->pos is the offset of the next entry to read; dir_emit records
- * d_off = ctx->pos (this entry's offset) and we advance ctx->pos after a
- * successful emit.  The persistent trie iterator caches its position as
- * emit_idx (the index of the next real entry it will yield); if a
- * telldir/seekdir lands ctx->pos away from the iterator, we re-initialize
- * and fast-forward to the requested entry so random seeks resume correctly
- * (generic/257, generic/637). */
+ * ctx->pos is the offset of the next entry to read and dir_emit is passed
+ * ctx->pos (this entry's offset).  Note that what userspace sees as record
+ * N's d_off is record N+1's offset: filldir64 back-patches the previous
+ * record's d_off with the offset of the entry it is currently filling
+ * (fs/readdir.c), and the last record in the buffer gets the final
+ * ctx->pos.  That back-patch is precisely what makes seekdir(d_off)
+ * resume at entry N+1 (generic/257, generic/637).
+ *
+ * The persistent trie iterator caches its position as emit_idx (the index
+ * of the next real entry it will yield); if a telldir/seekdir lands
+ * ctx->pos away from the iterator, briefs_trie_iter_seek restores the
+ * nearest recorded checkpoint and fast-forwards < ckpt_stride entries so
+ * random seeks resume in bounded time instead of O(target) walks from the
+ * root (generic/676). */
 int briefs_readdir(struct file *file, struct dir_context *ctx) {
 	struct inode *dir = file_inode(file);
 	struct briefs_inode_info *binfo = briefs_i(dir);
@@ -91,32 +98,24 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 	target = ctx->pos - 2;
 
 	/* If the iterator is not positioned at `target` (telldir/seekdir to a
-	 * non-linear offset, or a rewind), re-initialize and skip forward.
-	 * Also re-initialize when the cached iterator's generation is stale:
-	 * rewinddir(3) lseeks to offset 0, so target == emit_idx == 0 and the
-	 * index check alone would skip the re-init, but the directory may have
-	 * grown between the opendir(3) and the rewinddir(3) (each add/remove
-	 * bumps binfo->trie_gen).  Reusing the stale iterator would then hit
-	 * the gen mismatch in briefs_trie_iter_next (-ESTALE) and return a
-	 * short read with no real entries (generic/471: POSIX requires that
-	 * names added before rewinddir be returned by subsequent readdir). */
+	 * non-linear offset, or a rewind), reposition it: restore the nearest
+	 * checkpoint and fast-forward, or walk forward from the current
+	 * position.  Also reposition when the cached iterator's generation is
+	 * stale: rewinddir(3) lseeks to offset 0, so target == emit_idx == 0
+	 * and the index check alone would skip the reposition, but the
+	 * directory may have grown between the opendir(3) and the
+	 * rewinddir(3) (each add/remove bumps binfo->trie_gen).  Reusing the
+	 * stale iterator would then hit the gen mismatch in
+	 * briefs_trie_iter_next (-ESTALE) and return a short read with no
+	 * real entries (generic/471: POSIX requires that names added before
+	 * rewinddir be returned by subsequent readdir). */
 	if (target != iter->emit_idx || iter->gen != binfo->trie_gen) {
-		char skip_name[BRIEFS_NAME_LEN + 1];
-		u64 k, skip = target;
-		int skip_len;
-		u8 skip_type;
-		u64 skip_ino;
-
 		mutex_lock(&binfo->trie_lock);
-		briefs_trie_iter_init(iter, &binfo->disk_inode, binfo->trie_gen);
-		iter->emit_idx = 0;
-		for (k = 0; k < skip; k++) {
-			if (briefs_trie_iter_next(dir->i_sb, iter, binfo->trie_gen,
-			                          &skip_ino, &skip_type, skip_name,
-			                          &skip_len) != 0)
-				break;	/* seek past EOF */
-			iter->emit_idx++;
-		}
+		/* binfo->trie_gen is read while holding trie_lock, matching the
+		 * old re-init, so the seek never walks against a generation
+		 * that mutated between the outer check and the lock. */
+		briefs_trie_iter_seek(iter, dir->i_sb, &binfo->disk_inode,
+				      binfo->trie_gen, target);
 		mutex_unlock(&binfo->trie_lock);
 	}
 
@@ -153,6 +152,7 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 
 		ctx->pos++;
 		iter->emit_idx++;
+		briefs_trie_ckpt_record(iter);
 	}
 
 	return 0;

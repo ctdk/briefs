@@ -21,6 +21,16 @@
 
 #define TRIE_ANCESTRY_LIMIT 256
 
+/* Checkpoint policy for readdir seeks: snapshot the settled post-emit
+ * iterator state every TRIE_CKPT_STRIDE emitted entries; keep at most
+ * TRIE_CKPT_MAX checkpoints or TRIE_CKPT_BUDGET bytes of blob state per
+ * iterator, whichever binds first.  When a cap is hit, drop every other
+ * checkpoint and double the stride, so a restore is always followed by
+ * < stride skip steps while the footprint halves. */
+#define TRIE_CKPT_STRIDE	64
+#define TRIE_CKPT_MAX		4096
+#define TRIE_CKPT_BUDGET	(128 * 1024)
+
 /* Forward decl: briefs_trie_seed_pool() (below) uses the iterator stack before
  * trie_iter_push() is defined later in this file.
  */
@@ -1289,6 +1299,11 @@ struct trie_iter *briefs_trie_iter_alloc(void)
 	iter->pending = false;
 	iter->gen = 0;
 	iter->emit_idx = 0;
+	iter->ckpts = NULL;
+	iter->ckpt_cnt = 0;
+	iter->ckpt_cap = 0;
+	iter->ckpt_stride = TRIE_CKPT_STRIDE;
+	iter->ckpt_bytes = 0;
 	return iter;
 }
 
@@ -1299,6 +1314,8 @@ void briefs_trie_iter_free(struct trie_iter *iter)
 {
 	if (!iter)
 		return;
+	briefs_trie_ckpt_clear(iter);
+	kfree(iter->ckpts);
 	kfree(iter->stack);
 	kfree(iter->leaf_emitted);
 	kfree(iter);
@@ -1520,4 +1537,261 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 	}
 
 	return -ENOENT;
+}
+
+/*
+ * briefs_trie_ckpt_clear - drop all checkpoints, resetting the policy to
+ * its initial stride.  The ckpts[] pointer array is kept for reuse.
+ */
+void briefs_trie_ckpt_clear(struct trie_iter *iter)
+{
+	int i;
+
+	for (i = 0; i < iter->ckpt_cnt; i++) {
+		kfree(iter->ckpts[i]->refs);
+		kfree(iter->ckpts[i]->flags);
+		kfree(iter->ckpts[i]);
+	}
+	iter->ckpt_cnt = 0;
+	iter->ckpt_bytes = 0;
+	iter->ckpt_stride = TRIE_CKPT_STRIDE;
+}
+
+/*
+ * trie_ckpt_thin - drop every other checkpoint and double the stride.
+ * Preserves the gap invariant "adjacent live checkpoints <= ckpt_stride"
+ * (gaps double as the stride doubles), so a restore is still followed by
+ * < stride skip steps.
+ */
+static void trie_ckpt_thin(struct trie_iter *iter)
+{
+	int i, keep;
+
+	if (iter->ckpt_cnt < 2)
+		return;
+
+	for (i = 1; i < iter->ckpt_cnt; i += 2) {
+		iter->ckpt_bytes -= sizeof(struct trie_ckpt) +
+				    (size_t)iter->ckpts[i]->sp * 9;
+		kfree(iter->ckpts[i]->refs);
+		kfree(iter->ckpts[i]->flags);
+		kfree(iter->ckpts[i]);
+	}
+	keep = 0;
+	for (i = 0; i < iter->ckpt_cnt; i += 2)
+		iter->ckpts[keep++] = iter->ckpts[i];
+	iter->ckpt_cnt = keep;
+	iter->ckpt_stride *= 2;
+}
+
+/*
+ * briefs_trie_ckpt_record - snapshot the current settled walk state as a
+ * checkpoint, if policy allows.  Called after each successful
+ * briefs_trie_iter_next() whose entry was actually emitted (pending == false,
+ * dir.c owns emit_idx).  Best-effort: on ENOMEM or a full budget the
+ * checkpoint is skipped and seeks degrade to the full-skip path.
+ */
+void briefs_trie_ckpt_record(struct trie_iter *iter)
+{
+	struct trie_ckpt *cp;
+	size_t size;
+
+	/* Only the settled post-emit state is checkpointable: while an entry
+	 * is pending, the walk has already consumed it and the stack sits
+	 * one entry ahead of emit_idx. */
+	if (iter->pending)
+		return;
+
+	if (iter->emit_idx % iter->ckpt_stride)
+		return;
+
+	/* Append-only keeps ckpts[] sorted and duplicate-free.  The walk
+	 * state at a given (gen, emit_idx) is deterministic, so re-recording
+	 * a position already held (e.g. re-crossed boundaries after a
+	 * restore) is never needed. */
+	if (iter->ckpt_cnt &&
+	    iter->ckpts[iter->ckpt_cnt - 1]->emit_idx >= iter->emit_idx)
+		return;
+
+	size = sizeof(*cp) + (size_t)iter->sp * 9;
+	if (iter->ckpt_cnt >= TRIE_CKPT_MAX ||
+	    iter->ckpt_bytes + size > TRIE_CKPT_BUDGET) {
+		trie_ckpt_thin(iter);
+		if (iter->ckpt_cnt >= TRIE_CKPT_MAX ||
+		    iter->ckpt_bytes + size > TRIE_CKPT_BUDGET)
+			return;	/* nothing to thin / blob alone over budget */
+	}
+
+	if (iter->ckpt_cnt == iter->ckpt_cap) {
+		struct trie_ckpt **grown;
+		int newcap = iter->ckpt_cap ? iter->ckpt_cap * 2 : 16;
+
+		grown = krealloc(iter->ckpts, newcap * sizeof(*grown),
+				GFP_KERNEL);
+		if (!grown)
+			return;
+		iter->ckpts = grown;
+		iter->ckpt_cap = newcap;
+	}
+
+	cp = kmalloc(sizeof(*cp), GFP_KERNEL);
+	if (!cp)
+		return;
+
+	cp->refs = NULL;
+	cp->flags = NULL;
+	if (iter->sp) {
+		cp->refs = kmalloc_array(iter->sp, sizeof(u64), GFP_KERNEL);
+		cp->flags = kmalloc(iter->sp, GFP_KERNEL);
+		if (!cp->refs || !cp->flags) {
+			kfree(cp->refs);
+			kfree(cp->flags);
+			kfree(cp);
+			return;
+		}
+		memcpy(cp->refs, iter->stack, iter->sp * sizeof(u64));
+		memcpy(cp->flags, iter->leaf_emitted, iter->sp);
+	}
+
+	cp->emit_idx = iter->emit_idx;
+	cp->gen = iter->gen;
+	cp->sp = iter->sp;
+
+	iter->ckpts[iter->ckpt_cnt++] = cp;
+	iter->ckpt_bytes += size;
+}
+
+/*
+ * trie_ckpt_find - binary search for the checkpoint with the largest
+ * emit_idx <= target, or NULL if none.
+ */
+static struct trie_ckpt *trie_ckpt_find(struct trie_iter *iter, u64 target)
+{
+	int lo = 0, hi = iter->ckpt_cnt - 1, best = -1;
+
+	while (lo <= hi) {
+		int mid = lo + (hi - lo) / 2;
+
+		if (iter->ckpts[mid]->emit_idx <= target) {
+			best = mid;
+			lo = mid + 1;
+		} else {
+			hi = mid - 1;
+		}
+	}
+	return best >= 0 ? iter->ckpts[best] : NULL;
+}
+
+/*
+ * trie_ckpt_restore - restore the walk state from a checkpoint.  Returns
+ * false (and leaves the iterator alone) if the blob does not fit the
+ * current stack; the caller falls back to a root re-walk.
+ */
+static bool trie_ckpt_restore(struct trie_iter *iter, struct trie_ckpt *cp)
+{
+	/* iter->cap only ever grows and the blob was captured from this same
+	 * iterator, so cp->sp always fits; guard anyway in case that
+	 * invariant is ever broken. */
+	if (cp->sp > iter->cap)
+		return false;
+
+	if (cp->sp) {
+		memcpy(iter->stack, cp->refs, cp->sp * sizeof(u64));
+		memcpy(iter->leaf_emitted, cp->flags, cp->sp);
+	}
+	iter->sp = cp->sp;
+	iter->emit_idx = cp->emit_idx;
+	iter->gen = cp->gen;
+	iter->pending = false;
+	return true;
+}
+
+/*
+ * trie_iter_skip - advance the walk `steps` real entries, recording
+ * checkpoints at stride boundaries as we go.  Stops early (seek past EOF)
+ * on any briefs_trie_iter_next() error, leaving emit_idx at the number of
+ * entries actually consumed, exactly as the old dir.c skip loop did.
+ */
+static void trie_iter_skip(struct trie_iter *iter, struct super_block *sb,
+			   u64 current_gen, u64 steps)
+{
+	char name[BRIEFS_NAME_LEN + 1];
+	u64 k;
+
+	for (k = 0; k < steps; k++) {
+		if (briefs_trie_iter_next(sb, iter, current_gen,
+					  NULL, NULL, name, NULL) != 0)
+			break;	/* seek past EOF */
+		iter->emit_idx++;
+		briefs_trie_ckpt_record(iter);
+	}
+}
+
+/*
+ * briefs_trie_iter_seek - position the iterator so its next yield is the
+ * `target`-th real entry.  Replaces the old always-re-init-and-skip-from-
+ * root seek in briefs_readdir, which cost O(target) walks per out-of-line
+ * seek (quadratic under generic/676's random-seek phases).
+ */
+void briefs_trie_iter_seek(struct trie_iter *iter, struct super_block *sb,
+			   struct briefs_inode *di, u64 current_gen,
+			   u64 target)
+{
+	struct trie_ckpt *cp;
+	u64 cur;
+
+	/* `visited` is a cyclic-trie backstop only; a long-lived fd doing
+	 * many seeks would otherwise ratchet it toward visit_cap across
+	 * calls and abort a healthy trie with a bogus -EIO. */
+	iter->visited = 0;
+
+	if (iter->gen != current_gen) {
+		/* Rewinddir-after-growth (generic/471) or any add/remove/
+		 * rename since the last call: everything cached about the
+		 * old trie -- including every checkpoint -- is invalid. */
+		briefs_trie_ckpt_clear(iter);
+		briefs_trie_iter_init(iter, di, current_gen);
+		iter->emit_idx = 0;
+		trie_iter_skip(iter, sb, current_gen, target);
+		return;
+	}
+
+	/* While an entry sits in the pending buffer the walk has already
+	 * consumed it; fold its index into emit_idx so the invariant
+	 * "emit_idx == index of the next entry _next yields" holds (the
+	 * buffered entry is abandoned, exactly what a re-init would do). */
+	cur = iter->emit_idx;
+	if (iter->pending) {
+		iter->pending = false;
+		iter->emit_idx++;
+		cur = iter->emit_idx;
+	}
+
+	if (target == cur)
+		return;
+
+	if (target > cur) {
+		/* Forward seek: continue from the current position; no root
+		 * restart (previously even forward seeks re-walked from 0).
+		 * At EOF the first _next returns -ENOENT: an O(1) empty read,
+		 * same output as today's re-init-and-walk-to-EOF. */
+		trie_iter_skip(iter, sb, current_gen, target - cur);
+		return;
+	}
+
+	/* Backward seek: restore the nearest checkpoint at or below the
+	 * target, then skip the remainder (< ckpt_stride steps). */
+	cp = trie_ckpt_find(iter, target);
+	if (cp && trie_ckpt_restore(iter, cp)) {
+		trie_iter_skip(iter, sb, current_gen, target - iter->emit_idx);
+		return;
+	}
+
+	/* No usable checkpoint below the target: re-walk from the root.
+	 * Existing checkpoints stay put; they are still valid for this
+	 * generation.  Position 0 is a virtual checkpoint (the state
+	 * briefs_trie_iter_init just built). */
+	briefs_trie_iter_init(iter, di, current_gen);
+	iter->emit_idx = 0;
+	trie_iter_skip(iter, sb, current_gen, target);
 }

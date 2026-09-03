@@ -1038,6 +1038,20 @@ int briefs_trie_update_entry(struct super_block *sb, struct briefs_inode *di,
                             const char *name, size_t name_len,
                             u64 new_ino, u8 new_type);
 
+/* Checkpoint of a trie iterator's settled post-emit state (pending == false,
+ * i.e. exactly the state from which briefs_trie_iter_next() yields the entry
+ * named by emit_idx).  Valid only for the generation it was captured under;
+ * cleared wholesale on gen mismatch.  refs[]/flags[] are separate
+ * allocations sized exactly to sp so the copies stay FORTIFY-clean
+ * (a flexible-array tail of mixed u64/u8 cannot be __counted_by). */
+struct trie_ckpt {
+	u64 emit_idx;
+	u64 gen;
+	int sp;
+	u64 *refs;	/* kmalloc'd copy of stack[0..sp) */
+	u8 *flags;	/* kmalloc'd copy of leaf_emitted[0..sp) */
+};
+
 /* Trie iterator for readdir - depth-first walk yielding leaves */
 struct trie_iter {
 	u64 *stack;
@@ -1065,12 +1079,29 @@ struct trie_iter {
 				* backstop; see briefs_trie_iter_next)
 				*/
 	u64 visit_cap;         /* 0 = unset; lazily computed on first _next call */
+	/* Checkpoints of the settled post-emit walk state, captured every
+	 * ckpt_stride emitted entries so briefs_trie_iter_seek() can restore
+	 * the nearest one below a seekdir target and skip < ckpt_stride
+	 * entries instead of re-walking from the root.  Valid only for gen;
+	 * cleared wholesale on a generation mismatch.  Recording is
+	 * best-effort: on ENOMEM or a full budget seeks degrade to the old
+	 * full-skip path. */
+	struct trie_ckpt **ckpts;
+	int ckpt_cnt;          /* number of live checkpoints (sorted by emit_idx) */
+	int ckpt_cap;          /* allocated slots in ckpts[] */
+	u64 ckpt_stride;       /* emit entries between checkpoints; doubles when
+				* TRIE_CKPT_MAX / TRIE_CKPT_BUDGET is hit */
+	size_t ckpt_bytes;     /* bytes currently held in checkpoint blobs */
 };
 
 struct trie_iter *briefs_trie_iter_alloc(void);
 void briefs_trie_iter_free(struct trie_iter *iter);
 void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di, u64 gen);
 int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter, u64 current_gen, u64 *ino, u8 *type, char *name_buf, int *name_len);
+void briefs_trie_ckpt_clear(struct trie_iter *iter);
+void briefs_trie_ckpt_record(struct trie_iter *iter);
+void briefs_trie_iter_seek(struct trie_iter *iter, struct super_block *sb,
+			   struct briefs_inode *di, u64 current_gen, u64 target);
 
 /*
  * Packed directory-trie entries store only a 2-byte little-endian length
