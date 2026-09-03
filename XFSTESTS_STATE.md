@@ -5,7 +5,59 @@ measured by fresh full-suite and targeted runs on the VM.
 
 ## Overview
 
-**Current state (2026-09-02, master `c356c9f`):** the deferred **problem-2**
+**Current state (2026-09-03, master `facf534` + `c1e5445`):** the quadratic
+seekdir follow-up is closed. `briefs_readdir` now checkpoints the trie
+iterator's settled post-emit state every 64 emitted entries (per-fd, in
+`struct trie_iter`; generation-tagged, cleared on `trie_gen` mismatch)
+and `seekdir` restores the nearest checkpoint below the target and skips
+< stride entries, so a seek costs O(stride) instead of O(N). `generic/676`
+(`t_readdir_3`, 4000 files) drops **~604s → ~58s** and PASSES under the
+restored 300s default timeout — the 1200s harness override from `c356c9f`
+is reverted (`c1e5445`). No on-disk format change (offsets and
+checkpoints are session-local). The 30000-file thinning path (stride
+ratchet 64→512 at the 128 KiB blob budget) passes, and the readdir
+regression set `003 080 112 257 471 637 676 736` passes 8/8 with fsck
+validation enabled.
+
+**Latest full-suite run:** 2026-09-03, every generic test on the VM,
+kernel `6.12.101-lockdep`, at the seekdir fix content (`facf534` +
+working-tree `c1e5445`; the archive's commit field records the pre-commit
+tree state). All 793 tests ran fresh (RESUMED 0), 676 at the default
+300s timeout.
+Archive: `tests/xfstests/runs/run-20260903-175757-kernel.txt`.
+
+| Bucket           | Count | Notes                                                    |
+|------------------|------:|----------------------------------------------------------|
+| Selected         |   793 | all generic tests                                        |
+| Pass             |   455 | incl. 676 at 58s; flaky tier 127 299 340 388 617 all PASS |
+| Fail             |     4 | 311 538 547 563 (all accepted/flaky, see below)           |
+| Not run          |   332 | `_require_*` gate or unsupported feature                 |
+| Skipped          |     2 | 475 492 (skip list honored)                              |
+| Hang             |     0 | 676 fixed by the checkpoint seek (`facf534`)              |
+| Mount fail       |     0 | runner tears down DM targets before each test            |
+
+vs the 2026-09-01 baseline (456/2/1): `676` HANG→PASS (+1) with the
+timeout override reverted; `538` (DIO unaligned-AIO flake) and `547`
+(475-family flake) fired this run (−2). Both are documented flaky-tier
+tests with no relation to the readdir-only change; everything else is
+identical, zero btree checksum mismatches and zero lockdep splats for
+the whole run+boot.
+
+- **New open item (pre-existing, discovered this cycle):** a rare
+  `btree: node N checksum mismatch` can still fire inside `generic/112`'s
+  AIO-fsx window (~2/10 runs at HEAD, 6/10 with the checkpoint build —
+  not statistically separable). The reader at the splat
+  (`briefs_fallocate → briefs_next_extent`, `trust_verified=false`)
+  demonstrably holds `extent_lock` shared, and no unlocked editor was
+  found by inspection, so the problem-2 "a torn node cannot be observed
+  at all" invariant claim in `btree.c` is refuted by this repro — but the
+  mechanism is unidentified. 112 itself PASSES (the `-EIO` is swallowed
+  by the fallocate hole-bounding fallback). Did not fire in this
+  full-suite run. Next step: instrumented re-read healing check. See
+  `~/src/briefs-notes/112-btree-checksum-mismatch-triage.md` (session
+  notes) and the memory topic file.
+
+**Prior state (2026-09-02, master `c356c9f`):** the deferred **problem-2**
 lockless read-vs-writeback btree race is fixed (`5ccf40a` + `d03e776`:
 per-inode `extent_lock` converted mutex→rwsem; every `trust_verified=false`
 tree read — root-pointer snapshot included — now holds it shared; mutators
@@ -31,12 +83,12 @@ stress tests are now deterministic:
   next. Verified: 720 PASS, zero dmesg findings, fresh boot.
 - **`generic/676` HANG in the 09-01 full run — timeout marginality, not a
   regression:** `t_readdir_3` seeks to 4000 random positions per ops-mode;
-  `briefs_readdir` implements seekdir as iterator re-init + linear skip, so
-  the test is quadratic (~604s measured, vs the 300s default). Reproduces
+  `briefs_readdir` implemented seekdir as iterator re-init + linear skip, so
+  the test was quadratic (~604s measured, vs the 300s default). Reproduced
   on the ddcb7ef baseline module isolated; the binary terminates cleanly
   ("All tests passed"). Harness fix `c356c9f`: 676 timeout → 1200s.
-  Underlying quadratic seekdir recorded as a follow-up perf item
-  (offset-indexed directory entries).
+  **Resolved 2026-09-03 by the checkpointed seekdir (`facf534`); the
+  override is reverted (`c1e5445`) and 676 PASSES at the 300s default.**
 - **Hard FAIL (accepted non-PASS):** `311` (dm-flakey + fsync timing,
   reproduces on known-good baselines), `563` (cgroup writeback disabled on
   6.12, iput CVE workaround). `475`/`492` stay on the skip list (see
