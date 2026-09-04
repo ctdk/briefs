@@ -5,7 +5,49 @@ measured by fresh full-suite and targeted runs on the VM.
 
 ## Overview
 
-**Current state (2026-09-03, master `facf534` + `c1e5445`):** the quadratic
+**Current state (2026-09-04, master `e6d3d6d`):** the generic/112 btree
+checksum mismatch is root-caused and fixed. A range delete frees emptied
+leaves and drops only their parent idx entries, so a surviving
+predecessor's `next_leaf` dangles at the freed block, whose cached
+buffer keeps a corpse image (the delete path zeroes the leaf payload
+during compaction; the freed branch never rewrites num_keys or the
+checksum). `btree_lower_bound_block` was the one reader that followed
+the chain, so a trust=false walk into the corpse failed the CRC — the
+mismatch splat — and after block reuse the chain would have named a
+valid leaf at the wrong key range for trust=true readers. The bound is
+now derived from the idx structure (leaf miss bubbles -ENOENT to the
+parent, which retries right-sibling children); `next_leaf` is
+write-only in the kernel, on-disk images unchanged. Instrumented
+evidence: 5/5 captured splats had the block free in the allocator
+bitmap, all 126 slots zero, buffer frozen, disk coherent-or-reused.
+Verification: generic/112 loop 5 splats → 0 over 12 runs; regression set
+091 092 112 209 263 363 551 617 679 127 521 passes 11/11 with fsck
+validation enabled (516/517 are environmental not-runs: dedupe
+unsupported); full-suite bracket below.
+
+**Latest full-suite run:** 2026-09-04, every generic test on the VM,
+kernel `6.12.101-lockdep`, at the leaf-chain fix content (`e6d3d6d`;
+the archive's commit field records the pre-commit tree state). All 793
+tests ran fresh (RESUMED 0), 676 at the default 300s timeout.
+Archive: `tests/xfstests/runs/run-20260904-063947-kernel.txt`.
+
+| Bucket           | Count | Notes                                                    |
+|------------------|------:|----------------------------------------------------------|
+| Selected         |   793 | all generic tests                                        |
+| Pass             |   456 | flaky tier 127 299 340 388 538 617 all PASS              |
+| Fail             |     3 | 311 547 563 (all accepted/flaky, see below)              |
+| Not run          |   332 | `_require_*` gate or unsupported feature                 |
+| Skipped          |     2 | 475 492 (skip list honored)                              |
+| Hang             |     0 |                                                           |
+| Mount fail       |     0 | runner tears down DM targets before each test            |
+
+vs the 2026-09-03 baseline (455/4/0): `538` (DIO unaligned-AIO flake)
+passed this run (+1); `311`, `547` (475-family flake) and `563`
+(cgroup writeback, disabled) fired as always. Zero btree checksum
+mismatches and zero lockdep splats for the whole run+boot; deltas are
+known flakes only, none related to the reader-side-only change.
+
+**Prior state (2026-09-03, master `facf534` + `c1e5445`):** the quadratic
 seekdir follow-up is closed. `briefs_readdir` now checkpoints the trie
 iterator's settled post-emit state every 64 emitted entries (per-fd, in
 `struct trie_iter`; generation-tagged, cleared on `trie_gen` mismatch)
@@ -17,43 +59,13 @@ is reverted (`c1e5445`). No on-disk format change (offsets and
 checkpoints are session-local). The 30000-file thinning path (stride
 ratchet 64→512 at the 128 KiB blob budget) passes, and the readdir
 regression set `003 080 112 257 471 637 676 736` passes 8/8 with fsck
-validation enabled.
+validation enabled. Full-suite 455/4(311 538 547 563)/0,
+archive `tests/xfstests/runs/run-20260903-175757-kernel.txt`.
 
-**Latest full-suite run:** 2026-09-03, every generic test on the VM,
-kernel `6.12.101-lockdep`, at the seekdir fix content (`facf534` +
-working-tree `c1e5445`; the archive's commit field records the pre-commit
-tree state). All 793 tests ran fresh (RESUMED 0), 676 at the default
-300s timeout.
-Archive: `tests/xfstests/runs/run-20260903-175757-kernel.txt`.
-
-| Bucket           | Count | Notes                                                    |
-|------------------|------:|----------------------------------------------------------|
-| Selected         |   793 | all generic tests                                        |
-| Pass             |   455 | incl. 676 at 58s; flaky tier 127 299 340 388 617 all PASS |
-| Fail             |     4 | 311 538 547 563 (all accepted/flaky, see below)           |
-| Not run          |   332 | `_require_*` gate or unsupported feature                 |
-| Skipped          |     2 | 475 492 (skip list honored)                              |
-| Hang             |     0 | 676 fixed by the checkpoint seek (`facf534`)              |
-| Mount fail       |     0 | runner tears down DM targets before each test            |
-
-vs the 2026-09-01 baseline (456/2/1): `676` HANG→PASS (+1) with the
-timeout override reverted; `538` (DIO unaligned-AIO flake) and `547`
-(475-family flake) fired this run (−2). Both are documented flaky-tier
-tests with no relation to the readdir-only change; everything else is
-identical, zero btree checksum mismatches and zero lockdep splats for
-the whole run+boot.
-
-- **New open item (pre-existing, discovered this cycle):** a rare
-  `btree: node N checksum mismatch` can still fire inside `generic/112`'s
-  AIO-fsx window (~2/10 runs at HEAD, 6/10 with the checkpoint build —
-  not statistically separable). The reader at the splat
-  (`briefs_fallocate → briefs_next_extent`, `trust_verified=false`)
-  demonstrably holds `extent_lock` shared, and no unlocked editor was
-  found by inspection, so the problem-2 "a torn node cannot be observed
-  at all" invariant claim in `btree.c` is refuted by this repro — but the
-  mechanism is unidentified. 112 itself PASSES (the `-EIO` is swallowed
-  by the fallocate hole-bounding fallback). Did not fire in this
-  full-suite run. Next step: instrumented re-read healing check. See
+- **generic/112 btree checksum mismatch — CLOSED by `e6d3d6d`** (was the
+  open item from the seekdir cycle): root-caused to the dangling
+  `next_leaf` chain link followed by `btree_lower_bound_block`; see the
+  2026-09-04 section above. Full investigation tables live in
   `~/src/briefs-notes/112-btree-checksum-mismatch-triage.md` (session
   notes) and the memory topic file.
 
