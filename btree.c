@@ -7,7 +7,11 @@
  * briefs_disk_extent.offset (logical block number); every leaf is maintained
  * sorted by offset, and internal nodes carry separator keys (the min key of
  * each child's right neighbor) plus absolute child block pointers. Leaves are
- * threaded left-to-right by next_leaf for O(E) in-order traversal.
+ * threaded left-to-right by next_leaf, which is maintained on every split but
+ * never traversed by the kernel: a range delete frees emptied leaves and drops
+ * only their parent idx entries, so a surviving predecessor's chain link
+ * dangles at the freed block. All kernel walks (in-order and lower-bound)
+ * descend the idx structure, which cannot reference a freed leaf.
  *
  * Inode states:
  *   inline-only : InodeFlagIndexed clear, extent_inline_base == 0, up to 8
@@ -249,8 +253,9 @@ static int btree_lookup_leaf(struct briefs_extent_btree_node *node,
  * Returns @cb's result (0/-ENOENT) or -EIO on a read or null-child failure.
  *
  * btree_lower_bound_block is NOT routed here: its leaf work (scan for the first
- * extent with offset > @iblock, then follow next_leaf once with a stale-linkage
- * re-scan) is too different from a single leaf callback to share cleanly. */
+ * extent with offset > @iblock) is simple enough, but on a miss it must retry
+ * right-sibling subtrees at each internal level, which the single-callback
+ * skeleton here cannot express. */
 static int btree_descend_to_leaf(struct super_block *sb, u64 block, u64 iblock,
 				 btree_leaf_cb cb, void *ctx, bool trust_verified)
 {
@@ -300,24 +305,31 @@ static int btree_lookup_block(struct super_block *sb, u64 block, u64 iblock,
  *
  * Descends exactly like btree_lookup_block (to the leaf whose subtree holds
  * @iblock's range), then scans that leaf for the first extent with offset >
- * @iblock. If the leaf holds no such extent (every extent there ends at or before
- * @iblock, i.e. @iblock sits in a hole that spans into the next leaf), follows
- * next_leaf once and returns its first extent. Returns 0 and fills *ext, -ENOENT
- * if no extent has offset > @iblock (hole runs to EOF / the query end), or -EIO
- * on a read/checksum failure. */
+ * @iblock. If that subtree holds no such extent (@iblock sits in a hole that
+ * spans past the leaf), the bound is the leftmost live extent of the next
+ * sibling child in idx order, so each internal level retries the children to
+ * the right of the one covering @iblock. The bound is therefore derived from
+ * the parent idx structure, never from the leaf next_leaf chain: a range delete
+ * frees emptied leaves and drops only their parent idx entries, so a surviving
+ * predecessor's next_leaf dangles at the freed block, whose cached buffer
+ * holds a zeroed-payload corpse that fails the CRC (observed as "node N
+ * checksum mismatch" under generic/112's punch+fallocate mix) -- and once the
+ * block is reused, the chain would name a valid node at the WRONG key range.
+ * Returns 0 and fills *ext, -ENOENT if no extent has offset > @iblock (hole
+ * runs to EOF / the query end), or -EIO on a read/checksum failure. */
 static int btree_lower_bound_block(struct super_block *sb, u64 block, u64 iblock,
 				   struct briefs_extent *ext, bool trust_verified)
 {
 	struct buffer_head *bh;
 	struct briefs_extent_btree_node *node;
-	int ret;
+	int p, c, n, ret;
 
 	node = btree_read_node(sb, block, trust_verified, false, &bh);
 	if (!node)
 		return -EIO;
 
 	if (btree_node_is_leaf(node)) {
-		int i, j, nk, num_keys = le16_to_cpu(node->hdr.num_keys);
+		int i, num_keys = le16_to_cpu(node->hdr.num_keys);
 
 		for (i = 0; i < num_keys; i++) {
 			struct briefs_disk_extent *de = &node->u.leaf.extents[i];
@@ -329,58 +341,42 @@ static int btree_lower_bound_block(struct super_block *sb, u64 block, u64 iblock
 				return 0;
 			}
 		}
-		/* No extent > @iblock in this leaf: the bound (if any) is the
-		 * first extent of the next leaf. */
-		{
-			u64 next = le64_to_cpu(node->hdr.next_leaf);
-
-			brelse(bh);
-			if (next == 0)
-				return -ENOENT;
-			node = btree_read_node(sb, next, trust_verified, false, &bh);
-			if (!node)
-				return -EIO;
-			/* Scan the next leaf for the first extent > @iblock rather
-			 * than trusting extents[0]: a leaf split/merge can repoint
-			 * next_leaf at a leaf whose first extent is at or below
-			 * @iblock.  Trust_verified=false readers now hold
-			 * extent_lock shared, which excludes concurrent splitters,
-			 * so this is defense-in-depth -- but returning extents[0]
-			 * blindly here previously yielded a hole mapping ending at
-			 * or before its start (zero length) and tripped
-			 * iomap_iter_done's WARN_ON_ONCE.  Fall back to -ENOENT
-			 * (hole to query end) if the next leaf has no such extent.
-			 */
-			nk = le16_to_cpu(node->hdr.num_keys);
-			for (j = 0; j < nk; j++) {
-				struct briefs_disk_extent *de = &node->u.leaf.extents[j];
-
-				if (le64_to_cpu(de->offset) > iblock) {
-					briefs_disk_extent_to_cpu(de, ext);
-					brelse(bh);
-					return 0;
-				}
-			}
-			brelse(bh);
-			return -ENOENT;
-		}
+		/* No extent > @iblock in this leaf: tell the parent level so it
+		 * can take the bound from a right sibling subtree. */
+		brelse(bh);
+		return -ENOENT;
 	}
 
-	{
-		int p = btree_internal_find_child(node, iblock);
-		u64 child = (p < le16_to_cpu(node->hdr.num_keys))
-			    ? le64_to_cpu(node->u.internal.idx[p].child)
-			    : le64_to_cpu(node->u.internal.trailing_child);
-		brelse(bh);
+	/* Internal node: children 0..n-1 via idx[], child n via trailing_child.
+	 * Descend the child whose key range holds @iblock first; on -ENOENT,
+	 * retry the following children in idx order. Each retry's range lies
+	 * entirely above @iblock, so its own descent returns its leftmost live
+	 * extent -- which is exactly the lower bound the (dangle-prone)
+	 * next_leaf chain used to approximate. The internal node's buffer is
+	 * held across the retries because the child pointers are re-read from
+	 * it (the same hold-across-recursion pattern as
+	 * btree_delete_range_subtree). */
+	n = le16_to_cpu(node->hdr.num_keys);
+	p = btree_internal_find_child(node, iblock);
+	for (c = p; c <= n; c++) {
+		u64 child = (c < n) ? le64_to_cpu(node->u.internal.idx[c].child)
+				    : le64_to_cpu(node->u.internal.trailing_child);
+
 		if (child == 0) {
+			brelse(bh);
 			pr_err("briefs: btree: internal node %llu has null child\n",
 			       block);
 			return -EIO;
 		}
 		ret = btree_lower_bound_block(sb, child, iblock, ext,
-					       trust_verified);
-		return ret;
+					      trust_verified);
+		if (ret != -ENOENT) {
+			brelse(bh);
+			return ret;	/* 0 or -EIO */
+		}
 	}
+	brelse(bh);
+	return -ENOENT;
 }
 
 int briefs_btree_next_extent(struct super_block *sb, u64 root_block, u64 iblock,
@@ -1255,9 +1251,10 @@ int briefs_btree_insert_locked(struct super_block *sb, struct briefs_inode *di,
 /* Recursive in-order descent of the subtree rooted at @block, calling @cb for
  * each leaf extent in ascending offset order. Visits children via the internal
  * idx array + trailing_child -- NOT next_leaf -- so leaves freed and dropped
- * from their parent during a range delete (whose next_leaf link would dangle at
- * a freed/reused block) are never visited. @depth bounds recursion as a guard
- * against a corrupt/cyclic tree. Stops early if @cb returns negative. */
+ * from their parent during a range delete (whose next_leaf link dangles at a
+ * freed/reused block) are never visited; no kernel reader traverses the chain.
+ * @depth bounds recursion as a guard against a corrupt/cyclic tree. Stops early
+ * if @cb returns negative. */
 static int btree_walk_descend(struct super_block *sb, u64 block, int depth,
 			      int (*cb)(const struct briefs_extent *, void *),
 			      void *ctx)
@@ -1329,7 +1326,8 @@ int briefs_btree_for_each_extent(struct super_block *sb, struct briefs_inode *di
 
 	/* Tree-backed: descend the idx tree in order. This visits only leaves
 	 * still referenced by their parent's idx; leaves freed and dropped during
-	 * a range delete (whose next_leaf link would dangle) are skipped. */
+	 * a range delete (whose dangling next_leaf is unreachable -- no kernel
+	 * reader traverses the chain) are skipped. */
 	if (di->extent_inline_base == 0)
 		return 0;
 	return btree_walk_descend(sb, di->extent_inline_base, 0, cb, ctx);
