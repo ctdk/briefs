@@ -60,8 +60,15 @@ SCRATCH_DEV="${SCRATCH_DEV:-/dev/loop1}"
 TEST_MNT="${TEST_DIR:-/mnt/briefs-test}"
 SCRATCH_MNT="${SCRATCH_MNT:-/mnt/briefs-scratch}"
 
-# Ensure module is loaded.
-modprobe briefs_fs 2>/dev/null || insmod "/lib/modules/$(uname -r)/extra/briefs/briefs_fs.ko" 2>/dev/null || true
+# Ensure module is loaded (kernel-mount runs only).  A FUSE run must NOT
+# auto-load the kernel module: a silently-loaded module makes accidental
+# kernel mounts succeed, which is exactly the failure mode that invalidated
+# the 2026-08-06 FUSE results (tests mounting via the kernel instead of the
+# fuse.briefs bridge looked like passes).
+case "$MOUNT_CMD" in
+*fuse*) : ;;
+*) modprobe briefs_fs 2>/dev/null || insmod "/lib/modules/$(uname -r)/extra/briefs/briefs_fs.ko" 2>/dev/null || true ;;
+esac
 
 # Remove any device-mapper devices that wrap TEST_DEV or SCRATCH_DEV.  Tests
 # such as generic/475 create dm-error/dm-thin-pool/dm-log-writes stacks on top
