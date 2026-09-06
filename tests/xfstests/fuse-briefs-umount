@@ -5,6 +5,14 @@
 # so the next test's mkfs doesn't race the journal checkpoint.
 set -uo pipefail
 mnt="${@: -1}"
+# xfstests calls UMOUNT_PROG with either a mountpoint (_scratch_unmount) or a
+# raw device (_check_briefs_filesystem -> _umount_or_remount_ro passes $device).
+# Resolve a device spec to its mountpoint so umount(8)/fusermount work in both
+# cases AND the pidfile key matches the one fuse-briefs-mount wrote (it keys
+# by mountpoint).  Without this, the device-form call left the scratch mount
+# up and the post-test fsck refused to run ("is mounted"), failing 029/030.
+mp=$(findmnt -rncv -S "$mnt" -o TARGET 2>/dev/null | head -1)
+[ -n "$mp" ] && mnt="$mp"
 pidfile="/tmp/fuse-briefs-$(echo "$mnt" | tr / _).pid"
 # Try umount (kernel umount works on FUSE mounts) then fusermount fallback.
 umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || \
