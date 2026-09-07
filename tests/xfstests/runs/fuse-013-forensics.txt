@@ -1,0 +1,32 @@
+=== date ===
+Mon Sep  7 22:22:42 UTC 2026
+=== fsstress proc states ===
+--- pid 2603627 fsstress ---
+stack:
+[<0>] do_wait+0x79/0x170
+[<0>] kernel_wait4+0xb7/0x170
+[<0>] __do_sys_wait4+0x9d/0xb0
+[<0>] do_syscall_64+0x9a/0x1c0
+[<0>] entry_SYSCALL_64_after_hwframe+0x76/0x7e
+syscall: 61 0xffffffffffffffff 0x7ffcf2b77b5c 0x0 0x0 0x0 0x0 0x7ffcf2b77ad0 0x7f33b798a687
+--- pid 2603629 fsstress ---
+stack:
+[<0>] request_wait_answer+0xf2/0x2f0
+[<0>] __fuse_simple_request+0xda/0x2a0
+[<0>] fuse_rename_common+0x117/0x2b0
+[<0>] fuse_rename2+0x5c/0xb0
+[<0>] vfs_rename+0x810/0xdb0
+[<0>] do_renameat2+0x5f6/0x630
+[<0>] __x64_sys_renameat2+0x80/0xd0
+[<0>] do_syscall_64+0x9a/0x1c0
+[<0>] entry_SYSCALL_64_after_hwframe+0x76/0x7e
+syscall: 316 0xffffff9c 0x55e71017e470 0xffffff9c 0x55e710180d10 0x4 0x1 0x7ffcf2b776a8 0x7f33b795a48f
+=== fuse connection queue ===
+/sys/fs/fuse/connections/46/ waiting=1
+=== SIGQUIT daemon ===
+daemon pid: 2603607
+=== daemon alive after QUIT? ===
+daemon exited
+=== fsstress still wedged? ===
+=== goroutine dump from daemon log ===
+77:SIGQUIT: quit

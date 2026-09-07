@@ -1,0 +1,274 @@
+SIGQUIT: quit
+PC=0x490e41 m=0 sigcode=0
+
+goroutine 0 gp=0x94cfe0 m=0 mp=0x94dda0 [idle]:
+runtime.futex(0x94def8, 0x80, 0x0, 0x0, 0x0, 0x0)
+	/usr/local/go/src/runtime/sys_linux_amd64.s:569 +0x21 fp=0x7ffe127b5750 sp=0x7ffe127b5748 pc=0x490e41
+runtime.futexsleep(0x423e7a?, 0x127b57c8?, 0x462b08?)
+	/usr/local/go/src/runtime/os_linux.go:73 +0x30 fp=0x7ffe127b57a0 sp=0x7ffe127b5750 pc=0x44d970
+runtime.notesleep(0x94def8)
+	/usr/local/go/src/runtime/lock_futex.go:47 +0x87 fp=0x7ffe127b57d8 sp=0x7ffe127b57a0 pc=0x423807
+runtime.mPark(...)
+	/usr/local/go/src/runtime/proc.go:1967
+runtime.stopm()
+	/usr/local/go/src/runtime/proc.go:3008 +0x8c fp=0x7ffe127b5808 sp=0x7ffe127b57d8 pc=0x458e2c
+runtime.exitsyscallNoP(0x3c0d4e8baf00)
+	/usr/local/go/src/runtime/proc.go:5114 +0x22a fp=0x7ffe127b5850 sp=0x7ffe127b5808 pc=0x45dd8a
+runtime.mcall()
+	/usr/local/go/src/runtime/asm_amd64.s:496 +0x55 fp=0x7ffe127b5868 sp=0x7ffe127b5850 pc=0x48d6b5
+
+goroutine 1 gp=0x3c0d4e1da1e0 m=nil [sync.WaitGroup.Wait, 100 minutes]:
+runtime.gopark(0x3c0d4e1ee308?, 0x0?, 0x10?, 0xe3?, 0x5000700000007?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0x3c0d4e83d6b0 sp=0x3c0d4e83d690 pc=0x4883ae
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:468
+runtime.semacquire1(0x3c0d4e250ed0, 0x0, 0x1, 0x0, 0x19)
+	/usr/local/go/src/runtime/sema.go:192 +0x232 fp=0x3c0d4e83d718 sp=0x3c0d4e83d6b0 pc=0x468192
+sync.runtime_SemacquireWaitGroup(0x10?, 0xc0?)
+	/usr/local/go/src/runtime/sema.go:114 +0x2e fp=0x3c0d4e83d750 sp=0x3c0d4e83d718 pc=0x489b0e
+sync.(*WaitGroup).Wait(0x3c0d4e250ec8)
+	/usr/local/go/src/sync/waitgroup.go:206 +0x85 fp=0x3c0d4e83d778 sp=0x3c0d4e83d750 pc=0x4983e5
+github.com/hanwen/go-fuse/v2/fuse.(*Server).Wait(...)
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:489
+github.com/ctdk/briefs-utils/fuse.Mount({0x7ffe127b6e8e, 0x9}, {{0x7ffe127b6e9b?, 0x12?}, 0x20?})
+	/go/src/github.com/ctdk/briefs-utils/fuse/fuse.go:199 +0x838 fp=0x3c0d4e83d9a0 sp=0x3c0d4e83d778 pc=0x59de78
+main.main.func1({0x3c0d4e28eb08?, 0x6f5988?}, 0x3c0d4e28eb08)
+	/go/src/github.com/ctdk/briefs-utils/cmd/fuse/fuse.go:80 +0x350 fp=0x3c0d4e83da60 sp=0x3c0d4e83d9a0 pc=0x634770
+github.com/urfave/cli/v3.(*Command).run(0x3c0d4e28eb08, {0x6f5988, 0x3c0d4e260a50}, {0x3c0d4e1ec050, 0x5, 0x5})
+	/home/vagrant/go/pkg/mod/github.com/urfave/cli/v3@v3.10.1/command_run.go:382 +0x2d9a fp=0x3c0d4e83ded0 sp=0x3c0d4e83da60 pc=0x618c3a
+github.com/urfave/cli/v3.(*Command).Run(...)
+	/home/vagrant/go/pkg/mod/github.com/urfave/cli/v3@v3.10.1/command_run.go:95
+main.main()
+	/go/src/github.com/ctdk/briefs-utils/cmd/fuse/fuse.go:87 +0x3a5 fp=0x3c0d4e83df48 sp=0x3c0d4e83ded0 pc=0x6343c5
+runtime.main()
+	/usr/local/go/src/runtime/proc.go:290 +0x2d5 fp=0x3c0d4e83dfe0 sp=0x3c0d4e83df48 pc=0x454015
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0x3c0d4e83dfe8 sp=0x3c0d4e83dfe0 pc=0x48f301
+
+goroutine 2 gp=0x3c0d4e1dad20 m=nil [force gc (idle), 3 minutes]:
+runtime.gopark(0x1d1a2f75bface?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0x3c0d4e20efa8 sp=0x3c0d4e20ef88 pc=0x4883ae
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:468
+runtime.forcegchelper()
+	/usr/local/go/src/runtime/proc.go:375 +0xb3 fp=0x3c0d4e20efe0 sp=0x3c0d4e20efa8 pc=0x454333
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0x3c0d4e20efe8 sp=0x3c0d4e20efe0 pc=0x48f301
+created by runtime.init.7 in goroutine 1
+	/usr/local/go/src/runtime/proc.go:363 +0x1a
+
+goroutine 3 gp=0x3c0d4e1db2c0 m=nil [GC sweep wait]:
+runtime.gopark(0x1?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0x3c0d4e20f788 sp=0x3c0d4e20f768 pc=0x4883ae
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:468
+runtime.bgsweep(0x3c0d4e238000)
+	/usr/local/go/src/runtime/mgcsweep.go:324 +0x151 fp=0x3c0d4e20f7c8 sp=0x3c0d4e20f788 pc=0x43e0b1
+runtime.gcenable.gowrap1()
+	/usr/local/go/src/runtime/mgc.go:214 +0x17 fp=0x3c0d4e20f7e0 sp=0x3c0d4e20f7c8 pc=0x42f417
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0x3c0d4e20f7e8 sp=0x3c0d4e20f7e0 pc=0x48f301
+created by runtime.gcenable in goroutine 1
+	/usr/local/go/src/runtime/mgc.go:214 +0x66
+
+goroutine 4 gp=0x3c0d4e1db4a0 m=nil [GC scavenge wait]:
+runtime.gopark(0x12806c?, 0x89017?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0x3c0d4e20ff78 sp=0x3c0d4e20ff58 pc=0x4883ae
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:468
+runtime.(*scavengerState).park(0x94cc00)
+	/usr/local/go/src/runtime/mgcscavenge.go:425 +0x49 fp=0x3c0d4e20ffa8 sp=0x3c0d4e20ff78 pc=0x43bb29
+runtime.bgscavenge(0x3c0d4e238000)
+	/usr/local/go/src/runtime/mgcscavenge.go:658 +0x59 fp=0x3c0d4e20ffc8 sp=0x3c0d4e20ffa8 pc=0x43c0b9
+runtime.gcenable.gowrap2()
+	/usr/local/go/src/runtime/mgc.go:215 +0x17 fp=0x3c0d4e20ffe0 sp=0x3c0d4e20ffc8 pc=0x42f3d7
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0x3c0d4e20ffe8 sp=0x3c0d4e20ffe0 pc=0x48f301
+created by runtime.gcenable in goroutine 1
+	/usr/local/go/src/runtime/mgc.go:215 +0xa5
+
+goroutine 5 gp=0x3c0d4e250000 m=nil [GOMAXPROCS updater (idle), 100 minutes]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0x3c0d4e210788 sp=0x3c0d4e210768 pc=0x4883ae
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:468
+runtime.updateMaxProcsGoroutine()
+	/usr/local/go/src/runtime/proc.go:7095 +0xe7 fp=0x3c0d4e2107e0 sp=0x3c0d4e210788 pc=0x4627c7
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0x3c0d4e2107e8 sp=0x3c0d4e2107e0 pc=0x48f301
+created by runtime.defaultGOMAXPROCSUpdateEnable in goroutine 1
+	/usr/local/go/src/runtime/proc.go:7083 +0x37
+
+goroutine 6 gp=0x3c0d4e2505a0 m=nil [finalizer wait, 100 minutes]:
+runtime.gopark(0x463815?, 0x1c8?, 0x20?, 0xd9?, 0x3c0d4e20e601?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0x3c0d4e20e620 sp=0x3c0d4e20e600 pc=0x4883ae
+runtime.runFinalizers()
+	/usr/local/go/src/runtime/mfinal.go:210 +0x107 fp=0x3c0d4e20e7e0 sp=0x3c0d4e20e620 pc=0x42e387
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0x3c0d4e20e7e8 sp=0x3c0d4e20e7e0 pc=0x48f301
+created by runtime.createfing in goroutine 1
+	/usr/local/go/src/runtime/mfinal.go:172 +0x3d
+
+goroutine 7 gp=0x3c0d4e250780 m=nil [cleanup wait, 100 minutes]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0x3c0d4e210f68 sp=0x3c0d4e210f48 pc=0x4883ae
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:468
+runtime.(*cleanupQueue).dequeue(0x94cee0)
+	/usr/local/go/src/runtime/mcleanup.go:522 +0xd4 fp=0x3c0d4e210fa0 sp=0x3c0d4e210f68 pc=0x42b0d4
+runtime.runCleanups()
+	/usr/local/go/src/runtime/mcleanup.go:718 +0x45 fp=0x3c0d4e210fe0 sp=0x3c0d4e210fa0 pc=0x42b745
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0x3c0d4e210fe8 sp=0x3c0d4e210fe0 pc=0x48f301
+created by runtime.(*cleanupQueue).createGs in goroutine 1
+	/usr/local/go/src/runtime/mcleanup.go:672 +0xa5
+
+goroutine 8 gp=0x3c0d4e250960 m=nil [GC worker (idle), 3 minutes]:
+runtime.gopark(0x1d1a2f75ec1c5?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0x3c0d4e211740 sp=0x3c0d4e211720 pc=0x4883ae
+runtime.gcBgMarkWorker(0x3c0d4e1f6150)
+	/usr/local/go/src/runtime/mgc.go:1791 +0xeb fp=0x3c0d4e2117c8 sp=0x3c0d4e211740 pc=0x431eeb
+runtime.gcBgMarkStartWorkers.gowrap1()
+	/usr/local/go/src/runtime/mgc.go:1695 +0x17 fp=0x3c0d4e2117e0 sp=0x3c0d4e2117c8 pc=0x431dd7
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0x3c0d4e2117e8 sp=0x3c0d4e2117e0 pc=0x48f301
+created by runtime.gcBgMarkStartWorkers in goroutine 1
+	/usr/local/go/src/runtime/mgc.go:1695 +0x105
+
+goroutine 9 gp=0x3c0d4e250b40 m=nil [GC worker (idle), 3 minutes]:
+runtime.gopark(0x1d1a2f7609185?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0x3c0d4e211f40 sp=0x3c0d4e211f20 pc=0x4883ae
+runtime.gcBgMarkWorker(0x3c0d4e1f6150)
+	/usr/local/go/src/runtime/mgc.go:1791 +0xeb fp=0x3c0d4e211fc8 sp=0x3c0d4e211f40 pc=0x431eeb
+runtime.gcBgMarkStartWorkers.gowrap1()
+	/usr/local/go/src/runtime/mgc.go:1695 +0x17 fp=0x3c0d4e211fe0 sp=0x3c0d4e211fc8 pc=0x431dd7
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0x3c0d4e211fe8 sp=0x3c0d4e211fe0 pc=0x48f301
+created by runtime.gcBgMarkStartWorkers in goroutine 1
+	/usr/local/go/src/runtime/mgc.go:1695 +0x105
+
+goroutine 18 gp=0x3c0d4e250f00 m=nil [sync.WaitGroup.Wait, 100 minutes]:
+runtime.gopark(0x576f3e?, 0x3c0d4e250ec8?, 0xff?, 0xff?, 0x3c0d4e66bf08?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0x3c0d4e21de50 sp=0x3c0d4e21de30 pc=0x4883ae
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:468
+runtime.semacquire1(0x3c0d4e250ed0, 0x0, 0x1, 0x0, 0x19)
+	/usr/local/go/src/runtime/sema.go:192 +0x232 fp=0x3c0d4e21deb8 sp=0x3c0d4e21de50 pc=0x468192
+sync.runtime_SemacquireWaitGroup(0x0?, 0x0?)
+	/usr/local/go/src/runtime/sema.go:114 +0x2e fp=0x3c0d4e21def0 sp=0x3c0d4e21deb8 pc=0x489b0e
+sync.(*WaitGroup).Wait(0x3c0d4e250ec8)
+	/usr/local/go/src/sync/waitgroup.go:206 +0x85 fp=0x3c0d4e21df18 sp=0x3c0d4e21def0 pc=0x4983e5
+github.com/hanwen/go-fuse/v2/fuse.(*Server).Serve(0x3c0d4e250d20)
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:460 +0x85 fp=0x3c0d4e21dfc8 sp=0x3c0d4e21df18 pc=0x5768e5
+github.com/hanwen/go-fuse/v2/fs.Mount.gowrap1()
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fs/mount.go:26 +0x17 fp=0x3c0d4e21dfe0 sp=0x3c0d4e21dfc8 pc=0x58c2b7
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0x3c0d4e21dfe8 sp=0x3c0d4e21dfe0 pc=0x48f301
+created by github.com/hanwen/go-fuse/v2/fs.Mount in goroutine 1
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fs/mount.go:26 +0x9f
+
+goroutine 82 gp=0x3c0d4e625c20 m=9 mp=0x3c0d4e702008 [syscall, 100 minutes]:
+syscall.Syscall(0x0, 0xa, 0x3c0d4e9001b0, 0x20080)
+	/usr/local/go/src/syscall/syscall_linux.go:74 +0x25 fp=0x3c0d4e83bdd8 sp=0x3c0d4e83bd78 pc=0x4a9ae5
+syscall.read(0x3c0d4e250e88?, {0x3c0d4e9001b0?, 0x3c0d4e61e008?, 0x3c0d4e61e008?})
+	/usr/local/go/src/syscall/zsyscall_linux_amd64.go:736 +0x38 fp=0x3c0d4e83be18 sp=0x3c0d4e83bdd8 pc=0x4a7f38
+syscall.Read(...)
+	/usr/local/go/src/syscall/syscall_unix.go:183
+github.com/hanwen/go-fuse/v2/fuse.(*Server).readRequest.func1(...)
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:375
+github.com/hanwen/go-fuse/v2/fuse.handleEINTR(...)
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:348
+github.com/hanwen/go-fuse/v2/fuse.(*Server).readRequest(0x3c0d4e250d20)
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:373 +0x1aa fp=0x3c0d4e83bf28 sp=0x3c0d4e83be18 pc=0x575f6a
+github.com/hanwen/go-fuse/v2/fuse.(*Server).loop(0x3c0d4e250d20)
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:548 +0x6c fp=0x3c0d4e83bfc8 sp=0x3c0d4e83bf28 pc=0x576c2c
+github.com/hanwen/go-fuse/v2/fuse.(*Server).readRequest.gowrap2()
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:410 +0x17 fp=0x3c0d4e83bfe0 sp=0x3c0d4e83bfc8 pc=0x576437
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0x3c0d4e83bfe8 sp=0x3c0d4e83bfe0 pc=0x48f301
+created by github.com/hanwen/go-fuse/v2/fuse.(*Server).readRequest in goroutine 64
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:410 +0x46d
+
+goroutine 68 gp=0x3c0d4e8ba780 m=7 mp=0x3c0d4e247008 [syscall, 96 minutes]:
+syscall.Syscall(0x0, 0xa, 0x3c0d4e2fa1b0, 0x200d0)
+	/usr/local/go/src/syscall/syscall_linux.go:74 +0x25 fp=0x3c0d4e369dd8 sp=0x3c0d4e369d78 pc=0x4a9ae5
+syscall.read(0x3c0d4e250e88?, {0x3c0d4e2fa1b0?, 0x3c0d4e2451a0?, 0x3c0d4e28e848?})
+	/usr/local/go/src/syscall/zsyscall_linux_amd64.go:736 +0x38 fp=0x3c0d4e369e18 sp=0x3c0d4e369dd8 pc=0x4a7f38
+syscall.Read(...)
+	/usr/local/go/src/syscall/syscall_unix.go:183
+github.com/hanwen/go-fuse/v2/fuse.(*Server).readRequest.func1(...)
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:375
+github.com/hanwen/go-fuse/v2/fuse.handleEINTR(...)
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:348
+github.com/hanwen/go-fuse/v2/fuse.(*Server).readRequest(0x3c0d4e250d20)
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:373 +0x1aa fp=0x3c0d4e369f28 sp=0x3c0d4e369e18 pc=0x575f6a
+github.com/hanwen/go-fuse/v2/fuse.(*Server).loop(0x3c0d4e250d20)
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:548 +0x6c fp=0x3c0d4e369fc8 sp=0x3c0d4e369f28 pc=0x576c2c
+github.com/hanwen/go-fuse/v2/fuse.(*Server).readRequest.gowrap2()
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:410 +0x17 fp=0x3c0d4e369fe0 sp=0x3c0d4e369fc8 pc=0x576437
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0x3c0d4e369fe8 sp=0x3c0d4e369fe0 pc=0x48f301
+created by github.com/hanwen/go-fuse/v2/fuse.(*Server).readRequest in goroutine 49
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:410 +0x46d
+
+goroutine 64 gp=0x3c0d4e8baf00 m=nil [sync.Mutex.Lock, 100 minutes]:
+runtime.gopark(0x0?, 0x3c0d4e83f858?, 0xb0?, 0xe5?, 0x200?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0x3c0d4e83f828 sp=0x3c0d4e83f808 pc=0x4883ae
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:468
+runtime.semacquire1(0x3c0d4e28e09c, 0x0, 0x3, 0x2, 0x16)
+	/usr/local/go/src/runtime/sema.go:192 +0x232 fp=0x3c0d4e83f890 sp=0x3c0d4e83f828 pc=0x468192
+internal/sync.runtime_SemacquireMutex(0x11?, 0x12?, 0x200?)
+	/usr/local/go/src/runtime/sema.go:95 +0x25 fp=0x3c0d4e83f8c8 sp=0x3c0d4e83f890 pc=0x4899e5
+internal/sync.(*Mutex).lockSlow(0x3c0d4e28e098)
+	/usr/local/go/src/internal/sync/mutex.go:149 +0x15d fp=0x3c0d4e83f918 sp=0x3c0d4e83f8c8 pc=0x496a9d
+internal/sync.(*Mutex).Lock(...)
+	/usr/local/go/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/usr/local/go/src/sync/mutex.go:46
+github.com/ctdk/briefs-utils/fuse.(*BrieFS).lockOtherInodeBlock(0x3c0d4e28e008?, 0x2000?, 0x0?)
+	/go/src/github.com/ctdk/briefs-utils/fuse/fuse.go:265 +0xb9 fp=0x3c0d4e83f938 sp=0x3c0d4e83f918 pc=0x59e159
+github.com/ctdk/briefs-utils/fuse.(*BrieFS).renameWhiteout(0x3c0d4e28e008, 0x8, {0x3c0d4e1f4060, 0x11}, 0x11, {0x3c0d4e1ea0b0, 0xe})
+	/go/src/github.com/ctdk/briefs-utils/fuse/link_ops.go:652 +0x791 fp=0x3c0d4e83fbb8 sp=0x3c0d4e83f938 pc=0x5a8ff1
+github.com/ctdk/briefs-utils/fuse.(*BrieFS).renameInDir(0x69b900?, 0x422b9f?, {0x3c0d4e1f4060?, 0x3c0d4e83fc48?}, 0x426765?, {0x3c0d4e1ea0b0?, 0x69b900?}, 0x4e83fc01?)
+	/go/src/github.com/ctdk/briefs-utils/fuse/link_ops.go:311 +0x35 fp=0x3c0d4e83fc08 sp=0x3c0d4e83fbb8 pc=0x5a6895
+github.com/ctdk/briefs-utils/fuse.(*brieFSNode).Rename(0x6cb5e0?, {0x0?, 0x3c0d4e1ea0b0?}, {0x3c0d4e1f4060?, 0x574953?}, {0x6f4bd0?, 0x3c0d4e5fa840?}, {0x3c0d4e1ea0b0?, 0x0?}, 0x4)
+	/go/src/github.com/ctdk/briefs-utils/fuse/fuse.go:724 +0x6c fp=0x3c0d4e83fc58 sp=0x3c0d4e83fc08 pc=0x5a03ec
+github.com/hanwen/go-fuse/v2/fs.(*rawBridge).Rename(0x3c0d4e278180, 0x3c0d4e1f61c0, 0x3c0d4e28e7a8, {0x3c0d4e1f4060, 0x11}, {0x3c0d4e1ea0b0, 0xe})
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fs/bridge.go:615 +0x152 fp=0x3c0d4e83fce0 sp=0x3c0d4e83fc58 pc=0x580b72
+github.com/hanwen/go-fuse/v2/fuse.doRename2(0x3c0d4e250d20, 0x3c0d4e28e588)
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/opcode.go:429 +0x64 fp=0x3c0d4e83fd28 sp=0x3c0d4e83fce0 pc=0x56ae64
+github.com/hanwen/go-fuse/v2/fuse.(*protocolServer).handleRequest(0x3c0d4e250d20, 0x3c0d4e245500, 0x3c0d4e28e588)
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/protocol-server.go:50 +0x202 fp=0x3c0d4e83fe20 sp=0x3c0d4e83fd28 pc=0x572ac2
+github.com/hanwen/go-fuse/v2/fuse.(*Server).handleRequest(0x3c0d4e250d20, 0x3c0d4e28e588)
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:602 +0x2f2 fp=0x3c0d4e83ff28 sp=0x3c0d4e83fe20 pc=0x577252
+github.com/hanwen/go-fuse/v2/fuse.(*Server).loop(0x3c0d4e250d20)
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:573 +0x105 fp=0x3c0d4e83ffc8 sp=0x3c0d4e83ff28 pc=0x576cc5
+github.com/hanwen/go-fuse/v2/fuse.(*Server).readRequest.gowrap2()
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:410 +0x17 fp=0x3c0d4e83ffe0 sp=0x3c0d4e83ffc8 pc=0x576437
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0x3c0d4e83ffe8 sp=0x3c0d4e83ffe0 pc=0x48f301
+created by github.com/hanwen/go-fuse/v2/fuse.(*Server).readRequest in goroutine 29
+	/home/vagrant/go/pkg/mod/github.com/hanwen/go-fuse/v2@v2.10.1/fuse/server.go:410 +0x46d
+
+rax    0xca
+rbx    0x0
+rcx    0x490e43
+rdx    0x0
+rdi    0x94def8
+rsi    0x80
+rbp    0x7ffe127b5790
+rsp    0x7ffe127b5748
+r8     0x0
+r9     0x0
+r10    0x0
+r11    0x286
+r12    0x45db60
+r13    0x2
+r14    0x94cfe0
+r15    0x14a
+rip    0x490e41
+rflags 0x286
+cs     0x33
+fs     0x0
+gs     0x0

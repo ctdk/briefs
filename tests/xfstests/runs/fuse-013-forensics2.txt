@@ -1,0 +1,15 @@
+=== repro start 22:38:43 ===
+=== WEDGE DETECTED at 22:39:03 (poll 4) ===
+D-state pid: none; fuse waiting: 1
+--- all fsstress states ---
+pid 2608052 state S
+pid 2608053 state S
+--- fuse connections ---
+/sys/fs/fuse/connections/46/ waiting=1
+=== SIGQUIT daemon 22:39:04 ===
+daemon exited on QUIT
+goroutine dump: 266 lines
+=== repro done 22:39:14 ===
+  RESUMED:    0
+========================================
+  -> archive written: /vagrant/tests/xfstests/runs/run-20260907-223843-fuse.txt
