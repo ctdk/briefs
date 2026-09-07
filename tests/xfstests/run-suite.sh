@@ -129,6 +129,10 @@ get_timeout() {
         generic/127) echo 1200 ;;   # 6x concurrent fsx (mmap variants)
         generic/521) echo 1200 ;;   # 1M-op DIO fsx soak
         generic/522) echo 1200 ;;   # 1M-op buffered fsx soak
+        generic/013) echo 1200 ;;   # 3x fsstress-1000; bridge syncs journal +
+                                    # fdatasyncs the device per op, so each
+                                    # phase is ~4x kernel time; 300s KILLed a
+                                    # healthy run mid-phase-1 (2026-09-07)
         generic/017) echo 900 ;;    # 10k nested fcollapse ops (collect/rebuild O(E)/op)
         generic/011) echo 900 ;;    # dirstress (concurrent dir ops)
         generic/475) echo 900 ;;    # dm-error crash-replay
@@ -494,7 +498,12 @@ for testname in "$@"; do
     # Run without -b briefs so result files land in results/generic/ and the
     # existing generic golden outputs are used.
     tsecs=$(get_timeout "$testname")
-    timeout "$tsecs" ./check "$testname" 2>&1 | tee "$LOG_DIR/check-${testbase}-${RUN_TIMESTAMP}.log"
+    # SIGKILL, not the default SIGTERM: bash defers an untrapped SIGTERM while
+    # it waits for a foreground child, so a wedged test (e.g. fsstress stuck in
+    # D-state on the mount) never dies and the "timeout" runs forever
+    # (2026-09-07, generic/013: 300s timeout still alive 65min later).  A KILLed
+    # timeout exits 137, handled as HANG below alongside the classic 124.
+    timeout -s KILL "$tsecs" ./check "$testname" 2>&1 | tee "$LOG_DIR/check-${testbase}-${RUN_TIMESTAMP}.log"
     status=${PIPESTATUS[0]}
 
     # Clean up mounts before moving on, best effort.
@@ -515,7 +524,7 @@ for testname in "$@"; do
 
     # Optional fsck validation (enabled via FSCK_ENABLED=1).
     # Runs after each test to catch on-disk consistency bugs early.
-    if [ "$FSCK_ENABLED" = "1" ] && [ "$status" -ne 124 ]; then
+    if [ "$FSCK_ENABLED" = "1" ] && [ "$status" -ne 124 ] && [ "$status" -ne 137 ]; then
         if "$FSCK_BRIEFS_PROG" -n "$TEST_DEV" 2>&1 | tee "$LOG_DIR/fsck-${testbase}-${RUN_TIMESTAMP}.log"; then
             : # fsck clean
         else
@@ -525,7 +534,8 @@ for testname in "$@"; do
         fi
     fi
 
-    if [ "$status" -eq 124 ]; then
+    # 124 = SIGTERM'd by timeout; 137 = SIGKILL'd (see the -s KILL note above).
+    if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
         echo "  -> HANG (timeout)"
         HANG=$((HANG + 1))
         STATUS["$testbase"]=HANG
