@@ -38,11 +38,18 @@ Forensics in `fuse-hang-forensics-20260908.md` (evidence:
 `fuse-hang-forensics-20260908.txt`).  Not one family:
 - **~48 = throughput blowout, not a deadlock.**  The bridge runs a full
   journal checkpoint on every metadata op (~6 device fsyncs, ~31 ms per
-  create — measured 24,406 fsyncs / 125 s for 4096 creates on generic/006),
-  because `syncLocked`'s back-pressure condition
-  (journal_write.go:278 `writePos == JournalLogStart`) is true after every
-  checkpoint (it sets logStart = writePos) — a context-free misport of the
-  kernel's ring-full-only test (journal.c:591-618).  Metadata-heavy tests
+  create — measured 24,406 fsyncs / 125 s for 4096 creates on generic/006):
+  the bridge calls `Journal.Sync` per metadata op, and `syncLocked`'s
+  back-pressure condition (journal_write.go:278 `writePos ==
+  JournalLogStart`) is true after every checkpoint (it sets logStart =
+  writePos — the empty-ring state).  The condition is a faithful port of
+  the kernel's *sync-path* back-pressure (journal.c:2476), which also fires
+  in the empty state; the divergence is call frequency — the kernel syncs
+  the journal only on explicit fsync/sync_fs/DIRSYNC (dir.c:25 rejects
+  per-create flushes as far too slow), so its rare path became the bridge's
+  every-op common case.  FIX A landed 2026-09-08 (blocksSinceCheckpoint
+  gate + retire-first full-ring handling + per-sync allocator bitmap
+  writes; ~6 fsyncs/op → ~2).  Metadata-heavy tests
   exceed the 300 s timeout with zero output.
 - **4 = genuine livelock** (full-core CPU burn all 300 s): 091 617 751 760.
 - **11 unclassified** (no scope-CPU report): 014 069 103 108 133 249 449
@@ -112,9 +119,11 @@ alone converts 98 kernel passes into NOT RUN.
 
 ## Follow-ups
 1. ~~Reproduce one HANG with SIGQUIT forensics~~ DONE 2026-09-08 — root
-   cause of the dominant family found (per-op checkpoint misport; see
-   fuse-hang-forensics-20260908.md).  Remaining: fix it (options A/B in the
-   forensics doc), chase the 4 livelocks (091 617 751 760) and the 11
+   cause of the dominant family found (per-op checkpoint from per-op Sync
+   hitting the kernel-faithful sync-path back-pressure; see
+   fuse-hang-forensics-20260908.md).  Fix A landed 2026-09-08 in
+   briefs-utils (blocksSinceCheckpoint gate).  Remaining: VM/suite
+   validation of fix A, chase the 4 livelocks (091 617 751 760) and the 11
    unclassified HANGs, then re-run the 63.
 2. Port TrieIterator to a dynamic name stack (011 013 070 078).
 3. Triage the remaining FAILs individually (the taxonomy above covers
