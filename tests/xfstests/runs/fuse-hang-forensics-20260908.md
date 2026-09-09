@@ -185,6 +185,93 @@ Validation on the 64G VM image (/dev/vdb1, journal 64 blocks):
   for exactly this; plain `umount` does not — test scripts must wait for
   the daemon pid to exit before fsck.
 
+## Fix B: landed and validated 2026-09-09
+
+Implemented in briefs-utils (bu-refactor-1).  The bridge no longer syncs the
+journal per metadata op — kernel parity (dir.c:25: the kernel syncs only on
+fsync/sync_fs/DIRSYNC/O_SYNC, plus unmount and the ring-full back-pressure
+checkpoint).
+
+Architecture (the bridge's analog of kernel buffer heads):
+
+- **Per-op block cache** (cacheBegin/loadBlock/saveBlock) gives one shared
+  working buffer per block within an op — the kernel gets this for free
+  from sb_bread/sb_getblk; without it two roles landing on the same packed
+  trie page (parent + last sibling) clobbered each other.
+- **Deferred-metadata map** (`BrieFS.dirtyBlocks`): a successful op ends
+  with `mergeCache` — dirty blocks move into daemon memory with NO I/O.
+  Readers stay coherent between merge and drain through a dirty-view hook
+  on `BlockDevice.ReadBlock`.  This is the bridge's write-back cache: the
+  kernel's pinned, not-yet-dirty buffer heads.
+- **Drain at the commit point**: the journal's syncLocked calls the
+  `MetaSyncer` hook AFTER persisting log_end (the commit point) and BEFORE
+  the allocator bitmap persist — so the records justifying a block are
+  always durable before the block reaches the device page cache
+  (kernel parity: briefs_journal_flush_owned), and a completed sync leaves
+  the on-disk bitmaps converged with the committed records.
+- **Deferred frees** — the generic/040/041 free-vs-commit class under fix B:
+  `trieReleasePage` and `freeInodeData` used to free blocks in memory
+  BEFORE their freeing records (JRN_TRIE_ALLOC op=1 / JRN_EXTENT_FREE)
+  committed; previously the per-op op-end sync retroactively gated this.
+  A freed block could be reallocated for data whose fresh content the
+  drain then overwrote (caught by TestCrashSlotReuseReplay: a reused trie
+  page clobbered a new file's data — live readback was already corrupt
+  BEFORE the crash).  Now `deferBlockFree` queues the free in `pendingFrees`
+  and drops the block's deferred content; `SyncMeta` applies the frees
+  after the commit point.  The frees apply in SyncMeta — NOT in
+  SyncAllocators — because the pre-commit ring-full back-pressure path
+  (`checkpointLocked(flushPending=false)` inside syncLocked) also calls
+  SyncAllocators and would publish bitmap frees ahead of their uncommitted
+  records, reintroducing the same corruption in the other direction.
+  Freed-after-own-sync paths (commitExtentChange, xattr chain rewrite)
+  use `freeBlockNow`, which also drops any stale deferred copy.
+- **Crash model** (kill -9: process memory lost, OS page cache survives):
+  an unsynced op simply never happened — the same semantics a buffered op
+  has against the kernel.  A completed journal sync leaves the image fully
+  converged (fsck clean on the raw crashed image, no replay needed).
+
+Unit tests: full `go test ./...` green, `-race` green.  Three tests updated
+for the new contract (crash test syncs before the kill; trie-cap test
+flushes deferred metadata before corrupting on-disk state; fstrim/hardlink
+tests sync before asserting free counts).
+
+Validation on the 64G VM image (/dev/vdb1, journal 64 blocks), same
+conditions as the fix A A/B:
+
+- **200 shell creates through the bridge: 0.06 s (~0.3 ms/op), second
+  batch 0.11 s** — fix A left 38 ms/op; the per-op Sync was the whole
+  residual.  For scale, the kernel module does ~0.5 ms/op.
+- **Crash after a synced workload** (kill -9 of the real daemon pid, no
+  unmount): raw-image fsck CLEAN, 14 committed records converged; fresh
+  mount reads every synced file back.
+- **Crash with unsynced creates pending**: fsck exit 0; remount shows the
+  synced files intact and the unsynced creates gone (kernel-equivalent
+  buffered semantics).
+- **generic/006: PASS in 6 s** (was ~311 s against the 300 s timeout —
+  pure per-op-Sync blowout; a 50× cut, now far under the kernel-adjacent
+  scale).
+
+Gotchas found during validation:
+
+- The mount helper's pidfile can hold a pid that is not the serving daemon
+  (a race with the systemd-run unit's fork); crash tests must take the pid
+  from `ps` (`[f]use.briefs -i <dev> -m <mnt>`), or the "crash" silently
+  degrades to a clean unmount.
+- systemd-run refuses to append the daemon's stdout to a log file owned by
+  a non-root user ("Failed at step STDOUT"): a stale log from a user
+  earlier mount attempt wedges every later root mount with a bare
+  "timed out waiting for <mnt>".  rm the stale /tmp log to recover.
+- **Expected fsck WARNING after a post-replay crash** (not a fix B bug):
+  `MarkCleanAfterReplay` bumps checkpoint_seq in the superblock without
+  writing a checkpoint block — kernel-faithful (journal.c:2177 does the
+  same; the checkpoint path's block-before-superblock order at
+  journal.c:838 only covers real checkpoints).  So an image crashed between
+  a replay-bearing mount and the first checkpoint shows "checkpoint seq
+  mismatch: payload=N, superblock=N+1" (fsck exit 0).  The window exists
+  in the kernel too but was invisible in the bridge because the old
+  per-op checkpoint closed it after one op.  A clean unmount checkpoint
+  clears it (verified: final fsck fully clean, no warnings).
+
 ## Remaining follow-ups
 
 1. Livelock family: repro one of 091/617/751/760, capture where the CPU goes
@@ -192,4 +279,7 @@ Validation on the 64G VM image (/dev/vdb1, journal 64 blocks):
 2. Classify the 11 tests with no scope-CPU report (014 069 103 108 133 249
    449 511 524 563 747) — likely family 1, but confirm at least one.
 3. generic/475 dm-error (separate, pre-existing: fsstress D-state ~5 h).
+4. After fix B: re-run the 63 HANGs and re-diff against the kernel baseline
+   (fix A+B together are the kernel's actual design; the ~48 throughput
+   blowouts should clear, the 4 livelocks and dm-error are separate).
 4. After the fix lands: re-run the 63 and re-diff against kernel baseline.
