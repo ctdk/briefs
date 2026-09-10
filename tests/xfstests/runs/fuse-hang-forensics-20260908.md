@@ -535,21 +535,76 @@ detached (`sudo setsid nohup ... &` via the `vagrant ssh -- 'bash -s'`
 heredoc pattern) and never alongside anything else that holds the test
 devices.
 
+## The ENOSPC cluster closed: deferred-free reclaim (2026-09-10)
+
+Triage confirmed the pendingFrees starvation, and widened the cluster:
+reading the test bodies (before any re-run) showed **102 and 226 are the
+same mechanism, not separate large-write surfaces** — 102 is
+`pwrite 800M` + `rm` ×10 on a 1GB fs, 226 is `pwrite 64M` + `rm` ×16 on
+a 256M fs (tagged `enospc`); both print xfs_io errors through the output
+filter, so a spurious ENOSPC in loop 2+ lands in the diff.  371 (pwrite
+80M + rm, 100 iterations ×2 workers, no fsync anywhere) and 511 (256M
+pwrite fills the fs, rm, then fsx's writes need the freed blocks) are
+likewise delete-then-write.  Only 274 has no delete-then-write at all
+(its fills stay on disk and the writes go into preallocated unwritten
+space), so its fix C failure was a different, unattributed mechanism
+(its .full was purged before triage — see the purge lesson).
+
+Root cause chain, fully verified: deferred frees apply to the in-memory
+allocator bitmap only when their journal records commit (the 040/041
+reuse-before-commit guard, fix B); fix C removed the per-write sync that
+retroactively applied them; and `sync(2)`/`syncfs(2)` cannot reach a
+regular FUSE mount — the 6.12 client registers `.sync_fs = fuse_sync_fs`
+(inode.c:1205) but sets `fc->sync_fs = 1` only under `if (ctx->is_bdev)`
+(inode.c:1738-1742, fuseblk only), and go-fuse has no SYNCFS handler
+either, so the kernel would disable it permanently anyway (ENOSYS at
+inode.c:755).  generic/275's captured evidence is the mechanism in one
+frame: "Post rm space: 0 available, 100% capacity" after `rm` + sync.
+
+**Fix: utils 0e4fc16 — reclaim on demand, NOT free-at-op-time.**  Freeing
+at op time was rejected: it would let a freed block be reused before its
+freeing record commits (the ca4478b regression class) AND the ring-full
+back-pressure path calls SyncAllocators pre-commit, which would publish
+frees to the on-disk bitmap ahead of uncommitted records.  Instead the
+Allocator gets a `reclaim` hook fired once after a failed
+allocBlock/AllocBlocks scan; BrieFS wires it to `reclaimPendingFrees`
+(cache.go), which `journal.Sync(false)`s when frees are pending and
+reports whether to retry.  The sync commits the freeing records first
+and SyncMeta applies the frees after the commit point — a block never
+becomes reusable before its previous freeing is durable (the ordering
+the kernel gets from its commit thread + ordered data).  Statfs now
+reports the pending frees as available (`FreeCountDataPlus`), so df
+matches what a write can actually obtain; the kernel gets the same
+visibility from kjournald, the divergence is documented at both sites.
+This also heals the ring-wrap starvation (writeRecordLocked's
+back-pressure path drains pendingFrees only at the next sync) by the
+same mechanism.  Regression test
+`fuse/reclaim_test.go:TestDeferredFreeReclaimOnENOSPC` (fill, truncate
+without sync, second file's write must succeed and crash-replay clean);
+with the hook unwired it reproduces generic/275's exact "no space left
+on device".
+
+**Validation: all six tests PASS** (FSCK_ENABLED=1, fresh LOG_DIR,
+`/go/bin/fuse.briefs` built at 0e4fc16 = fix C + 736a395 + reclaim;
+archive `run-20260910-222942-fuse.txt`, ~8 min): 274 275 371 511 102
+226 — 6 PASS / 0 FAIL / 0 HANG / 0 fsck-warn.  274's attribution
+between the reclaim hook and the 736a395 lazy-drain commit is ambiguous
+(both are in the binary; the old failure output no longer exists to
+distinguish), but the cluster is closed either way.
+
 ## Remaining follow-ups
 
-1. ~~Triage 007~~ DONE (above).  ~~Triage 585 dir-not-empty~~ DONE
-   (above).
-2. ~~Scope-CPU the 44 still-hanging tests~~ DONE (above): 35 were
-   per-write-sync throughput; 9 remain (069 074 113 410 476 642 747
-   748 750) — scope-CPU the 9 the same way (systemd scope Consumed lines
-   + daemon SIGQUIT dumps at the hang point).
-3. Triage the fix C failure surfaces: the ENOSPC cluster (274 275 371
-   511 — pendingFrees starvation suspect), 127's mmap size error, and
-   the 102/226 large-buffered-write diffs.
-4. Deferred-free reclaim (generalized by fix C, see above): free
-   in-memory at op time, defer only the on-disk bitmap publish, keep
-   SyncAllocators free of pending frees.
-5. generic/475 dm-error (separate, pre-existing: fsstress D-state ~5 h).
-6. Re-run the full 793-test suite under fix C (+ the 736a395 tail/boundary
-   drain commit) to get the post-fix totals.
-5. After the fix lands: re-run the 63 and re-diff against kernel baseline.
+1. ~~Triage 007~~ DONE.  ~~Triage 585~~ DONE.  ~~ENOSPC cluster 102
+   226 274 275 371 511~~ DONE (reclaim, utils 0e4fc16, above).
+2. Scope-CPU the 9 still-hanging tests (069 074 113 410 476 642 747 748
+   750) the same way (systemd scope Consumed lines + daemon SIGQUIT
+   dumps at the hang point; mind the cumulative-CPU trap).
+3. Triage 127's mmap size error (single-instance fsx repro with seed
+   191110531, `-N 100000`, 256K file; the `-R -W` variants are the
+   mmap-ENABLED ones — the `_nommap` function names in the test lie).
+   563 remains the known accepted cgroup-writeback FAIL.
+4. generic/475 dm-error (separate, pre-existing: fsstress D-state ~5 h).
+5. Benchmark 736a395 (fsx A/B for the residual 1,052 fdatasyncs/10K ops;
+   the 45-test re-run archive measured 42c9b58 only).
+6. Re-run the full 793-test suite under fix C + 736a395 + 0e4fc16 to
+   get the post-fix totals and re-diff against the kernel baseline.
