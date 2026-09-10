@@ -320,13 +320,11 @@ The old sub-families did not survive contact either:
 **The 4 new FAILs** (first time these tests ever completed under the
 bridge — all new surfaces, none triaged yet):
 
-- 007 (dirstress create/remove/lookup): `creat: No space left on device`
-  after far more iterations than the reference — real-bug candidate:
-  either frees deferred into `pendingFrees` never reclaim in the
-  in-memory allocator without a sync (reclaim starvation → spurious
-  ENOSPC) or unlinks failing so files accumulate.  Needs triage; if the
-  former, the fix is to free in-memory at op time and keep the deferred
-  side for the on-disk bitmap only.
+- 007 (dirstress create/remove/lookup): `creat: No space left on device` —
+  FIXED 2026-09-09 (briefs-utils, see below).  Starvation hypothesis
+  REFUTED by measurement: the failing VM run consumed only 130 of 16.5M
+  blocks (df sampling) while emitting 1768 ENOSPCs — the frees were not
+  starved; the ENOSPC was spurious.
 - 500: `fstrim: the discard operation is not supported` — the bridge's
   FITRIM is not wired through the FUSE ioctl path (harness/feature gap;
   the unit-level fstrimOp works).
@@ -338,14 +336,82 @@ bridge — all new surfaces, none triaged yet):
 0 FSCK WARN across every test that completed: fix B's deferred write-back
 left no on-disk corruption fsck can detect under real workloads.
 
+## generic/007 triage (2026-09-09) — spurious ENOSPC from name-heap dead space
+
+007 was HANG before fix B, so this surface had never been reached.  The
+incoming starvation hypothesis (deferred frees in `pendingFrees` never
+reclaiming in the in-memory allocator without a sync) was **refuted by
+measurement**: a VM repro (nametest -l namelist -s 1 -i 100000 -z on a
+16.5M-block image, df sampled every 5s) hit 1768 ENOSPCs in 15s while
+consuming only 130 blocks — the allocator was nowhere near exhausted;
+the ENOSPC was spurious.
+
+**Root cause: the bridge is a pre-generic/089 port.**  It was missing
+both halves of kernel commit 8780683:
+
+1. **Lazy name-heap compaction** (kernel trie_page.c:427).  The per-trie-
+   page name heap is a bump allocator whose `FreeNameOff` high-water mark
+   never shrinks; freeing a node orphans its name bytes as dead space
+   (capacity 4096-2324 = 1772 bytes).  A nameless INTERM node (created by
+   a middle-byte `trieFindOrCreateChild` with nameLen 0) can land on a
+   page already full of dead space — the pool scan's has-name-heap check
+   passes trivially for size 0.  When a shorter prefix name is later
+   inserted ("nametest.1" over "nametest.12"), the re-leafing
+   `trieStoreName` needs fresh heap space on that page → spurious ENOSPC
+   with the heap mostly dead.  Intermittent because it needs the longer
+   name created before its prefix.
+2. **Store-name-before-LEAF-commit ordering** at all 3 insert sites
+   (kernel trie.c:587/:662/:720): a failed `trieStoreName` after the slot
+   is already marked LEAF leaves a nameless leaf (unfindable by lookup →
+   orphaned inode).
+
+**Fix (briefs-utils commit 5028653, bu-refactor-1):** ported both halves
+into `fuse/trie_mutate.go` — `triePageCompactNames` (kernel-faithful
+layout compaction, aborts untouched on corrupt-heap anomalies) called
+from `triePageAllocName`'s would-ENOSPC path, with the compacted layout
+persisted even when the retry still fails; and the 3-site reordering
+(store name first, then mark LEAF).  Bridge-only hazard handled at each
+site: `trieStoreName` mutates the shared op-cache page buffer, so a
+`*briefs.TrieSlot` parsed before the store is stale — every reordered
+site re-parses the slot before setting LEAF bits (the kernel edits page
+memory in place and has no such staleness).
+
+**Proof:** new `fuse/trie_compact_test.go` — `TestTriePageCompactNames`
+(heap math + live-name readability + reclaimed-space allocation) and
+`TestTrieNameHeapChurnNoSpuriousENOSPC`, a 50k-op create/remove churn
+over prefix-family names with randomized (fixed-seed) pick order that
+fails on the old code at iteration 776 with exactly the spurious ENOSPC
+and passes on the fix.  Full `go test ./...` green, `-race` green.
+
+**VM repro A/B:** identical script — old daemon: 1768 ENOSPCs, 130
+blocks consumed; fixed daemon: **0 ENOSPC in 17s, counts match the
+007.out reference exactly** (creates 18736 OK / 18802 EEXIST, removes
+18675 OK, lookups 12000 OK, cleanup 61 removes).  Harness re-run with
+FSCK_ENABLED=1: **generic/007 PASS in 18s, fsck clean** (archive
+run-20260910-013335-fuse.txt).
+
+Secondary finding while triaging (follow-up, NOT 007's cause): ring-full
+back-pressure in `writeRecordLocked` sets `j.dirty = false` before
+`checkpointLocked(true)`, so the checkpoint's flushPending-inner-sync
+never runs → **SyncMeta never drains `pendingFrees` on ring wrap** —
+deferred frees only reclaim on explicit fsync/sync/unmount.  Bounded by
+trie pages (~130 blocks here) but a latent starvation class for
+delete-then-write-without-sync workloads.  Fix shape: free in the
+in-memory allocator at op time and defer only the on-disk bitmap publish
+— with frees kept OUT of SyncAllocators (pre-commit back-pressure calls
+it; publishing ahead of uncommitted records is the 040/041 corruption
+class).
+
 ## Remaining follow-ups
 
-1. Triage the two real-bug-candidate FAILs (007 ENOSPC / deferred-free
-   reclaim starvation; 585 dir-not-empty) — 007 reproduces within the
-   timeout now.
+1. ~~Triage 007~~ DONE (above).  Triage 585 dir-not-empty (real-bug
+   candidate).
 2. Scope-CPU the 44 still-hanging tests to split: per-write sync cost
    (fsx/fsstress members; next fix is deferring commitExtentChange's
    journal sync like fix B did for metadata ops) vs mmap-deadlock family
    (074 127 …) vs true livelock (091 760).
-3. generic/475 dm-error (separate, pre-existing: fsstress D-state ~5 h).
-4. After the fix lands: re-run the 63 and re-diff against kernel baseline.
+3. Deferred-free reclaim on ring wrap (secondary finding above): free
+   in-memory at op time, defer only the on-disk bitmap publish, keep
+   SyncAllocators free of pending frees.
+4. generic/475 dm-error (separate, pre-existing: fsstress D-state ~5 h).
+5. After the fix lands: re-run the 63 and re-diff against kernel baseline.
