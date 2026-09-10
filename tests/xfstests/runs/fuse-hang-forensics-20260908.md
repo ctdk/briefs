@@ -328,8 +328,9 @@ bridge — all new surfaces, none triaged yet):
 - 500: `fstrim: the discard operation is not supported` — the bridge's
   FITRIM is not wired through the FUSE ioctl path (harness/feature gap;
   the unit-level fstrimOp works).
-- 585: `rm: cannot remove ...: Directory not empty` — real-bug candidate
-  (stale dirent left visible).
+- 585: `rm: cannot remove ...: Directory not empty` — FIXED 2026-09-09
+  (briefs-utils, see the 585 section below; FUSE presentation-layer bug,
+  not a dirent leak).
 - 589: mount.fuse.briefs usage/propagation-flag failures — the mount
   helper does not handle the test's bind/propagation forms (harness gap).
 
@@ -402,10 +403,78 @@ in-memory allocator at op time and defer only the on-disk bitmap publish
 it; publishing ahead of uncommitted records is the 040/041 corruption
 class).
 
+## generic/585 triage (2026-09-09) — whiteouts presented as directories
+
+The `rm: cannot remove '...tmp.MVVxkOTAsB': Directory not empty` was NOT
+fsstress (fsstress had already passed) — it was `_require_renameat2`'s
+cleanup (common/renameat2): `renameat2 -w foo bar` then `rm -rf $dir`.
+The whiteout left at `foo` could never be removed, so the rmdir failed
+ENOTEMPTY forever.  The incoming hypothesis (stale dirent left visible)
+was **refuted**: the leftover is a real, fsck-consistent on-disk whiteout
+entry; the bridge-side state after `renameWhiteout` is correct (proven by
+unit test: trie ftype 2, on-disk inode mode 0020000, nlink 1, slot dump
+via dd confirmed).  The failure is entirely in the FUSE presentation
+layer, by two compounding bugs:
+
+1. **Lookup ftype type collision** (fuse.go).  The trie's dirent ftype is
+   S_IFMT>>12: 4=dir, 8=reg, 10=symlink, **2=chardev** — and RENAME_WHITEOUT
+   creates chardevs.  But the Lookup switch tested ftype against
+   `briefs.NodeTypeDir` (0x02), which is a *trie node-type bit*, not a
+   dirent type — so every ftype-2 entry got StableAttr.Mode = S_IFDIR.
+   go-fuse's `setEntryOut` then builds the reply mode as
+   `(out.Attr.Mode & 07777) | n.stableAttr.Mode` → 0040000.
+2. **Zero-perm whiteout + go-fuse's patcher**.  The whiteout was created
+   with bare `S_IFCHR` (no permission bits).  go-fuse's `rawBridge.setAttr`
+   (bridge.go:265) rewrites any zero-perm mode in Getattr/Lookup replies
+   to `|= 0644` plus `|= 0111` when S_IFDIR — net reply
+   **0040755 = `drwxr-xr-x`**, matching the observed `4 directory 1 755`.
+   With the whiteout looking like a non-empty directory, `rm -rf` recursed
+   into it, unlink failed, rmdir failed ENOTEMPTY — un-removable entry.
+
+**Fix (briefs-utils commit 099bf08, bu-refactor-1)** — three kernel-parity
+changes plus
+one latent-bug fix, all in the FUSE layer:
+
+1. Lookup: StableAttr.Mode from `childInode.Filemode` unconditionally (the
+   on-disk inode is authoritative, like the kernel's lookup which igets and
+   derives everything from the inode; go-fuse masks StableAttr.Mode to the
+   S_IFMT type bits itself).
+2. Readdir: `mode := uint32(ftype) << 12` — the kernel's exact formula
+   (dir.c:139 `file_type = (entry_type << 12) & S_IFMT`) — instead of a
+   4/8/10 switch that defaulted chardev/blockdev/fifo/socket d_types to
+   DT_REG.
+3. `renameWhiteout`: create with `S_IFCHR | 0600` (kernel dir.c:1036
+   `S_IFCHR | WHITEOUT_MODE` parity), so the mode is never zero even if
+   the patcher runs.
+4. `NullPermissions: true` in fs.Options — go-fuse's zero-perm patcher is
+   off; modes are reported exactly as stored.  This was a latent bug
+   beyond 585: any `chmod 000` file stat'ed as 0644 (and 000 dirs as
+   0755).
+
+**Proof:** new `fuse/rename_whiteout_test.go` — `TestRenameWhiteoutChardev`
+asserts the whiteout's trie ftype is 2, inode mode 0020600, nlink 1, and
+that a plain `unlinkInDir` removes it (the exact 585 failure mode).  Full
+`go test ./...` green, `-race` green.  Host mount repro with the fixed
+daemon: `foo` stats as `character special file ... 600` (`crw-------`,
+rdev 0,0 — kernel parity), `bar` as the moved regular file, `rm -rf`
+succeeds, unmount + fsck **completely clean** (no leaked blocks, no
+leftover entries — also clears the earlier "3 allocated / 2 referenced"
+suspicion for this path; that observation came from the fsstress-worked
+585 image, not the whiteout path).  Same repro on the VM (/dev/vdb1,
+/go/bin/fuse.briefs): identical results, fsck clean.  Harness re-run
+with FSCK_ENABLED=1: **generic/585 PASS, fsck clean** (archive
+run-20260910-032321-fuse.txt; use a fresh LOG_DIR for re-runs — the
+runner skips any test with an existing check-*.log in LOG_DIR).
+
+Note for the kernel-backed side: the 6.12 FUSE client forwards
+RENAME_WHITEOUT to the daemon (FUSE_RENAME2, flags; no kernel-side
+vfs_whiteout), so this is bridge-only surface — the kernel module creates
+whiteouts itself in briefs_rename_whiteout and is unaffected.
+
 ## Remaining follow-ups
 
-1. ~~Triage 007~~ DONE (above).  Triage 585 dir-not-empty (real-bug
-   candidate).
+1. ~~Triage 007~~ DONE (above).  ~~Triage 585 dir-not-empty~~ DONE
+   (above).
 2. Scope-CPU the 44 still-hanging tests to split: per-write sync cost
    (fsx/fsstress members; next fix is deferring commitExtentChange's
    journal sync like fix B did for metadata ops) vs mmap-deadlock family
