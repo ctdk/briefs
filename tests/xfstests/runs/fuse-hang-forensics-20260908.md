@@ -471,16 +471,85 @@ RENAME_WHITEOUT to the daemon (FUSE_RENAME2, flags; no kernel-side
 vfs_whiteout), so this is bridge-only surface — the kernel module creates
 whiteouts itself in briefs_rename_whiteout and is unaffected.
 
+## The 44-hang re-run under fix C (2026-09-10): throughput family confirmed
+
+Fix C (utils 42c9b58, no per-write journal sync — see the fix C notes in
+`briefs-fuse-hang-forensics-63hangs` memory; fsx A/B 23,832→2,694 device
+syncs, 187s→22s per 10K ops) was validated by re-running the 44 fix-B
+hangs plus the NOTRUN 108 (45 tests, FSCK_ENABLED=1, fresh LOG_DIR,
+`/go/bin/fuse.briefs` built at 42c9b58; archive
+`run-20260910-203043-fuse.txt`, 86 minutes):
+
+    27 PASS / 8 FAIL / 1 NOTRUN / 9 HANG / 0 fsck-warn
+    (fix B on the same 45: 0 PASS / 4 FAIL / 1 NOTRUN / 44 HANG here,
+     counting only these 45 of its 63)
+
+- **35 of the 44 hangs cleared — the per-write sync cost was the dominant
+  family**, and the fix-B split of the 44 into "throughput vs livelock vs
+  mmap" is settled: 091 and 760 (the fix-B "genuine livelock" pair) both
+  PASS under fix C, so that label is refuted — they were throughput-
+  coupled like the rest.  311 (which hangs on the kernel module too)
+  also passes.
+- **Remaining 9 hangs: 069 074 113 410 476 642 747 748 750.**  The
+  mmap/flush family is in here (074 and 113; 127 is its sibling but now
+  FAILS fast instead of hanging — see below).  The rest need a fresh
+  scope-CPU round.
+- **New FAIL surfaces unmasked** (they hung under fix B, so the failure
+  was never visible):
+  - `274/275/371/511` — an ENOSPC cluster.  Leading suspect: fix C
+    removed the per-write sync, and with it the per-write SyncMeta that
+    applied `pendingFrees` — freed blocks now return to the allocator
+    only at the next fsync/sync/umount, so delete-then-write-without-sync
+    tests (exactly 275's shape) starve.  This generalizes the known
+    ring-wrap finding: the proper fix is the same (free in-memory at op
+    time, defer only the on-disk bitmap publish).
+  - `127` — fsx with `-R -W` (mapped reads AND writes; the flags enable
+    mmap ops, not disable them — easy to misread): after ~5155 ops fsx
+    reports `Size error: expected 0x3775c stat 0x14274`.  The file size
+    diverged from fsx's model mid-run — a real correctness surface for
+    the mmap path, previously masked by the hang.
+  - `102/226` — 800MB single write / 16×64MB buffered writes on a 256M
+    filesystem; output diffs not yet triaged (226's failure output
+    truncates at the write loop, 102's diff needs the .full file).
+  - `563` — the known accepted cgroup-writeback FAIL, unchanged.
+
+**Misdiagnosis trap (new):** a daemon that burned CPU *during* a test
+looks "stuck" in `ps` — `%CPU` and TIME are cumulative over process
+lifetime, not instantaneous.  After interrupting this run's generic/069,
+its scratch daemon showed "35.4% CPU, 3:32" with zero clients and was
+called a livelock; a SIGQUIT goroutine dump showed every goroutine idle
+in `read()` on /dev/fuse, and the CPU total had not grown between two
+samples taken 10 minutes apart.  The ~210s CPU (8 threads × ~26s) was
+legitimately consumed serving 069's fsstress load before the client
+died.  Same class as the `ps etimes` trap above: sample twice, compare
+deltas, before calling anything wedged.
+
+**Run-mechanics trap:** the first launch of this re-run failed two ways
+at once — the `vagrant ssh -- sudo bash -c '...'` quoting collapsed
+("bash: -c: option requires an argument") AND the suite raced the fsx
+benchmark that still held /dev/vdb1 at /mnt/testfuse (run-suite's
+cleanup only unmounts the xfstests mountpoints), so all 45 tests
+instant-MKFS-failed and self-archived as run-20260910-194329 (45×
+mkfs_fail; that garbage archive is deleted).  Launch long suites
+detached (`sudo setsid nohup ... &` via the `vagrant ssh -- 'bash -s'`
+heredoc pattern) and never alongside anything else that holds the test
+devices.
+
 ## Remaining follow-ups
 
 1. ~~Triage 007~~ DONE (above).  ~~Triage 585 dir-not-empty~~ DONE
    (above).
-2. Scope-CPU the 44 still-hanging tests to split: per-write sync cost
-   (fsx/fsstress members; next fix is deferring commitExtentChange's
-   journal sync like fix B did for metadata ops) vs mmap-deadlock family
-   (074 127 …) vs true livelock (091 760).
-3. Deferred-free reclaim on ring wrap (secondary finding above): free
+2. ~~Scope-CPU the 44 still-hanging tests~~ DONE (above): 35 were
+   per-write-sync throughput; 9 remain (069 074 113 410 476 642 747
+   748 750) — scope-CPU the 9 the same way (systemd scope Consumed lines
+   + daemon SIGQUIT dumps at the hang point).
+3. Triage the fix C failure surfaces: the ENOSPC cluster (274 275 371
+   511 — pendingFrees starvation suspect), 127's mmap size error, and
+   the 102/226 large-buffered-write diffs.
+4. Deferred-free reclaim (generalized by fix C, see above): free
    in-memory at op time, defer only the on-disk bitmap publish, keep
    SyncAllocators free of pending frees.
-4. generic/475 dm-error (separate, pre-existing: fsstress D-state ~5 h).
+5. generic/475 dm-error (separate, pre-existing: fsstress D-state ~5 h).
+6. Re-run the full 793-test suite under fix C (+ the 736a395 tail/boundary
+   drain commit) to get the post-fix totals.
 5. After the fix lands: re-run the 63 and re-diff against kernel baseline.
