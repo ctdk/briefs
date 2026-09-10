@@ -272,14 +272,80 @@ Gotchas found during validation:
   per-op checkpoint closed it after one op.  A clean unmount checkpoint
   clears it (verified: final fsck fully clean, no warnings).
 
+## The 63 re-run under fix B (2026-09-09/10): family 1 was NOT the whole story
+
+All 63 re-run against the fix-B bridge (run-20260909-193211-fuse.txt,
+fsck validation on):
+
+|            | 2026-09-07 (pre fix A+B) | 2026-09-09 (fix B) |
+|------------|------:|------:|
+| HANG       | 63 | 44 |
+| PASS       |  0 | 14 |
+| FAIL       |  0 |  4 |
+| NOT RUN    |  0 |  1 |
+| FSCK WARN  |  — |  0 |
+
+Cleared: 006 100 103 249 310 339 471 488 558 617 676 707 736 751 (PASS);
+007 500 585 589 (now FAIL — triageable, see below); 108 (NOT RUN).
+
+Still hanging (44): 014 027 069 074 077 091 095 102 113 114 127 129 132
+133 224 226 247 273 274 275 311 320 347 366 371 410 416 418 449 460 465
+476 511 524 563 590 610 627 642 747 748 750 760 761.
+
+**The "~48 throughput blowouts" attribution is REFUTED as the dominant
+family.**  Removing the per-op syncs cleared only 19 of 63.  What the old
+scope-CPU analysis classified as one I/O-bound family splits into at
+least: genuine per-op-Sync blowouts (cleared), and a still-hanging
+majority whose blocker is something else.  Leading suspect for the
+fsx/fsstress-heavy members: the WRITE path still syncs per extent change —
+`commitExtentChange` runs `journal.Sync(false)` + two Fdatasyncs on every
+extent-list mutation (kernel parity argument does not apply: the kernel
+does NOT sync the journal on buffered writes; it only dirties pages and
+commits records lazily).  A 1M-op buffered fsx (522-class) pays a full
+journal commit + device flush per write.  Second suspect for the
+mmap/fsx members (074 127 …): the known silent msync/flush deadlock
+family (see the mmap-writeback-deadlock memory).  Next forensics step:
+scope-CPU the 44 again — idle (deadlock/round-trip) vs full-core
+(livelock) vs I/O-bound (per-write syncs) now separates cleanly.
+
+The old sub-families did not survive contact either:
+
+- **Livelock family (4)**: 617 and 751 now PASS — the "full-core burn"
+  was throughput-coupled or flake, not an independent livelock.  091 and
+  760 still hang.
+- **Unclassified 11**: 100 103 249 108 cleared; 014 069 449 511 524 747
+  still hang (with 133, 563 also hanging on re-check).
+- 311 hangs on the kernel baseline too — not bridge-specific.
+
+**The 4 new FAILs** (first time these tests ever completed under the
+bridge — all new surfaces, none triaged yet):
+
+- 007 (dirstress create/remove/lookup): `creat: No space left on device`
+  after far more iterations than the reference — real-bug candidate:
+  either frees deferred into `pendingFrees` never reclaim in the
+  in-memory allocator without a sync (reclaim starvation → spurious
+  ENOSPC) or unlinks failing so files accumulate.  Needs triage; if the
+  former, the fix is to free in-memory at op time and keep the deferred
+  side for the on-disk bitmap only.
+- 500: `fstrim: the discard operation is not supported` — the bridge's
+  FITRIM is not wired through the FUSE ioctl path (harness/feature gap;
+  the unit-level fstrimOp works).
+- 585: `rm: cannot remove ...: Directory not empty` — real-bug candidate
+  (stale dirent left visible).
+- 589: mount.fuse.briefs usage/propagation-flag failures — the mount
+  helper does not handle the test's bind/propagation forms (harness gap).
+
+0 FSCK WARN across every test that completed: fix B's deferred write-back
+left no on-disk corruption fsck can detect under real workloads.
+
 ## Remaining follow-ups
 
-1. Livelock family: repro one of 091/617/751/760, capture where the CPU goes
-   (test-side spin; 617 is the known io_uring DIO soak flake candidate).
-2. Classify the 11 tests with no scope-CPU report (014 069 103 108 133 249
-   449 511 524 563 747) — likely family 1, but confirm at least one.
+1. Triage the two real-bug-candidate FAILs (007 ENOSPC / deferred-free
+   reclaim starvation; 585 dir-not-empty) — 007 reproduces within the
+   timeout now.
+2. Scope-CPU the 44 still-hanging tests to split: per-write sync cost
+   (fsx/fsstress members; next fix is deferring commitExtentChange's
+   journal sync like fix B did for metadata ops) vs mmap-deadlock family
+   (074 127 …) vs true livelock (091 760).
 3. generic/475 dm-error (separate, pre-existing: fsstress D-state ~5 h).
-4. After fix B: re-run the 63 HANGs and re-diff against the kernel baseline
-   (fix A+B together are the kernel's actual design; the ~48 throughput
-   blowouts should clear, the 4 livelocks and dm-error are separate).
 4. After the fix lands: re-run the 63 and re-diff against kernel baseline.
