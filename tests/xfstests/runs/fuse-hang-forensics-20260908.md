@@ -707,6 +707,24 @@ Three distinct signatures, none of them the 007/585/127 fixes:
   ~/src/briefs-notes/fuse-fixd-logs/073-daemon-mount.log.  Solo repro
   should reproduce the cut, then inspect which allocation in the
   DIR_UPDATE replay path returns ENOSPC.**
+
+  **ROOT-CAUSED + FIXED 09-11 (utils 01734ab).  Two prongs of the
+  kernel's generic/475 replay fix were missing from the bridge: (1)
+  trieSeedPool — replayDirUpdate never seeded the partial-trie-page
+  pool from the parent's on-disk trie, so replay inserts took the
+  fresh-page branch where the live path reused a partial page, and
+  ENOSPC'd on the full fs; (2) replayTrieBlocks — pass 1 never
+  collected JRN_TRIE_ALLOC blocks for pass 2's page-inits to pop LIFO,
+  so replay re-allocated blocks the window had already reserved
+  (invisible to AllocBlock) and ENOSPC'd.  Both ported from kernel
+  journal.c/trie.c with kernel-parity EEXIST tolerance; regression
+  tests TestReplayTriePoolSeedingFullFs and TestReplayTrieBlockPoolFullFs
+  pin them independently on full-fs crash-replays (each fails
+  deterministically without its prong, passes with the other disabled).
+  VM validation 09-11: solo generic/073 with the fixed binary PASSES
+  (run-20260911-152737-fuse.txt), daemon log clean of replay errors.
+  The flakey-remount family members 335/336/343 share the mechanism
+  and should re-validate on the next subset run.**
 - **B. sync(2) is a silent no-op (520).**  Only the `_scratch_sync`
   (global sync) cases fail; every fsync case passes.  sync(2) can never
   reach a regular FUSE mount's daemon (6.12 sets fc->sync_fs only for
@@ -842,11 +860,42 @@ left to the kernel's own dirty-page throttling (the same place the
 kernel module's write path gets its).  Commit-time FlushPendingWB keeps
 the WAIT flags, and the end-of-fsync Fdatasync still covers blocks
 kicked out of the tracked set before they completed, so the ordering
-and power-fail guarantees are unchanged.  Solo 074 re-run measures
-whether the unmount now fits the 300s budget; if the ~11.6 GB writeback
-at disk rate is intrinsic, 074/642 get get_timeout overrides like
-089/299 (074 is in the same fstest class as 089, which already carries
-a 3600s override for exactly this bulk reason).
+and power-fail guarantees are unchanged.
+
+Solo 074 re-run results (09-11, two runs):
+
+- With kick-only (TIMEOUT_SECS=900): still HANG.  So the blocking drain
+  was not the whole story.
+- Instrumented re-run (TIMEOUT_SECS=1200 + root /proc/<pid>/io
+  sampling): still HANG at 1200 s, with write_bytes at 28.1 GB by
+  el=720 s and 34.5 GB by el=871 s — a steady ~45 MB/s, no plateau, no
+  D-state accumulation.  Continuous progress, NOT a wedge: the daemon
+  is simply being asked to write far more than the test's logical
+  volume.  (The SIGQUIT goroutine capture for this run was lost to a
+  tool outage inside the capture window; the rate evidence + code
+  reading below were sufficient to classify.)
+
+Root cause — extent-index rebuild write amplification (09-11): the
+bridge's write path sets `rebuildNeeded` for every extent-adding op and
+`rebuildExtentIndex` (file_ops.go) re-allocates and re-writes the ENTIRE
+extent B+tree (BuildBtreeLeaves + BuildBtreeIndex over all E extents)
+per FUSE WRITE request — the code comment says outright: "the
+incremental insert is deferred".  generic/074's fstest writes 10-30 MB
+files in 512 B fragments with holes (`-F -b 512`, stride 1 KB), so
+each file fragments to ~7.7K extents = ~61+ leaf blocks (126 extents
+per leaf) that are re-written on EVERY writeback request that extends
+the tree — tens of GB of amplified device writes for a test whose
+logical volume is a few GB, growing quadratically with file size.  The
+kernel module passes 074 quickly because briefs_extent.c APPENDS
+extents to a chain (O(1) amortized), never rebuilds.  A timeout
+override cannot absorb this (the 1200 s run was still mid-storm at
+34.5 GB); the fix is localized rebuilding — reuse leaf blocks whose
+extent chunk is unchanged (reuse is only valid for an equal-content
+prefix whose boundary leaf is rebuilt, because a reused leaf's stored
+next_leaf must match its new successor), rebuild the few index nodes
+on top, and free only the actually-replaced blocks.  Tracked as the
+incremental-rebuild task; same root cause expected for 069 (raw-write
+throughput) and 642.
 
 ## Remaining follow-ups
 
