@@ -108,7 +108,10 @@ SKIPPED=0
 UNKNOWN=0
 FSCK_WARN=0
 RESUMED=0
-TIMEOUT_SECS=300
+# Default per-test timeout budget (seconds); override in the environment to
+# measure tests suspected of exceeding it without editing get_timeout (which
+# is the durable fix for a test that legitimately needs longer).
+: "${TIMEOUT_SECS:=300}"
 
 # Canonical per-test outcome: each test lands in exactly one category, recorded
 # here.  The counters above still drive the printed summary (for continuity with

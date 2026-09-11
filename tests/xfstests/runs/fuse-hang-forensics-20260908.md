@@ -672,7 +672,7 @@ FAIL diff (pre-fix -> post-fix):
 
 The 11 HANGs: 069 074 103 113 410 476 521 522 642 748 750 (747 now
 passes).  Scope-CPU from the systemd Consumed lines: every one burned
-<48 s CPU over its window (069 10.7 s, 074 6.4 s, 113 4.0 s, 642 2.8 s,
+<48 s CPU over their windows (069 10.7 s, 074 6.4 s, 113 4.0 s, 642 2.8 s,
 410 22.8 s, 476 38.6 s, 521 43.8 s, 522 48.0 s, 748 33.8 s, 750 39.7 s;
 103's scope emitted no Consumed line at all — started 02:06:37,
 "Deactivated" 02:11:34, the full ~297 s to the KILL).  All wedge-shaped
@@ -681,16 +681,184 @@ CPU-seconds).  Forensics re-run of the 11 with the fixed watcher is in
 flight; the first watcher's 642 capture was lost to a filename bug
 (`generic/642` contains a slash -> unwritable subdirectory path).
 
+### The 7 FAIL regressions: .out.bad triage (2026-09-11)
+
+Three distinct signatures, none of them the 007/585/127 fixes:
+
+- **A. flakey remount fails fast (073 335 336 343).**  All four fail
+  with `mount.fuse.briefs: timed out waiting for /mnt/briefs-scratch`
+  remounting the dm-flakey device after the power-cut switch —
+  generic/073's check log shows failure at 2 s, so the daemon is not
+  slowly replaying; it either errors out or liveloops at mount almost
+  immediately.  The daemon log is a shared filename and was overwritten,
+  so the concrete error is unconfirmed — needs a solo repro that saves
+  the log at the failure instant.  Note the same remount SUCCEEDS in
+  520's cases, so it is state-dependent (journal content at the cut?),
+  not "flakey device" per se.  The initial mount on the flakey device
+  also succeeds in every one of these tests.
+  **UPDATE 2026-09-11 (fix-D validation run): the surviving daemon log
+  finally shows the concrete error — `journal replay: replay pass 2
+  (apply): replay record type 7 (JRN_DIR_UPDATE) at block 26213825: no
+  space left on device`, then the daemon exits and the mount helper
+  times out.  So the daemon ERRORS OUT at mount: replay-apply hits
+  ENOSPC (allocator exhaustion or a device-write error surfaced as
+  ENOSPC on the flakey device) applying a directory-update record whose
+  trie/slot re-derivation needs an allocation.  Log preserved at
+  ~/src/briefs-notes/fuse-fixd-logs/073-daemon-mount.log.  Solo repro
+  should reproduce the cut, then inspect which allocation in the
+  DIR_UPDATE replay path returns ENOSPC.**
+- **B. sync(2) is a silent no-op (520).**  Only the `_scratch_sync`
+  (global sync) cases fail; every fsync case passes.  sync(2) can never
+  reach a regular FUSE mount's daemon (6.12 sets fc->sync_fs only for
+  fuseblk; go-fuse has no SYNCFS dispatch — recorded during the reclaim
+  work), so under fix B's deferred write-back nothing commits and the
+  cut loses the whole workload ("After:" empty).  The per-op-sync
+  bridge masked this.  Fix options: fuseblk mount + a patched go-fuse
+  SYNCFS dispatch, or accept sync(2) as unwired and document it.
+- **C. rename old-name loss (534).**  After truncate+rename+fsync and
+  the cut, `bar` survives with correct size/content but `foo` STILL
+  EXISTS too — same-inode rename where the old name's removal is lost.
+  fsync committed everything (bar is right), so this is replay
+  idempotency or a deferred-trie state issue in the rename path, not a
+  sync gap.
+- **D. fio aio-dio EIO (300).**  Three `io_u error ... Input/output
+  error` on 128K DIO writes under the random aio-dio pattern — real
+  bridge DIO bug, unrelated to durability.
+
+069's wedge produced no D-state client (FUSE waits are interruptible),
+so the D-state-only watcher v1 missed it; watcher v2 (D-state OR frozen
+check-log) is now watching the re-run.
+
+### All 11 HANGs classified (2026-09-11, task #12 complete)
+
+hang11b targeted re-run (run-20260911-102239-fuse.txt): 9 FAIL fast (the
+watcher's SIGQUIT converts hangs by design), 410 HANG with no capture,
+0 fsck-warn.  Every capture was settled by goroutine dumps plus a
+per-thread /proc poller (/tmp/daemon-poll.log):
+
+- **521/522/642/748/750 = fsync-path whole-device fsync ladder.**
+  BrieFSNode.Fsync -> Journal.Sync -> syncLocked -> syncSuperblock ->
+  `j.file.Sync()` on the raw device fd (journal_write.go:585), once per
+  commit, seconds each on the VM virtio disk.  Poller proof for 521:
+  daemon write_bytes climbs 25M->393M over 45 s with D-state threads
+  cycling blkdev_issue_flush — continuous progress, a ladder of slow
+  flushes, not a wedge.  Watcher trigger B ("waiting>=1 persistent")
+  cannot distinguish one stuck request from a ladder of slow ones.
+- **750 = same ladder.**  The "142 runnable go-fuse goroutines" is
+  writers piling behind the serialized device flush, not a Go runtime
+  pathology; write_bytes climbed 104M->2.7G over the window.
+- **074/103 = checkpoint whole-device fsync** (checkpointLocked
+  `j.file.Sync()` at journal_write.go:514/:563) under the journal lock.
+- **476 = whole-device fdatasync** (DrainPendingData ->
+  BlockDevice.Fdatasync, device.go:165) plus a sync.Mutex waiter.
+- **069 = raw write throughput** (3M 4-byte O_APPEND writes, each a
+  full tree walk) — workload cost, not a barrier.
+- **410 = known flaky**, hung again, no capture.
+
+NET: 8 of the 9 captures are the whole-device-barrier family, so
+targeted flushes (fix D below) are the single lever for all of them.
+
+### Residue-panic family fixed (utils ce27022 + 8424fe5)
+
+The hang11b captures also yielded two daemon-panic root causes, both
+fixed 2026-09-11 with regression tests, full fuse suite green (~23 s):
+
+- **ce27022, inline truncates (generic/551 daemon death).**  The generic
+  extent path's rebuildExtentIndex called SetInlineExtents([8]Extent{})
+  which CLOBBERS the inline data region — inline_extents and inline_data
+  are the same 256 bytes — so a down-truncate wiped the surviving head
+  (the kernel handles inline separately, file.c:1236); a truncate-up past
+  256 left the flag set with FileSize>256, panicking every later
+  readFileData/promoteInlineData on the out-of-range region slice.
+  InlineData() returns the region BY VALUE: mutations require
+  SetInlineData back.
+- **8424fe5, MAX_LFS_FILESIZE tail (generic/525 daemon death).**
+  writeExtentData's blockEnd = blockStart + blockSize overflows to
+  INT64_MIN at the final block; readFileData had endOff/extEnd/blkEnd
+  overflows plus a PHANTOM loop iteration (blkOff += blockSize wraps
+  negative and INT64_MIN < readEnd re-enters, slicing buf[-101:]).
+  EFBIG gates mirror file.c:3483 and inode_newsize_ok; a write ending
+  exactly at s_maxbytes is legal (525 passes on the kernel), so the
+  loops are hardened, not gated.
+
+### Fix D: targeted writeback flushes (utils 4e2761f, 2026-09-11)
+
+Replaces the whole-device barrier family:
+
+- BlockDevice tracks blocks written since the last flush (pendingWB,
+  noted by every WriteBlock/WriteBlockSlot; capped at 8192 entries with
+  an inline drain so no-fsync workloads like 069 cannot grow it without
+  bound).  FlushPendingWB completes writeback with sync_file_range
+  (WAIT_BEFORE|WRITE|WAIT_AFTER) over coalesced contiguous runs.
+- Journal journal-block and superblock writes are write-through
+  (WriteAt + sync_file_range), so the commit point never advances past
+  a record whose block is still only in the page cache.
+- The three `j.file.Sync()` barriers become a WBFlusher hook the bridge
+  implements over FlushPendingWB (standalone users keep the old
+  whole-file Sync fallback).
+- checkpointLocked now flushes the allocator pools BEFORE the
+  checkpoint block that snapshots them; the old code ordered this
+  correctly only by accident, its single trailing Sync covering pools
+  and checkpoint block together, after.
+- Fsync keeps exactly ONE device flush (Fdatasync) at the end — power-
+  fail parity with the kernel's per-fsync blkdev_issue_flush (82c9a61);
+  unmount keeps its dev.Sync; the xattr and label-set paths use
+  targeted flushes.
+
+Design note: RWF_SYNC/RWF_DSYNC pwritev2 was considered and rejected —
+the kernel routes both through generic_write_sync ->
+vfs_fsync_range -> blkdev_issue_flush, i.e. the very per-write device
+flush being removed.  sync_file_range is the correct primitive: it is
+explicitly documented as not flushing disk caches, matching
+sync_dirty_buffer semantics.
+
+### Fix D residue: the 074/642 post-body unmount storm (09-11)
+
+The 22-test fix-D validation subset came back 13/4/3 with the barrier
+family gone (103 476 521 522 748 750 all PASS — 521 was the flagship
+1M-op DIO fsx ladder) and 335/336/343 of the flakey-remount family
+fixed by the changed writeback timing.  Three HANGs remained: 069
+(raw-write throughput), 074, and-by-extension 642.  A solo 074 run with
+the daemon poller + a SIGQUIT goroutine dump classified the 074 shape:
+
+- The test body COMPLETES (check prints the NNs); the hang is inside
+  check's `_check_filesystems` -> `_scratch_unmount`, while the kernel
+  pushes the test's remaining mmap-dirty pages through the FUSE
+  writeback-cache connection (fstest writes ~11.6 GB cumulative on a
+  3 GB-RAM VM; poller showed write_bytes climbing 0.36 -> 11.61 GB at a
+  steady 56-74 MB/s, only 3 transient D-state samples — continuous
+  progress, NOT a wedge).
+- Goroutine dump: goroutine 1 in go-fuse `sync.WaitGroup.Wait` (the
+  unmount waiting for in-flight requests, 3 minutes), goroutine 47
+  [running] inside a Write request blocked in noteWB's over-cap drain
+  — the blocking `sync_file_range(WAIT_*)` — i.e. every 8192-block
+  (32 MB) batch stalled a writer on disk completion.  The observed
+  56-74 MB/s may be that convoy, not the virtio floor.
+
+Mitigation (2nd commit of fix D, utils): noteWB's over-cap drain is now
+KICK-ONLY — `sync_file_range(SYNC_FILE_RANGE_WRITE)` without any WAIT
+flags — so the write path never stalls on disk and back-pressure is
+left to the kernel's own dirty-page throttling (the same place the
+kernel module's write path gets its).  Commit-time FlushPendingWB keeps
+the WAIT flags, and the end-of-fsync Fdatasync still covers blocks
+kicked out of the tracked set before they completed, so the ordering
+and power-fail guarantees are unchanged.  Solo 074 re-run measures
+whether the unmount now fits the 300s budget; if the ~11.6 GB writeback
+at disk rate is intrinsic, 074/642 get get_timeout overrides like
+089/299 (074 is in the same fstest class as 089, which already carries
+a 3600s override for exactly this bulk reason).
+
 ## Remaining follow-ups
 
 1. ~~Triage 007~~ DONE.  ~~Triage 585~~ DONE.  ~~ENOSPC cluster 102
    226 274 275 371 511~~ DONE (reclaim, utils 0e4fc16, above).
    ~~Triage 127~~ DONE (drain window, utils ffdc719, above).
-2. ~~Scope-CPU~~ DONE (all 11 < 48 s CPU — wedge-shaped, above).  Now:
-   triage the 11 HANGs from the watcher goroutine dumps (069 074 103 113
-   410 476 521 522 642 748 750), then the 7 genuine FAIL regressions
-   (073 300 335 336 343 520 534 — durability family, see the re-run
-   section above), then the remaining FAILs.
+2. ~~Scope-CPU~~ DONE (all 11 < 48 s CPU — wedge-shaped, above).
+   ~~Triage the 11 HANGs from the watcher goroutine dumps~~ DONE 09-11
+   (classification section above; 8 of 9 captures = whole-device barrier
+   family, fixed by utils 4e2761f).  Now: the 7 genuine FAIL regressions
+   (073 300 335 336 343 520 534 — durability family, triage section
+   above; needs solo repros), then the remaining FAILs.
 3. 563 remains the known accepted cgroup-writeback FAIL.
 4. generic/475 dm-error (separate, pre-existing: fsstress D-state ~5 h).
 5. Benchmark 736a395 (fsx A/B for the residual 1,052 fdatasyncs/10K ops;
