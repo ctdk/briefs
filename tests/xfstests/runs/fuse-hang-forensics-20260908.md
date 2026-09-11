@@ -647,18 +647,58 @@ Gotchas collected on the way:
   parent's command line matches `pgrep -f repro127`, tripping single-
   instance guards.
 
+## The full-suite re-run under fix C + 736a395 + 0e4fc16 + ffdc719 (2026-09-11)
+
+run-20260911-011508-fuse.txt (commit 063e746, VM 01:15-08:15): **277 PASS
+/ 72 FAIL / 431 NOT RUN / 2 SKIP / 11 HANG / 0 fsck-warn** (793 processed),
+against the pre-fix full run's 188/110/63 (run-20260907-225019-fuse.txt)
+and the kernel baseline's 456 PASS / 3 accepted FAIL (311 547 563).
+
+FAIL diff (pre-fix -> post-fix):
+- 49 fixed: 008 011 013 029 033 059 062 070 071 075 078 086 089 101 112
+  130 198 210 214 240 251 263 286 299 322 340 344 345 346 354 361 363
+  401 412 428 437 439 446 469 479 567 619 626 647 650 729 749 758 759 —
+  the fix-B/C/007/585/127 clusters plus the DIO stress cluster.
+- 11 newly failing, of which only 7 are genuine PASS->FAIL regressions:
+  **073 300 335 336 343 520 534** — and 6 of those 7 (all but 300, fio
+  aio-dio) are fsync/log-replay/power-failure durability tests
+  (write+fsync+replay, dm content-after-power-failure, link+fsync).  That
+  points at fix B's deferred write-back/durability semantics, not the
+  007/585/127 fixes.  Corroborating: 521/522, the 1M-op fsx soaks that
+  PASSED with the per-op-sync bridge, now HANG under the deferred
+  write-back cache.
+- 4 are HANG->FAIL promotions (progress, still broken): 108 500 563 589
+  (500 FSTRIM unwired, 589 mount-helper gap, 563 the accepted cgwb FAIL).
+
+The 11 HANGs: 069 074 103 113 410 476 521 522 642 748 750 (747 now
+passes).  Scope-CPU from the systemd Consumed lines: every one burned
+<48 s CPU over its window (069 10.7 s, 074 6.4 s, 113 4.0 s, 642 2.8 s,
+410 22.8 s, 476 38.6 s, 521 43.8 s, 522 48.0 s, 748 33.8 s, 750 39.7 s;
+103's scope emitted no Consumed line at all — started 02:06:37,
+"Deactivated" 02:11:34, the full ~297 s to the KILL).  All wedge-shaped
+blocked waits, NOT the old throughput family (which burned hundreds of
+CPU-seconds).  Forensics re-run of the 11 with the fixed watcher is in
+flight; the first watcher's 642 capture was lost to a filename bug
+(`generic/642` contains a slash -> unwritable subdirectory path).
+
 ## Remaining follow-ups
 
 1. ~~Triage 007~~ DONE.  ~~Triage 585~~ DONE.  ~~ENOSPC cluster 102
    226 274 275 371 511~~ DONE (reclaim, utils 0e4fc16, above).
    ~~Triage 127~~ DONE (drain window, utils ffdc719, above).
-2. Scope-CPU the 9 still-hanging tests (069 074 113 410 476 642 747 748
-   750) the same way (systemd scope Consumed lines + daemon SIGQUIT
-   dumps at the hang point; mind the cumulative-CPU trap).
+2. ~~Scope-CPU~~ DONE (all 11 < 48 s CPU — wedge-shaped, above).  Now:
+   triage the 11 HANGs from the watcher goroutine dumps (069 074 103 113
+   410 476 521 522 642 748 750), then the 7 genuine FAIL regressions
+   (073 300 335 336 343 520 534 — durability family, see the re-run
+   section above), then the remaining FAILs.
 3. 563 remains the known accepted cgroup-writeback FAIL.
 4. generic/475 dm-error (separate, pre-existing: fsstress D-state ~5 h).
 5. Benchmark 736a395 (fsx A/B for the residual 1,052 fdatasyncs/10K ops;
    the 45-test re-run archive measured 42c9b58 only).
-6. Re-run the full 793-test suite under fix C + 736a395 + 0e4fc16 +
-   ffdc719 to get the post-fix totals and re-diff against the kernel
-   baseline.
+6. ~~Re-run the full 793-test suite~~ DONE 2026-09-11
+   (run-20260911-011508-fuse.txt, section above).
+7. pendingFrees never drain on ring wrap: writeRecordLocked clears
+   j.dirty at journal_write.go:242 BEFORE the back-pressure checkpoint
+   at :252 fires mid-op, so the in-flight record commits only at the
+   next Sync and the bridge's queued deferred frees are not applied by
+   the checkpoint path — recorded 2026-09-09, still unaddressed.
