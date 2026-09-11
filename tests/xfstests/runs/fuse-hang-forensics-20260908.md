@@ -897,6 +897,55 @@ on top, and free only the actually-replaced blocks.  Tracked as the
 incremental-rebuild task; same root cause expected for 069 (raw-write
 throughput) and 642.
 
+### Resolution: 074 PASSES in 442 s (09-11)
+
+The hang decomposed into FOUR stacked per-op costs, each fixed and
+measured in turn (all in briefs-utils, committed on bu-refactor-1):
+
+1. **Full-B+tree re-emit per WRITE** (the amplification above) →
+   localized leaf-diff rebuild `rebuildExtentIndexWrite`
+   (utils 8643303): positional 126-extent chunking, equal-content
+   prefix minus boundary leaf reuses its old blocks, index levels
+   always rebuilt fresh, only replaced leaves + old idx freed.
+   Device writes for the 074 shape: 34.5 GB → ~5 GB.  Regression
+   tests: prefix reuse, middle-shift reuses nothing, kill-9 crash
+   replay through reused blocks.
+2. **Ring-wrap whole-set writeback wait**: checkpointLocked's first
+   syncWB waited (sync_file_range WAIT_*) over the whole mixed
+   data+metadata pending set under j.mu every ring wrap (~every 500
+   fragmented ops) — invisible on the local tmpfs probe, dominant on
+   the VM.  Now KICK-ONLY (utils cd69023), matching the kernel's
+   checkpoint (journal.c:705 flushes only journal-owned metadata +
+   allocator bitmaps, never user data).  fsync/unmount keep the waits,
+   so the power-fail promise is unchanged.
+3. **Per-op O(E) tree walk + CRC on the WRITE path**
+   (collectExtentTree per request; run #2 was CPU-bound at 131%) →
+   per-inode walked-tree cache (utils 694151f): entries validated by
+   the (root, total) pair against the freshly-read inode — every
+   rebuild allocates a fresh root, so a matching root means the cached
+   tree IS the on-disk tree.  Shared read-only entries; the write path
+   clones before insertExtentSorted's in-place merges (the merge test
+   pins this: a mutated shared chunk would make the prefix compare
+   falsely match).  64 entries, arbitrary-victim eviction.
+4. **Per-op O(E) walk on GETATTR/LOOKUP/READ — the real dominant CPU
+   sink.**  A SIGQUIT goroutine dump of still-wedged run #3 (the dump
+   cost the run: recorded FAIL by design) showed the spinning threads
+   in WalkBtree/VerifyBtreeNodeChecksum under GETATTR, not WRITE: the
+   attr fillers (fillAttrOut, fillEntryOut) walked the whole
+   CRC-verified tree on EVERY Getattr/Lookup just to sum ext.Len for
+   st_blocks, and the read path did the same per READ.  fstest stats
+   and reads constantly.  Routed through the same cache: extentBlocksOf
+   for the fillers, collectExtentTree in readExtentData (utils
+   50027af).  In-process probe: 8-9 µs/op on the 074 shape.
+
+Result: solo `generic/074` run-20260911-175053-fuse.txt — **PASS in
+442 s** (73 s harness overhead + ~370 s test body + unmount), where
+both post-kick runs HANGed past 900 s and the pre-fix run past 1200 s
+at 34.5 GB device writes.  One contaminated intermediate run (my own
+pkill hit a suite I didn't realize was live — the interrupted launch
+HAD fired) confirmed the body pacing: ~22 MB into fstest.2 within
+~2 min of test time.
+
 ## Remaining follow-ups
 
 1. ~~Triage 007~~ DONE.  ~~Triage 585~~ DONE.  ~~ENOSPC cluster 102
