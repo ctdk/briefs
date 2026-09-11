@@ -592,19 +592,73 @@ between the reclaim hook and the 736a395 lazy-drain commit is ambiguous
 (both are in the binary; the old failure output no longer exists to
 distinguish), but the cluster is closed either way.
 
+## generic/127 closed: the SyncMeta drain window (2026-09-11, utils ffdc719)
+
+Root cause.  SyncMeta swapped the deferred-metadata map empty under
+`dirtyMu` and then wrote the blocks to the device page cache with NO shard
+lock.  Between the swap-out and a block's write landing, the dirty view no
+longer served that block, so a concurrent op on a SIBLING inode in the same
+4K inode-table block (file writes serialize on the inode-block shard lock,
+which the drain does not hold) based its whole-block read-modify-write on
+the stale page-cache copy and regressed every sibling slot.  Two fsx files
+created consecutively share one inode-table block, and the flusher
+variant's `-f` (constant fsync) drives the drains — the writer/flusher pair
+reproduces, single instances do not.
+
+Evidence chain:
+- Marker-gated bridge instrumentation (env/file-gated `debugf`, since
+  `systemd-run` strips the environment) logged every size-touching op,
+  every drain, and diffed every whole-block `setDirtyBlock` store landing
+  for a block whose drain was still in flight.
+- With the drain window artificially widened 20 ms (debug-gated sleep),
+  the pair failed in <1 min and the detector showed the sibling slot
+  regressing with a BACKWARDS mtime — an op's own slot always carries a
+  fresh timestamp, so a backwards mtime is unambiguously a stale base.
+  The regressed numbers matched the fsx error exactly:
+  "Size error: expected 0x28342 stat 0x26a1d" = 164674 -> 158237.
+- The same widened window with the fix: 200K ops, both fsx A-OK.
+- Deterministic pin: `TestSyncMetaDrainKeepsSiblingSlots` parks a drain
+  via the `syncMetaPause` test seam between snapshot and writes, then
+  writes to the sibling inode; on the old swap-out shape it fails with
+  "sibling write during drain regressed a: size 100, want 50".
+
+Fix (utils ffdc719): the drain copies the map, writes the snapshot, and
+only afterwards deletes entries no concurrent op re-stored meanwhile
+(CAS-delete).  The dirty view covers every block for the whole window; a
+concurrently-stored newer copy stays in the map for the next drain.
+
+Result: generic/127 PASS in the harness (run-20260911-005329-fuse.txt) —
+the first time it has passed on EITHER implementation (the kernel module
+wedges on the 127-class msync/flush deadlock, a different mechanism).
+
+Gotchas collected on the way:
+- The pair repro's one-shot `umount` races a still-running previous pair:
+  `pkill -9` orphans the FUSE mount, the next `mkfs` refuses ("is
+  mounted"), and the script exits WITHOUT writing its status marker while
+  the previous script's `wait` completes and writes its own — a later
+  launch then reads a stale status/log set and "confirms" a run that never
+  happened.  The repro now loop-umounts to completion, guards against
+  concurrent instances with `flock` (pgrep self-matches the setsid
+  launcher chain), and writes distinct failure markers.
+- fsx's `-f` variants use `_flush` filenames: the six instances do NOT
+  share files.  The failure needed CONCURRENCY between two files sharing
+  one inode-table block, not a shared-file race.
+- `setsid` forks when the child is a process-group leader; the transient
+  parent's command line matches `pgrep -f repro127`, tripping single-
+  instance guards.
+
 ## Remaining follow-ups
 
 1. ~~Triage 007~~ DONE.  ~~Triage 585~~ DONE.  ~~ENOSPC cluster 102
    226 274 275 371 511~~ DONE (reclaim, utils 0e4fc16, above).
+   ~~Triage 127~~ DONE (drain window, utils ffdc719, above).
 2. Scope-CPU the 9 still-hanging tests (069 074 113 410 476 642 747 748
    750) the same way (systemd scope Consumed lines + daemon SIGQUIT
    dumps at the hang point; mind the cumulative-CPU trap).
-3. Triage 127's mmap size error (single-instance fsx repro with seed
-   191110531, `-N 100000`, 256K file; the `-R -W` variants are the
-   mmap-ENABLED ones — the `_nommap` function names in the test lie).
-   563 remains the known accepted cgroup-writeback FAIL.
+3. 563 remains the known accepted cgroup-writeback FAIL.
 4. generic/475 dm-error (separate, pre-existing: fsstress D-state ~5 h).
 5. Benchmark 736a395 (fsx A/B for the residual 1,052 fdatasyncs/10K ops;
    the 45-test re-run archive measured 42c9b58 only).
-6. Re-run the full 793-test suite under fix C + 736a395 + 0e4fc16 to
-   get the post-fix totals and re-diff against the kernel baseline.
+6. Re-run the full 793-test suite under fix C + 736a395 + 0e4fc16 +
+   ffdc719 to get the post-fix totals and re-diff against the kernel
+   baseline.
