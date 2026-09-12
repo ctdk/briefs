@@ -118,7 +118,10 @@ RESUMED=0
 # older logs); the run archive derives its totals from STATUS, so the archive is
 # always internally consistent (categories sum to tests_processed).  Category
 # tokens: PASS FAIL NOTRUN SKIPPED HANG MOUNT MKFS UNKNOWN RESUMED.
-declare -A STATUS
+# The explicit `=()` matters: bash (5.2, set -u) treats a declared-but-
+# never-assigned associative array as unbound, so ${#STATUS[@]} in
+# write_archive crashed a zero-test run ("STATUS: unbound variable").
+declare -A STATUS=()
 # fsck warnings are an annotation, not a run category: a test that passes can
 # still trip a post-test fsck, so keep these separate from STATUS.
 FSCK_WARN_TESTS=()
