@@ -1153,7 +1153,7 @@ suite green; binaries deployed to the VM.  Solo re-validation
 (run-20260912-095821-fuse.txt): 341 342 376 510 771 all PASS, 0 HANG,
 0 fsck-warn — the cluster is closed.
 
-### Resolution: 299 — per-block journal-record amplification, one falloc = 26M records (09-12)
+### Resolution: 299 — three per-block terms: journal records, block lists, extent structs (09-12)
 
 Solo re-runs killed the daemon identically (4 kills, all
 `anon-rss:3193760kB` on the 3.9 GB VM), so the full-run "OOM flake"
@@ -1163,37 +1163,105 @@ daemon) separated the suspects: dirtyBlocks=3 (0 MB),
 pendingFrees≤2.5K, extentTrees≈6 — every persistent deferred structure
 tiny, while heapAlloc oscillated 600 MB→2.1 GB with heapSys pinned at
 2.8 GB and `journalDirty=true` mid-op.  Not a leak: one operation's
-transient working set.
+transient working set.  Three per-block terms, fixed in three
+stages.
 
-Root cause: `commitExtentChange` journaled **one JRN_EXTENT_ALLOC per
-allocated block** (file_ops.go, `Length: 1` hardcoded).  generic/299's
+**Term 1 — journal-record amplification (fixed, utils efc8cf4).**
+`commitExtentChange` journaled **one JRN_EXTENT_ALLOC per allocated
+block** (file_ops.go, `Length: 1` hardcoded).  generic/299's
 `falloc 0 $FILE_SIZE` over the whole ~100 GB scratch = 26,214,278
 blocks = 26.2M records from a single operation.  The ~2800-record ring
-filled ~9,300 times — a back-pressure checkpoint each fill — and the
-26M transient record buffers grew the Go heap arena until the oom-killer
-chose the daemon (fio's oom_score_adj 250 made it the pick, but the
-daemon genuinely held the memory).  The kernel never had this shape:
-btree.c journals **run-encoded** — one
+filled ~9,300 times — a back-pressure checkpoint each fill.  The kernel
+never had this shape: btree.c journals **run-encoded** — one
 `briefs_journal_extent_alloc(..., ext->len, ...)` per extent — and the
 on-disk record format always carried a length; only the bridge producer
 hardcoded 1.  Both replay sides (kernel journal.c
 replay_extent_alloc/free, bridge journal_replay.go) already handled
 Length > 1, and fsck does not interpret extent records.
-
-Fix (utils efc8cf4, `fuse: run-encode journal EXTENT_ALLOC/FREE
-records`; instrumentation e85cb03):
 `journalContigRuns` coalesces commitExtentChange's block lists into
 maximal contiguous runs (one record per run); the single-block producers
 (dir trie promotion, inline promotion, xattr/symlink blocks, inode free)
 pass an explicit length; freeInodeData journals one EXTENT_FREE per
-extent like the kernel's briefs_btree_free_all (a giant-file unlink had
-the same amplification).  Pinned by TestExtentJournalRunEncodedAndReplay:
-record counts O(runs) for a half-device falloc + truncate, and crash
-replay reserves/frees the same allocator bits the live path did.
+extent like the kernel's briefs_btree_free_all.  Pinned by
+TestExtentJournalRunEncodedAndReplay: record counts O(runs) for a
+half-device falloc + truncate, and crash replay reserves/frees the same
+allocator bits the live path did.
 
-Why 09-11's full run survived: marginality, not a different code path —
-the same 26M records were written; GC timing kept peak RSS just under
-the kill ceiling.  The 09-12 run lost that race.
+**Term 1 was necessary but NOT sufficient.**  Solo 299 under efc8cf4
+still OOM'd — daemon killed 44 s after mount
+(run-20260912-104059-fuse.txt), same ~3.19 GB anon-rss, with a
+mid-spike MemStats sample showing heapAlloc=97 MB but heapSys=3334 MB
+(the spike's arena stays grown; Go MADV_FREE keeps the RSS, so the NEXT
+spike lands on the ceiling under VM pressure: fio + page cache on the
+3.9 GB VM).
+
+**Term 2 — per-block `[]uint64` lists (fixed, utils 7850ccf).**  Even
+post-efc8cf4 every whole-device op materialized each touched block
+three times over: the rollback list (`allocated`, appended per block
+in allocUnwrittenHole's run path and fallback, writeExtentData's hole
+path, rebuildExtentIndex, promoteInlineData, the xattr chain), the free
+list (`freedAbs`, built per block inside freeExtentRange/shiftExtents —
+pure waste: an extent's overlapping portion is phys-contiguous by
+construction), and the pending-free queue (`pendingFrees`, appended per
+block by deferBlockFree; commitExtentChange's trailing loops and
+freeInodeData fed it per block).  ~200 MB per list per op, ~600 MB
+live, doubled by append growth and the GC goal.  The kernel works in
+extents and never builds per-block lists.  runlist.go adds
+`blockRun`/`runAccum` — one entry per maximal contiguous run,
+tail-merged (`addBlock`) as per-block allocation hands out consecutive
+blocks: `allocated` threads as `*runAccum` through every write/falloc
+path; freeExtentRange/shiftExtents emit one run per overlapping extent
+portion; `deferBlockFreeRun` queues a whole extent free in one entry;
+SyncMeta and the error-restore path operate per run; oldNodes stay
+per-block (bounded by node count, never O(#blocks)).  mem_debug gained
+a SIGUSR2 pprof heap-profile dump for exactly this spike window.
+Full utils suite green, including the crash-replay parity tests.
+
+Solo 299 re-validation under 7850ccf: **still OOM'd** — daemon killed
+34 s after mount (run-20260912-112528-fuse.txt), same ~3.19 GB
+anon-rss.  Two external pollers had also now failed identically (zero
+ticks, zero profiles captured — nothing survives the memory pressure
+being observed), so the sampling moved inside the daemon
+(**utils a0a53c9**): `BRIEFS_MEM_TICK=<seconds>` self-dumps the
+memstats line on a ticker, writes a heap profile at each fresh 512 MB
+heapAlloc threshold, and the mount helper forwards the variable
+through systemd-run's clean environment.  The next run captured 25
+ticks + 3 profiles before the kill: **every tracked counter tiny**
+(dirtyBlocks 0-1, pendingFrees ≤800 blocks in ≤300 runs, extentTrees
+entries in the low thousands) while heapAlloc still oscillated
+593 MB→2.5 GB — and the profile named **99.64 % of live heap at
+`allocUnwrittenHole`** (560 MB in the sampled window, the stack running
+through fallocateOp→preallocate).
+
+**Term 3 — the per-block Extent fallback (fixed, utils 4f04584).**
+`allocUnwrittenHole`'s fragmentation fallback allocated one block at a
+time and appended one ~40-byte `briefs.Extent` per block.  299's bash
+loop cycles `falloc 0 $FILE_SIZE` over the whole device while fio
+randwrites interleave, so after the first cycle no contiguous run of
+seg blocks exists and **every subsequent whole-device falloc took the
+fallback** — ~26 M one-block Extent structs ≈ 1-2.6 GB transient ×
+append doubling × GC goal.  The kernel's briefs_zero_alloc_hole
+(file.c:2840) has the same per-block shape but its 24-byte C arrays
+fit; the bridge diverges to **one extent per free-space fragment**:
+new `Allocator.AllocRunsUpTo` harvests maximal contiguous runs in a
+single bitmap pass (TrimFreeRuns' scan shape, allocating), truncating
+the final run to the remaining request; a short harvest re-loops so
+the pending-free reclaim (which per-block allocation got on every
+miss) can still turn a partial harvest complete, and ENOSPC leaves
+the taken runs in the rollback list exactly as before.  Hole coverage
+is unchanged — only the memory shape.  Evidence archive:
+`~/src/briefs-notes/299-prof5-evidence/` (memstats tick log, OOM
+lines, pprof analysis; the raw profiles were lost to the next run's
+cleanup before being copied off).
+
+Solo 299 re-validation under 4f04584: **PASS**
+(run-20260912-115400-fuse.txt).  The BRIEFS_MEM_TICK curve confirms the
+fix at the source: heapAlloc peaked at **12 MB** for the whole run
+(previously oscillating to 2.5 GB), heapSys stayed at 24 MB (previously
+3.8 GB), no OOM kill, and the daemon survived the full ~10-minute
+suite.  generic/299 is closed.  The durability-family re-check
+(040 041 069 073 534 536 335 336 343) is in flight since record and
+free shapes changed under efc8cf4/7850ccf/4f04584.
 
 ## Remaining follow-ups
 
