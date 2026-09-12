@@ -1107,16 +1107,13 @@ solo measurement).  get_timeout now gives all four 900 s.
 FAIL diff (09-11 → 09-12): 15 fixed, 6 new.  The 6:
 
 - **341 342 376 510 771 — one cluster, one mechanism** (below).
-- **299 — an OOM flake, not a bridge bug**: fio invoked the kernel
-  oom-killer (oom_score_adj 250) during the 999G verifier and the kernel
-  chose the daemon: `Killed process 3091420 (fuse.briefs) total-vm
-  ~6 GB anon-rss:3193760kB`.  Everything downstream — 480 `Transport
-  endpoint is not connected`, "filesystem on /dev/vdc1 is inconsistent",
-  the malformed remount usage error — is the post-daemon-death cascade.
-  No panic in the daemon log.  Watch item: the daemon's ~3.1 GB anon RSS
-  under fio pressure (per-op block cache + deferred maps) is large;
-  memory headroom under the deferred model may deserve a look if 299
-  flakes again.
+- **299 — deterministic bridge OOM, root-caused (09-12, corrected
+  below)**: the initial "OOM flake, not a bridge bug" read was wrong.
+  Solo re-runs reproduced the kill identically (4 kills, all
+  `anon-rss:3193760kB`), and SIGUSR1 MemStats dumps (utils mem_debug.go)
+  showed the persistent deferred structures (dirtyBlocks,
+  pendingFrees, extent trees) staying tiny while one falloc's transient
+  working set blew the heap.  See the resolution section below.
 
 ### Resolution: 341/342/376/510/771 — poisoned first-touch replay anchor (09-12)
 
@@ -1152,7 +1149,51 @@ ENOENTs as a no-op, undrained-tail records re-derive genuinely, and
 every rename's del/add pair stays on one root (a refresh-on-restore
 design was tried first and REVERTED — it fixed 341 but broke 534, whose
 first parent snapshot arrives AFTER its first dir-add).  Full utils
-suite green; binaries deployed to the VM.
+suite green; binaries deployed to the VM.  Solo re-validation
+(run-20260912-095821-fuse.txt): 341 342 376 510 771 all PASS, 0 HANG,
+0 fsck-warn — the cluster is closed.
+
+### Resolution: 299 — per-block journal-record amplification, one falloc = 26M records (09-12)
+
+Solo re-runs killed the daemon identically (4 kills, all
+`anon-rss:3193760kB` on the 3.9 GB VM), so the full-run "OOM flake"
+disposition was wrong — the kill is deterministic.  The USR1 MemStats
+dumps (new mem_debug.go instrumentation, `sudo kill -USR1` to the root
+daemon) separated the suspects: dirtyBlocks=3 (0 MB),
+pendingFrees≤2.5K, extentTrees≈6 — every persistent deferred structure
+tiny, while heapAlloc oscillated 600 MB→2.1 GB with heapSys pinned at
+2.8 GB and `journalDirty=true` mid-op.  Not a leak: one operation's
+transient working set.
+
+Root cause: `commitExtentChange` journaled **one JRN_EXTENT_ALLOC per
+allocated block** (file_ops.go, `Length: 1` hardcoded).  generic/299's
+`falloc 0 $FILE_SIZE` over the whole ~100 GB scratch = 26,214,278
+blocks = 26.2M records from a single operation.  The ~2800-record ring
+filled ~9,300 times — a back-pressure checkpoint each fill — and the
+26M transient record buffers grew the Go heap arena until the oom-killer
+chose the daemon (fio's oom_score_adj 250 made it the pick, but the
+daemon genuinely held the memory).  The kernel never had this shape:
+btree.c journals **run-encoded** — one
+`briefs_journal_extent_alloc(..., ext->len, ...)` per extent — and the
+on-disk record format always carried a length; only the bridge producer
+hardcoded 1.  Both replay sides (kernel journal.c
+replay_extent_alloc/free, bridge journal_replay.go) already handled
+Length > 1, and fsck does not interpret extent records.
+
+Fix (utils efc8cf4, `fuse: run-encode journal EXTENT_ALLOC/FREE
+records`; instrumentation e85cb03):
+`journalContigRuns` coalesces commitExtentChange's block lists into
+maximal contiguous runs (one record per run); the single-block producers
+(dir trie promotion, inline promotion, xattr/symlink blocks, inode free)
+pass an explicit length; freeInodeData journals one EXTENT_FREE per
+extent like the kernel's briefs_btree_free_all (a giant-file unlink had
+the same amplification).  Pinned by TestExtentJournalRunEncodedAndReplay:
+record counts O(runs) for a half-device falloc + truncate, and crash
+replay reserves/frees the same allocator bits the live path did.
+
+Why 09-11's full run survived: marginality, not a different code path —
+the same 26M records were written; GC timing kept peak RSS just under
+the kill ceiling.  The 09-12 run lost that race.
 
 ## Remaining follow-ups
 
