@@ -144,6 +144,16 @@ get_timeout() {
                                     # ENOSPC-full scratch fs adds ~170s; 300s
                                     # was marginal (intermittent HANGs on the
                                     # ddcb7ef baseline too, 2026-09-01)
+        generic/074) echo 900 ;;    # fsx 1M-op mmap writeback soak; 442s solo
+                                    # (2026-09-10) vs 300s KILL in the 09-12
+                                    # full run
+        generic/642) echo 900 ;;    # same shape as 074; 421s solo (2026-09-10)
+        generic/750) echo 900 ;;    # fsx 1M-op DIO soak, first measured under
+                                    # fix D in the 09-12 full run (300s KILL);
+                                    # budget matched to the 074/642 family
+        generic/410) echo 900 ;;    # soak; HANG at 300s in the 09-12 full run,
+                                    # needs first solo measurement under the
+                                    # raised budget
         *)           echo "$TIMEOUT_SECS" ;;
     esac
 }
