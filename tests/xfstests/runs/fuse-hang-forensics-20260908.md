@@ -1104,6 +1104,39 @@ all 300 s-budget KILLs of legitimate soaks (074 442 s and 642 421 s
 measured solo on 09-10; 750 first surfaced under fix D; 410 needs a
 solo measurement).  get_timeout now gives all four 900 s.
 
+### Resolution: the last 4 budget soaks — 074/642/750/410 all PASS (09-12)
+
+Solo re-validation under the raised 900 s budgets
+(run-20260912-120632): **074 PASS, 642 PASS, 750 PASS** — the 09-12
+full-run HANGs were purely 300 s-budget KILLs of legitimate fsx soaks.
+
+**410 was NOT a soak/budget issue** — the first solo run completed well
+inside the budget and FAILed instead: repeated
+`mount.fuse.briefs: usage:` errors plus
+`timed out waiting for .../mpB` and
+`mount: ... mpB: WARNING: failed to apply propagation flags`.
+Root cause: the `fuse-briefs-mount` MOUNT_PROG wrapper scraped 410's
+mount-namespace forms as `<dev> <mnt>`:
+
+- `_mount --bind $mpA $mpB` hit the scrape loop's `*) shift ;;`
+  catch-all, which DROPPED `--bind` and re-issued
+  `mount -t fuse.briefs $mpA $mpB` — a fresh daemon mount of the same
+  scratch dev at mpB instead of a bind mount.  The mangled mount then
+  timed out, and every subsequent `--make-*` on mpB hit a mount that
+  was not what the test expected.
+- `$MOUNT_PROG --make-shared $mpA` reached the wrapper with 2 args, so
+  the scrape loop was skipped entirely and `--make-shared` was assigned
+  as the dev name — mount(8) then garbled the invocation into the
+  helper's usage error.
+
+Bind/rbind/move and `--make-*` are pure VFS operations mount(8)
+performs itself; the fuse.briefs type helper is never involved.  Fix:
+the wrapper now detects `--bind|--rbind|--move|-B|-M|--make-*` and
+`exec mount "$@"` verbatim (passthrough runs before the scrape loop, so
+`$@` is pristine).  Solo re-run: **410 PASS**
+(run-20260912-124627) — "known flaky 410" was this wrapper bug all
+along.
+
 FAIL diff (09-11 → 09-12): 15 fixed, 6 new.  The 6:
 
 - **341 342 376 510 771 — one cluster, one mechanism** (below).

@@ -12,6 +12,18 @@
 # xfstests.
 set -uo pipefail
 
+# Bind/move/propagation forms (`--bind <src> <dst>`, `--rbind`, `--move`,
+# `--make-* <mnt>`) are pure VFS operations that mount(8) performs itself —
+# the fuse.briefs type helper is never involved.  generic/410 exercises
+# them.  Pass them through unchanged instead of scraping them as
+# <dev> <mnt>, which re-mounted the source as a fresh fuse.briefs mount
+# (or garbled the invocation into the helper's usage error).
+for a in "$@"; do
+  case "$a" in
+    --bind|--rbind|--move|-B|-M|--make-*) exec mount "$@" ;;
+  esac
+done
+
 dev=""
 mnt=""
 opts=""
