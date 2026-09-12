@@ -785,7 +785,10 @@ per-thread /proc poller (/tmp/daemon-poll.log):
   BlockDevice.Fdatasync, device.go:165) plus a sync.Mutex waiter.
 - **069 = raw write throughput** (3M 4-byte O_APPEND writes, each a
   full tree walk) — workload cost, not a barrier.
-- **410 = known flaky**, hung again, no capture.
+- **410 = known flaky**, hung again, no capture.  (09-12 update: the
+  "flaky" label was wrong — see the budget-soak resolution section:
+  the fuse-briefs-mount wrapper mangled 410's --bind/--make-*
+  invocations.  Fixed; solo PASS.)
 
 NET: 8 of the 9 captures are the whole-device-barrier family, so
 targeted flushes (fix D below) are the single lever for all of them.
