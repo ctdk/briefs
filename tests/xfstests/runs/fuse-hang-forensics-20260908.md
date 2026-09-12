@@ -1093,6 +1093,67 @@ PASS, 0 FAIL/0 HANG/0 fsck-warn.  With this, every member of the 7-FAIL
 regression set from the full re-run is resolved or accepted (073 534
 300 fixed, 335 336 343 fixed, 520 accepted).
 
+## The 09-12 full 793-test run: fix D + efb2c87, second mechanism (09-12)
+
+run-20260912-022251-fuse.txt (commit 35dfb93, fsck_enabled 0): **289 PASS
+/ 67 FAIL / 431 NOT RUN / 2 SKIP / 4 HANG** vs the 09-11 run's 277/72/11
+— 12 more PASS, 5 fewer FAIL, 11 HANGs down to 4.  The HANG→PASS
+promotions are fix D paying off across the whole barrier family
+(incl. 103 113 521 522 748); the remaining 4 HANGs are 074 410 642 750,
+all 300 s-budget KILLs of legitimate soaks (074 442 s and 642 421 s
+measured solo on 09-10; 750 first surfaced under fix D; 410 needs a
+solo measurement).  get_timeout now gives all four 900 s.
+
+FAIL diff (09-11 → 09-12): 15 fixed, 6 new.  The 6:
+
+- **341 342 376 510 771 — one cluster, one mechanism** (below).
+- **299 — an OOM flake, not a bridge bug**: fio invoked the kernel
+  oom-killer (oom_score_adj 250) during the 999G verifier and the kernel
+  chose the daemon: `Killed process 3091420 (fuse.briefs) total-vm
+  ~6 GB anon-rss:3193760kB`.  Everything downstream — 480 `Transport
+  endpoint is not connected`, "filesystem on /dev/vdc1 is inconsistent",
+  the malformed remount usage error — is the post-daemon-death cascade.
+  No panic in the daemon log.  Watch item: the daemon's ~3.1 GB anon RSS
+  under fio pressure (per-op block cache + deferred maps) is large;
+  memory headroom under the deferred model may deserve a look if 299
+  flakes again.
+
+### Resolution: 341/342/376/510/771 — poisoned first-touch replay anchor (09-12)
+
+All five failed with DOUBLED directory entries after a crash-replay
+(341's a/ = `[x x y y]`).  In-process repro (utils
+TestReplay341RenameDirRecreateName): mkdir a; mkdir a/x; 32K foo/bar
+in a/x; `_scratch_sync` (no-op on FUSE); `mv a/x a/y`; mkdir a/x (new
+empty dir reusing the old name); fsync; cut; replay.
+
+Root cause: `replayParents` (8a780be's per-replay parent-inode cache,
+loaded once at the parent's first DIR_UPDATE) was **poisoned by an
+early-window INODE_FULL snapshot**.  The rename that emptied a/ freed
+its trie root, the add of "y" re-created one, and the mkdir of the new
+"x" journaled a parent INODE_FULL — whose post-mutation DirTrieRoot was
+restored onto the inode block BEFORE the first DIR_UPDATE touched a/.
+First-touch then cached that snapshot's STALE root instead of the live
+path's final state.  The stale root's freed slot had been live-reused
+(pool scan order) for the new "y" leaf, so the re-derived dir-adds
+`trieLinkChild`ed a second copy of the entries into pages reachable
+from the final root.
+
+Why the kernel cannot hit it: its crash cut loses unflushed metadata,
+so the inode block holds the window START at replay iget and an inode
+restored before its first DIR_UPDATE is simply uncached; the bridge
+drains all metadata at every fsync, so the pre-replay block holds the
+window END — which is the anchor re-derivation needs.
+
+Fix (utils 5e62601, "pristine anchor"): the first time replay restores
+an inode not yet in replayParents, stash the PRE-restore slot content
+(`replayParentsPristine`); replayDirUpdate's first touch prefers the
+stash.  At the pre-replay anchor every drained add EEXISTS / del
+ENOENTs as a no-op, undrained-tail records re-derive genuinely, and
+every rename's del/add pair stays on one root (a refresh-on-restore
+design was tried first and REVERTED — it fixed 341 but broke 534, whose
+first parent snapshot arrives AFTER its first dir-add).  Full utils
+suite green; binaries deployed to the VM.
+
 ## Remaining follow-ups
 
 1. ~~Triage 007~~ DONE.  ~~Triage 585~~ DONE.  ~~ENOSPC cluster 102
