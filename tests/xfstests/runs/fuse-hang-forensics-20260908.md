@@ -725,6 +725,11 @@ Three distinct signatures, none of them the 007/585/127 fixes:
   (run-20260911-152737-fuse.txt), daemon log clean of replay errors.
   The flakey-remount family members 335/336/343 share the mechanism
   and should re-validate on the next subset run.**
+  **UPDATE 09-12: they do NOT — the re-validation run
+  (run-20260912-010647-fuse.txt) failed all three with the same
+  073-family signature (replay JRN_DIR_UPDATE ENOSPC for 335/336; raw
+  "bad trie page magic 0xabababab" for 343).  A second, distinct
+  mechanism: see the "Resolution: 335/336/343" section below.**
 - **B. sync(2) is a silent no-op (520).**  Only the `_scratch_sync`
   (global sync) cases fail; every fsync case passes.  sync(2) can never
   reach a regular FUSE mount's daemon (6.12 sets fc->sync_fs only for
@@ -1047,6 +1052,47 @@ shape if ever revisited: fuseblk mount so the kernel sets fc->sync_fs,
 plus a go-fuse FUSE_SYNCFS dispatch patched in via a local fork or a
 replace directive.
 
+## Resolution: 335/336/343 — freed trie pages never reached the disk (09-12)
+
+After 01734ab, the re-validation run (run-20260912-010647-fuse.txt)
+still failed all three with the same signatures (JRN_DIR_UPDATE replay
+ENOSPC for 335/336; raw "bad trie page magic 0xabababab" for 343), so
+a second mechanism was at work.  In-process repro of 335 built
+(utils fuse TestReplay335FullWindowReplay): it failed deterministically
+at the re-derived create-time dir-add of a/b/foo, which walks a/b's trie
+root 2368 — the page the mv later emptied and freed.
+
+All three tests call `_scratch_sync` — a NO-OP on the FUSE mount (the
+520 finding) — so the single fsync commits the ENTIRE window since
+mount and replay must re-derive every create against already-applied
+on-disk state.  When the mv empties a/b's trie, collapseAncestry frees
+root block 2368, and `deferBlockFree` DROPPED the page's deferred
+content at free time (cache.go, the generic/040/041 clobber guard):
+the page had never been written to disk, so at the cut block 2368 held
+mkfs-era garbage.  Replay's re-derived dir-add walked it → bad magic →
+TrieInsert collapsed the error to ENOSPC (the known 073 gotcha (e));
+343 surfaced the raw magic error through a different call path.
+
+The kernel avoids this twice over: its sync_fs works (the mid-test
+_scratch_sync checkpoints the creates and shrinks the window), and its
+Phase 2 pin-survives-free design (5524267 + ca4478b) keeps freed-but-
+dirty metadata buffers journal-owned until the commit writes them.
+
+Fix (utils efb2c87): deferBlockFree keeps the deferred content, and
+SyncMeta now drains BEFORE applying the pending frees, so a freed block
+cannot enter the allocator while its stale copy is still pending — the
+drain can never clobber the block's next owner (the free-vs-commit
+class the drop guarded).  cacheDrop still clears the per-op cache;
+freeBlockNow keeps its drop (its callers free after their own sync
+already drained).  On a drain error the taken frees are restored to
+pendingFrees.  Replay tolerates the re-derived dir-del re-freeing the
+resurrected root (dataAlloc.FreeBlock is an idempotent bitmap clear).
+
+VM validation 09-12: run-20260912-014325-fuse.txt — 335/336/343 all
+PASS, 0 FAIL/0 HANG/0 fsck-warn.  With this, every member of the 7-FAIL
+regression set from the full re-run is resolved or accepted (073 534
+300 fixed, 335 336 343 fixed, 520 accepted).
+
 ## Remaining follow-ups
 
 1. ~~Triage 007~~ DONE.  ~~Triage 585~~ DONE.  ~~ENOSPC cluster 102
@@ -1061,8 +1107,12 @@ replace directive.
    074/642/069 rebuild amplification fixed (074 PASSES, above).
    ~~520~~ ACCEPTED 09-12 (sync(2) cannot reach a non-fuseblk daemon —
    section above; joins 563 as accepted FAIL).
-   Remaining: 335/336/343 (expect fixed by 01734ab, re-validate on
-   next subset run), then the remaining FAILs.
+   ~~335/336/343~~ FIXED 09-12 (freed trie pages never reached the
+   disk — not the 01734ab mechanism; see the "Resolution: 335/336/343"
+   section above; utils efb2c87, run-20260912-014325-fuse.txt 3/3).
+   The 7-FAIL regression set from the full re-run is fully closed
+   (fixed: 073 300 335 336 343 534; accepted: 520).  Remaining: the
+   residual FAILs from the full run's 72 (accepted: 563, 520).
 3. 563 remains the known accepted cgroup-writeback FAIL.
 4. generic/475 dm-error (separate, pre-existing: fsstress D-state ~5 h).
 5. Benchmark 736a395 (fsx A/B for the residual 1,052 fdatasyncs/10K ops;
