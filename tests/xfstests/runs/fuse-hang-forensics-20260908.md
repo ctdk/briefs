@@ -738,7 +738,8 @@ Three distinct signatures, none of them the 007/585/127 fixes:
   EXISTS too — same-inode rename where the old name's removal is lost.
   fsync committed everything (bar is right), so this is replay
   idempotency or a deferred-trie state issue in the rename path, not a
-  sync gap.
+  sync gap.  **ROOT-CAUSED + FIXED 09-11 (utils 8a780be) — see the
+  "Resolution: 534" section below.**
 - **D. fio aio-dio EIO (300).**  Three `io_u error ... Input/output
   error` on 128K DIO writes under the random aio-dio pattern — real
   bridge DIO bug, unrelated to durability.
@@ -946,6 +947,42 @@ pkill hit a suite I didn't realize was live — the interrupted launch
 HAD fired) confirmed the body pacing: ~22 MB into fstest.2 within
 ~2 min of test time.
 
+## Resolution: 534 replay re-derives the old name across trie churn (09-11)
+
+Root cause (utils fix 8a780be): the rename empties the parent's
+directory trie, whose live path frees the old root
+(collapseAncestry) and re-creates a fresh one — trie root churn the
+kernel shares (trie.c frees the root and clears dir_trie_root at
+lines 1082-1097).  The bridge's replayDirUpdate re-read the parent
+inode block for EVERY JRN_DIR_UPDATE record, so the re-derived
+DEL(foo) and ADD(foo→bar) could land on different trie instances
+when a create-time JRN_INODE_FULL snapshot restore (which re-points
+DirTrieRoot at the stale pre-churn root) interleaved mid-replay:
+ADD applied to the final on-disk root R2, DEL applied to stale root
+R1 — foo survived replay with bar correct.  fsync committed
+everything (fsync is commit-not-checkpoint under fix B), so the
+on-disk state at the cut was already post-rename and the old name
+was pure re-derivation, exactly as triage suspected.
+
+The kernel is immune by accident of its inode cache: replay_dir_update
+(journal.c:898) igets the parent once and mutates the CACHED
+binfo->disk_inode; later replay_inode_full restores write the raw
+block but never refresh the cached copy, so every DIR_UPDATE in the
+window applies against the same mutated inode.  The fix ports that:
+replayDirUpdate reads the parent inode block once (replayParents map
+scoped to replayJournal), and the persist step writes the mutated
+copy back each time.  Freed-parent (magic 0) records skip, matching
+kernel iget -EINVAL.  Regression test TestReplayRenameOldNameStaysGone534
+mirrors the test's op sequence through the bridge methods, cuts
+without the unmount checkpoint, replays, and asserts foo is gone —
+fails deterministically pre-fix.
+
+VM validation: solo generic/534 PASSES (run-20260912-001634-fuse.txt,
+first post-fix run; the earlier FAIL run-20260911-234304-fuse.txt was
+the launch without HOST_OPTIONS that mounted kernel-briefs by
+mistake, and 534v's run-20260911-234944-fuse.txt reproduced the FAIL
+on the FUSE path pre-fix).
+
 ## Remaining follow-ups
 
 1. ~~Triage 007~~ DONE.  ~~Triage 585~~ DONE.  ~~ENOSPC cluster 102
@@ -954,9 +991,15 @@ HAD fired) confirmed the body pacing: ~22 MB into fstest.2 within
 2. ~~Scope-CPU~~ DONE (all 11 < 48 s CPU — wedge-shaped, above).
    ~~Triage the 11 HANGs from the watcher goroutine dumps~~ DONE 09-11
    (classification section above; 8 of 9 captures = whole-device barrier
-   family, fixed by utils 4e2761f).  Now: the 7 genuine FAIL regressions
-   (073 300 335 336 343 520 534 — durability family, triage section
-   above; needs solo repros), then the remaining FAILs.
+   family, fixed by utils 4e2761f).  ~~The 7 genuine FAIL regressions~~
+   073 + 534 root-caused and fixed (01734ab, 8a780be, sections above);
+   074/642/069 rebuild amplification fixed (074 PASSES, above).
+   Remaining: 300 (solo PASS but residual fio falloc_raicer EIO —
+   errToErrno now logs raw error text, utils e68e4a1, repro in flight),
+   520 (sync(2) structurally cannot reach a non-fuseblk daemon — fix
+   needs fuseblk + go-fuse SYNCFS dispatch, or accept-and-document),
+   335/336/343 (expect fixed by 01734ab, re-validate on next subset run),
+   then the remaining FAILs.
 3. 563 remains the known accepted cgroup-writeback FAIL.
 4. generic/475 dm-error (separate, pre-existing: fsstress D-state ~5 h).
 5. Benchmark 736a395 (fsx A/B for the residual 1,052 fdatasyncs/10K ops;
