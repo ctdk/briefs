@@ -1140,6 +1140,15 @@ the wrapper now detects `--bind|--rbind|--move|-B|-M|--make-*` and
 (run-20260912-124627) — "known flaky 410" was this wrapper bug all
 along.
 
+The same scrape loop also ate **generic/361's remount**
+(`-o remount,ro <mnt>` consumed the -o and left one positional →
+usage error, so the remount never ran and 361 — which only checks the
+remount does not hang — passed vacuously, in every prior full run).
+Remounts are mount(8)-only MS_REMOUNT ops too; the passthrough now
+covers `-o remount,...` and `-oremount,...` forms (055081e), and 361
+passes with the remount actually exercised
+(run-20260912-190519).
+
 ## The 09-12 full 793-test run #3: all closures hold (09-12)
 
 run-20260912-132029-fuse.txt (commit 1313837, fsck_enabled 0): **300
