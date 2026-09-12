@@ -1259,9 +1259,11 @@ Solo 299 re-validation under 4f04584: **PASS**
 fix at the source: heapAlloc peaked at **12 MB** for the whole run
 (previously oscillating to 2.5 GB), heapSys stayed at 24 MB (previously
 3.8 GB), no OOM kill, and the daemon survived the full ~10-minute
-suite.  generic/299 is closed.  The durability-family re-check
-(040 041 069 073 534 536 335 336 343) is in flight since record and
-free shapes changed under efc8cf4/7850ccf/4f04584.
+suite.  generic/299 is closed.  The durability-family re-check under
+the changed record/free shapes: **8/8 PASS**
+(run-20260912-115724-fuse.txt — 040 041 069 073 335 336 343 534;
+536 NOT RUN is the harness's standard "briefs does not support
+shutdown" notrun).
 
 ## Remaining follow-ups
 
