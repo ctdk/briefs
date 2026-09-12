@@ -1140,6 +1140,36 @@ the wrapper now detects `--bind|--rbind|--move|-B|-M|--make-*` and
 (run-20260912-124627) — "known flaky 410" was this wrapper bug all
 along.
 
+## The 09-12 full 793-test run #3: all closures hold (09-12)
+
+run-20260912-132029-fuse.txt (commit 1313837, fsck_enabled 0): **300
+PASS / 59 FAIL / 431 NOT RUN / 2 SKIP / 1 HANG** vs run #2's
+289/67/4 — 11 more PASS, 8 fewer FAIL, HANGs down to 1.
+
+Category diff (run #2 → #3):
+
+- **13 promotions to PASS** — every closure held in the full suite:
+  299 (three-term OOM fix 4f04584), 341/342/376/510/771 (pristine
+  replay anchor 5e62601), 074/642/750 (900 s budgets), 410 (wrapper
+  passthrough fix), and 409/411/632 (409/411 are 410's mount-namespace
+  family — the same wrapper fix cleared them; 632 a run-#2 flake
+  reverting).
+- **2 regressions, both known flakes**:
+  - **476 PASS→HANG at 293 s** — the whole-device fdatasync hang
+    family's documented flake (run #1 HANG, run #2 PASS, run #3 HANG).
+    It ran just under the default 300 s budget — the same shape that
+    074/642/750 presented before their budgets were raised to 900 s.
+    Treatment matches: get_timeout raised to 900 s, solo re-validation
+    below.
+  - **547 PASS→FAIL** — the documented 475-family crash-consistency
+    flake (remote-vs-local fs mismatch in the replay check; run #2
+    PASS, run #3 FAIL — same output shape as the historical flake).
+
+FAIL-list diff run #2 → #3: **9 fixed** (299 341 342 376 409 411 510
+632 771 — the OOM fix, the replay-anchor cluster, 410's wrapper family,
+and 632's run-#2 flake reverting), **1 new** (547 flake).  The 59
+remaining FAILs are all previously triaged/accepted families.
+
 FAIL diff (09-11 → 09-12): 15 fixed, 6 new.  The 6:
 
 - **341 342 376 510 771 — one cluster, one mechanism** (below).

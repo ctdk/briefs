@@ -151,6 +151,12 @@ get_timeout() {
                                     # (2026-09-10) vs 300s KILL in the 09-12
                                     # full run; solo PASS under the 900s budget
                                     # (run-20260912-120632)
+        generic/476) echo 900 ;;    # whole-device fdatasync soak of the barrier
+                                    # family; flaky-hang record (run #1 HANG,
+                                    # run #2 PASS, run #3 HANG at 293s — just
+                                    # under the 300s default); same shape
+                                    # 074/642/750 presented before their
+                                    # budgets were raised
         generic/642) echo 900 ;;    # same shape as 074; 421s solo (2026-09-10);
                                    # solo PASS under the 900s budget
                                    # (run-20260912-120632)
