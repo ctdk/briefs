@@ -742,7 +742,9 @@ Three distinct signatures, none of them the 007/585/127 fixes:
   "Resolution: 534" section below.**
 - **D. fio aio-dio EIO (300).**  Three `io_u error ... Input/output
   error` on 128K DIO writes under the random aio-dio pattern — real
-  bridge DIO bug, unrelated to durability.
+  bridge DIO bug, unrelated to durability.  **ROOT-CAUSED + FIXED
+  09-11/12 (utils e68e4a1 + ebf9863) — see the "Resolution: 300"
+  section below.**
 
 069's wedge produced no D-state client (FUSE waits are interruptible),
 so the D-state-only watcher v1 missed it; watcher v2 (D-state OR frozen
@@ -983,6 +985,42 @@ the launch without HOST_OPTIONS that mounted kernel-briefs by
 mistake, and 534v's run-20260911-234944-fuse.txt reproduced the FAIL
 on the FUSE path pre-fix).
 
+## Resolution: 300 punch-path ENOSPC mislabeled EIO (09-11/12)
+
+The triage's "DIO bug" read was wrong on two counts.  The solo repro
+(run-20260912-002448, PASS with `errors: total=0`) still showed
+`falloc_raicer: err=5 (func=td_io_queue, error=Input/output error)`,
+and generic/300's fio config tells the rest: falloc_raicer and both
+punch_hole_raicer jobs use `ioengine=falloc` — they issue ONLY
+fallocate syscalls, no writes at all.  So the EIO was returned by the
+FALLOCATE op itself.
+
+Root cause (utils e68e4a1 + ebf9863): on the racer-filled device the
+punch path's full extent-index rebuild needed a fresh leaf block and
+the allocator (meta-class, shield-bypassed, reclaim-retried) genuinely
+found none — ENOSPC, wrapped as `alloc leaf 145: no space left on
+device`.  errToErrno's bare type switch saw only the fmt.Errorf
+wrapper and converted EVERY wrapped syscall error to EIO.  fio's
+config explicitly tolerates ENOSPC (`ignore_error=,ENOSPC`,
+`continue_on_error=write`) but not EIO, so the mislabel poisoned the
+job dispatch where the real errno would have been ignored.
+
+Fix: errToErrno now unwraps via errors.As so a buried errno reaches
+the caller, and logs only the truly errno-less internal failures
+(e68e4a1 added the logging that captured the raw text above; ebf9863
+added the unwrap — Fsync's three bare-EIO returns are routed through
+the same helper).  Validation run-20260912-004446: PASS, and every
+fio job error is now err=28 (No space left on device), which the test
+tolerates — zero EIOs, no new daemon EIO lines.
+
+Known divergence remaining (accepted for now): the bridge's punch
+does a full index rebuild that allocates every leaf fresh, where the
+kernel's briefs_btree_delete_range punches in place and never
+allocates — so a punch on a genuinely full fs can ENOSPC where the
+kernel cannot.  The write path's localized leaf-diff rebuild
+(utils 8643303) is the shape of the eventual fix if this ever bites a
+test that does NOT tolerate punch ENOSPC.
+
 ## Remaining follow-ups
 
 1. ~~Triage 007~~ DONE.  ~~Triage 585~~ DONE.  ~~ENOSPC cluster 102
@@ -992,12 +1030,12 @@ on the FUSE path pre-fix).
    ~~Triage the 11 HANGs from the watcher goroutine dumps~~ DONE 09-11
    (classification section above; 8 of 9 captures = whole-device barrier
    family, fixed by utils 4e2761f).  ~~The 7 genuine FAIL regressions~~
-   073 + 534 root-caused and fixed (01734ab, 8a780be, sections above);
+   073 + 534 + 300 root-caused and fixed (01734ab, 8a780be,
+   e68e4a1+ebf9863, sections above);
    074/642/069 rebuild amplification fixed (074 PASSES, above).
-   Remaining: 300 (solo PASS but residual fio falloc_raicer EIO —
-   errToErrno now logs raw error text, utils e68e4a1, repro in flight),
-   520 (sync(2) structurally cannot reach a non-fuseblk daemon — fix
-   needs fuseblk + go-fuse SYNCFS dispatch, or accept-and-document),
+   Remaining: 520 (sync(2) structurally cannot reach a non-fuseblk
+   daemon — fix needs fuseblk + go-fuse SYNCFS dispatch, or
+   accept-and-document; decision pending),
    335/336/343 (expect fixed by 01734ab, re-validate on next subset run),
    then the remaining FAILs.
 3. 563 remains the known accepted cgroup-writeback FAIL.
