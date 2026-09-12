@@ -733,6 +733,12 @@ Three distinct signatures, none of them the 007/585/127 fixes:
   cut loses the whole workload ("After:" empty).  The per-op-sync
   bridge masked this.  Fix options: fuseblk mount + a patched go-fuse
   SYNCFS dispatch, or accept sync(2) as unwired and document it.
+  **ACCEPTED 2026-09-12 (user decision): sync(2) is a documented
+  limitation of the non-fuseblk FUSE mount — kernel-parity behavior
+  would require fuseblk + a patched go-fuse FUSE_SYNCFS (opcode 50)
+  dispatch, which is not worth the dependency patch for one test.
+  520 joins 563 as an accepted FAIL; the forensics doc and
+  xfstests-fuse-status record it.**
 - **C. rename old-name loss (534).**  After truncate+rename+fsync and
   the cut, `bar` survives with correct size/content but `foo` STILL
   EXISTS too — same-inode rename where the old name's removal is lost.
@@ -1021,6 +1027,26 @@ kernel cannot.  The write path's localized leaf-diff rebuild
 (utils 8643303) is the shape of the eventual fix if this ever bites a
 test that does NOT tolerate punch ENOSPC.
 
+## 520 accepted: sync(2) cannot reach a non-fuseblk daemon (09-12)
+
+Root cause confirmed against the 6.12 source: fuse registers
+.sync_fs = fuse_sync_fs, but sets `fc->sync_fs = 1` only under
+`if (ctx->is_bdev)` (fs/fuse/inode.c:1742 — fuseblk mounts); for every
+other FUSE mount fuse_sync_fs returns 0 immediately when
+`!fc->sync_fs` (inode.c:740).  The FUSE_SYNCFS opcode (50) is simply
+never sent, and go-fuse v2.10.1 has no dispatch for it in any case.
+So sync(2) on a fuse.briefs mount commits nothing — under fix B's
+deferred write-back the cut at the end of generic/520's sync-only
+workload loses everything, and only the fsync cases pass.
+
+Decision (user, 2026-09-12): ACCEPTED as a documented limitation —
+same class as every other non-fuseblk FUSE filesystem (the kernel
+would permanently disable sync_fs on ENOSYS even if we could see the
+requests, inode.c:755).  520 joins 563 as an accepted FAIL.  The fix
+shape if ever revisited: fuseblk mount so the kernel sets fc->sync_fs,
+plus a go-fuse FUSE_SYNCFS dispatch patched in via a local fork or a
+replace directive.
+
 ## Remaining follow-ups
 
 1. ~~Triage 007~~ DONE.  ~~Triage 585~~ DONE.  ~~ENOSPC cluster 102
@@ -1033,11 +1059,10 @@ test that does NOT tolerate punch ENOSPC.
    073 + 534 + 300 root-caused and fixed (01734ab, 8a780be,
    e68e4a1+ebf9863, sections above);
    074/642/069 rebuild amplification fixed (074 PASSES, above).
-   Remaining: 520 (sync(2) structurally cannot reach a non-fuseblk
-   daemon — fix needs fuseblk + go-fuse SYNCFS dispatch, or
-   accept-and-document; decision pending),
-   335/336/343 (expect fixed by 01734ab, re-validate on next subset run),
-   then the remaining FAILs.
+   ~~520~~ ACCEPTED 09-12 (sync(2) cannot reach a non-fuseblk daemon —
+   section above; joins 563 as accepted FAIL).
+   Remaining: 335/336/343 (expect fixed by 01734ab, re-validate on
+   next subset run), then the remaining FAILs.
 3. 563 remains the known accepted cgroup-writeback FAIL.
 4. generic/475 dm-error (separate, pre-existing: fsstress D-state ~5 h).
 5. Benchmark 736a395 (fsx A/B for the residual 1,052 fdatasyncs/10K ops;
