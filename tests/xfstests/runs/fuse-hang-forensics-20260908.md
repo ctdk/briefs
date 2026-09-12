@@ -1159,8 +1159,11 @@ Category diff (run #2 → #3):
     family's documented flake (run #1 HANG, run #2 PASS, run #3 HANG).
     It ran just under the default 300 s budget — the same shape that
     074/642/750 presented before their budgets were raised to 900 s.
-    Treatment matches: get_timeout raised to 900 s, solo re-validation
-    below.
+    Treatment matches: get_timeout raised to 900 s, and solo
+    re-validation **476 PASS** (run-20260912-185516) — a legitimate
+    soak the 300 s default was killing on its long runs.  With that,
+    the full-suite HANG count is zero for every test whose budget
+    matches its soak time.
   - **547 PASS→FAIL** — the documented 475-family crash-consistency
     flake (remote-vs-local fs mismatch in the replay check; run #2
     PASS, run #3 FAIL — same output shape as the historical flake).

@@ -156,7 +156,8 @@ get_timeout() {
                                     # run #2 PASS, run #3 HANG at 293s — just
                                     # under the 300s default); same shape
                                     # 074/642/750 presented before their
-                                    # budgets were raised
+                                    # budgets were raised; solo PASS under
+                                    # the 900s budget (run-20260912-185516)
         generic/642) echo 900 ;;    # same shape as 074; 421s solo (2026-09-10);
                                    # solo PASS under the 900s budget
                                    # (run-20260912-120632)
