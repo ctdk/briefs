@@ -13,16 +13,31 @@
 set -uo pipefail
 
 # Bind/move/propagation forms (`--bind <src> <dst>`, `--rbind`, `--move`,
-# `--make-* <mnt>`) are pure VFS operations that mount(8) performs itself —
-# the fuse.briefs type helper is never involved.  generic/410 exercises
-# them.  Pass them through unchanged instead of scraping them as
-# <dev> <mnt>, which re-mounted the source as a fresh fuse.briefs mount
-# (or garbled the invocation into the helper's usage error).
-for a in "$@"; do
-  case "$a" in
+# `--make-* <mnt>`) and remount forms (`-o remount,... <mnt>`) are pure
+# VFS operations that mount(8) performs itself — the fuse.briefs type
+# helper is never involved.  generic/409/410/411 exercise the former;
+# generic/361 the latter (previously the scrape loop consumed
+# `-o remount,ro` and left one positional, so the wrapper died with a
+# usage error and the remount never happened — 361 passed vacuously,
+# its "remount should not hang" check trivially satisfied).
+argv=("$@")
+i=0
+while [ "$i" -lt "${#argv[@]}" ]; do
+  case "${argv[$i]}" in
     --bind|--rbind|--move|-B|-M|--make-*) exec mount "$@" ;;
+    -o)
+      # Remounts carry the MS_REMOUNT flag inside the option value.
+      [ "$((i + 1))" -lt "${#argv[@]}" ] && \
+        case "${argv[$((i + 1))]}" in
+          remount,*) exec mount "$@" ;;
+        esac
+      i=$((i + 1))
+      ;;
+    -oremount,*) exec mount "$@" ;;
   esac
+  i=$((i + 1))
 done
+unset argv i
 
 dev=""
 mnt=""
