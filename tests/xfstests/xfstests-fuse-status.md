@@ -25,6 +25,7 @@ The 20 tests: generic/087 088 093 125 193 256 314 355 375 444 597 598 633
 | R5 | `fuse_set_acl` delegates the ACL→mode update to the daemon ("Fuse userspace is responsible for updating access permissions in the inode"); the bridge stored the blob verbatim (375) | `1b2528c` `setXattrOp` recomputes the mode from the access ACL and clears S_ISGID unless in_group_or_capable — the same condition the kernel signals (invisibly to go-fuse 2.10.1) via FUSE_SETXATTR_ACL_KILL_SGID in `setxattr_flags` |
 | R6 | fuse_setattr never runs `posix_acl_chmod` (fs/fuse/dir.c:2365 defers it): a chmod left the stored access ACL stale, so the next setfacl that matched the stale ACL issued no setxattr and the mode never followed (375, second shape) | `c4688dc` `syncAccessAclToMode` in setattrOp's chmod branch (`__posix_acl_chmod_masq` port) |
 | R7 | fusermount3 mounts nosuid,nodev,noexec: setid exec from the mount impossible (633 "setid binaries on regular mounts") | `5a2093b` mount with suid,dev,exec (kernel-mount parity) |
+| R8 | `mount.fuse.briefs` discarded the `-o` value, so `mount -t fuse.briefs -o nosuid` mounted with the daemon's defaults and the request never reached the FUSE mount. generic/128 passed vacuously before the allow_other fix (its qa_user exec died with EACCES before any semantics ran); with allow_other its setuid-root `ls` really ran as root | `9bd009c` helper forwards `-o` via `--mount-opts`; the daemon merges — nosuid/nodev/noexec drop the matching permissive default, unrecognized options pass through for the kernel to reject (696's `-o noacl` fails its `_try_scratch_mount` and is skipped, same PASS) |
 
 generic/633 passes outright — better than the plan's target of 19/20 with 633
 a documented partial.  Its remaining `--test-core` suite needs no idmapped
@@ -50,8 +51,12 @@ mounts; the idmapped-mount campaign stays out of scope as planned.
   fusermount3's own noexec default) diverge from the kernel `mount -t
   briefs` defaults; `MountOptions.Options` clears them.
 
-## Full-suite baseline
+## Full-suite runs
 
-- 20260912-132029 (pre-Family-1): 300/59/1
-- Full-suite re-run after Family 1: see `runs/` for the newest archive and
-  `diff-runs.sh` for the regression diff against the baseline.
+- 20260912-132029 (pre-Family-1 baseline): 300/59/1
+- 20260913-201548 (after Family 1, 793 tests): **327/33/0 hangs** — diff
+  vs baseline: 27 FAIL→PASS (the 20 family tests plus 126 237 294 317
+  318 452 547), 476 HANG→PASS, and one PASS→FAIL regression generic/128
+  — a *vacuous* baseline pass unmasked by allow_other (root cause R8
+  above, fixed by `9bd009c` after this run).  No new hangs; every
+  durability/perf closure from the 09-08..09-12 campaigns held.
