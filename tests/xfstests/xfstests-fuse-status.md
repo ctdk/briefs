@@ -60,3 +60,8 @@ mounts; the idmapped-mount campaign stays out of scope as planned.
   — a *vacuous* baseline pass unmasked by allow_other (root cause R8
   above, fixed by `9bd009c` after this run).  No new hangs; every
   durability/perf closure from the 09-08..09-12 campaigns held.
+- 20260914-021234 (with the R8 fix, 793 tests): **328/32/0 hangs** —
+  the only change vs 201548 is generic/128 FAIL→PASS.  Vs the baseline:
+  27 FAIL→PASS, 476 HANG→PASS, and ZERO PASS→FAIL regressions.  This is
+  the campaign's closing record: all 20 Family-1 tests pass, every prior
+  closure holds, and the mount now honors `-o` options.
