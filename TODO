@@ -7,7 +7,7 @@
   independent or unique to briefs. (Started: norecovery, errors=, debug/nodebug.)
 - Revise briefs(5) man page.
 - Quotas
-- POSIX ACLs
+- [Done] POSIX ACLs (kernel a113c76; also implemented in the FUSE bridge)
 - online resize (or any resize)
 - extend inode map/add inodes to existing volume
 - [Done] Make journal size configurable.

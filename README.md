@@ -64,7 +64,7 @@ BrieFS recognizes the following filesystem-specific mount options:
 RELATED
 -------
 
-* [github.com/ctdk/briefs-utils](https://github.com/ctdk/briefs-utils): The briefs utilities, written in Golang, composed of `mkfs.briefs`, `fsck.briefs`, and `fuse.briefs`. `mkfs.briefs` creates BrieFS volumes, `fsck.briefs` checks and repairs BrieFS volumes, and `fuse.briefs` provides an **experimental** read-write FUSE bridge for those same BrieFS volumes. The FUSE bridge implements full kernel parity (all dir/file ops, xattrs, fileattr/chattr, renameat2, fallocate/setattr/killpriv) with a Go port of the kernel journal, but has not yet been tested across the full xfstests suite. See the `xfstests-fuse-status.md` document in `briefs-utils` for the current xfstests pass/fail record and known issues.
+* [github.com/ctdk/briefs-utils](https://github.com/ctdk/briefs-utils): The briefs utilities, written in Golang, composed of `mkfs.briefs`, `fsck.briefs`, and `fuse.briefs`. `mkfs.briefs` creates BrieFS volumes, `fsck.briefs` checks and repairs BrieFS volumes, and `fuse.briefs` provides an **experimental** read-write FUSE bridge for those same BrieFS volumes. The FUSE bridge implements full kernel parity (all dir/file ops, xattrs, POSIX ACLs, fileattr/chattr, renameat2, fallocate/setattr/killpriv) with a Go port of the kernel journal, and has been validated across the full generic xfstests suite (793 tests; latest run 2026-09-15: 328 PASS / 32 FAIL / 0 HANG, every residual failure triaged). See the `xfstests-fuse-status.md` document in `briefs-utils` for the current xfstests pass/fail record and known issues.
 * [github.com/ctdk/modern-xiafs](https://github.com/ctdk/modern-xiafs): Computer filesystem archaeology. A port of an ancient Linux filesystem to modern kernels, updated as I get around to it.
 
 RATIONALE
@@ -126,7 +126,10 @@ WORKS
 * Nanosecond-precision timestamps
 * Extended attributes (user, trusted, and security namespaces; large values may
   span chained 4 KiB continuation blocks; crash-safe journal replay and fsck
-  validation; no POSIX ACLs)
+  validation)
+* POSIX ACLs (access and default lists, stored as `system.posix_acl_access` and
+  `system.posix_acl_default` xattrs; enforced via `SB_POSIXACL`, with the
+  usual setgid-clearing semantics on chmod)
 * Direct I/O (O_DIRECT)
 * chattr/lsattr inode flags: +S (sync), +D (dirsync), +i (immutable), +a
   (append-only), +d (nodump), +A (noatime), exposed through both
@@ -138,10 +141,10 @@ DEFINITELY MISSING OR BROKEN
 
 * The journal is a **logical/metadata journal**, not a block-image one. It records and replays allocator changes, inode updates, directory changes, trie-page allocations, and symlink data, but it does **not** journal B+ tree extent-index *node structure*: a torn extent-index split is not reconstructed by replay. Instead it relies on ordered durable writes — every B+ tree index block the inode snapshot references is drained (synced) before the `JRN_INODE_FULL` record is written, so the journaled snapshot never points at a not-yet-on-disk tree block. If that ordering is violated by a crash the journal can't cover, `fsck.briefs --repair-only=btree-rebuild` can repair the damage offline.
 * Data journaling is not implemented. Metadata (allocations, inode updates, directory changes, etc.) is journaled and replayed on mount, but ordinary file writeback goes through the page cache and is only durable after `sync`/`fsync`/flush. A crash after a buffered write but before flush may lose data. This is the same trade-off most filesystems make by default; full data journaling is not currently planned.
-* No POSIX ACLs, quotas, reflink/COW, fscrypt, fsverity, or online resize.
-  Extended attributes (user, trusted, and security namespaces), direct I/O, and
-  chattr/lsattr inode flags are supported.
-* FUSE implementation (requires less commitment than the kernel module). An experimental read-write FUSE bridge exists via briefs-utils (`fuse.briefs`), with full kernel parity (all dir/file ops, xattrs, fileattr/chattr, renameat2, fallocate/setattr/killpriv) and a Go port of the kernel journal, but it has not yet been tested across the full xfstests suite. See the `xfstests-fuse-status.md` document in `briefs-utils` for the current pass/fail record and known issues.
+* No quotas, reflink/COW, fscrypt, fsverity, or online resize. Extended
+  attributes (user, trusted, and security namespaces), POSIX ACLs, direct
+  I/O, and chattr/lsattr inode flags are supported.
+* FUSE implementation (requires less commitment than the kernel module). An experimental read-write FUSE bridge exists via briefs-utils (`fuse.briefs`), with full kernel parity (all dir/file ops, xattrs, POSIX ACLs, fileattr/chattr, renameat2, fallocate/setattr/killpriv) and a Go port of the kernel journal. It has been validated across the full generic xfstests suite (793 tests; latest run 2026-09-15: 328 PASS / 32 FAIL / 0 HANG, every residual failure triaged). See the `xfstests-fuse-status.md` document in `briefs-utils` for the current pass/fail record and known issues.
 * Thorough annotations - Annotating the source code thoroughly will wait until things settle down. Right now everything's still in constant flux, so there's no point thoroughly annotating something that may change unrecognizably or flat out disappear soon.
 * Refactoring. Since BrieFS is partly a project to learn about using AI assistance while coding, even though I've been reviewing what it's doing there's definitely some weirdness and clunkiness that needs to be gussied up and organized so it's easier to understand. This will go nicely hand in hand with the annotation project above.
 

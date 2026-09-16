@@ -65,3 +65,7 @@ mounts; the idmapped-mount campaign stays out of scope as planned.
   27 FAIL→PASS, 476 HANG→PASS, and ZERO PASS→FAIL regressions.  This is
   the campaign's closing record: all 20 Family-1 tests pass, every prior
   closure holds, and the mount now honors `-o` options.
+- 20260915-212640 (793 tests, at the briefs-utils re-review HEAD `a24c72d`
+  after the 18-commit refactor series): **328/32/0 hangs** — per-test
+  status byte-identical to 021234 across all 793 tests.  The refactor
+  introduced no behavioral change at suite scale.
