@@ -1694,6 +1694,140 @@ static inline int briefs_sync_dirty_buffer(struct buffer_head *bh,
 	return 0;
 }
 
+/*
+ * Batched synchronous metadata write-back.  The commit paths (journal owned
+ * set, journal block range, allocator bitmap) used to loop sb_bread +
+ * briefs_sync_dirty_buffer, paying a full device round trip per buffer;
+ * a checkpoint with N metadata buffers serialized N waits.  This batches
+ * them: a bounded window of buffers is submitted, then waited on once, so
+ * N buffers cost ~1 round trip (plus merged requests via the plug), not N.
+ *
+ * Per-buffer semantics are exactly briefs_sync_dirty_buffer's: the submit
+ * stage replicates the submit half of __sync_dirty_buffer() (lock_buffer ->
+ * test_clear_buffer_dirty -> get_bh + bh->b_end_io = end_buffer_write_sync ->
+ * submit_bh(REQ_OP_WRITE|REQ_SYNC)); the wait stage is wait_on_buffer + the
+ * briefs_check_meta_write_error() quiesce + briefs_handle_meta_write_error()
+ * error chokepoint.  A buffer
+ * found clean is not written at all (the one-write-per-buffer guarantee
+ * of the generic/475 fix), an unmapped buffer fails like __sync_dirty_buffer
+ * does, and a write error is reported once, after the window drains.
+ *
+ * Ownership contract: briefs_meta_batch_add() TAKES OVER the caller's
+ * buffer reference (the sb_bread pin).  The caller must NOT brelse a
+ * buffer it added -- the reference is released in the wait stage (clean
+ * buffers are released immediately inside add).  The reference is held
+ * across submit -> wait because the buffer stays locked while the write
+ * is in flight (end_buffer_write_sync unlocks): __sync_dirty_buffer's contract
+ * holds, and the in-flight buffer is buffer_busy by its own I/O rather
+ * than by our pin -- the rest of a large dirty set stays unpinned and
+ * pdflush-eligible while a window syncs, preserving the generic/676 fix
+ * (which failed only when a large batch was pinned AND unwritten for the
+ * whole wait).  Memory is bounded: a checkpoint with thousands of dirty
+ * buffers flows through BRIEFS_META_BATCH_MAX-sized windows.
+ *
+ * The caller MUST call briefs_meta_batch_wait() exactly once before the
+ * batch goes out of scope, on every path (success and error alike), or
+ * the outstanding references leak.
+ */
+#define BRIEFS_META_BATCH_MAX 64
+
+struct briefs_meta_batch {
+	struct super_block *sb;
+	const char *ctx;
+	struct buffer_head *bhs[BRIEFS_META_BATCH_MAX];
+	struct blk_plug plug;
+	bool plugged;
+	unsigned int n;
+	int error;
+};
+
+static inline void briefs_meta_batch_init(struct briefs_meta_batch *b,
+					  struct super_block *sb,
+					  const char *ctx)
+{
+	b->sb = sb;
+	b->ctx = ctx;
+	b->n = 0;
+	b->error = 0;
+	b->plugged = false;
+}
+
+/* Wait stage: drain the window.  Flush the plug first so the submitted
+ * bios reach the queue (adjacent blocks may merge), then wait on every
+ * pending buffer, quiescing and reporting write errors through the
+ * chokepoint.  Returns 0 on success, -EIO if any write failed (also
+ * latched by add() itself).  Safe to call with an empty window.
+ */
+static inline int briefs_meta_batch_wait(struct briefs_meta_batch *b)
+{
+	unsigned int i;
+	int ret = b->error;
+
+	if (b->plugged) {
+		blk_finish_plug(&b->plug);
+		b->plugged = false;
+	}
+	for (i = 0; i < b->n; i++) {
+		struct buffer_head *bh = b->bhs[i];
+
+		wait_on_buffer(bh);
+		if (briefs_check_meta_write_error(bh))
+			ret = -EIO;
+		brelse(bh);
+	}
+	b->n = 0;
+	b->error = 0;
+	if (ret)
+		briefs_handle_meta_write_error(b->sb, b->ctx);
+	return ret;
+}
+
+/* Submit stage: one buffer, no wait.  Consumes the caller's reference in
+ * every case (transferred to the window if submitted, released if clean).
+ */
+static inline void briefs_meta_batch_add(struct briefs_meta_batch *b,
+					  struct buffer_head *bh)
+{
+	if (b->n == BRIEFS_META_BATCH_MAX)
+		briefs_meta_batch_wait(b);
+
+	lock_buffer(bh);
+	if (test_clear_buffer_dirty(bh)) {
+		if (!buffer_mapped(bh)) {
+			/* Device hot-removed under us: fail the I/O like
+			 * __sync_dirty_buffer does.  Nothing is pending on
+			 * this buffer, so drop its reference right away. */
+			unlock_buffer(bh);
+			brelse(bh);
+			b->error = -EIO;
+			return;
+		}
+		if (!b->plugged) {
+			blk_start_plug(&b->plug);
+			b->plugged = true;
+		}
+		/* The submit half of __sync_dirty_buffer() on 6.12: the
+		 * get_bh is dropped by end_buffer_write_sync (the b_end_io
+		 * completion), the buffer stays locked until I/O
+		 * completion, and our transferred caller reference is held
+		 * across submit -> wait per __sync_dirty_buffer's contract.
+		 * On a lost write end_buffer_write_sync marks
+		 * BH_Write_EIO, which the wait stage's
+		 * briefs_check_meta_write_error() quiesce is built for.
+		 */
+		get_bh(bh);
+		bh->b_end_io = end_buffer_write_sync;
+		submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
+		b->bhs[b->n++] = bh;
+	} else {
+		/* Clean (pdflush won the race, or an earlier sync quiesced
+		 * it): no write is submitted, so the one-write guarantee
+		 * holds.  Drop the caller's reference now. */
+		unlock_buffer(bh);
+		brelse(bh);
+	}
+}
+
 /* briefs_journal_track_bh() is defined in journal.c; see briefs_journal.h. */
 struct briefs_journal;
 void briefs_journal_track_bh(struct briefs_journal *j, struct buffer_head *bh);

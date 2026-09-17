@@ -196,3 +196,110 @@ ld_shape:     7.933 s  63.0 MiB/s
 ld_readback:  0.318 s  1572.3 MiB/s
 
 == done 2026-09-17T08:05:49Z
+== briefs perf-write: device /dev/vdc1, 10240 MiB
+### briefs (device /dev/vdc1, 10240 MiB, 2026-09-17T08:56:13Z)
+--- stats after mount
+data_alloc_calls=0
+data_free_calls=0
+inode_alloc_calls=0
+inode_free_calls=0
+journal_records=0
+journal_checkpoints=0
+journal_replay_records=0
+btree_splits=0
+btree_extents_added=0
+btree_extents_freed=0
+dir_adds=0
+dir_dels=0
+truncate_calls=0
+fallocate_calls=0
+punch_holes=0
+seq_buffered: 8.165 s  1254.1 MiB/s
+--- stats after seq_buffered (delta from mount)
+> data_alloc_calls=10241
+> inode_alloc_calls=1
+> journal_records=10243
+> journal_checkpoints=3
+> btree_extents_added=10240
+> dir_adds=1
+seq_fsync:    172.189 s  59.5 MiB/s
+--- stats after seq_fsync (delta)
+> data_alloc_calls=20482
+> data_free_calls=3
+> inode_alloc_calls=2
+> inode_free_calls=1
+> journal_records=30732
+> journal_checkpoints=10236
+> btree_extents_added=20480
+> dir_adds=2
+> dir_dels=1
+seq_osync:    174.635 s  58.6 MiB/s
+--- stats after seq_osync (delta)
+> data_alloc_calls=30723
+> data_free_calls=6
+> inode_alloc_calls=3
+> inode_free_calls=2
+> journal_records=51221
+> journal_checkpoints=20477
+> btree_extents_added=30720
+> dir_adds=3
+> dir_dels=2
+ld_shape:     9.221 s  54.2 MiB/s  (500 files)
+--- stats after ld_shape (delta)
+> data_alloc_calls=31231
+> data_free_calls=9
+> inode_alloc_calls=503
+> inode_free_calls=3
+> journal_records=53235
+> journal_checkpoints=20978
+> btree_extents_added=31220
+> dir_adds=503
+> dir_dels=3
+ld_readback:  0.350 s  1428.6 MiB/s
+--- stats after ld_readback (delta)
+
+### ext4 (device /dev/vdc1, 10240 MiB, 2026-09-17T09:02:20Z)
+seq_buffered: 18.588 s  550.9 MiB/s
+seq_fsync:    154.790 s  66.2 MiB/s
+seq_osync:    151.572 s  67.6 MiB/s
+ld_shape:     8.065 s  62.0 MiB/s  (500 files)
+ld_readback:  0.365 s  1369.9 MiB/s
+
+== done 2026-09-17T09:07:55Z
+# --- P2 (batched commit-path metadata syncs), 2026-09-17: module built from
+# the working tree at P2 (briefs_meta_batch in briefs.h converts
+# briefs_journal_flush_owned PASS 2, the journal-range sync loop, and
+# briefs_alloc_sync's changed-block writes to submit-all-then-wait-all,
+# 64-buffer windows, plugged). Same VM/device/size. Raw run: 08:56:13Z.
+#
+# briefs MiB/s     baseline    P1       P2      delta vs P1   note
+# seq_buffered      1157.7   1308.8   1254.1     -4.2%       noise (P1's win
+#                                                        over baseline +8.3%
+#                                                        still stands)
+# seq_fsync           59.2     57.9     59.5      +2.8%       10236 checkpoints
+#                                                        for 10240 fsyncs,
+#                                                        unchanged; batching
+#                                                        is working but the
+#                                                        metadata round trips
+#                                                        were a small slice
+#                                                        of per-fsync time
+# seq_osync           57.4     56.9     58.6      +3.0%
+# ld_shape            52.0     50.2     54.2      +8.0%       most owned buffers
+#                                                        per checkpoint of
+#                                                        the shapes (500
+#                                                        files), most to gain
+#                                                        from one wait
+# ld_readback       1736.1   1805.1   1428.6    -20.9%       read path
+#                                                        untouched; 0.28-0.36s
+#                                                        samples, high variance
+#
+# ext4 (this run): buffered 550.9, fsync 66.2, osync 67.6, ld_shape 62.0.
+# Briefs/ext4 ratios are essentially unchanged from P1 (fsync 0.90x vs
+# 0.90x, buffered 2.28x vs 2.29x): the batching did not shift the device
+# side of the ratio, i.e. per-fsync time on this device is dominated by
+# the 1 MiB data write plus the fixed whole-FS checkpoint costs (journal
+# range, superboard commit, allocator scan), not by the serial metadata
+# buffer waits P2 removed. The measured briefs-vs-briefs gains are real
+# but modest. The remaining ~10% fsync-shape gap to ext4 is the
+# structural per-fsync whole-FS checkpoint (narrowed per-inode commit
+# semantics), which is explicitly deferred as a journal redesign.

@@ -284,26 +284,36 @@ int briefs_journal_flush_owned(struct briefs_journal *j)
 	}
 
 	/* PASS 2: re-resolve via sb_bread (pin gone -> bh may be evicted) and
-	 * sync+quiesce each still-dirty buffer.
+	 * sync+quiesce each still-dirty buffer.  The syncs are BATCHED
+	 * (briefs_meta_batch): per-buffer briefs_sync_dirty_buffer serialized
+	 * a full device round trip per owned buffer; submitting the window
+	 * first and waiting once collapses that to ~1 round trip while the
+	 * per-buffer semantics (one write, clean-buffer skip, quiesce-on-EIO
+	 * through the chokepoint) are unchanged.  Ownership: add() takes the
+	 * sb_bread reference (released in the wait stage, not here).
 	 */
-	hlist_for_each_entry_safe(ob, tmp, &batch, node) {
-		struct buffer_head *bh = sb_bread(j->vfs_sb, ob->block);
+	{
+		struct briefs_meta_batch mb;
 
-		if (bh) {
-			if (buffer_uptodate(bh)) {
-				if (buffer_dirty(bh) &&
-				    briefs_sync_dirty_buffer(bh, j->vfs_sb,
-							     "owned flush"))
-					ret = -EIO;
+		briefs_meta_batch_init(&mb, j->vfs_sb, "owned flush");
+		hlist_for_each_entry_safe(ob, tmp, &batch, node) {
+			struct buffer_head *bh = sb_bread(j->vfs_sb, ob->block);
+
+			if (bh) {
+				if (buffer_uptodate(bh)) {
+					briefs_meta_batch_add(&mb, bh);
+				} else {
+					ret = -EIO;	/* sb_bread read failure (expected on dm-error) */
+					brelse(bh);
+				}
 			} else {
-				ret = -EIO;	/* sb_bread read failure (expected on dm-error) */
+				ret = -EIO;
 			}
-			brelse(bh);
-		} else {
-			ret = -EIO;
+			hlist_del(&ob->node);
+			kfree(ob);
 		}
-		hlist_del(&ob->node);
-		kfree(ob);
+		if (briefs_meta_batch_wait(&mb))
+			ret = -EIO;
 	}
 
 	if (ret)
@@ -2558,21 +2568,25 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 	 * Force every journal block in the sync range to disk.  Journal record
 	 * blocks are written by briefs_journal_write_block() (not tracked in the
 	 * owned set, which holds metadata only), so this loop is their durable
-	 * flush; the briefs_sync_dirty_buffer() calls are no-ops on already-clean
-	 * blocks and an explicit barrier on any still-dirty one.
+	 * flush; the batched adds are no-ops on already-clean blocks and an
+	 * explicit barrier on any still-dirty one.  Batched (briefs_meta_batch)
+	 * so the range's serial per-block round trips collapse into ~1: journal
+	 * blocks are typically adjacent and the plug merges them.
 	 */
-	for (pos = sync_start; ; pos = briefs_journal_next_block(j, pos)) {
-		struct buffer_head *bh = sb_bread(j->vfs_sb, pos);
-		if (bh) {
-			if (buffer_dirty(bh)) {
-				if (briefs_sync_dirty_buffer(bh, j->vfs_sb,
-							    "journal sync block"))
-					io_err = true;
-			}
-			brelse(bh);
+	{
+		struct briefs_meta_batch mb;
+
+		briefs_meta_batch_init(&mb, j->vfs_sb, "journal sync block");
+		for (pos = sync_start; ; pos = briefs_journal_next_block(j, pos)) {
+			struct buffer_head *bh = sb_bread(j->vfs_sb, pos);
+
+			if (bh)
+				briefs_meta_batch_add(&mb, bh);
+			if (pos == sync_end)
+				break;
 		}
-		if (pos == sync_end)
-			break;
+		if (briefs_meta_batch_wait(&mb))
+			io_err = true;
 	}
 
 	/* Re-acquire write_lock for state updates and checkpoint. */

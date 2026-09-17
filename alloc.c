@@ -961,11 +961,11 @@ static u64 alloc_level_block_offset(struct briefs_alloc *alloc, u64 words_per_bl
 static int briefs_alloc_sync_level(struct briefs_alloc *alloc, u64 *array,
                                     u64 words, int level,
                                     u64 words_per_block,
-                                    u64 l0_blocks, u64 l1_blocks)
+                                    u64 l0_blocks, u64 l1_blocks,
+                                    struct briefs_meta_batch *mb)
 {
 	u64 level_blocks = (words + words_per_block - 1) / words_per_block;
 	u64 i, j;
-	int err;
 
 	for (i = 0; i < level_blocks; i++) {
 		struct buffer_head *bh;
@@ -992,14 +992,21 @@ static int briefs_alloc_sync_level(struct briefs_alloc *alloc, u64 *array,
 		}
 
 		if (dirty) {
-			err = briefs_sync_write_buffer(bh, alloc->sb,
-							"alloc bitmap sync");
-			if (err) {
-				brelse(bh);
-				return err;
-			}
+			/* Mark dirty and hand the reference to the batch,
+			 * which submits without waiting so all changed
+			 * bitmap blocks across the three levels write back
+			 * in ~1 round trip instead of one each (the old
+			 * per-block briefs_sync_write_buffer serial round
+			 * trips dominated checkpoint cost).  The caller
+			 * waits the batch before the header sync, so the
+			 * on-disk ordering (bitmap before free_count) is
+			 * preserved.
+			 */
+			mark_buffer_dirty(bh);
+			briefs_meta_batch_add(mb, bh);
+		} else {
+			brelse(bh);
 		}
-		brelse(bh);
 	}
 	return 0;
 }
@@ -1013,6 +1020,7 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 	u64 words_per_block;
 	u64 l0_blocks, l1_blocks, l2_blocks;
 	int ret;
+	struct briefs_meta_batch mb;
 
 	mutex_lock(&alloc->lock);
 	if (!alloc || !alloc->sb || !alloc->l0) {
@@ -1028,25 +1036,27 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 	pr_debug("briefs: syncing allocator: %llu+%llu+%llu blocks\n",
 		l0_blocks, l1_blocks, l2_blocks);
 
-	/* Sync level 0 */
+	/* Sync levels 0-2 into one batched window (the level loop adds
+	 * changed blocks without waiting; briefs_meta_batch_wait below drains
+	 * them all, so the per-changed-block serial device round trips of the
+	 * old per-block briefs_sync_write_buffer collapse into ~1).  The wait
+	 * runs on every path so no buffer reference is leaked when a level
+	 * loop fails mid-way.
+	 */
+	briefs_meta_batch_init(&mb, alloc->sb, "alloc bitmap sync");
 	ret = briefs_alloc_sync_level(alloc, alloc->l0, alloc->l0_words, 0,
-	                               words_per_block, l0_blocks, l1_blocks);
-	if (ret) {
-		mutex_unlock(&alloc->lock);
-		return ret;
-	}
-
-	/* Sync level 1 */
-	ret = briefs_alloc_sync_level(alloc, alloc->l1, alloc->l1_words, 1,
-	                               words_per_block, l0_blocks, l1_blocks);
-	if (ret) {
-		mutex_unlock(&alloc->lock);
-		return ret;
-	}
-
-	/* Sync level 2 */
-	ret = briefs_alloc_sync_level(alloc, alloc->l2, alloc->l2_words, 2,
-	                               words_per_block, l0_blocks, l1_blocks);
+	                               words_per_block, l0_blocks, l1_blocks,
+	                               &mb);
+	if (!ret)
+		ret = briefs_alloc_sync_level(alloc, alloc->l1, alloc->l1_words, 1,
+		                               words_per_block, l0_blocks, l1_blocks,
+		                               &mb);
+	if (!ret)
+		ret = briefs_alloc_sync_level(alloc, alloc->l2, alloc->l2_words, 2,
+		                               words_per_block, l0_blocks, l1_blocks,
+		                               &mb);
+	if (briefs_meta_batch_wait(&mb))
+		ret = ret ?: -EIO;
 	if (ret) {
 		mutex_unlock(&alloc->lock);
 		return ret;
