@@ -162,15 +162,23 @@ btree_read_node(struct super_block *sb, u64 block, bool trust_verified,
 	return node;
 }
 
-/* Recompute a node's checksum, memoize it, and mark the buffer dirty. */
-static void btree_commit_node(struct buffer_head *bh, struct super_block *sb)
+/* Recompute a node's checksum, memoize it, mark the buffer dirty, and record
+ * the node in the owning inode's dirty-node set (P1 tracking; journaled
+ * mounts only -- without a journal there is no drain that would ever consume
+ * the set, so recording would just pin memory until evict). */
+static void btree_commit_node(struct buffer_head *bh, struct super_block *sb,
+			      struct briefs_inode *di)
 {
+	struct briefs_inode_info *binfo =
+		container_of(di, struct briefs_inode_info, disk_inode);
 	struct briefs_extent_btree_node *node =
 		(struct briefs_extent_btree_node *)bh->b_data;
 
 	node->checksum = cpu_to_le64(briefs_chain_checksum(bh->b_data));
 	set_buffer_verified(bh);
 	briefs_mark_buffer_dirty(bh, sb);
+	if (briefs_sb(sb)->journal)
+		briefs_btree_track_dirty(binfo, bh);
 }
 
 /* Allocate a fresh zeroed node buffer (caller fills header + payload, then
@@ -404,6 +412,7 @@ int briefs_btree_lookup(struct super_block *sb, u64 root_block, u64 iblock,
  */
 struct btree_conv_ctx {
 	struct super_block *sb;
+	struct briefs_inode *di;		/* owning inode (for dirty tracking) */
 	u64 start_blk;
 	u64 end_blk;
 	struct briefs_extent prefix;
@@ -470,7 +479,7 @@ static int btree_convert_unwritten_leaf(struct briefs_extent_btree_node *node,
 		if (cstart == off && cend == eend) {
 			/* Whole extent is written: clear the flag in place. */
 			de->flags = cpu_to_le32(flags & ~BRIEFS_EXT_UNWRITTEN);
-			btree_commit_node(bh, sb);
+			btree_commit_node(bh, sb, c->di);
 			return 0;
 		}
 
@@ -482,7 +491,7 @@ static int btree_convert_unwritten_leaf(struct briefs_extent_btree_node *node,
 		de->phys = cpu_to_le64(phys + (cstart - off));
 		de->len = cpu_to_le64(cend - cstart);
 		de->flags = cpu_to_le32(flags & ~BRIEFS_EXT_UNWRITTEN);
-		btree_commit_node(bh, sb);
+		btree_commit_node(bh, sb, c->di);
 
 		if (cstart > off) {
 			c->prefix.offset = off;
@@ -516,6 +525,7 @@ int briefs_btree_convert_unwritten_range(struct super_block *sb,
 		container_of(di, struct briefs_inode_info, disk_inode);
 	struct btree_conv_ctx c = {
 		.sb = sb,
+		.di = di,
 		.start_blk = start_blk,
 		.end_blk = end_blk,
 		.have_prefix = false,
@@ -564,7 +574,8 @@ int briefs_btree_convert_unwritten_range(struct super_block *sb,
 static void btree_absorb_split(struct briefs_extent_btree_node *parent,
 			       struct buffer_head *parent_bh, int p,
 			       u64 sibling, u64 separator,
-			       struct super_block *sb)
+			       struct super_block *sb,
+			       struct briefs_inode *di)
 {
 	int num_keys = le16_to_cpu(parent->hdr.num_keys);
 
@@ -589,7 +600,7 @@ static void btree_absorb_split(struct briefs_extent_btree_node *parent,
 	}
 
 	parent->hdr.num_keys = cpu_to_le16(num_keys + 1);
-	btree_commit_node(parent_bh, sb);
+	btree_commit_node(parent_bh, sb, di);
 }
 
 /* If the child at position @p of @parent is full, split it and absorb the
@@ -675,15 +686,15 @@ static int btree_maybe_split_child(struct super_block *sb,
 		}
 		child->hdr.next_leaf = cpu_to_le64(sib_block);
 
-		btree_commit_node(child_bh, sb);
-		btree_commit_node(sib_bh, sb);
+		btree_commit_node(child_bh, sb, di);
+		btree_commit_node(sib_bh, sb, di);
 
 		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
 					    0, sib_block, 1, -1);
 
 		btree_absorb_split(parent, parent_bh, p, sib_block,
 				   le64_to_cpu(sib->u.leaf.extents[0].offset),
-				   sb);
+				   sb, di);
 	} else {
 		/* Internal split: push the median separator up. With 253 keys
 		 * (idx[0..252], 254 children), median index = 126. Left keeps
@@ -718,13 +729,13 @@ static int btree_maybe_split_child(struct super_block *sb,
 			       (BRIEFS_BTREE_IDX_KEYS - mid) * sizeof(child->u.internal.idx[0]));
 		}
 
-		btree_commit_node(child_bh, sb);
-		btree_commit_node(sib_bh, sb);
+		btree_commit_node(child_bh, sb, di);
+		btree_commit_node(sib_bh, sb, di);
 
 		briefs_journal_extent_alloc(bsi->journal, di->inode_number,
 					    0, sib_block, 1, -1);
 
-		btree_absorb_split(parent, parent_bh, p, sib_block, sep, sb);
+		btree_absorb_split(parent, parent_bh, p, sib_block, sep, sb, di);
 	}
 
 	brelse(sib_bh);
@@ -795,7 +806,7 @@ static int btree_leaf_insert(struct super_block *sb, struct briefs_inode *di,
 		    left.flags == ext->flags) {
 			left.len += ext->len;
 			briefs_cpu_extent_to_disk(&left, &ents[pos - 1]);
-			btree_commit_node(bh, sb);
+			btree_commit_node(bh, sb, di);
 			briefs_journal_extent_alloc(bsi->journal,
 						    di->inode_number, ext->offset,
 						    ext->phys, ext->len, -1);
@@ -816,7 +827,7 @@ static int btree_leaf_insert(struct super_block *sb, struct briefs_inode *di,
 			right.phys = ext->phys;
 			right.len += ext->len;
 			briefs_cpu_extent_to_disk(&right, &ents[pos]);
-			btree_commit_node(bh, sb);
+			btree_commit_node(bh, sb, di);
 			briefs_journal_extent_alloc(bsi->journal,
 						    di->inode_number, ext->offset,
 						    ext->phys, ext->len, -1);
@@ -830,7 +841,7 @@ static int btree_leaf_insert(struct super_block *sb, struct briefs_inode *di,
 		(size_t)(n - pos) * sizeof(ents[0]));
 	briefs_cpu_extent_to_disk(ext, &ents[pos]);
 	node->hdr.num_keys = cpu_to_le16(n + 1);
-	btree_commit_node(bh, sb);
+	btree_commit_node(bh, sb, di);
 	briefs_journal_extent_alloc(bsi->journal, di->inode_number, ext->offset,
 				    ext->phys, ext->len, -1);
 	*added = true;
@@ -995,8 +1006,8 @@ static int btree_ensure_root_room(struct super_block *sb, struct briefs_inode *d
 		}
 	}
 
-	btree_commit_node(root_bh, sb);
-	btree_commit_node(sib_bh, sb);
+	btree_commit_node(root_bh, sb, di);
+	btree_commit_node(sib_bh, sb, di);
 
 	/* New internal root, one level above the old root. */
 	newroot->hdr.magic = cpu_to_le32(BRIEFS_BTREE_MAGIC);
@@ -1007,7 +1018,7 @@ static int btree_ensure_root_room(struct super_block *sb, struct briefs_inode *d
 	newroot->u.internal.idx[0].child = cpu_to_le64(root_block);
 	newroot->u.internal.idx[0].high_key = cpu_to_le64(separator);
 	newroot->u.internal.trailing_child = cpu_to_le64(sib_block);
-	btree_commit_node(newroot_bh, sb);
+	btree_commit_node(newroot_bh, sb, di);
 
 	briefs_journal_extent_alloc(bsi->journal, di->inode_number,
 				    0, sib_block, 1, -1);
@@ -1096,7 +1107,7 @@ static int btree_spill_inline(struct super_block *sb, struct briefs_inode *di,
 		memset(&node->u.leaf.extents[m], 0,
 		       (BRIEFS_BTREE_LEAF_FANOUT - m) * sizeof(node->u.leaf.extents[0]));
 	}
-	btree_commit_node(bh, sb);
+	btree_commit_node(bh, sb, di);
 	brelse(bh);
 
 	briefs_journal_extent_alloc(bsi->journal, di->inode_number, 0,
@@ -1635,7 +1646,7 @@ static bool btree_delete_range_subtree(struct super_block *sb,
 			return true;
 		}
 		node->hdr.num_keys = cpu_to_le16(new_n);
-		btree_commit_node(bh, sb);
+		btree_commit_node(bh, sb, di);
 		brelse(bh);
 		return false;
 	}
@@ -1711,7 +1722,7 @@ static bool btree_delete_range_subtree(struct super_block *sb,
 	}
 
 	node->hdr.num_keys = cpu_to_le16(out);
-	btree_commit_node(bh, sb);
+	btree_commit_node(bh, sb, di);
 	brelse(bh);
 	return false;
 }
@@ -1934,4 +1945,140 @@ int briefs_btree_drain(struct super_block *sb, u64 root_block, u64 max_nodes)
 	if (cap == 0)
 		cap = 1ull << 20;
 	return btree_drain_subtree(sb, root_block, &cap);
+}
+
+/*
+ * briefs_btree_track_dirty - record @bh in the owning inode's dirty-node set.
+ *
+ * Called from btree_commit_node() for every node a mutator dirties, so the
+ * pre-snapshot drain can touch exactly the dirtied blocks instead of walking
+ * the whole tree. Leaf lock discipline: btree_dirty_lock is only ever the
+ * innermost lock (taken under extent_lock here, under j->write_lock by the
+ * drain), so the extent_lock -> j->write_lock order is untouched.
+ */
+void briefs_btree_track_dirty(struct briefs_inode_info *binfo,
+			      struct buffer_head *bh)
+{
+	mutex_lock(&binfo->btree_dirty_lock);
+	if (xa_err(xa_store(&binfo->btree_dirty_nodes, bh->b_blocknr,
+			    XA_ZERO_ENTRY, GFP_KERNEL))) {
+		/*
+		 * Allocation failure: the entry was NOT recorded, so the set
+		 * may under-report. Mark degraded; the next drain falls back
+		 * to the conservative full-tree walk, which covers any block
+		 * this failure lost, and resumes tracking afterwards.
+		 */
+		binfo->btree_dirty_degraded = true;
+	}
+	mutex_unlock(&binfo->btree_dirty_lock);
+}
+
+/*
+ * briefs_btree_drain_dirty - drain the inode's dirty-node set.
+ *
+ * Replacement for the per-snapshot briefs_btree_drain() walk (P1): instead of
+ * sb_bread()ing every node in the tree (O(E) per JRN_INODE_FULL record, twice
+ * per fsync -- O(E^2) over a per-record-fsync file creation), touch exactly
+ * the nodes dirtied since the last drain. Per-node behavior is identical to
+ * btree_drain_subtree(): sb_bread + write-error check, deliberately NO
+ * synchronous write -- durability comes from the journal's owned-buffer flush,
+ * which writes the pinned (tracked) node buffers before the commit point.
+ *
+ * Batches of at most 64 blocks are extracted-and-cleared under
+ * btree_dirty_lock, then processed outside the lock: two concurrent fsyncs
+ * never serialize on each other's I/O, and blocks re-dirtied (and thus
+ * re-tracked) by a concurrent mutator after the batch was cut are simply
+ * synced again by this pass and drained again by the next one -- the
+ * superset-tracker contract, never a loss.
+ *
+ * Returns 0 on success, -EIO if a node read or a previous writeback of a
+ * drained node failed.
+ */
+int briefs_btree_drain_dirty(struct briefs_inode_info *binfo,
+			     struct super_block *sb)
+{
+	int ret = 0;
+
+	if (binfo->btree_dirty_degraded) {
+		/*
+		 * A track-time xa_store failed; the set may be missing
+		 * entries. Fall back to the conservative full walk, which
+		 * covers whatever was lost, then resume tracking.
+		 */
+		struct briefs_inode *di = &binfo->disk_inode;
+		u64 base, total, cap;
+
+		binfo->btree_dirty_degraded = false;
+		if (!(di->flags & InodeFlagIndexed))
+			return 0;
+		base = di->extent_inline_base;
+		total = di->num_extents_total;
+		cap = total + 16;
+		if (cap > (1ull << 20))
+			cap = 1ull << 20;
+		if (base == 0)
+			return 0;
+		return briefs_btree_drain(sb, base, cap);
+	}
+
+	for (;;) {
+		XA_STATE(xas, &binfo->btree_dirty_nodes, 0);
+		u64 blocks[64];
+		unsigned int n = 0;
+		bool last;
+		void *entry;
+
+		/* Cut a batch: collect-and-erase under the lock so entries can
+		 * never be lost between collection and sync. Deleting the
+		 * current entry inside xas_for_each is the documented-safe
+		 * pattern; iteration resumes at the next node. */
+		mutex_lock(&binfo->btree_dirty_lock);
+		xas_lock(&xas);
+		xas_for_each(&xas, entry, ULONG_MAX) {
+			blocks[n++] = xas.xa_index;
+			xas_store(&xas, NULL);
+			if (n == ARRAY_SIZE(blocks))
+				break;
+		}
+		last = (n < ARRAY_SIZE(blocks));
+		xas_unlock(&xas);
+		mutex_unlock(&binfo->btree_dirty_lock);
+
+		/* Process the batch outside the lock: no other fsync's I/O is
+		 * held behind this one, and a mutator re-dirtying (and thus
+		 * re-tracking) a batch block just costs it a second sync here
+		 * and a drain in the next round. */
+		for (unsigned int i = 0; i < n; i++) {
+			struct buffer_head *bh;
+			u64 block = blocks[i];
+
+			if (!briefs_block_in_range(sb, block)) {
+				pr_debug("briefs: dirty-node drain: node %llu out of range\n",
+					 block);
+				continue;
+			}
+			bh = sb_bread(sb, block);
+			if (!bh) {
+				pr_debug("briefs: dirty-node drain: sb_bread node %llu failed\n",
+					 block);
+				ret = -EIO;
+				continue;
+			}
+			if (buffer_dirty(bh)) {
+				/* Flushed by the journal sync path's owned-buffer
+				 * flush; leave it marked dirty (same contract
+				 * as btree_drain_subtree). */
+			} else if (buffer_write_io_error(bh)) {
+				/* A previous writeback failed; clear the error
+				 * and report it. */
+				clear_buffer_write_io_error(bh);
+				ret = -EIO;
+			}
+			brelse(bh);
+		}
+
+		if (last)
+			break;
+	}
+	return ret;
 }

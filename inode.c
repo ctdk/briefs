@@ -859,6 +859,9 @@ struct inode *briefs_alloc_vfs_inode(struct super_block *sb) {
 	mutex_init(&binfo->trie_lock);
 	init_rwsem(&binfo->extent_lock);
 	init_rwsem(&binfo->xattr_sem);
+	mutex_init(&binfo->btree_dirty_lock);
+	xa_init(&binfo->btree_dirty_nodes);
+	binfo->btree_dirty_degraded = false;
 	binfo->trie_gen = 0;
 	/*
 	 * The slab ctor (briefs_init_once) only inits the VFS inode; it does not
@@ -890,6 +893,9 @@ struct inode *briefs_alloc_vfs_inode(struct super_block *sb) {
 /* briefs_free_inode - free a VFS inode (called by VFS inode cache) */
 void briefs_free_inode(struct inode *inode) {
 	struct briefs_inode_info *binfo = briefs_i(inode);
+
+	xa_destroy(&binfo->btree_dirty_nodes);
+	mutex_destroy(&binfo->btree_dirty_lock);
 	kmem_cache_free(briefs_inode_cachep, binfo);
 }
 /* briefs_iget - get an inode by number */
@@ -1126,6 +1132,22 @@ struct inode *briefs_iget_with_gen(struct super_block *sb, u64 ino, u32 gen)
 /* briefs_evict_inode - cleanup inode on eviction */
 void briefs_evict_inode(struct inode *inode) {
 	pr_debug("briefs: evict_inode inode %lu\n", inode->i_ino);
+
+	/*
+	 * P1 dirty-node tracking: drain any still-tracked dirty tree nodes
+	 * before the inode leaves memory. The drain is what guarantees an
+	 * empty set means "every referenced node is durable": without this,
+	 * a node dirtied on an error path that never reached a
+	 * briefs_journal_inode_full() drain could survive eviction in the
+	 * journal-owned set, and a later iget of the same inode number
+	 * would see a clean set while the journal still holds the unsynced
+	 * buffer -- its next snapshot could then reference a block the
+	 * drain skipped. Errors are ignored (the evict cannot fail); the
+	 * buffer stays pinned in the journal-owned set, so a write failure
+	 * still surfaces at flush_owned time.
+	 */
+	if (briefs_sb(inode->i_sb)->journal)
+		briefs_btree_drain_dirty(briefs_i(inode), inode->i_sb);
 
 	/*
 	 * Truncate the page cache first — this releases all folios and

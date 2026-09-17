@@ -13,6 +13,7 @@
 #include <linux/unaligned.h>
 #include <linux/atomic.h>
 #include <linux/list.h>
+#include <linux/xarray.h>
 #include <linux/kobject.h>
 #include <linux/lockdep.h>
 #include <linux/preempt.h>
@@ -1253,6 +1254,26 @@ struct briefs_inode_info {
 	 */
 	struct briefs_disk_inode pending_journal_snapshot;
 	bool has_pending_journal_snapshot;
+	/*
+	 * Per-inode dirty-node tracking (P1): the set of this inode's B+tree
+	 * node blocks dirtied since the last drain. btree_commit_node() records
+	 * every node it dirties here, so briefs_journal_inode_full() can make
+	 * its pre-snapshot drain touch exactly the dirtied blocks instead of
+	 * walking the whole tree (the old O(E) briefs_btree_drain). Indices
+	 * are node block numbers; entries are (void *)1 (the block number is
+	 * the index). Guarded by btree_dirty_lock, which is a leaf lock taken
+	 * under extent_lock (mutators) and under j->write_lock (the drain) --
+	 * it must never acquire anything else. btree_dirty_degraded is set
+	 * when an xa_store fails; the next drain then falls back to the
+	 * conservative full-tree walk (the set may have lost entries), so the
+	 * tracked set is always a superset of what the drain covers. Entries
+	 * are cleared only by the drain, and the drain at evict guarantees a
+	 * reloaded inode never sees dirty-but-undrained nodes from a previous
+	 * incarnation.
+	 */
+	struct xarray btree_dirty_nodes;
+	struct mutex btree_dirty_lock;
+	bool btree_dirty_degraded;
 };
 
 /* yanked from the xiafs module, which in turn was yanked from minix */
@@ -1595,6 +1616,29 @@ void briefs_btree_free_nodes_only(struct super_block *sb, struct briefs_inode *d
  * @max_nodes as a guard against corrupt/cyclic trees.
  * Returns 0 on success, -EIO if any node write failed. */
 int briefs_btree_drain(struct super_block *sb, u64 root_block, u64 max_nodes);
+
+/* Per-inode dirty-node tracking (P1): btree_commit_node() records each node
+ * it dirties in binfo->btree_dirty_nodes. briefs_btree_drain_dirty() drains
+ * exactly that set (walk-equivalent: sb_bread + write-error check, no sync --
+ * durability comes from the journal's owned-buffer flush) and clears it, so
+ * briefs_journal_inode_full() no longer walks the whole tree per snapshot.
+ * The set is a superset tracker: every node the JRN_INODE_FULL snapshot can
+ * reference was committed (and thus recorded) before the inode fields
+ * pointing at it were published, so draining the set covers the snapshot.
+ * A failed xa_store sets btree_dirty_degraded and the next drain falls back
+ * to the conservative full-tree briefs_btree_drain() walk. An empty set means
+ * no node has been dirtied since the last drain or since the inode was read
+ * from disk -- both imply every node the snapshot references is already
+ * durable. Called from briefs_journal_inode_full() (which may run under
+ * j->write_lock) and from fsync; the per-inode lock is a leaf, so the
+ * extent_lock -> j->write_lock order is untouched.
+ * briefs_btree_drain_dirty() returns 0 on success, -EIO if a node read or a
+ * previous writeback of a drained node failed.
+ */
+void briefs_btree_track_dirty(struct briefs_inode_info *binfo,
+			      struct buffer_head *bh);
+int briefs_btree_drain_dirty(struct briefs_inode_info *binfo,
+			     struct super_block *sb);
 
 /* Convert the unwritten blocks in [start_blk, end_blk) of the tree-backed
  * extent covering @start_blk to written, splitting the extent so un-written

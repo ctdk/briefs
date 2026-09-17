@@ -101,3 +101,98 @@ ld_shape:     13.797 s  36.2 MiB/s
 ld_readback:  0.336 s  1488.1 MiB/s
 
 == done 2026-09-17T07:29:47Z
+# --- P1 (per-inode dirty-node tracking), 2026-09-17: module built from the
+# working tree at P1 (this commit; baseline 875ec08). Same VM/device/size.
+#
+# briefs MiB/s     baseline    P1       delta      note
+# seq_buffered      1157.7   1308.8    +13.1%   the O(E)-walk win
+# seq_fsync           59.2     57.9     -2.2%   noise; per-fsync checkpoint
+#                                             (10236 for 10240 fsyncs,
+#                                             unchanged) dominates -- P2
+# seq_osync           57.4     56.9     -0.9%   noise, same as fsync
+# ld_shape            52.0     50.2     -3.5%   noise
+# ld_readback       1736.1   1805.1     +4.0%
+#
+# The pre-snapshot drain no longer sb_breads every node in the tree per
+# JRN_INODE_FULL record; it touches exactly the nodes dirtied since the
+# last drain (an empty set is a no-op). seq_buffered, which journals a
+# snapshot per persist, gained the predicted ~13%; the fsync-shaped
+# workloads did not move because their cost is the per-fsync checkpoint
+# (whole-FS owned-buffer flush + allocator bitmap sync + superblock
+# commit), not the walk. That is the P2 target.
+#
+# Data-quality note: ext4's numbers swing run-to-run on this VM (osync
+# 37.5 -> 64.2, ld_shape 36.2 -> 63.0 MiB/s between the baseline and this
+# run), so the briefs/ext4 ratio is per-run context only; the
+# briefs-vs-briefs columns above are the regression gate.
+
+== briefs perf-write: device /dev/vdc1, 10240 MiB
+### briefs (device /dev/vdc1, 10240 MiB, 2026-09-17T07:53:46Z)
+--- stats after mount
+data_alloc_calls=0
+data_free_calls=0
+inode_alloc_calls=0
+inode_free_calls=0
+journal_records=0
+journal_checkpoints=0
+journal_replay_records=0
+btree_splits=0
+btree_extents_added=0
+btree_extents_freed=0
+dir_adds=0
+dir_dels=0
+truncate_calls=0
+fallocate_calls=0
+punch_holes=0
+seq_buffered: 7.824 s  1308.8 MiB/s
+--- stats after seq_buffered (delta from mount)
+> data_alloc_calls=10241
+> inode_alloc_calls=1
+> journal_records=10243
+> journal_checkpoints=3
+> btree_extents_added=10240
+> dir_adds=1
+seq_fsync:    176.820 s  57.9 MiB/s
+--- stats after seq_fsync (delta)
+> data_alloc_calls=20482
+> data_free_calls=3
+> inode_alloc_calls=2
+> inode_free_calls=1
+> journal_records=30732
+> journal_checkpoints=10236
+> btree_extents_added=20480
+> dir_adds=2
+> dir_dels=1
+seq_osync:    179.842 s  56.9 MiB/s
+--- stats after seq_osync (delta)
+> data_alloc_calls=30723
+> data_free_calls=6
+> inode_alloc_calls=3
+> inode_free_calls=2
+> journal_records=51221
+> journal_checkpoints=20477
+> btree_extents_added=30720
+> dir_adds=3
+> dir_dels=2
+ld_shape:     9.955 s  50.2 MiB/s  (500 files)
+--- stats after ld_shape (delta)
+> data_alloc_calls=31231
+> data_free_calls=9
+> inode_alloc_calls=503
+> inode_free_calls=3
+> journal_records=53235
+> journal_checkpoints=20978
+> btree_extents_added=31220
+> dir_adds=503
+> dir_dels=3
+ld_readback:  0.277 s  1805.1 MiB/s
+--- stats after ld_readback (delta)
+
+### ext4 (device /dev/vdc1, 10240 MiB, 2026-09-17T08:00:02Z)
+seq_buffered: 17.910 s  571.7 MiB/s
+seq_fsync:    160.098 s  64.0 MiB/s
+seq_osync:    159.505 s  64.2 MiB/s
+ld_shape:     7.933 s  63.0 MiB/s
+ld_readback:  0.318 s  1572.3 MiB/s
+
+== done 2026-09-17T08:05:49Z

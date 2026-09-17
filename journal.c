@@ -2725,25 +2725,25 @@ int briefs_journal_inode_full(struct briefs_journal *j, struct inode *inode,
 	 * contents, so a crash before this drain could leave the snapshot
 	 * pointing at a stale/pre-modification index block.
 	 *
-	 * Tree-backed inodes (InodeFlagIndexed): the root lives in
-	 * extent_inline_base and the index is a B+ tree, drained recursively
-	 * and lock-free by briefs_btree_drain (every reachable dirty node is
-	 * sync_dirty_buffer()'d). Inline-only inodes keep their extents in the
-	 * inode block itself, which is persisted with the snapshot -- no
-	 * separate index blocks to drain.
+	 * P1 dirty-node tracking: drain the per-inode set of tree blocks
+	 * dirtied since the last drain instead of walking the whole tree (the
+	 * old recursive briefs_btree_drain -- O(E) sb_breads per snapshot, so
+	 * O(E^2) over a per-record-fsync file creation). Every node the
+	 * snapshot references was btree_commit_node()'d (and thus tracked)
+	 * before the inode fields pointing at it were published under
+	 * extent_seq, so the tracked set is a superset of what the snapshot
+	 * can reference; an empty set means nothing was dirtied since the
+	 * last drain or since the inode was loaded from disk -- both imply
+	 * every referenced node is already durable. Inline-only inodes and
+	 * directories never accumulate entries, so the old InodeFlagIndexed
+	 * guards are unnecessary. Degraded tracking (xa_store failure) falls
+	 * back to the full walk inside briefs_btree_drain_dirty().
 	 */
-	if (le32_to_cpu(di->flags) & InodeFlagIndexed) {
-		u64 base = le64_to_cpu(di->extent_inline_base);
-		u64 total = le64_to_cpu(di->num_extents_total);
-		u64 cap = total + 16;
+	{
+		int err = briefs_btree_drain_dirty(binfo, j->vfs_sb);
 
-		if (cap > (1ull << 20))
-			cap = 1ull << 20;
-		if (base != 0) {
-			int err = briefs_btree_drain(j->vfs_sb, base, cap);
-			if (err)
-				return err;
-		}
+		if (err)
+			return err;
 	}
 
 	/* Phase 3a: Defer the journal write by storing the snapshot in the
@@ -2760,6 +2760,16 @@ int briefs_journal_inode_full(struct briefs_journal *j, struct inode *inode,
  * Flush a specific inode's pending journal snapshot.
  * Called at syscall boundaries to ensure the deferred JRN_INODE_FULL
  * record is written to the journal before the syscall returns.
+ *
+ * LOCKING FIX: this used to call __briefs_journal_write_record_locked()
+ * directly, but its caller (briefs_inode_sync, the IS_SYNC/IS_DIRSYNC
+ * write path) does NOT hold j->write_lock -- the "_locked" contract is
+ * that the caller holds it (every other caller goes through
+ * briefs_journal_write_record, the serialized public entry).  Take the
+ * public entry here so O_SYNC metadata writes cannot interleave with a
+ * concurrent journal writer (the 011 livelock family).  Also tolerate a
+ * NULL journal (journaless mount): there is nothing to flush, and the
+ * old code returned -EINVAL up the O_SYNC write path.
  */
 int briefs_flush_inode_pending_journal_snapshot(struct briefs_journal *j,
                                                  struct inode *inode)
@@ -2767,6 +2777,8 @@ int briefs_flush_inode_pending_journal_snapshot(struct briefs_journal *j,
 	struct briefs_inode_info *binfo = briefs_i(inode);
 	struct jrn_inode_full rec;
 
+	if (!j)
+		return 0;
 	if (!binfo->has_pending_journal_snapshot)
 		return 0;
 
@@ -2777,7 +2789,7 @@ int briefs_flush_inode_pending_journal_snapshot(struct briefs_journal *j,
 
 	binfo->has_pending_journal_snapshot = false;
 
-	return __briefs_journal_write_record_locked(j, JRN_INODE_FULL, &rec, sizeof(rec));
+	return briefs_journal_write_record(j, JRN_INODE_FULL, &rec, sizeof(rec));
 }
 
 /*

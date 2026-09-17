@@ -137,19 +137,14 @@ int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
 
 		briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
 
-		/* Drain any B-tree index blocks before writing the snapshot. */
-		if (le32_to_cpu(disk_di.flags) & InodeFlagIndexed) {
-			u64 base = le64_to_cpu(disk_di.extent_inline_base);
-			u64 total = le64_to_cpu(disk_di.num_extents_total);
-			u64 cap = total + 16;
-			if (cap > (1ull << 20))
-				cap = 1ull << 20;
-			if (base != 0) {
-				ret = briefs_btree_drain(inode->i_sb, base, cap);
-				if (ret)
-					return ret;
-			}
-		}
+		/* Drain this inode's dirtied B-tree index blocks before writing
+		 * the snapshot (P1: the per-inode dirty-node set -- every
+		 * node a mutator dirtied since the last drain -- instead of
+		 * the old whole-tree walk). Empty set: nothing was dirtied,
+		 * every referenced node is already durable. */
+		ret = briefs_btree_drain_dirty(binfo, inode->i_sb);
+		if (ret)
+			return ret;
 
 		memset(&rec, 0, sizeof(rec));
 		rec.ino = cpu_to_le64(inode->i_ino);
