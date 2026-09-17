@@ -51,6 +51,95 @@ mounts; the idmapped-mount campaign stays out of scope as planned.
   fusermount3's own noexec default) diverge from the kernel `mount -t
   briefs` defaults; `MountOptions.Options` clears them.
 
+## Shutdown support (XFS_IOC_GOINGDOWN, landed 2026-09-16)
+
+The bridge ports the kernel's `briefs_shutdown` (inode.c:159):
+XFS_IOC_GOINGDOWN — numerically identical to BRIEFS_IOC_GOINGDOWN and
+F2FS_IOC_SHUTDOWN — rides FUSE_IOCTL to the daemon's mount-ioctl dispatch
+alongside FITRIM/FSLABEL (briefs-utils `fuse/ioctl_mount.go`, commit
+69a4dfe). Kernel parity: DEFAULT/LOGFLUSH/NOLOGFLUSH flags (else EINVAL),
+idempotency checked before flag validation (so an already-RO mount may
+still shut down, generic/599), CAP_SYS_ADMIN gate, post-shutdown EROFS
+mutations and EIO reads/fsync, and an unmount that skips the checkpoint
+*and* the journal Close-flush while the deferred-metadata drain and device
+sync still run (generic/417). The `_IOR` flags word arrives only as the
+payload address — restricted FUSE ioctl mode copies no input for _IOR
+commands — so the daemon reads it from the caller's memory at
+IoctlIn.Arg via `/proc/<pid>/mem`, degrading to DEFAULT flags when
+unreadable.
+
+Unit tests (`fuse/shutdown_test.go`) pin flag semantics, the freeze
+refusal contract, and the crash-sim unmount for both flag halves.
+Notable finding: NOLOGFLUSH "loses" only the uncommitted journal
+records, not the mutation itself — the unmount's deferred-metadata drain
+persists the trie/inode blocks directly, which is exactly what the
+kernel's put_super does after a shutdown (flush_owned, generic/417),
+so the pinned observable is the on-disk replay range, not mutation
+visibility.
+
+### Solo run of the 37 shutdown-gated tests (`run-20260916-185725`)
+
+18 PASS / 2 FAIL / 16 NOT RUN / 0 HANG, binary @69a4dfe. The semantically
+critical ones all pass: 052 (LOGFLUSH journal-replay survival), 599
+(RO-mount shutdown), 417 (post-shutdown unmount sync), 474, 051/388,
+042, 392, 461, 468, 505, 507, 530, 536, 635, 646, 730, 737. The 16
+NOT RUN are other-feature gates: fiemap 043–049, norecovery 050, log
+configs 054/055, quota 506, crtime 508, exchangerange 722, logdev 766,
+atomic writes 775/778. (623 does execute — this xfs_io build has the
+`shutdown` command — and its gate `_require_xfs_io_shutdown` passes;
+it was excluded from the solo list on the mistaken belief it did not.)
+
+The 2 FAILs are pre-existing bridge gaps newly unmasked by the gate
+opening, not shutdown bugs:
+
+- generic/622 — fails at "atime didn't increase (in-memory)": the
+  bridge's known atime gap. Its shutdown usage works; the lazytime
+  atime checks do not.
+- generic/705 — the extent check is `filefrag`, and filefrag silently
+  degrades to "0 extents found" for *any* bridge file: FIEMAP is
+  EOPNOTSUPP (the 6.12 VFS intercepts FS_IOC_FIEMAP before FUSE, and
+  fs/fuse implements no `->fiemap`; even a forwarding client would cap
+  the restricted-mode transfer at 32 bytes). Verified live on a healthy
+  file with a real extent — filefrag prints "0 extents found" with
+  exit 0. The test's shutdown/cycle-mount flow itself works: the 10000
+  files survive with sizes intact. 705 is bridge-unaddressable until
+  and unless the kernel FUSE client grows fiemap support (same class
+  as O_TMPFILE; generic/032 stays NOT RUN at its explicit fiemap gate).
+
+- generic/623 — the post-shutdown fsync reported EROFS, not the
+  expected EIO: fsync flushes the mmap-dirtied page first, and that
+  writeback write hit the frozen gate. Fixed in briefs-utils 855fb23:
+  post-shutdown *data writes* now return EIO — the kernel's fs-level
+  contract (writepages' early -EIO, the path the mmap flush exercises;
+  XFS, the test's origin, returns EIO from the whole write path after a
+  shutdown) — while the journal-failure freeze keeps EROFS. The kernel
+  module's EROFS for a plain post-shutdown write is the VFS SB_RDONLY
+  check at the syscall layer, which never reaches the filesystem and
+  cannot be reproduced in the bridge (go-fuse's fs API drops the
+  FUSE write_flags that would distinguish writeback writes). 623 PASS,
+  042 536 622 unchanged by the fix (re-checked, run-20260917-011750).
+
+### Full-suite validation
+
+Two 793-test full runs at the shutdown-campaign HEADs, both zero-
+regression vs the 328/32/0 baseline (run-20260915-212640):
+
+- `run-20260916-192804-fuse.txt` (binary @69a4dfe): **346/35/0 hangs**
+  — the per-test diff vs the baseline is exactly the 21 shutdown-set
+  changes: 18 NOT RUN→PASS and 3 NOT RUN→FAIL (622, 623, 705); the
+  other 772 tests byte-identical.
+- `run-20260917-012004-fuse.txt` (binary @855fb23, after the 623
+  write-errno fix): **347/34/0 hangs** — the only change vs the run
+  above is 623 FAIL→PASS.  Solo re-check of the fix on 623, 042, 536,
+  622: `run-20260917-011750-fuse.txt`.
+
+Closing record: 19 shutdown-gated tests newly PASS (18 at the feature
+plus 623 at the errno fix); the 2 residual FAILs are pre-existing
+bridge gaps (622 atime, 705 fiemap), not shutdown bugs; 16 of the 37
+gated tests stay NOT RUN on other feature gates (fiemap 043–049,
+norecovery 050, log configs 054/055, quota 506, crtime 508,
+exchangerange 722, logdev 766, atomic writes 775/778).
+
 ## Full-suite runs
 
 - 20260912-132029 (pre-Family-1 baseline): 300/59/1
