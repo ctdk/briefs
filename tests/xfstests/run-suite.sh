@@ -332,11 +332,25 @@ write_archive() {
 # hangs (notes from 2026-08-02/08-04, before Phase 1). Re-verified 2026-08-13
 # on current (Phase 1, 134d4a4) code: 40x/20x/20x loop iterations on both the
 # stock and lockdep kernels, zero hangs - un-skipped.
-# generic/068/074/464/476: documented as fixed in memory and re-verified
+# generic/074/464/476: documented as fixed in memory and re-verified
 # 2026-08-18 at full-suite scale (4/4 PASS, 0 hang, TIMEOUT_SECS=900) -
-# un-skipped. 068 = xfs_freeze hang (FIFREEZE/FITHAW c274292); 074 = mmap
-# writeback extent leak + AB-BA deadlock (fb649e8 + truncate_setsize fix);
-# 464 = trie_iter_grow double-free (4ef6ccb); 476 = all-writes fsstress.
+# un-skipped. 074 = mmap writeback extent leak + AB-BA deadlock (fb649e8 +
+# truncate_setsize fix); 464 = trie_iter_grow double-free (4ef6ccb);
+# 476 = all-writes fsstress.
+# generic/068: RE-SKIPPED 2026-09-18.  Was skipped for an xfs_freeze hang
+# (FIFREEZE/FITHAW c274292), un-skipped 2026-08-18 on 4/4 PASS - but the
+# hang was still there at a flake rate of roughly 1 wedge per 3-5 looped
+# runs: solo-068 loops wedged the VM hard (network dead, console blank
+# and unresponsive, no panic text; reboot-only) during 2026-09-17 full
+# suite + repro loops and a 2026-09-18 module bisect.  Bisect verdict:
+# PRE-EXISTING - the wedge reproduces at 875ec08 (write path identical
+# to the 456/3 baseline), so it is not a P1 (05ad8d8) / P2 (1df9a9d)
+# regression.  All wedge-run check logs end at "generic/068 44-46s ..."
+# (~2/3 through the run, in the xfs_freeze cycles interleaved with
+# fsstress + fstest -m mmap loops, ITERATIONS=10).  Silent family, zero
+# lockdep splats, same class as 127/521.  Evidence and driver:
+# ~/src/briefs-notes/068-freeze-wedge/.  Re-verify with LOOPED runs
+# (>=8), not 3-4 solo passes, before un-skipping again.
 # generic/051/461/753: previously skipped for hangs (notes from 2026-08-04,
 # pre-Phase-1). Re-verified 2026-08-18 on current code (3x iterations each,
 # SKIP_TESTS="" TIMEOUT_SECS=1800): 051 3/3, 461 3/3, 753 3/3 PASS, zero
@@ -382,7 +396,7 @@ write_archive() {
 # subset, which includes generic/475, in full).  Use the "+set" test so an
 # explicitly empty SKIP_TESTS is honored (a plain := would re-apply this default
 # to an empty value).
-[ -n "${SKIP_TESTS+set}" ] || SKIP_TESTS="generic/475 generic/492"
+[ -n "${SKIP_TESTS+set}" ] || SKIP_TESTS="generic/475 generic/492 generic/068"
 
 should_skip() {
     local test="$1"
