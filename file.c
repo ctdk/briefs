@@ -1031,6 +1031,24 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			goto out_copy;
 	}
 
+	/*
+	 * Direct-I/O writes hold inode_lock only across SUBMISSION: for an
+	 * async iocb (libaio/io_uring) iomap_dio_rw returns -EIOCBQUEUED once
+	 * the bios are queued, briefs_dio_write then drops inode_lock, and
+	 * the write bios keep flying with no lock held.  notify_change()
+	 * serializes US against new submissions via this inode_lock, but not
+	 * against those completions -- so at this point a truncate's freed
+	 * blocks can still have write bios in flight.  Freeing such a block
+	 * (briefs_btree_delete_range below) hands it straight back to the
+	 * allocator, the next allocation on ANY inode reuses it (data block,
+	 * unwritten extent, btree node), and the stale bio lands on the new
+	 * owner, clobbering it.  Drain outstanding DIO before any size
+	 * mutation, as ext4_truncate() and xfs_setattr_size() both do.
+	 * (generic/299: fallocate/truncate loop concurrent with random
+	 * aio-dio corrupted a *different* file's verified data.)
+	 */
+	inode_dio_wait(inode);
+
 	/* notify_change() translates the ATTR_KILL_SUID / ATTR_KILL_SGID bits
 	 * that do_truncate() adds (via dentry_needs_remove_privs) into ATTR_MODE
 	 * with the setid bits cleared before calling ->setattr.  The size-change
@@ -3535,6 +3553,26 @@ long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 			return ret;
 		}
 	}
+
+	/*
+	 * Punch/zero/collapse/insert detach blocks from the live mapping
+	 * (freeing them, zeroing them, or shifting the ranges above them)
+	 * while direct-I/O write bios may still be in flight: briefs_dio_write
+	 * holds inode_lock only across submission, so an async iocb's bios
+	 * complete after we acquired the lock.  Without the drain, a freed
+	 * block is immediately reusable and the stale bio lands on its new
+	 * owner (generic/299's fallocate/truncate-vs-aio-dio corruption, where
+	 * fio's own 128k write buffer was found stamped across 19 recycled
+	 * blocks of a different file; the deferred generic/617 punch-under-DIO
+	 * flake is plausibly the same window); collapse/insert additionally
+	 * shift blocks under in-flight bios, landing writes at the wrong
+	 * offsets.  Drain outstanding DIO first, as ext4's punch/zero/collapse/
+	 * insert paths all do.  Plain preallocation only adds unwritten extents
+	 * and disturbs nothing in flight, so it does not drain.
+	 */
+	if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE |
+		    FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_INSERT_RANGE))
+		inode_dio_wait(inode);
 
 	if (mode & FALLOC_FL_PUNCH_HOLE) {
 		briefs_stat_inc(bsi, punch_holes);
