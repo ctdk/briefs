@@ -158,3 +158,13 @@ exchangerange 722, logdev 766, atomic writes 775/778).
   after the 18-commit refactor series): **328/32/0 hangs** — per-test
   status byte-identical to 021234 across all 793 tests.  The refactor
   introduced no behavioral change at suite scale.
+- 20260916-192804 and 20260917-012004 (shutdown campaign, binaries @69a4dfe
+  then @855fb23): **346/35/0** then **347/34/0** — per-test detail in the
+  shutdown section above.
+- 20260920-185047 (final pre-push closing run, same binary @855fb23 as
+  012004, same skip list 475+492): **349/33/0 hangs** — only two per-test
+  changes vs 20260917, both improvements, ZERO regressions: generic/081
+  NOT RUN→PASS and generic/108 FAIL→PASS.  Both are dm-error-path tests
+  (dm-snapshot fill / partial-device failure) whose dm setup is
+  nondeterministic; no bridge code changed between the runs.  Closing
+  record for the fuse-failure-closing push.
