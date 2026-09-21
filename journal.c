@@ -265,7 +265,9 @@ int briefs_journal_flush_owned(struct briefs_journal *j)
 			/*
 			 * A prior flush_owned (or a synchronous site) may have
 			 * already tried to write this buffer and hit a failing
-			 * device: end_buffer_write_sync() clears BH_Uptodate on a
+			 * device: the write completion (end_buffer_write_sync()
+			 * on < 7.2, bh_end_write() on >= 7.2) clears
+			 * BH_Uptodate on a
 			 * lost write.  Calling mark_buffer_dirty() on a
 			 * !uptodate buffer trips WARN_ON_ONCE(!buffer_uptodate)
 			 * (fs/buffer.c) -- the non-allowlisted message that

@@ -1708,8 +1708,8 @@ static inline int briefs_sync_dirty_buffer(struct buffer_head *bh,
  *
  * Per-buffer semantics are exactly briefs_sync_dirty_buffer's: the submit
  * stage replicates the submit half of __sync_dirty_buffer() (lock_buffer ->
- * test_clear_buffer_dirty -> get_bh + bh->b_end_io = end_buffer_write_sync ->
- * submit_bh(REQ_OP_WRITE|REQ_SYNC)); the wait stage is wait_on_buffer + the
+ * test_clear_buffer_dirty -> briefs_compat_bh_write_submit(), the
+ * version-appropriate submission); the wait stage is wait_on_buffer + the
  * briefs_check_meta_write_error() quiesce + briefs_handle_meta_write_error()
  * error chokepoint.  A buffer
  * found clean is not written at all (the one-write-per-buffer guarantee
@@ -1810,18 +1810,19 @@ static inline void briefs_meta_batch_add(struct briefs_meta_batch *b,
 			blk_start_plug(&b->plug);
 			b->plugged = true;
 		}
-		/* The submit half of __sync_dirty_buffer() on 6.12: the
-		 * get_bh is dropped by end_buffer_write_sync (the b_end_io
-		 * completion), the buffer stays locked until I/O
-		 * completion, and our transferred caller reference is held
-		 * across submit -> wait per __sync_dirty_buffer's contract.
-		 * On a lost write end_buffer_write_sync marks
+		/* Submit through the compat wrapper: on < 7.2 this is the
+		 * submit half of __sync_dirty_buffer() (its get_bh is
+		 * dropped by end_buffer_write_sync, the b_end_io
+		 * completion); on >= 7.2 it is bh_submit() with bh_end_write,
+		 * which takes no reference of its own (see the refcount
+		 * audit in compat/compat-buffer.h).  Either way the buffer
+		 * stays locked until I/O completion, our transferred caller
+		 * reference survives to the wait stage per
+		 * __sync_dirty_buffer's contract, and a lost write marks
 		 * BH_Write_EIO, which the wait stage's
 		 * briefs_check_meta_write_error() quiesce is built for.
 		 */
-		get_bh(bh);
-		bh->b_end_io = end_buffer_write_sync;
-		submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
+		briefs_compat_bh_write_submit(bh);
 		b->bhs[b->n++] = bh;
 	} else {
 		/* Clean (pdflush won the race, or an earlier sync quiesced
