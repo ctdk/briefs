@@ -63,7 +63,7 @@ static struct dentry *briefs_get_parent(struct dentry *child)
 
 	parent_ino = binfo->disk_inode.parent_inode;
 	if (parent_ino == 0) {
-		pr_err("briefs: get_parent: ino %lu has no parent\n", inode->i_ino);
+		pr_err("briefs: get_parent: ino %lu has no parent\n", (unsigned long)inode->i_ino);
 		return ERR_PTR(-ESTALE);
 	}
 

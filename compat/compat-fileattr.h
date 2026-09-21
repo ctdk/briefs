@@ -19,6 +19,7 @@
  * expects its includer to have <linux/fs.h> already (not guaranteed in
  * force-include position). */
 struct dentry;
+struct file;
 struct mnt_idmap;
 
 #include <linux/fileattr.h>

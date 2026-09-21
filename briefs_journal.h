@@ -365,7 +365,7 @@ static inline void briefs_persist_and_journal_inode_warn(struct super_block *sb,
 {
 	if (briefs_persist_and_journal_inode(sb, vfs_inode, di, false))
 		pr_warn_ratelimited("briefs: inode %lu persist+journal failed\n",
-				    vfs_inode->i_ino);
+				    (unsigned long)vfs_inode->i_ino);
 }
 
 /* Flush pending inode snapshots to the journal. Called at syscall boundaries

@@ -607,7 +607,7 @@ static int xattr_chain_load(struct inode *inode, struct xattr_chain *chain)
 		u64 next;
 
 		if (chain->count >= BRIEFS_XATTR_MAX_CHAIN) {
-			pr_warn("briefs: xattr chain too long at ino=%lu\n", inode->i_ino);
+			pr_warn("briefs: xattr chain too long at ino=%lu\n", (unsigned long)inode->i_ino);
 			brelse(bh);
 			xattr_chain_release(chain);
 			return -EIO;
@@ -805,7 +805,7 @@ static void briefs_xattr_free_chain_locked(struct inode *inode, u64 head)
 
 		if (++visited > BRIEFS_XATTR_MAX_CHAIN) {
 			pr_warn("briefs: xattr free loop detected at ino=%lu\n",
-				inode->i_ino);
+				(unsigned long)inode->i_ino);
 			break;
 		}
 

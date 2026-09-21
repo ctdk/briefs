@@ -94,18 +94,10 @@ static int __briefs_set_acl(struct inode *inode, struct posix_acl *acl,
 	}
 
 	if (acl) {
-		size = posix_acl_to_xattr(inode->i_sb->s_user_ns, acl, NULL, 0);
-		if (size < 0)
-			return size;
-		value = kmalloc(size, GFP_KERNEL);
-		if (!value)
-			return -ENOMEM;
-		error = posix_acl_to_xattr(inode->i_sb->s_user_ns, acl,
-					   value, size);
-		if (error < 0) {
-			kfree(value);
+		error = briefs_compat_acl_to_xattr(inode->i_sb->s_user_ns,
+						   acl, &value, &size);
+		if (error)
 			return error;
-		}
 	}
 
 	error = briefs_xattr_set(inode, name, value, size, 0);

@@ -64,6 +64,18 @@
 #define BRIEFS_HAS_IOMAP_BIO_READ 0
 #endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+#define BRIEFS_HAS_INODE_STATE_HELPERS 1	/* i_state behind typed accessors */
+#else
+#define BRIEFS_HAS_INODE_STATE_HELPERS 0
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+#define BRIEFS_HAS_ACL_TO_XATTR_ALLOC 1	/* posix_acl_to_xattr allocs */
+#else
+#define BRIEFS_HAS_ACL_TO_XATTR_ALLOC 0
+#endif
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
 #define BRIEFS_HAS_BH_SUBMIT 1		/* buffer_head -> bio conversion */
 #else
@@ -79,6 +91,8 @@
 #include "compat-fileattr.h"
 #include "compat-iomap.h"
 #include "compat-buffer.h"
+#include "compat-inode.h"
+#include "compat-acl.h"
 #include "compat-vfs-ops.h"
 
 #endif /* _BRIEFS_COMPAT_H */

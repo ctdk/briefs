@@ -179,7 +179,7 @@ int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
 }
 /* Open file */
 int briefs_open(struct inode *inode, struct file *file) {
-	pr_debug("briefs: open inode %lu\n", inode->i_ino);
+	pr_debug("briefs: open inode %lu\n", (unsigned long)inode->i_ino);
 
 	/* Direct I/O is handled by the iter functions (briefs_read_iter /
 	 * briefs_write_iter route IOCB_DIRECT to iomap_dio_rw); nothing to do
@@ -191,7 +191,7 @@ int briefs_open(struct inode *inode, struct file *file) {
 }
 /* Release file */
 int briefs_release(struct inode *inode, struct file *file) {
-	pr_debug("briefs: release inode %lu\n", inode->i_ino);
+	pr_debug("briefs: release inode %lu\n", (unsigned long)inode->i_ino);
 	return 0;
 }
 
@@ -538,7 +538,7 @@ static int briefs_promote_inline_data(struct inode *inode)
 	briefs_persist_disk_inode(inode->i_sb, inode->i_ino, &binfo->disk_inode, false);
 
 	pr_debug("briefs: promoted inline inode %lu to block %llu\n",
-		 inode->i_ino, phys);
+		 (unsigned long)inode->i_ino, phys);
 	return 0;
 }
 
@@ -1245,7 +1245,7 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	}
 
 	pr_debug("briefs: setattr truncate ino=%lu %llu -> %llu\n",
-		inode->i_ino, old_size, new_size);
+		(unsigned long)inode->i_ino, old_size, new_size);
 
 	/* Inline-data truncate is handled separately. */
 	if (binfo->disk_inode.flags & InodeFlagInlineData) {
@@ -3859,7 +3859,7 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	int ret;
 	size_t len = strlen(symname);
 
-	pr_debug("briefs: symlink %pd -> %s in dir %lu\n", dentry, symname, dir->i_ino);
+	pr_debug("briefs: symlink %pd -> %s in dir %lu\n", dentry, symname, (unsigned long)dir->i_ino);
 
 	if (len == 0 || len > BRIEFS_NAME_LEN * 10)
 		return -ENAMETOOLONG;
@@ -3949,7 +3949,7 @@ int briefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 
 	d_instantiate(dentry, inode);
 
-	pr_debug("briefs: symlink inode %lu -> %s added to dir\n", inode->i_ino, symname);
+	pr_debug("briefs: symlink inode %lu -> %s added to dir\n", (unsigned long)inode->i_ino, symname);
 	ret = briefs_inode_sync(dir);
 	return ret;
 }
@@ -3963,7 +3963,7 @@ int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	int ret;
 
 	pr_debug("briefs: mknod %pd (mode=%o, rdev=%u:%u) in dir %lu\n",
-		 dentry, mode, MAJOR(rdev), MINOR(rdev), dir->i_ino);
+		 dentry, mode, MAJOR(rdev), MINOR(rdev), (unsigned long)dir->i_ino);
 
 	inode = briefs_new_inode(idmap, dir, dentry, mode, rdev);
 	if (IS_ERR(inode))
@@ -3975,7 +3975,7 @@ int briefs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 
 	d_instantiate(dentry, inode);
 
-	pr_debug("briefs: mknod inode %lu (mode=%o) added to dir\n", inode->i_ino, mode);
+	pr_debug("briefs: mknod inode %lu (mode=%o) added to dir\n", (unsigned long)inode->i_ino, mode);
 	ret = briefs_inode_sync(dir);
 	return ret;
 }
@@ -3989,7 +3989,7 @@ const char *briefs_get_link(struct dentry *dentry, struct inode *inode,
 	struct briefs_inode_info *binfo = briefs_i(inode);
 	char *link;
 
-	pr_debug("briefs: get_link inode=%lu\n", inode->i_ino);
+	pr_debug("briefs: get_link inode=%lu\n", (unsigned long)inode->i_ino);
 
 	if (!dentry)
 		return ERR_PTR(-ECHILD);

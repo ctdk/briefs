@@ -163,7 +163,7 @@ int briefs_dir_open(struct inode *inode, struct file *file) {
 	struct briefs_inode_info *binfo;
 	struct trie_iter *iter;
 
-	pr_debug("briefs: dir_open inode %lu\n", inode->i_ino);
+	pr_debug("briefs: dir_open inode %lu\n", (unsigned long)inode->i_ino);
 
 	if (!S_ISDIR(inode->i_mode))
 		return -ENOTDIR;
@@ -183,7 +183,7 @@ int briefs_dir_open(struct inode *inode, struct file *file) {
 
 /* Release directory — free the persistent trie iterator */
 int briefs_dir_release(struct inode *inode, struct file *file) {
-	pr_debug("briefs: dir_release inode %lu\n", inode->i_ino);
+	pr_debug("briefs: dir_release inode %lu\n", (unsigned long)inode->i_ino);
 	briefs_trie_iter_free(file->private_data);
 	file->private_data = NULL;
 	return 0;
@@ -324,7 +324,7 @@ struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned 
 	name = dentry->d_name.name;
 	name_len = dentry->d_name.len;
 
-	pr_debug("briefs: trie lookup for %pd in dir inode %lu\n", dentry, dir->i_ino);
+	pr_debug("briefs: trie lookup for %pd in dir inode %lu\n", dentry, (unsigned long)dir->i_ino);
 
 	/* Check for . and .. */
 	if (name_len == 1 && name[0] == '.') {
@@ -376,7 +376,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	int ret;
 	bool is_dir = S_ISDIR(mode);
 
-	pr_debug("briefs: create %pd (mode=%o) in dir %lu\n", dentry, mode, dir->i_ino);
+	pr_debug("briefs: create %pd (mode=%o) in dir %lu\n", dentry, mode, (unsigned long)dir->i_ino);
 
 	inode = briefs_new_inode(idmap, dir, dentry, mode, 0);
 	if (IS_ERR(inode))
@@ -395,13 +395,13 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 			 */
 			if (ret != -ENOSPC)
 				pr_err("briefs: failed to create dir trie root for ino %lu (err %d)\n",
-				       inode->i_ino, ret);
+				       (unsigned long)inode->i_ino, ret);
 			briefs_create_abort(dir->i_sb, dir, inode, &dentry->d_name, false);
 			return ret;
 		}
 
 		pr_debug("briefs: created dir trie root block=%llu for inode %lu\n",
-			binfo->disk_inode.dir_trie_root, inode->i_ino);
+			binfo->disk_inode.dir_trie_root, (unsigned long)inode->i_ino);
 	}
 
 	ret = briefs_finish_create(dir, dentry, inode, is_dir ? 1 : 0);
@@ -410,7 +410,7 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 
 	d_instantiate(dentry, inode);
 
-	pr_debug("briefs: created inode %lu, added to dir\n", inode->i_ino);
+	pr_debug("briefs: created inode %lu, added to dir\n", (unsigned long)inode->i_ino);
 	ret = briefs_dir_sync(dir);
 	return ret;
 }
@@ -473,7 +473,7 @@ int briefs_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 	ret = briefs_persist_and_journal_inode(sb, inode, &binfo->disk_inode, false);
 	if (ret)
 		pr_warn_ratelimited("briefs: tmpfile persist failed ino %lu: %d\n",
-				    inode->i_ino, ret);
+				    (unsigned long)inode->i_ino, ret);
 
 	return finish_open_simple(file, 0);
 }
@@ -492,7 +492,7 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 	u8 ftype;
 	int ret;
 
-	pr_debug("briefs: link %pd -> %pd in dir %lu\n", old_dentry, new_dentry, dir->i_ino);
+	pr_debug("briefs: link %pd -> %pd in dir %lu\n", old_dentry, new_dentry, (unsigned long)dir->i_ino);
 
 	if (!inode)
 		return -ENOENT;
@@ -578,7 +578,7 @@ int briefs_link(struct dentry *old_dentry, struct inode *dir,
 	ihold(inode);
 	d_instantiate(new_dentry, inode);
 
-	pr_debug("briefs: link inode %lu now has %u links\n", inode->i_ino, inode->i_nlink);
+	pr_debug("briefs: link inode %lu now has %u links\n", (unsigned long)inode->i_ino, inode->i_nlink);
 	ret = briefs_dir_sync(dir);
 	return ret;
 }

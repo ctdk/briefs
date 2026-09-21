@@ -484,7 +484,7 @@ struct inode *briefs_new_inode(struct mnt_idmap *idmap, struct inode *dir,
 		goto fail_inode;
 	}
 
-	if (!(inode->i_state & I_NEW)) {
+	if (!(briefs_compat_inode_state(inode) & I_NEW)) {
 		/* Inode already in cache — shouldn't happen for fresh alloc */
 		ret = -EEXIST;
 		goto fail_iget;
@@ -669,7 +669,7 @@ int briefs_finish_create(struct inode *dir, struct dentry *dentry,
 		ret = briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 		if (ret) {
 			pr_err("briefs: failed to journal new inode %lu: %d\n",
-			       inode->i_ino, ret);
+			       (unsigned long)inode->i_ino, ret);
 			briefs_create_abort(dir->i_sb, dir, inode, &dentry->d_name, false);
 			return ret;
 		}
@@ -711,7 +711,7 @@ int briefs_write_inode(struct inode *inode, struct writeback_control *wbc) {
 	binfo = briefs_i(inode);
 	block_lock = briefs_inode_block_lock(inode->i_sb, inode->i_ino);
 
-	pr_debug("briefs: write_inode %lu\n", inode->i_ino);
+	pr_debug("briefs: write_inode %lu\n", (unsigned long)inode->i_ino);
 
 	/*
 	 * Serialize read-modify-write cycles on the shared 4K inode block.
@@ -1033,7 +1033,7 @@ struct inode *briefs_iget(struct super_block *sb, u64 ino) {
 		return ERR_PTR(-ENOMEM);
 	}
 
-	if (inode->i_state & I_NEW) {
+	if (briefs_compat_inode_state(inode) & I_NEW) {
 		int ret = briefs_read_and_fill_inode(inode);
 		if (ret) {
 			unlock_new_inode(inode);
@@ -1107,7 +1107,7 @@ struct inode *briefs_iget_with_gen(struct super_block *sb, u64 ino, u32 gen)
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
 
-	if (inode->i_state & I_NEW) {
+	if (briefs_compat_inode_state(inode) & I_NEW) {
 		ret = briefs_read_and_fill_inode(inode);
 		if (ret) {
 			unlock_new_inode(inode);
@@ -1131,7 +1131,7 @@ struct inode *briefs_iget_with_gen(struct super_block *sb, u64 ino, u32 gen)
 }
 /* briefs_evict_inode - cleanup inode on eviction */
 void briefs_evict_inode(struct inode *inode) {
-	pr_debug("briefs: evict_inode inode %lu\n", inode->i_ino);
+	pr_debug("briefs: evict_inode inode %lu\n", (unsigned long)inode->i_ino);
 
 	/*
 	 * P1 dirty-node tracking: drain any still-tracked dirty tree nodes
