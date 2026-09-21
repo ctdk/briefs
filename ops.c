@@ -18,10 +18,10 @@
 
 /* Inode operations for directories */
 const struct inode_operations briefs_dir_inode_ops = {
-	.create = briefs_create,
+	.create = briefs_create_op,
 	.lookup = briefs_lookup,
 	.link = briefs_link,
-	.mkdir = briefs_mkdir,
+	.mkdir = briefs_mkdir_op,
 	.symlink = briefs_symlink,
 	.mknod = briefs_mknod,
 	.tmpfile = briefs_tmpfile,

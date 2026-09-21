@@ -2016,9 +2016,9 @@ int briefs_dir_open(struct inode *inode, struct file *file);
 int briefs_dir_release(struct inode *inode, struct file *file);
 
 /* Inode operations */
-int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl);
+int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode);
 struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
-int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode);
+struct dentry *briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode);
 int briefs_unlink(struct inode *dir, struct dentry *dentry);
 int briefs_rmdir(struct inode *dir, struct dentry *dentry);
 int briefs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,

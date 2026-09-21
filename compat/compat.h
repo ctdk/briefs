@@ -79,5 +79,6 @@
 #include "compat-fileattr.h"
 #include "compat-iomap.h"
 #include "compat-buffer.h"
+#include "compat-vfs-ops.h"
 
 #endif /* _BRIEFS_COMPAT_H */

@@ -365,8 +365,13 @@ struct dentry *briefs_lookup(struct inode *dir, struct dentry *dentry, unsigned 
 	}
 }
 
-/* briefs_create - create a new file or directory */
-int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl) {
+/* briefs_create - create a new file or directory
+ *
+ * Takes the post-v7.2 prototype: the VFS's bool excl parameter is gone
+ * (the EEXIST check happens before ->create is invoked, so BrieFS never
+ * consulted it); older kernels adapt via compat/compat-vfs-ops.h.
+ */
+int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode) {
 	struct inode *inode;
 	int ret;
 	bool is_dir = S_ISDIR(mode);
@@ -410,8 +415,15 @@ int briefs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	return ret;
 }
 
-/* briefs_mkdir - create a new directory */
-int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode) {
+/* briefs_mkdir - create a new directory
+ *
+ * Takes the post-v6.14 prototype (mkdir returns the dentry: ERR_PTR on
+ * failure, NULL on success); older kernels adapt via
+ * compat/compat-vfs-ops.h.
+ */
+struct dentry *briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode) {
+	int err;
+
 	/* Directories at least aren't getting the proper mode set. Let's do
 	 * so now, although we may want to split directories and non-directories
 	 * into their own functions. */
@@ -420,7 +432,8 @@ int briefs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dent
 		mode |= S_ISGID;
 
 	pr_debug("briefs: mkdir %pd (mode=%o)\n", dentry, mode);
-	return briefs_create(idmap, dir, dentry, mode, false);
+	err = briefs_create(idmap, dir, dentry, mode);
+	return err ? ERR_PTR(err) : NULL;
 }
 
 /*
