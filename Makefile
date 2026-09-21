@@ -25,6 +25,12 @@ BRIEFS_GIT := unknown
 endif
 ccflags-y += -DBRIEFS_BUILD_VERSION=\"$(BRIEFS_GIT)\"
 
+# Compat layer: force-include the umbrella header ahead of every file's
+# own #include list, so the stable wrapper names and feature flags are
+# visible regardless of include order.  All kernel-version handling in
+# the tree lives under compat/ (see compat/compat.h).
+ccflags-y += -include $(src)/compat/compat.h
+
 # Kernel build directory (change as needed)
 KDIR ?= /lib/modules/$(shell uname -r)/build
 

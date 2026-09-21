@@ -3,6 +3,10 @@
 #ifndef _BRIEFS_H
 #define _BRIEFS_H
 
+/* Compat umbrella, also force-included by the Makefile ahead of every
+ * compilation unit; included here first so briefs.h is self-contained. */
+#include "compat/compat.h"
+
 #include <linux/fs.h>
 #include <linux/fs_parser.h>
 #include <linux/types.h>
