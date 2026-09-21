@@ -40,6 +40,12 @@
 #define BRIEFS_HAS_MKDIR_DENTRY 0
 #endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#define BRIEFS_HAS_IOMAP_PRIVATE 1	/* private threaded through zero/mkwrite */
+#else
+#define BRIEFS_HAS_IOMAP_PRIVATE 0
+#endif
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
 #define BRIEFS_HAS_IOMAP_WRITE_OPS 1	/* iomap buffered-write series */
 #else

@@ -6,13 +6,14 @@
  * compat/compat-iomap.h - stable wrappers around the iomap entry
  * points whose prototypes changed between v6.12 and current upstream.
  *
- * v6.17 threaded a "write_ops" parameter through the buffered write /
- * zeroing helpers and a "private" parameter through zero_range,
- * truncate_page and page_mkwrite (buffered_write already carried a
- * private from v6.10); BrieFS passes NULL for all of them, as in-tree
- * filesystems without write_begin hooks do.  v6.19 moved the read path
- * behind the void-returning iomap_bio_read_* compat inlines; v6.17
- * also collapsed iomap_writepages() to a single writepage-context
+ * v6.16 threaded a "private" parameter through zero_range,
+ * truncate_page and page_mkwrite (buffered_write already carried one
+ * from v6.10); v6.17 then threaded a "write_ops" parameter through the
+ * buffered write and zeroing helpers (page_mkwrite was left at the
+ * v6.16 three-argument shape).  BrieFS passes NULL for all of them, as
+ * in-tree filesystems without write_begin hooks do.  v6.19 moved the
+ * read path behind the void-returning iomap_bio_read_* compat inlines;
+ * v6.17 also collapsed iomap_writepages() to a single writepage-context
  * argument that now carries the mapping, wbc and writeback ops.
  *
  * Every wrapper takes the v6.12 argument list (plus the ops pointer
@@ -32,7 +33,16 @@ briefs_compat_file_buffered_write(struct kiocb *iocb, struct iov_iter *from,
 {
 	return iomap_file_buffered_write(iocb, from, ops, NULL, NULL);
 }
+#else
+static inline ssize_t
+briefs_compat_file_buffered_write(struct kiocb *iocb, struct iov_iter *from,
+				   const struct iomap_ops *ops)
+{
+	return iomap_file_buffered_write(iocb, from, ops, NULL);
+}
+#endif
 
+#if BRIEFS_HAS_IOMAP_WRITE_OPS
 static inline int
 briefs_compat_zero_range(struct inode *inode, loff_t pos, loff_t len,
 			 bool *did_zero, const struct iomap_ops *ops)
@@ -46,20 +56,21 @@ briefs_compat_truncate_page(struct inode *inode, loff_t pos, bool *did_zero,
 {
 	return iomap_truncate_page(inode, pos, did_zero, ops, NULL, NULL);
 }
-
-static inline vm_fault_t
-briefs_compat_page_mkwrite(struct vm_fault *vmf, const struct iomap_ops *ops)
+#elif BRIEFS_HAS_IOMAP_PRIVATE
+static inline int
+briefs_compat_zero_range(struct inode *inode, loff_t pos, loff_t len,
+			 bool *did_zero, const struct iomap_ops *ops)
 {
-	return iomap_page_mkwrite(vmf, ops, NULL);
+	return iomap_zero_range(inode, pos, len, did_zero, ops, NULL);
+}
+
+static inline int
+briefs_compat_truncate_page(struct inode *inode, loff_t pos, bool *did_zero,
+			    const struct iomap_ops *ops)
+{
+	return iomap_truncate_page(inode, pos, did_zero, ops, NULL);
 }
 #else
-static inline ssize_t
-briefs_compat_file_buffered_write(struct kiocb *iocb, struct iov_iter *from,
-				   const struct iomap_ops *ops)
-{
-	return iomap_file_buffered_write(iocb, from, ops, NULL);
-}
-
 static inline int
 briefs_compat_zero_range(struct inode *inode, loff_t pos, loff_t len,
 			 bool *did_zero, const struct iomap_ops *ops)
@@ -73,13 +84,21 @@ briefs_compat_truncate_page(struct inode *inode, loff_t pos, bool *did_zero,
 {
 	return iomap_truncate_page(inode, pos, did_zero, ops);
 }
+#endif
 
+#if BRIEFS_HAS_IOMAP_PRIVATE
+static inline vm_fault_t
+briefs_compat_page_mkwrite(struct vm_fault *vmf, const struct iomap_ops *ops)
+{
+	return iomap_page_mkwrite(vmf, ops, NULL);
+}
+#else
 static inline vm_fault_t
 briefs_compat_page_mkwrite(struct vm_fault *vmf, const struct iomap_ops *ops)
 {
 	return iomap_page_mkwrite(vmf, ops);
 }
-#endif /* BRIEFS_HAS_IOMAP_WRITE_OPS */
+#endif
 
 /*
  * v6.19 reworked the iomap read path behind new prototypes
