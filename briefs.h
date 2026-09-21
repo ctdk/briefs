@@ -2032,11 +2032,11 @@ const char *briefs_get_link(struct dentry *dentry, struct inode *inode, struct d
 /* File operations */
 long briefs_fallocate(struct file *file, int mode, loff_t offset, loff_t len);
 
-/* chattr / lsattr inode flags */
-struct fileattr;
-int briefs_fileattr_get(struct dentry *dentry, struct fileattr *fa);
+/* chattr / lsattr inode flags (briefs_fileattr is the compat typedef for
+ * struct fileattr / struct file_kattr, see compat/compat-fileattr.h) */
+int briefs_fileattr_get(struct dentry *dentry, briefs_fileattr *fa);
 int briefs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
-                        struct fileattr *fa);
+                        briefs_fileattr *fa);
 
 /* File operations */
 ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to);

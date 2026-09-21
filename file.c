@@ -341,7 +341,7 @@ long briefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 /*
  * briefs_fileattr_get - get user-visible inode flags (chattr/lsattr/statx).
  */
-int briefs_fileattr_get(struct dentry *dentry, struct fileattr *fa)
+int briefs_fileattr_get(struct dentry *dentry, briefs_fileattr *fa)
 {
 	struct inode *inode = d_inode(dentry);
 	struct briefs_inode_info *binfo = briefs_i(inode);
@@ -363,7 +363,7 @@ int briefs_fileattr_get(struct dentry *dentry, struct fileattr *fa)
  * briefs_fileattr_set - set user-visible inode flags (chattr/lsattr/statx).
  */
 int briefs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
-                        struct fileattr *fa)
+                        briefs_fileattr *fa)
 {
 	struct inode *inode = d_inode(dentry);
 	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
@@ -675,8 +675,8 @@ static ssize_t briefs_iomap_buffered_write(struct kiocb *iocb,
 	if (ret)
 		goto out_unlock;
 	old_size = i_size_read(inode);
-	ret = iomap_file_buffered_write(iocb, from, &briefs_write_iomap_ops,
-					 NULL);
+	ret = briefs_compat_file_buffered_write(iocb, from,
+						&briefs_write_iomap_ops);
 	/*
 	 * iomap_file_buffered_write grows i_size but does not always mark the
 	 * inode dirty (e.g., when the write lands in an already-allocated run and
@@ -1150,8 +1150,9 @@ int briefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			 * extent_lock is taken here, preserving the no-AB-BA ordering
 			 * with the writeback path explained above.
 			 */
-			ret = iomap_truncate_page(inode, new_size, &did_zero,
-						  &briefs_iomap_ops);
+			ret = briefs_compat_truncate_page(inode, new_size,
+							   &did_zero,
+							   &briefs_iomap_ops);
 			if (ret)
 				return ret;
 		}
@@ -2943,7 +2944,8 @@ static long briefs_do_zero_range(struct file *file, int mode, loff_t offset,
 	 * written blocks this zeroes and dirties the folio; for holes/unwritten
 	 * it is a no-op (they already read as zero).  This covers partial-block
 	 * ranges, which stay "data" (generic/009 case 17). */
-	ret = iomap_zero_range(inode, offset, len, NULL, &briefs_iomap_ops);
+	ret = briefs_compat_zero_range(inode, offset, len, NULL,
+					&briefs_iomap_ops);
 	if (ret)
 		goto out;
 
@@ -4052,20 +4054,18 @@ const char *briefs_get_link(struct dentry *dentry, struct inode *inode,
  */
 static int briefs_iomap_read_folio(struct file *file, struct folio *folio)
 {
-	return iomap_read_folio(folio, &briefs_iomap_ops);
+	return briefs_compat_read_folio(folio, &briefs_iomap_ops);
 }
 
 static void briefs_iomap_readahead(struct readahead_control *rac)
 {
-	iomap_readahead(rac, &briefs_iomap_ops);
+	briefs_compat_readahead(rac, &briefs_iomap_ops);
 }
 
 static int briefs_iomap_writepages(struct address_space *mapping,
 				   struct writeback_control *wbc)
 {
-	struct iomap_writepage_ctx wpc = { };
-
-	return iomap_writepages(mapping, wbc, &wpc, &briefs_writeback_ops);
+	return briefs_compat_writepages(mapping, wbc, &briefs_writeback_ops);
 }
 
 /*
@@ -4139,7 +4139,7 @@ static vm_fault_t briefs_vm_page_mkwrite(struct vm_fault *vmf)
 	sb_start_pagefault(inode->i_sb);
 	file_update_time(vmf->vma->vm_file);
 	filemap_invalidate_lock_shared(inode->i_mapping);
-	ret = iomap_page_mkwrite(vmf, &briefs_write_iomap_ops);
+	ret = briefs_compat_page_mkwrite(vmf, &briefs_write_iomap_ops);
 	filemap_invalidate_unlock_shared(inode->i_mapping);
 	sb_end_pagefault(inode->i_sb);
 	return ret;
