@@ -461,6 +461,45 @@ const struct iomap_ops briefs_write_iomap_ops = {
  * so one begin call serves every folio inside a single extent (matching the
  * coalescing the old run-allocating writeback got for free).
  */
+#if BRIEFS_HAS_IOMAP_WRITEBACK_RANGE
+/*
+ * v6.17 writeback interface: ->writeback_range maps one folio range
+ * into the context (reusing the cached mapping while it still covers
+ * the range) and hands it to iomap_add_to_ioend; ->writeback_submit
+ * sends the accumulated ioend.  The mapping logic is identical to the
+ * pre-6.17 map_blocks below (same cache-hit condition, same
+ * allocate-on-miss write=true lookup through briefs_iomap_begin_common)
+ * -- ported after gfs2_writeback_range (fs/gfs2/bmap.c), including its
+ * memset of the context iomap: the context persists across calls, so a
+ * fresh mapping must not inherit fields from a stale one.  BrieFS
+ * never implemented ->prepare_ioend/->discard_folio, so
+ * iomap_ioend_writeback_submit is the same default submit path the
+ * 4-argument core used to apply.
+ */
+static ssize_t briefs_writeback_range(struct iomap_writepage_ctx *wpc,
+				      struct folio *folio, u64 pos,
+				      unsigned int len, u64 end_pos)
+{
+	if (pos < wpc->iomap.offset ||
+	    pos >= wpc->iomap.offset + wpc->iomap.length) {
+		int ret;
+
+		memset(&wpc->iomap, 0, sizeof(wpc->iomap));
+		ret = briefs_iomap_begin_common(wpc->inode, pos, len,
+						IOMAP_WRITE, &wpc->iomap,
+						true);
+		if (ret)
+			return ret;
+	}
+
+	return iomap_add_to_ioend(wpc, folio, pos, end_pos, len);
+}
+
+const struct iomap_writeback_ops briefs_writeback_ops = {
+	.writeback_range	= briefs_writeback_range,
+	.writeback_submit	= iomap_ioend_writeback_submit,
+};
+#else
 static int briefs_writeback_map_blocks(struct iomap_writepage_ctx *wpc,
 				       struct inode *inode, loff_t offset,
 				       unsigned int len)
@@ -476,6 +515,7 @@ static int briefs_writeback_map_blocks(struct iomap_writepage_ctx *wpc,
 const struct iomap_writeback_ops briefs_writeback_ops = {
 	.map_blocks	= briefs_writeback_map_blocks,
 };
+#endif /* BRIEFS_HAS_IOMAP_WRITEBACK_RANGE */
 
 /*
  * briefs_dio_write_end_io - complete a direct-I/O write.
