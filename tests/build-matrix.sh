@@ -8,16 +8,24 @@
 # kernels is caught here by the compiler (see compat/compat.h — the
 # build matrix is the feature probe for the version-guard boundaries).
 #
-# Usage (host, Debian trixie):
+# Usage (host, or the trixie VM — anywhere Debian trixie with trixie-
+#   backports configured; every header package installs in both):
 #   bash tests/build-matrix.sh [target ...]
-# Runs on the host because every trixie header package installs there.
+# In the VM, /boot sits on the root filesystem, so the linux-image
+# packages the 6.16/6.17 backports headers hard-depend on are harmless
+# there; on the host the 456M /boot partition is the constraint, which
+# is why the VM is the preferred place to run it.
 # With no arguments, runs all targets.  Targets:
-#   6.12            the running trixie-proper kernel's headers
+#   6.12            the running trixie-proper kernel's headers; when the
+#                   running kernel is a custom build not in apt (the VM's
+#                   -lockdep/-kasan kernels), the newest stock 6.12.x
+#                   point release in the apt index instead
 #   6.16 6.17 6.18 6.19 7.0 7.1   trixie-backports series (bare series
 #                   names resolve to the newest point release in the
 #                   apt index; full point versions also accepted)
-#   master          the prepared upstream tree (default /home/jeremy/src/linux,
-#                   override with BRIEFS_MASTER_DIR)
+#   master          the prepared upstream tree (default /home/jeremy/src/linux
+#                   on the host, /kernel-src/linux in the VM, where the
+#                   same tree is NFS-mounted; override with BRIEFS_MASTER_DIR)
 #
 # Output: an aligned PASS/FAIL table on stdout, saved to
 #   tests/build-matrix-results/<date>-<git-describe>.txt
@@ -36,6 +44,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$(dirname "$SCRIPT_DIR")"
 RESULTS_DIR="$SRC_DIR/tests/build-matrix-results"
 BRIEFS_MASTER_DIR="${BRIEFS_MASTER_DIR:-/home/jeremy/src/linux}"
+# The trixie VM sees the same prepared tree over NFS at /kernel-src/linux.
+[ -d "$BRIEFS_MASTER_DIR" ] || BRIEFS_MASTER_DIR=/kernel-src/linux
 
 # trixie-backports newest point release per series, as of the apt index
 # at authoring time; a bare-series target re-resolves this live.
@@ -73,10 +83,12 @@ config_ok() {
     return 0
 }
 
-# newest_backports_point SERIES — e.g. 6.16 -> 6.16.12+deb13.  The full
-# match excludes the -cloud/-rt/-common flavours by anchoring on the
-# plain "-amd64" suffix.
-newest_backports_point() {
+# newest_apt_point SERIES — e.g. 6.16 -> 6.16.12+deb13, or 6.12 ->
+# 6.12.107+deb13 (trixie proper; only the 6.16+ backports series live
+# in trixie-backports, and the regex matches any enabled suite).  The
+# full match excludes the -cloud/-rt/-common flavours by anchoring on
+# the plain "-amd64" suffix.
+newest_apt_point() {
     apt-cache search --names-only linux-headers 2>/dev/null |
         awk -v s="$1." '$1 ~ ("^linux-headers-" s "[0-9]+[+]deb13-amd64$") { print $1 }' |
         sort -V | tail -1 |
@@ -148,8 +160,20 @@ overall=0
 for t in "${targets[@]}"; do
     case "$t" in
     6.12)
-        # The running trixie-proper kernel's header set.
-        ver="$(uname -r)"
+        # The trixie-proper floor series.  Prefer the running kernel's
+        # own header set when it is a stock +deb13 build (the host); a
+        # custom kernel name (the VM's -lockdep/-kasan builds, which apt
+        # cannot provide) falls back to the newest stock point release
+        # in the apt index.
+        case "$(uname -r)" in
+        *+deb13*) ver="$(uname -r)" ;;
+        *)        ver="$(newest_apt_point 6.12)-amd64" ;;
+        esac
+        if [ -z "$ver" ] || [ "$ver" = "-amd64" ]; then
+            echo "$t FAIL-RESOLVE (no stock 6.12 headers in apt index)"
+            overall=1
+            continue
+        fi
         # linux-kbuild is named by the full version (e.g.
         # linux-kbuild-6.12.48+deb13), unlike the series-named
         # linux-headers-common packages.
@@ -161,7 +185,7 @@ for t in "${targets[@]}"; do
         run_target "master" "$BRIEFS_MASTER_DIR"
         ;;
     6.16|6.17|6.18|6.19|7.0|7.1)
-        full="$(newest_backports_point "$t")"
+        full="$(newest_apt_point "$t")"
         if [ -z "$full" ]; then
             echo "$t FAIL-RESOLVE (no +deb13 headers in apt index)"
             overall=1
