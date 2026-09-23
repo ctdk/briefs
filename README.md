@@ -84,7 +84,20 @@ Since trying out AI assisted coding was part of the reason for this in the first
 SUPPORTED KERNEL VERSIONS
 -------------------------
 
-For certain values of "support", anyway. As of this writing, all BrieFS development is being done using the Debian Linux kernel version 6.12.101 (in other words, the default on trixie when I set things up). Once it gets far enough along, it will jump up to track the current `linux` git repo. Other kernel versions and specific distro kernels may come as time and interest permit and dictate.
+For certain values of "support", anyway. Primary development is done against the Debian trixie kernel, 6.12.x, and that kernel — built with lockdep — remains the one the full xfstests suite runs on. As of the 2026-09 compat work, however, the same source tree builds and runs on everything from 6.12 up through the current `linux` git master: all kernel-version conditionals are consolidated in one place, the `compat/` directory (feature flags plus static-inline wrapper functions with the `#if`s inside their bodies), so no `#ifdef LINUX_VERSION_CODE`s are scattered through the rest of the sources. See the build matrix section below for how that range is actually exercised.
+
+BUILD MATRIX
+------------
+
+`tests/build-matrix.sh` builds the module against every kernel in the supported range: Debian's 6.12.x, the trixie-backports series (6.16, 6.17, 6.18, 6.19, 7.0, 7.1), and the current `linux` git master. It installs the matching headers where needed, checks that the required kernel options (`CONFIG_BUFFER_HEAD`, `CONFIG_FS_IOMAP`) are enabled, and builds the module for each target. It runs on the host or in the test VM, and the reports from the most recent runs are committed under `tests/build-matrix-results/`. Each compat boundary that the matrix compiles against is there because the API actually changed in that kernel — to name a few: mkdir started returning a `dentry *` in 6.15, the iomap writeback interface was reworked in 6.17, `i_state` became typed in 6.19, `posix_acl_to_xattr` allocates its result since 7.0, `i_ino` went from `unsigned long` to `u64` in 7.1, metadata batch submit moved to `bh_submit` in 7.2, and `->create` dropped its `excl` argument in 7.3.
+
+Compiling against a kernel only proves it compiles, though, so each version has also been boot-tested in the development VM:
+
+* 6.12.101 (the baseline, built with lockdep so lock-ordering gets validated)
+* 6.16.12, 6.17.13, 6.18.15, 6.19.14, 7.0.13, and 7.1.8 (the stock Debian kernels)
+* 7.3.0-rc4, built from `linux` git master, since no distro kernel that recent exists yet
+
+On every one of those the module was built fresh against the running kernel, loaded, and put through the same acceptance bar: the 138-test module suite in `tests/test-runner.sh`, an xfstests spot set of 11 generic tests (including the million-operation fsx soak in `generic/522`), and a dmesg check for warnings and oopses. All rounds to date (2026-09) have come back green, which means each compat arm has been exercised at runtime on a kernel that genuinely has that API, not merely compiled against one. On 6.12 itself the compat layer is held to a stricter bar: the module objects are byte-identical (compiler counter labels aside) to what they were before the compat layer existed, so the development kernel's behavior is provably unchanged.
 
 BUGS
 ----
