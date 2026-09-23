@@ -117,7 +117,7 @@ Per MEMORY.md, generic/547 was "FIXED 86fa48b" for chown+trie replay, but the fa
 
 ---
 
-### 8. generic/563 - Cgroup writeback (ENVIRONMENT)
+### 8. generic/563 - Cgroup writeback (RESOLVED-BY-CONFIG)
 **Failure:** Write timing/range check fails.
 
 ```
@@ -126,9 +126,19 @@ Per MEMORY.md, generic/547 was "FIXED 86fa48b" for chown+trie replay, but the fa
 + write is NOT in range 15938355.2 .. 17616076.8
 ```
 
-Per MEMORY.md, generic/563 is an environment issue: "563 (env)" - cgroup writeback charging test that fails due to test environment configuration, not BrieFS. The fix (SB_I_CGROUPWB) was landed in 55023ac, but the test still fails due to timing expectations.
+Historically an environment issue: `SB_I_CGROUPWB` was landed in `55023ac`
+and reverted by `9385fc8` because the 6.12.y VM kernel crashed at unmount
+(`cgroup_writeback_umount()` umount race + wb-switch use-after-free). The
+flag is re-enabled by `102b339` (2026-09-23) via the
+`BRIEFS_HAS_CGROUPWB_FIX` compat flag on kernels with both upstream fixes
+(CVE-2026-31703, CVE-2026-64378; boundaries >= 7.2, 7.1.4+, 6.18.39+,
+6.12.96+). 7.0.y never received the umount-race backport, so 7.0.13 and
+the 6.16-6.19 points remain expected-FAIL there; 6.12.96+ and 7.1.4+ are
+fixed.
 
-**Verdict:** ENVIRONMENT - cgroup writeback test, timing issue not a BrieFS bug
+**Verdict:** RESOLVED-BY-CONFIG (phase 2, 2026-09-23) — passes standalone
+and in the spot set on 6.12.101-lockdep and 7.3.0-rc4-lockdep+; the
+full-suite re-run with the flag ON is the phase-3 follow-up.
 
 ---
 

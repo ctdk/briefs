@@ -148,8 +148,11 @@ non-PASS; there are **no open BrieFS regressions** from the Phase-2 work.
     work — a `util-linux` task (skip-list entry since `991faac`).
   - `538` — DIO unaligned-AIO flake (0x5a data pattern, not metadata); was
     PASS at `ca4478b`, fired in the 08-30 run.
-  - `563` — cgroup writeback intentionally disabled (`9385fc8`, 6.12 iput
-    CVE-2026-31703 workaround; not a BrieFS defect).
+  - `563` — re-enabled on cgroup-writeback-fixed kernels by `102b339`
+    (2026-09-23, `BRIEFS_HAS_CGROUPWB_FIX`); passes standalone and in the
+    spot set on both lockdep kernels. Expected-FAIL remains the norm only
+    on gate-OFF kernels (unfixed 6.16-6.19/7.0 points — see the phase-2
+    addendum). Full-suite re-run is the phase-3 follow-up.
 - **Run-config note (08-30 run):** `SKIP_TESTS="475 492"` is recorded in the
   archive but was **not honored** by that run config — both ran and FAILed, so
   the run reports 0 skipped instead of 2. A category shift only; both are
@@ -253,7 +256,10 @@ skipped):
 
 - `generic/311` — pre-existing baseline flake (dm-flakey + fsync timing).
 - `generic/563` — cgroup writeback accounting; expected after `SB_I_CGROUPWB`
-  was disabled on 6.12 (`9385fc8`, iput CVE-2026-31703 workaround).
+  was disabled on 6.12 (`9385fc8`, iput CVE-2026-31703 workaround). Superseded
+  2026-09-23 by `102b339`: the flag is back on both-CVE-fixed kernels
+  (>= 7.2, 7.1.4+, 6.18.39+, 6.12.96+) and 563 passes again there — this
+  entry describes the run as taken, before the re-enable.
 - `generic/299` — **partially fixed** (`1005b2e` + `0fd1448`, 2026-08-19): the
   fallocate O(blocks) HANG and the commit-under-writeback / reuse-torn-write
   btree checksum races are fixed; 299 now passes ~70-80% of runs (was 0% hard
@@ -374,6 +380,23 @@ temporarily disables cgroup writeback (removes `SB_I_CGROUPWB`) so the wb-switch
 path is never entered.  A targeted run `generic/001..030` passes cleanly;
 `generic/563` (which tests per-cgroup writeback accounting) regresses and will
 remain failed until the VM kernel is updated.
+
+**Phase-2 addendum (2026-09-23, `102b339`):** The two bugs behind the
+`9385fc8` workaround are now corrected upstream and, where relevant, in the
+VM: CVE-2026-31703 (wb use-after-free in `inode_switch_wbs_work_fn()`,
+mainline 7.1-rc1) and CVE-2026-64378 (the `cgroup_writeback_umount()` vs
+`inode_switch_wbs()` umount race, mainline 7.2-rc1 — no 7.0.y backport ever
+existed, so 7.0.13 and the 6.16-6.19 points stay unfixed). Both-fixed
+boundaries: >= 7.2, 7.1.4+, 6.18.39+, 6.12.96+; the VM's 6.12.101 (past
+6.12.96, verified by fix shape in its kernel source) qualifies. The new
+`BRIEFS_HAS_CGROUPWB_FIX` compat flag re-enables `SB_I_CGROUPWB` on exactly
+those kernels, asserted per target by the build matrix. Verified 2026-09-23:
+generic/563 standalone 2/2 on 6.12.101-lockdep and 1/1 on
+7.3.0-rc4-lockdep+, plus 12/12 spot sets on both (563 is now a standing
+spot-set member) with clean dmesg; below the boundary the flag compiles
+away entirely, so the 6.12.48 byte-identical gate is intact (super.o
+unchanged). The full-suite re-run with the flag ON is the phase-3
+follow-up.
 
 **Subsequent run (2026-07-07, invalid):** After the `9385fc8` workaround, a full
 `./check -g auto -X .exclude` run completed without hanging or kernel oops, but it
@@ -864,7 +887,7 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 | Tests                         | Commit   | Area                                                          |
 |-------------------------------|----------|---------------------------------------------------------------|
 | 093 193 683 684 688           | a1eb7e0  | killpriv-on-modify (file_remove_privs on inline write + fallocate, ATTR_MODE on truncate) |
-| 563                           | 55023ac/9385fc8 | cgroup writeback (SB_I_CGROUPWB) temporarily disabled on 6.12 due to iput crash |
+| 563                           | 55023ac/9385fc8/102b339 | cgroup writeback (SB_I_CGROUPWB): disabled on 6.12 (`9385fc8`), re-enabled on both-CVE-fixed kernels (`102b339`) |
 | 617                           | 0cd7062  | punch-empty-tree straddler orphan                             |
 | 522 616                       | —        | punch-split-extent pagecache invalidation                     |
 | 074                           | fb649e8  | orphan dir-trie-page leak (trie_free_node)                    |
@@ -929,7 +952,9 @@ A large cluster of previously-failing tests now passes. Notable fixes:
 > pre-existing baseline flake. `050` is an expected-error-string mismatch on
 > read-only dirty-journal mount. `089` **now passes** (was a `TEST_DEV`-size
 > artifact). `563` fails because cgroup writeback was disabled
-> (`SB_I_CGROUPWB` workaround). `250`/`252` are DIO-error siblings (deferred
+> (`SB_I_CGROUPWB` workaround) — re-enabled on fixed kernels by `102b339`
+> (2026-09-23); passes on both lockdep kernels, suite re-run pending.
+> `250`/`252` are DIO-error siblings (deferred
 > conversion); `274` was a split regression now fixed by `141be8c`; `346` is a
 > flake.
 
