@@ -1955,13 +1955,19 @@ int briefs_btree_drain(struct super_block *sb, u64 root_block, u64 max_nodes)
  * the whole tree. Leaf lock discipline: btree_dirty_lock is only ever the
  * innermost lock (taken under extent_lock here, under j->write_lock by the
  * drain), so the extent_lock -> j->write_lock order is untouched.
+ *
+ * The xa_lock itself is taken softirq-safe (xa_store_irq here, irqsave in
+ * the drain): free_inode runs from the inode's RCU callback, so xa_destroy
+ * acquires this same lock in softirq context at eviction. A process-context
+ * holder with softirqs enabled could be preempted by that callback on the
+ * same CPU and spin forever waiting for the lock it already holds.
  */
 void briefs_btree_track_dirty(struct briefs_inode_info *binfo,
 			      struct buffer_head *bh)
 {
 	mutex_lock(&binfo->btree_dirty_lock);
-	if (xa_err(xa_store(&binfo->btree_dirty_nodes, bh->b_blocknr,
-			    XA_ZERO_ENTRY, GFP_KERNEL))) {
+	if (xa_err(xa_store_irq(&binfo->btree_dirty_nodes, bh->b_blocknr,
+				 XA_ZERO_ENTRY, GFP_KERNEL))) {
 		/*
 		 * Allocation failure: the entry was NOT recorded, so the set
 		 * may under-report. Mark degraded; the next drain falls back
@@ -2027,13 +2033,16 @@ int briefs_btree_drain_dirty(struct briefs_inode_info *binfo,
 		unsigned int n = 0;
 		bool last;
 		void *entry;
+		unsigned long flags;
 
 		/* Cut a batch: collect-and-erase under the lock so entries can
 		 * never be lost between collection and sync. Deleting the
 		 * current entry inside xas_for_each is the documented-safe
-		 * pattern; iteration resumes at the next node. */
+		 * pattern; iteration resumes at the next node. The xa_lock is
+		 * softirq-unsafe to hold with irqs on (see track_dirty):
+		 * xa_destroy takes it in RCU-softirq at inode free. */
 		mutex_lock(&binfo->btree_dirty_lock);
-		xas_lock(&xas);
+		xas_lock_irqsave(&xas, flags);
 		xas_for_each(&xas, entry, ULONG_MAX) {
 			blocks[n++] = xas.xa_index;
 			xas_store(&xas, NULL);
@@ -2041,7 +2050,7 @@ int briefs_btree_drain_dirty(struct briefs_inode_info *binfo,
 				break;
 		}
 		last = (n < ARRAY_SIZE(blocks));
-		xas_unlock(&xas);
+		xas_unlock_irqrestore(&xas, flags);
 		mutex_unlock(&binfo->btree_dirty_lock);
 
 		/* Process the batch outside the lock: no other fsync's I/O is
