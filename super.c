@@ -431,27 +431,21 @@ int briefs_fill_super(struct super_block *sb, struct fs_context *fc) {
 	 * any ACL xattr fall back to plain mode permission. */
 	sb->s_flags |= SB_POSIXACL;
 
+#if BRIEFS_HAS_CGROUPWB_FIX
 	/*
-	 * Cgroup-aware writeback is deliberately disabled on this kernel.
-	 *
-	 * Setting SB_I_CGROUPWB enables per-cgroup writeback ownership (and
-	 * thus correct io.stat accounting for cross-cgroup writes, see
-	 * generic/563).  However, the 6.12.y kernel used in the test VM has a
-	 * known race between cgroup_writeback_umount() and
-	 * inode_switch_wbs_work_fn(): the work function calls iput() after the
-	 * switch, but the superblock can already be torn down and sb->s_op
-	 * nulled, leading to a NULL pointer dereference at iput+0xca
-	 * (op->drop_inode) and a dead kworker.  Until the VM kernel has the
-	 * upstream fix for the cgroup_writeback_umount race (and
-	 * CVE-2026-31703), keep BrieFS out of the inode wb-switch path by not
-	 * setting SB_I_CGROUPWB.  This makes generic/563 fail again, but it
-	 * allows the rest of the generic xfstests group to complete without
-	 * hanging the VM.
-	 *
-	 * Re-enable once the VM kernel is updated past the fixed stable
-	 * versions (7.0.2+, 6.18.25+, or a 6.12.y backport of the
-	 * cgroup_writeback_umount fix and CVE-2026-31703).
+	 * Enable cgroup-aware writeback: per-inode wb ownership is
+	 * charged to the dirtier's cgroup, making io.stat and
+	 * generic/563 work.  Disabled before BRIEFS_HAS_CGROUPWB_FIX
+	 * (see compat/compat.h): two upstream wb-switch bugs -- the wb
+	 * use-after-free in inode_switch_wbs_work_fn() (CVE-2026-31703)
+	 * and the cgroup_writeback_umount() vs inode_switch_wbs() umount
+	 * race (CVE-2026-64378) -- crashed the 6.12 test VM at unmount
+	 * (9385fc8).  Must be set before any inode is allocated: journal
+	 * replay below creates inodes and inode_cgwb_enabled() is
+	 * consulted at inode creation.
 	 */
+	sb->s_iflags |= SB_I_CGROUPWB;
+#endif
 
 	/*
 	 * Replay journal on mount (unless the user asked to skip it).

@@ -26,6 +26,15 @@
  * all, Debian does not backport in-tree API-shape changes into older
  * series, and the cross-kernel build matrix (tests/build-matrix.sh) turns
  * a wrong boundary into a compile error, never a silent break.
+ *
+ * BRIEFS_HAS_CGROUPWB_FIX below is the one deliberate exception: it is
+ * keyed to stable-bugfix backport patchlevels (6.12.96, 6.18.39, 7.1.4),
+ * not an API-shape boundary.  Debian ships upstream stable point
+ * releases, so LINUX_VERSION_CODE still answers the question exactly.
+ * If Debian ever cherry-picked the fix into a lower patchlevel, the
+ * flag would stay 0 there -- conservative: generic/563 keeps failing
+ * but no crash risk.  The build-matrix flag probe asserts the boundary
+ * per target.
  */
 
 #include <linux/version.h>
@@ -92,6 +101,39 @@
 #define BRIEFS_HAS_CREATE_NO_EXCL 1	/* i_op->create dropped bool excl */
 #else
 #define BRIEFS_HAS_CREATE_NO_EXCL 0
+#endif
+
+/*
+ * Cgroup-writeback wb-switch bugfixes.  Both upstream bugs below must
+ * be fixed in a kernel before BrieFS sets SB_I_CGROUPWB (see the
+ * consumer in super.c, which follows the iomap.c writeback-arm
+ * precedent for a #if BRIEFS_HAS_* region outside compat/):
+ *
+ *   CVE-2026-31703: wb use-after-free in inode_switch_wbs_work_fn()
+ *     (upstream 6689f01d6740, mainline 7.1-rc1; stable 6.12.94 via
+ *     156cc63691c1, 6.18.25, 7.0.2, 6.1.178, 6.6.147)
+ *   CVE-2026-64378: cgroup_writeback_umount() vs inode_switch_wbs()
+ *     umount race (upstream cba38ec4cbd3 + follow-ups, mainline
+ *     7.2-rc1; stable 6.12.96 via c923cc3cb5cd, 6.18.39, 7.1.4,
+ *     6.6.145, 6.1.178)
+ *
+ * Both-fixed: >= 7.2, 7.1.y >= 7.1.4, 6.18.y >= 6.18.39,
+ * 6.12.y >= 6.12.96.  7.0.y is excluded entirely: it received only
+ * CVE-2026-31703 (7.0.2) before the tree EOL'd -- no CVE-2026-64378
+ * backport ever existed.  6.16/6.17 predate the CVE-2026-31703
+ * introducing commit (e1b849cfa6b6, v6.18) but never got the
+ * umount-race backport either (EOL first); 6.19.y likewise EOL'd
+ * unfixed.  6.1.y/6.6.y carry both fixes but sit below BrieFS's 6.12
+ * floor.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 4) ||			\
+	(LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 39) &&		\
+	 LINUX_VERSION_CODE <  KERNEL_VERSION(6, 19, 0)) ||		\
+	(LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 96) &&		\
+	 LINUX_VERSION_CODE <  KERNEL_VERSION(6, 13, 0))
+#define BRIEFS_HAS_CGROUPWB_FIX 1	/* both wb-switch bugs fixed */
+#else
+#define BRIEFS_HAS_CGROUPWB_FIX 0
 #endif
 
 #include "compat-fileattr.h"

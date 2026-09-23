@@ -1,0 +1,110 @@
+BrieFS build matrix  2026-09-23 14:16:55  git: 2471022-dirty
+
+6.12 PASS cgwb=0
+  installing: linux-headers-6.16.12+deb13-amd64
+Reading package lists...
+Building dependency tree...
+Reading state information...
+linux-headers-6.16.12+deb13-common is already the newest version (6.16.12-1~bpo13+1).
+linux-kbuild-6.16.12+deb13 is already the newest version (6.16.12-1~bpo13+1).
+The following additional packages will be installed:
+  linux-image-6.16.12+deb13-amd64
+Suggested packages:
+  linux-doc-6.16 debian-kernel-handbook
+The following NEW packages will be installed:
+  linux-headers-6.16.12+deb13-amd64 linux-image-6.16.12+deb13-amd64
+0 upgraded, 2 newly installed, 0 to remove and 187 not upgraded.
+1 not fully installed or removed.
+Need to get 0 B/175 MB of archives.
+After this operation, 183 MB of additional disk space will be used.
+Selecting previously unselected package linux-image-6.16.12+deb13-amd64.
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 971753 files and directories currently installed.)
+Preparing to unpack .../linux-image-6.16.12+deb13-amd64_6.16.12-1~bpo13+1_amd64.deb ...
+Unpacking linux-image-6.16.12+deb13-amd64 (6.16.12-1~bpo13+1) ...
+Selecting previously unselected package linux-headers-6.16.12+deb13-amd64.
+Preparing to unpack .../linux-headers-6.16.12+deb13-amd64_6.16.12-1~bpo13+1_amd64.deb ...
+Unpacking linux-headers-6.16.12+deb13-amd64 (6.16.12-1~bpo13+1) ...
+Setting up linux-image-6.16.12+deb13-amd64 (6.16.12-1~bpo13+1) ...
+I: /vmlinuz.old is now a symlink to boot/vmlinuz-6.17.13+deb13-amd64
+I: /initrd.img.old is now a symlink to boot/initrd.img-6.17.13+deb13-amd64
+I: /vmlinuz is now a symlink to boot/vmlinuz-6.16.12+deb13-amd64
+I: /initrd.img is now a symlink to boot/initrd.img-6.16.12+deb13-amd64
+/etc/kernel/postinst.d/dkms:
+Sign command: /lib/modules/6.16.12+deb13-amd64/build/scripts/sign-file
+Signing key: /var/lib/dkms/mok.key
+Public certificate (MOK): /var/lib/dkms/mok.pub
+
+Autoinstall of module nvidia/610.57.04 for kernel 6.16.12+deb13-amd64 (x86_64)
+Building module(s)............ done.
+Signing module /var/lib/dkms/nvidia/610.57.04/build/nvidia.ko
+Signing module /var/lib/dkms/nvidia/610.57.04/build/nvidia-modeset.ko
+Signing module /var/lib/dkms/nvidia/610.57.04/build/nvidia-drm.ko
+Signing module /var/lib/dkms/nvidia/610.57.04/build/nvidia-uvm.ko
+Signing module /var/lib/dkms/nvidia/610.57.04/build/nvidia-peermem.ko
+Installing /lib/modules/6.16.12+deb13-amd64/updates/dkms/nvidia.ko.xz
+Installing /lib/modules/6.16.12+deb13-amd64/updates/dkms/nvidia-modeset.ko.xz
+Installing /lib/modules/6.16.12+deb13-amd64/updates/dkms/nvidia-drm.ko.xz
+Installing /lib/modules/6.16.12+deb13-amd64/updates/dkms/nvidia-uvm.ko.xz
+Installing /lib/modules/6.16.12+deb13-amd64/updates/dkms/nvidia-peermem.ko.xz
+Running depmod..... done.
+
+Autoinstall of module virtualbox/7.2.16 for kernel 6.16.12+deb13-amd64 (x86_64)
+Building module(s).... done.
+Signing module /var/lib/dkms/virtualbox/7.2.16/build/vboxdrv/vboxdrv.ko
+Signing module /var/lib/dkms/virtualbox/7.2.16/build/vboxnetadp/vboxnetadp.ko
+Signing module /var/lib/dkms/virtualbox/7.2.16/build/vboxnetflt/vboxnetflt.ko
+Installing /lib/modules/6.16.12+deb13-amd64/updates/dkms/vboxdrv.ko.xz
+Installing /lib/modules/6.16.12+deb13-amd64/updates/dkms/vboxnetadp.ko.xz
+Installing /lib/modules/6.16.12+deb13-amd64/updates/dkms/vboxnetflt.ko.xz
+Running depmod..... done.
+
+Autoinstall on 6.16.12+deb13-amd64 succeeded for module(s) nvidia virtualbox.
+/etc/kernel/postinst.d/initramfs-tools:
+update-initramfs: Generating /boot/initrd.img-6.16.12+deb13-amd64
+/etc/kernel/postinst.d/zz-update-grub:
+Generating grub configuration file ...
+Found background image: .background_cache.png
+Found linux image: /boot/vmlinuz-6.17.13+deb13-amd64
+Found initrd image: /boot/initrd.img-6.17.13+deb13-amd64
+Found linux image: /boot/vmlinuz-6.16.12+deb13-amd64
+Found initrd image: /boot/initrd.img-6.16.12+deb13-amd64
+Found linux image: /boot/vmlinuz-6.12.48+deb13-amd64
+Found initrd image: /boot/initrd.img-6.12.48+deb13-amd64
+Warning: os-prober will not be executed to detect other bootable partitions.
+Systems on them will not be added to the GRUB boot configuration.
+Check GRUB_DISABLE_OS_PROBER documentation entry.
+Adding boot menu entry for UEFI Firmware Settings ...
+done
+Setting up linux-headers-6.16.12+deb13-amd64 (6.16.12-1~bpo13+1) ...
+
+Pending kernel upgrade!
+
+Running kernel version:
+  6.12.48+deb13-amd64
+
+Diagnostics:
+  The currently running kernel version is not the expected kernel version 6.17.13+deb13-amd64.
+
+Restarting the system to load the new kernel will not be handled automatically, so you should consider rebooting. [Return]
+
+The processor microcode seems to be up-to-date.
+
+Services to be restarted:
+
+Service restarts being deferred:
+ systemctl restart lightdm.service
+
+No containers need to be restarted.
+
+User sessions running outdated binaries:
+ jeremy @ session #5: chrome_crashpad[11267]
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+6.16 PASS cgwb=0
+6.17 PASS cgwb=0
+6.18 PASS cgwb=0
+6.19 PASS cgwb=0
+7.0 PASS cgwb=0
+7.1 PASS cgwb=1
+master PASS cgwb=1
+

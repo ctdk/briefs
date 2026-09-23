@@ -32,6 +32,15 @@
 # with per-target build logs beside it.  Exit status: nonzero if any
 # target failed.
 #
+# Every target also asserts the compile-time value of
+# BRIEFS_HAS_CGROUPWB_FIX (printed as cgwb=0/1).  The probe builds a
+# throwaway module force-including the real compat/compat.h, and its
+# result is compared against an independent boundary computation from
+# the target's own utsrelease.h -- the two disagreeing is a FAIL,
+# because that means the flag's version range and the bugfix record
+# have drifted apart (see compat/compat.h: keyed to stable-backport
+# patchlevels, 6.12.96/6.18.39/7.1.4+).
+#
 # One-time host prep, recorded for reproducibility:
 #   - trixie-backports enabled in /etc/apt/sources.list.
 #   - the master tree prepared once: `make defconfig` (x86_64 defconfig
@@ -110,6 +119,56 @@ ensure_installed() {  # ensure_installed [-t SUITE] PKG ...
     return 0
 }
 
+# cgwb_flag KDIR LOG — echo "0"/"1" as BRIEFS_HAS_CGROUPWB_FIX compiles
+# on this KDIR.  A throwaway kbuild module force-includes the real
+# compat/compat.h (so the probe sees exactly what the module build
+# sees) and stringifies the flag into its rodata.  Returns nonzero if
+# the probe build itself fails (log appended to LOG).
+cgwb_flag() {
+    local kdir="$1" log="$2" d
+    d="$(mktemp -d)" || return 2
+    {
+        echo "obj-m += cgwbprobe.o"
+        echo "ccflags-y += -include $SRC_DIR/compat/compat.h"
+    } > "$d/Makefile"
+    {
+        echo '#include <linux/module.h>'
+        echo '#include <linux/stringify.h>'
+        echo 'const char *cgwb_probe = "CGWB=" __stringify(BRIEFS_HAS_CGROUPWB_FIX);'
+        echo 'MODULE_LICENSE("GPL");'
+    } > "$d/cgwbprobe.c"
+    if ! make -C "$kdir" M="$d" >>"$log" 2>&1; then
+        rm -rf "$d"
+        return 2
+    fi
+    strings "$d/cgwbprobe.o" | grep -o 'CGWB=[01]' | head -1 | cut -d= -f2
+    local rc=$?
+    rm -rf "$d"
+    return $rc
+}
+
+# expected_cgwb KDIR — the value BRIEFS_HAS_CGROUPWB_FIX must have on
+# this kernel, computed independently of compat.h: the shell re-derives
+# the both-bugs-fixed boundaries (>= 7.2, 7.1.y >= 7.1.4,
+# 6.18.y >= 6.18.39, 6.12.y >= 6.12.96) from UTS_RELEASE.  Agreement of
+# the two implementations is the assert; keep in sync with compat.h.
+expected_cgwb() {
+    local uts x y z
+    uts="$(sed -n 's/^#define UTS_RELEASE "\(.*\)"/\1/p' \
+        "$1/include/generated/utsrelease.h" 2>/dev/null)"
+    [ -n "$uts" ] || return 2
+    x="$(echo "$uts" | sed -E 's/^([0-9]+)\..*/\1/')"
+    y="$(echo "$uts" | sed -E 's/^[0-9]+\.([0-9]+)\..*/\1/')"
+    z="$(echo "$uts" | sed -E 's/^[0-9]+\.[0-9]+\.([0-9]+).*/\1/')"
+    if [ "$x" -ge 7 ] 2>/dev/null; then
+        { [ "$y" -ge 2 ] || { [ "$y" -eq 1 ] && [ "$z" -ge 4 ]; }; } && { echo 1; return; }
+    elif [ "$x" -eq 6 ] 2>/dev/null; then
+        { { [ "$y" -eq 18 ] && [ "$z" -ge 39 ]; } || \
+          { [ "$y" -eq 12 ] && [ "$z" -ge 96 ]; }; } && { echo 1; return; }
+    fi
+    echo 0
+}
+
 run_target() {  # NAME KDIR — clean + modules build; echo "NAME STATUS"
     local name="$1" kdir="$2" autoconf status
 
@@ -135,7 +194,17 @@ run_target() {  # NAME KDIR — clean + modules build; echo "NAME STATUS"
     if make -C "$kdir" M="$SRC_DIR" clean >>"$log" 2>&1 && \
        make -C "$kdir" M="$SRC_DIR" modules >>"$log" 2>&1 && \
        [ -f "$SRC_DIR/briefs_fs.ko" ]; then
-        echo "$name PASS"
+        local cgwb want
+        if ! cgwb="$(cgwb_flag "$kdir" "$log")"; then
+            echo "$name FAIL-CGWB-PROBE (flag probe build failed; see $name.build.log)"
+            return 1
+        fi
+        want="$(expected_cgwb "$kdir")"
+        if [ "$cgwb" != "$want" ]; then
+            echo "$name FAIL-CGWB (flag=$cgwb expected=$want: compat.h/bugfix boundary drift)"
+            return 1
+        fi
+        echo "$name PASS cgwb=$cgwb"
         return 0
     fi
     echo "$name FAIL-BUILD (see tests/build-matrix-results/$name.build.log)"
