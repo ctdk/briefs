@@ -713,6 +713,7 @@ out_unlock:
 static ssize_t briefs_dio_write(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
+	unsigned int dio_flags = 0;
 	ssize_t ret;
 
 	inode_lock(inode);
@@ -733,13 +734,28 @@ static ssize_t briefs_dio_write(struct kiocb *iocb, struct iov_iter *from)
 	 * unaligned_io.  Aligned full-block DIO need not drain: briefs sizes each
 	 * allocated extent to the write's full-block count, so no IOMAP_F_NEW tail
 	 * extends past the write, and full-block writes have no edge to zero (last
-	 * writer wins per block).  NOWAIT cannot block to drain; the race is then
-	 * inherent to non-blocking overlapping DIO.
+	 * writer wins per block).
+	 *
+	 * The drain alone is not enough: it only serializes against DIO
+	 * submitted before us, while an unaligned AIO returns from iomap_dio_rw
+	 * at bio submission and the aligned writer above skips the drain -- its
+	 * write can then land before our still-in-flight edge-zero bio
+	 * (generic/538: a zero window at the unaligned write's head).
+	 * IOMAP_DIO_FORCE_WAIT makes the whole DIO, zero bios included, complete
+	 * before inode_unlock drops the submission lock, which is exactly how
+	 * XFS serializes unaligned DIO.  RWF_NOWAIT may neither drain nor wait,
+	 * and an unaligned write needs both, so fail it with -EAGAIN rather
+	 * than run racy (XFS does the same for extending unaligned writes).
 	 */
-	if (!(iocb->ki_flags & IOCB_NOWAIT) &&
-	    (iocb->ki_pos & (BRIEFS_BLOCK_SIZE - 1) ||
-	     iov_iter_count(from) & (BRIEFS_BLOCK_SIZE - 1)))
+	if (iocb->ki_pos & (BRIEFS_BLOCK_SIZE - 1) ||
+	    iov_iter_count(from) & (BRIEFS_BLOCK_SIZE - 1)) {
+		if (iocb->ki_flags & IOCB_NOWAIT) {
+			ret = -EAGAIN;
+			goto out_unlock;
+		}
 		inode_dio_wait(inode);
+		dio_flags = IOMAP_DIO_FORCE_WAIT;
+	}
 	ret = file_remove_privs(iocb->ki_filp);
 	if (ret)
 		goto out_unlock;
@@ -755,7 +771,7 @@ static ssize_t briefs_dio_write(struct kiocb *iocb, struct iov_iter *from)
 	 * invalidation -- is what makes generic/209 deterministic.
 	 */
 	ret = iomap_dio_rw(iocb, from, &briefs_write_iomap_ops,
-			   &briefs_dio_write_ops, 0, NULL, 0);
+			   &briefs_dio_write_ops, dio_flags, NULL, 0);
 out_unlock:
 	inode_unlock(inode);
 	if (ret > 0)
