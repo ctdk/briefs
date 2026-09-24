@@ -21,6 +21,14 @@ struct user_namespace;
  * false and a conversion error would have been carried into kmalloc()
  * as a huge size, surfacing as -ENOMEM anyway.  With a signed int the
  * original error is returned directly.
+ *
+ * Both arms return 0 on success and a negative errno on failure, with
+ * *valuep freed and NULLed on failure.  The first version of the
+ * pre-7.0 arm returned the convert call's raw value: on success that
+ * is the serialized byte count, so __briefs_set_acl's "if (error)"
+ * bailed out before briefs_xattr_set() -- every extended-ACL set
+ * silently no-opped on pre-7.0 kernels (generic/026, generic/053).
+ * The old call site tested "error < 0", which is the contract here.
  */
 static inline int briefs_compat_acl_to_xattr(struct user_namespace *user_ns,
 					     const struct posix_acl *acl,
@@ -32,6 +40,7 @@ static inline int briefs_compat_acl_to_xattr(struct user_namespace *user_ns,
 #else
 	int size = posix_acl_to_xattr(user_ns, acl, NULL, 0);
 	void *value;
+	int ret;
 
 	if (size < 0)
 		return size;
@@ -40,7 +49,13 @@ static inline int briefs_compat_acl_to_xattr(struct user_namespace *user_ns,
 		return -ENOMEM;
 	*sizep = size;
 	*valuep = value;
-	return posix_acl_to_xattr(user_ns, acl, value, size);
+	ret = posix_acl_to_xattr(user_ns, acl, value, size);
+	if (ret < 0) {
+		kfree(value);
+		*valuep = NULL;
+		return ret;
+	}
+	return 0;
 #endif
 }
 
