@@ -5,7 +5,53 @@ measured by fresh full-suite and targeted runs on the VM.
 
 ## Overview
 
-**Current state (2026-09-04, master `e6d3d6d`):** the generic/112 btree
+**Current state (2026-09-24, branch `briefs-compat` at `29cee61`,
+unpushed):** the kernel-compat campaign's phase 3 is complete.  The
+full suite ran twice on 6.12.101-lockdep with cgroup writeback
+re-enabled (`102b339`).  Round 1 aborted at the 05x tier and caught a
+real `b8817ac` regression: the pre-7.0 compat `acl_to_xattr` wrapper
+returned the serialized byte size on success, so every extended-ACL
+set silently no-op'd (fixed `8f1729c`; `generic/053` joined the spot
+set as the standing guard — no prior spot/boot/test-runner member set
+an extended ACL).  Round 2 was the first fully-fresh, fully-observed
+793-test run: **443 / 2 / 344 not-run / 4 skipped, zero hangs, RESUMED
+0, dmesg clean**, with `generic/563` passing in-suite for the first
+time since `9385fc8` (the phase-2 cgwb re-enable is now validated at
+full-suite level).  The two FAILs: `311` (the standing accepted
+dm-flakey flake) and `538`, which flaked once in-suite, triaged to a
+real data-corruption race — the aligned-overlap zero-window residual
+of the 551 fix, previously dismissed 06-24 for lack of evidence — and
+is **FIXED by `29cee61`**: unaligned direct writes pass
+`IOMAP_DIO_FORCE_WAIT` (the whole DIO, edge-zero bio included,
+completes before `inode_unlock`; the XFS model) and unaligned
+`RWF_NOWAIT` returns `-EAGAIN`.  Validated on `29cee61`: `538` solo
+x10 = 0 FAIL (pre-fix 1-in-10), `551` x20 = 0 FAIL (ERTB fix quiet),
+spot set 13/13, dmesg clean.  `538` leaves the flaky tier.
+
+**Latest full-suite run:** 2026-09-24 (phase-3 round 2), every generic
+test on the VM, kernel `6.12.101-lockdep`, module `8f1729c` content,
+cgroup writeback ON, fsck validation off.  All 793 tests ran fresh
+(RESUMED 0).
+Archive: `tests/xfstests/runs/run-20260924-003349-kernel.txt`.
+
+| Bucket           | Count | Notes                                                    |
+|------------------|------:|----------------------------------------------------------|
+| Selected         |   793 | all generic tests                                        |
+| Pass             |   443 | incl. 563 in-suite (first since 9385fc8), 299 026 053 547 |
+| Fail             |     2 | 311 (accepted) 538 (flake; root-caused + fixed same day) |
+| Not run          |   344 | `_require_*` gate or unsupported feature                 |
+| Skipped          |     4 | 068 127 475 492 (skip list honored)                      |
+| Hang             |     0 |                                                           |
+| Mount fail       |     0 | runner tears down DM targets before each test            |
+
+vs the 2026-09-19 "457" figure: **not a regression** — the earlier runs
+counted resume-skipped tests as PASS (the 09-19 run had 126 RESUMED;
+the 09-19 baseline itself inherited 14 outcome-unknown not-run logs
+from 09-11 as RESUMED).  443 is the first honest fully-observed count;
+see the phase-3 addendum below for the complete per-transition
+accounting.  Every baseline PASS except the 538 flake re-passed.
+
+**Prior state (2026-09-04, master `e6d3d6d`):** the generic/112 btree
 checksum mismatch is root-caused and fixed. A range delete frees emptied
 leaves and drops only their parent idx entries, so a surviving
 predecessor's `next_leaf` dangles at the freed block, whose cached
@@ -25,7 +71,8 @@ Verification: generic/112 loop 5 splats → 0 over 12 runs; regression set
 validation enabled (516/517 are environmental not-runs: dedupe
 unsupported); full-suite bracket below.
 
-**Latest full-suite run:** 2026-09-04, every generic test on the VM,
+**Full-suite run:** 2026-09-04 (superseded by the 2026-09-24 phase-3
+round above), every generic test on the VM,
 kernel `6.12.101-lockdep`, at the leaf-chain fix content (`e6d3d6d`;
 the archive's commit field records the pre-commit tree state). All 793
 tests ran fresh (RESUMED 0), 676 at the default 300s timeout.
@@ -396,7 +443,70 @@ generic/563 standalone 2/2 on 6.12.101-lockdep and 1/1 on
 spot-set member) with clean dmesg; below the boundary the flag compiles
 away entirely, so the 6.12.48 byte-identical gate is intact (super.o
 unchanged). The full-suite re-run with the flag ON is the phase-3
-follow-up.
+follow-up.  **(Completed 2026-09-24: 563 PASSES in-suite in the
+phase-3 round-2 run — see the phase-3 addendum below.)**
+
+**Phase-3 addendum (2026-09-24, briefs-compat, COMPLETE):** two
+full-suite rounds on 6.12.101-lockdep with the cgwb flag ON:
+
+- **Round 1 (module `102b339` content) aborted at the 05x tier:**
+  `generic/026` and `053` failed identically with a real `b8817ac`
+  regression the campaign had missed — compat-acl.h's pre-7.0 arm
+  `return posix_acl_to_xattr(...)` returns the serialized byte size on
+  success, so `__briefs_set_acl` bailed before `briefs_xattr_set` and
+  every extended-ACL set silently no-op'd (positive syscall return =
+  userspace success; `kmalloc` leak; `getfacl` fell back to the base
+  mode; pure u/g/o ACLs kept passing via `i_mode`).  No spot/boot/
+  test-runner member sets an extended ACL, and the byte gate had
+  sanctioned the acl.o delta without noticing the semantic change
+  (the original call site tested `error < 0`).  Fixed by `8f1729c`
+  (wrapper returns 0, kfrees+NULLs `*valuep` on failure); `026`+`053`
+  solo x3 PASS each; `053` added as the spot set's 13th member.
+- **Round 2 (module `8f1729c`): 443 / 2 / 344 not-run / 4 skipped
+  (068 127 475 492), zero hangs, RESUMED 0, dmesg clean** — the first
+  fully-fresh, fully-observed 793-test run.  `563` PASSED in-suite
+  (phase-2 headline validated); `299`/`026`/`053`/`547` PASS; `311`
+  the lone expected FAIL; `538` flaked once (below).
+- **The "456/457 vs 443" discrepancy is bookkeeping, not regression:**
+  `run-suite.sh`'s resume path sets `STATUS=RESUMED` for ANY existing
+  `check-<num>-*.log` in LOG_DIR without reading it (outcome-unknown,
+  log-existence skip), and the 09-19 baseline's 126 RESUMED were
+  counted as PASS — including a `66aee4f` "re-verification" grep,
+  which miscounted because xfstests prints "Passed all 1 tests" for
+  NOT-RUN tests too.  The 09-11 resume-source logs show all 14 tests
+  that flipped RESUMED->NOT-RUN (010 018 019 054 055 082 110 111 115
+  116 118 119 121 122) said "Not run" there as well (dbtest unbuilt,
+  no defrag, `CONFIG_FAIL_MAKE_REQUEST` off, no log configs/quotas/
+  reflink/dedupe — none can pass under kernel-mounted briefs); `127`
+  flipped RESUMED->SKIPPED (resume is checked before the skip list).
+  Per-transition cross-tab: 330 PASS->PASS, 111 RESUMED->PASS, 14
+  RESUMED->NOTRUN, 1 RESUMED->SKIPPED, 299+563 FAIL->PASS, 311
+  FAIL->FAIL, 538 PASS->FAIL, 330 NOTRUN->NOTRUN, 3 SKIPPED->SKIPPED —
+  100% accounted.  **Never count RESUMED as PASS.**
+- **`538` root-caused and FIXED (`29cee61`).**  The in-suite failure
+  (512 zeroed bytes at offset 0, `FAIL: [8704, 8192, 512, 0]`) plus a
+  1-in-10 solo loop reproduce the aligned-overlap zero-window — the
+  residual flagged 06-24 during the 551 work and dismissed for lack of
+  evidence.  Test 538 submits TWO AIO writes per `io_submit` batch on
+  a fresh `O_TRUNC` file: write 1 unaligned head @512, write 2 aligned
+  @position.  Write 1's `IOMAP_F_NEW` edge-zero bio is still in flight
+  when `briefs_dio_write` drops `inode_lock` at submission, and the
+  aligned write 2 skips the `400e400` unaligned drain — its data lands,
+  then the late zero bio clobbers 512 bytes.  Prediction held: write 2
+  is block-aligned only at positions 0/4096/8192/12288 and both
+  captured failures are at position 0; zeros, not btree magic — pure
+  DIO ordering, not ERTB/cgwb related.  Fix (XFS
+  `xfs_file_dio_write_unaligned` model): unaligned non-NOWAIT direct
+  writes pass `IOMAP_DIO_FORCE_WAIT` so the whole DIO, zero bios
+  included, completes before `inode_unlock` drops the submission lock;
+  unaligned `RWF_NOWAIT` can neither drain nor wait and returns
+  `-EAGAIN`.  Byte gate: the fix's 6.12.48 delta is confined to
+  `briefs_write_iter` (`briefs_dio_write` inlines into it; `-EAGAIN`
+  and flag codegen verified in the disassembly); file.o joins the
+  sanctioned deltas after acl.o (`b8817ac`) and btree.o (`2471022`).
+  Validated on `29cee61`: `538` solo x10 = 0 FAIL, `551` x20 = 0 FAIL
+  (the ERTB fix stays quiet under the new wait path), spot set 13/13,
+  dmesg clean over the whole round.
 
 **Subsequent run (2026-07-07, invalid):** After the `9385fc8` workaround, a full
 `./check -g auto -X .exclude` run completed without hanging or kernel oops, but it

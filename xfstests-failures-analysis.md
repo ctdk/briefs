@@ -137,8 +137,9 @@ the 6.16-6.19 points remain expected-FAIL there; 6.12.96+ and 7.1.4+ are
 fixed.
 
 **Verdict:** RESOLVED-BY-CONFIG (phase 2, 2026-09-23) — passes standalone
-and in the spot set on 6.12.101-lockdep and 7.3.0-rc4-lockdep+; the
-full-suite re-run with the flag ON is the phase-3 follow-up.
+and in the spot set on 6.12.101-lockdep and 7.3.0-rc4-lockdep+; and
+since the 2026-09-24 phase-3 round-2 full suite, **PASSES in-suite**
+(443/2 run, archive `run-20260924-003349`, module `8f1729c`).
 
 ---
 
