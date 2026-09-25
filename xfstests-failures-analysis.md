@@ -244,3 +244,117 @@ generic/051 generic/068 generic/070 generic/074 generic/224 generic/410 generic/
 **Remaining FAIL:** 5 (generic/050, generic/089, generic/311, generic/547, generic/563, generic/599, generic/623, generic/730)
 **Deferred:** 1 (generic/599 - VFS warning, not data corruption)
 **Accept as-is:** 6 (behavioral differences, pre-existing flakes)
+
+---
+
+## 2026-09-25 — 7.3.0-rc4 round transitions (briefs-compat)
+
+The 2026-09-24/25 full suite on `7.3.0-rc4-lockdep+` (run_id
+20260924-234953, module `080db0e`) moved six tests vs the 2026-09-24
+6.12.101 phase-3 round 2 (443/2/344/4); the round landed
+441/3/345/4.  All six are accounted here; everything else held its
+bucket (per-test status join of both archives).  Round narrative:
+XFSTESTS_STATE.md.
+
+### generic/083, generic/269 — new FAILs: 6.17+ iomap zeroing WARN (REAL, fix proposed)
+
+**Failure:** `_check_dmesg` hits; both tests are fsstress/ENOSPC fill
+tests ("fsstress on small filesystem", "fsstress + ENOSPC").  Per-test
+dmesg (083.dmesg / 269.dmesg, preserved in the round's results dir):
+
+    WARNING: fs/iomap/buffered-io.c:1679 at iomap_zero_range+0x34d/0x500
+        CPU#1: fsstress/377737
+    vdc1: writeback error on inode 818, offset 1859584, sector 199976
+    (repeated; plus "briefs: link failed to add dir entry: -28" fill noise)
+
+**Root cause:** the 6.17+ iomap rework added
+`WARN_ON_ONCE(folio_pos(folio) > iter->inode->i_size)` to
+`iomap_zero_iter()` (buffered-io.c:1679 — "warn about zeroing folios
+beyond eof that won't write back").  BrieFS's external-block
+`FALLOC_FL_ZERO_RANGE` handler (`briefs_do_zero_range`) passes the
+full unclamped range to `briefs_compat_zero_range()`, so pagecache
+zeroing runs past i_size and trips the assertion.  The inline-data
+path in the same function already clamps to i_size; the external path
+does not.  The "writeback error" lines are the new 6.17+ ioend error
+reporter surfacing ENOSPC during writeback — the tests fill the
+filesystem on purpose, so the lines are expected fill noise; the WARN
+is what `_check_dmesg` catches (its default filter excludes only
+lockdep patterns and the XFS AGFL warning).
+
+**Verdict:** real, but caught by an assertion 6.12 could never make —
+the same tests are silent on 6.12.101.  Zeroing beyond EOF in the
+pagecache is a no-op under KEEP_SIZE semantics, so no data path is
+wrong; the fix is to stop doing it.  **Fix proposed (B), not yet
+applied:** clamp the pagecache zeroing to i_size in
+`briefs_do_zero_range` (mirror the inline path's
+`z_end = min_t(loff_t, end, inode->i_size)`).
+
+### generic/571 — new NOTRUN: `->setlease` is a mandatory f_op member in 7.x (REAL compat gap, fix proposed)
+
+**Failure:** `_require_test_fcntl_setlease` runs `src/locktest -t
+file` on the test device; it returns EINVAL (22) on 7.3 → notrun.
+The same probe returns EAGAIN (11) on tmpfs and on 6.12 briefs
+(verified by running `src/locktest` directly).
+
+**Root cause:** 7.x removed `kernel_setlease()`'s generic fallback;
+it is now `if (filp->f_op->setlease) return
+filp->f_op->setlease(...); return -EINVAL;` — no f_op member, no
+leases.  ext4/xfs/shmem/libfs all declare `.setlease =
+generic_setlease`; `briefs_file_operations` (ops.c) does not.  On
+6.12 the removed fallback provided the generic behavior, so
+`fcntl(F_SETLEASE)` worked.  (The sysctl was also renamed
+`leases_enabled` -> `leases-enable` in the same window.)
+
+**Verdict:** real compat regression, not environmental.  **Fix
+proposed (A), not yet applied:** `.setlease = generic_setlease` in
+`briefs_file_operations`.  Open decision: unconditional vs
+compat-gated — unconditional changes 6.12 rodata/relocs, which the
+byte-identical 6.12 gate has not sanctioned for ops.c; a
+compat-gated `#if` initializer member would preserve 6.12 bytes
+(threshold version to be pinned via linux git log if gated).
+
+### generic/751 — new NOTRUN: environmental (harness bug), root-caused post-round
+
+**Failure:** "Cannot find debugfs on /sys/kernel/debug" —
+`_require_split_huge_pages_knob` -> `_require_debugfs` notruns
+(751 is the only generic test that uses `_require_debugfs`).
+
+**Root cause (proven 2026-09-25):** the round prep ran
+`tests/test-runner.sh`, whose phase 11e does
+
+    mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+
+(line 727, in since 79fad5f) as an "ensure mounted" step.  systemd's
+`sys-kernel-debug.mount` is already active at that point, and
+mounting over an existing mount SUCCEEDS — it stacks a second debugfs
+mount (same singleton superblock, device 0:11; observed as mount id
+160, source "none", over systemd's id 39).  With the stacked pair,
+`findmnt -rncv -T /sys/kernel/debug -o FSTYPE` emits TWO lines, and
+`_require_debugfs`'s exact match `[ "$type" = "debugfs" ]` fails.
+Proven two ways: a PATH-shadowing `findmnt` wrapper captured the
+two-line output and both mounts in the failing test process's
+mountinfo, and after `umount /sys/kernel/debug` (removing the shadow)
+the IDENTICAL run-suite invocation **passed 751**.  The 6.12
+phase-2/3 round preps (smoke + spot set) never ran test-runner on
+their boots, which is why only the 7.3 round tripped it.  (Triage
+note: xfstests prints "Passed all 1 tests" for NOT-RUN tests too —
+never judge pass/fail from that summary line alone.)
+
+**Verdict:** environmental, not BrieFS, not a kernel regression.
+751 (page-cache truncation / THP-split stress) passes on 7.3 with a
+clean mount table.  **Fix proposed (C), not yet applied:** guard the
+test-runner mount, e.g. `mountpoint -q /sys/kernel/debug ||
+mount -t debugfs none /sys/kernel/debug`.  GOTCHA for future rounds:
+any boot that ran test-runner carries the shadow mount — check
+`findmnt -rncv -T /sys/kernel/debug -o FSTYPE | wc -l` = 1 before a
+suite round.
+
+### generic/538, generic/777 — moved to PASS (improvements)
+
+538 FAIL->PASS: the 29cee61 unaligned-DIO fix (IOMAP_DIO_FORCE_WAIT
+for unaligned direct writes, -EAGAIN for unaligned RWF_NOWAIT)
+validated at full-suite level on 7.3; its 6.12-round failure was the
+1-in-10 aligned-overlap flake.  777 NOTRUN->PASS: exportfs
+open-by-handle test; the 6.12-round NR reason is unrecorded (the old
+logs were purged before the reason was captured) — recorded as an
+improvement, environmental on the 6.12 side.

@@ -28,28 +28,33 @@ completes before `inode_unlock`; the XFS model) and unaligned
 x10 = 0 FAIL (pre-fix 1-in-10), `551` x20 = 0 FAIL (ERTB fix quiet),
 spot set 13/13, dmesg clean.  `538` leaves the flaky tier.
 
-**Latest full-suite run:** 2026-09-24 (phase-3 round 2), every generic
-test on the VM, kernel `6.12.101-lockdep`, module `8f1729c` content,
-cgroup writeback ON, fsck validation off.  All 793 tests ran fresh
-(RESUMED 0).
-Archive: `tests/xfstests/runs/run-20260924-003349-kernel.txt`.
+**Latest full-suite run:** 2026-09-24/25 (the 7.3-rc4 round), every
+generic test on the VM, kernel `7.3.0-rc4-lockdep+` (`linux` git
+master, lockdep config), module `080db0e` content, cgroup writeback
+ON (7.3 is past the 7.2 both-CVEs-fixed threshold), fsck validation
+off.  All 793 tests ran fresh (RESUMED 0).
+Archive: `tests/xfstests/runs/run-20260924-234953-kernel.txt`.
 
 | Bucket           | Count | Notes                                                    |
 |------------------|------:|----------------------------------------------------------|
 | Selected         |   793 | all generic tests                                        |
-| Pass             |   443 | incl. 563 in-suite (first since 9385fc8), 299 026 053 547 |
-| Fail             |     2 | 311 (accepted) 538 (flake; root-caused + fixed same day) |
-| Not run          |   344 | `_require_*` gate or unsupported feature                 |
+| Pass             |   441 | incl. 563 in-suite (cgwb ON on 7.3), 551, 521+522, 299    |
+| Fail             |     3 | 311 (accepted) 083 269 (new 6.17+ iomap WARN; fix proposed) |
+| Not run          |   345 | 571 751 new (see below); rest `_require_*` gate or unsupported feature |
 | Skipped          |     4 | 068 127 475 492 (skip list honored)                      |
 | Hang             |     0 |                                                           |
 | Mount fail       |     0 | runner tears down DM targets before each test            |
 
-vs the 2026-09-19 "457" figure: **not a regression** — the earlier runs
-counted resume-skipped tests as PASS (the 09-19 run had 126 RESUMED;
-the 09-19 baseline itself inherited 14 outcome-unknown not-run logs
-from 09-11 as RESUMED).  443 is the first honest fully-observed count;
-see the phase-3 addendum below for the complete per-transition
-accounting.  Every baseline PASS except the 538 flake re-passed.
+vs the 2026-09-24 6.12.101 phase-3 round 2 (443/2/344/4): six
+transitions, 100% accounted (per-test status join of both archives).
+**083 and 269** PASS->FAIL (new-in-6.17 iomap zeroing WARN, fix
+proposed); **571 and 751** PASS->NOTRUN (571 = the 7.x mandatory
+`->setlease` f_op member, fix proposed; 751 = environmental debugfs
+shadow mount, root-caused post-round, 751 passes with a clean mount
+table); **538** FAIL->PASS (the 29cee61 fix validated at suite
+level); **777** NOTRUN->PASS.  Full detail in the 7.3-rc4 addendum
+below and in xfstests-failures-analysis.md.  Every 6.12-round PASS
+except the six accounted transitions re-passed.
 
 **Prior state (2026-09-04, master `e6d3d6d`):** the generic/112 btree
 checksum mismatch is root-caused and fixed. A range delete frees emptied
@@ -507,6 +512,70 @@ full-suite rounds on 6.12.101-lockdep with the cgwb flag ON:
   Validated on `29cee61`: `538` solo x10 = 0 FAIL, `551` x20 = 0 FAIL
   (the ERTB fix stays quiet under the new wait path), spot set 13/13,
   dmesg clean over the whole round.
+
+**7.3-rc4 round addendum (2026-09-24/25, briefs-compat, run_id
+20260924-234953):** the phase-3 rounds re-run on the current `linux`
+git master — kernel `7.3.0-rc4-lockdep+`, module `080db0e` content
+(the 29cee61 fix), cgwb ON, fsck off, RESUMED 0, ~5 h.
+**441 PASS / 3 FAIL / 345 not-run / 4 skipped / 0 hang** over 793
+tests (archive `run-20260924-234953-kernel.txt`).  vs the 6.12
+phase-3 round 2 (443/2/344/4): **six transitions, 100% accounted**
+(per-test status join of both archives; every other test held its
+bucket):
+
+- **083, 269 PASS->FAIL** — both `_check_dmesg` hits from the
+  new-in-6.17 `WARN_ON_ONCE(folio_pos(folio) > iter->inode->i_size)`
+  in `iomap_zero_iter` (buffered-io.c:1679), fired by BrieFS's
+  unclamped ZERO_RANGE pagecache zeroing (`briefs_do_zero_range`'s
+  external path passes the full range to
+  `briefs_compat_zero_range`; the inline path already clamps).  The
+  tests are fsstress/ENOSPC fill tests; the 6.17+ ioend error
+  reporter's new "writeback error on inode ..." lines are expected
+  ENOSPC-during-writeback noise, not the failure.  Silent on 6.12
+  (the assertion did not exist there).  Fix proposed (clamp to
+  i_size), not yet applied — see xfstests-failures-analysis.md.
+- **571 PASS->NOTRUN** — real compat gap: 7.x made `->setlease` a
+  mandatory f_op member (`kernel_setlease` lost its generic EINVAL
+  fallback; ext4/xfs/shmem/libfs all declare `generic_setlease`),
+  so `fcntl(F_SETLEASE)` returns EINVAL on BrieFS and
+  `_require_test_fcntl_setlease` gates the test out.  Worked on 6.12
+  via the removed fallback.  Fix proposed
+  (`.setlease = generic_setlease` in `briefs_file_operations`),
+  not yet applied.
+- **751 PASS->NOTRUN** — environmental, root-caused post-round, not
+  BrieFS: the round prep ran `tests/test-runner.sh`, whose phase 11e
+  "ensure mounted" line (`mount -t debugfs none /sys/kernel/debug
+  2>/dev/null || true`, line 727) STACKS a second debugfs mount over
+  systemd's instead of failing — and `_require_debugfs`'s
+  `findmnt -T` exact-match then sees two "debugfs" lines and notruns
+  (751 is the only generic test using `_require_debugfs`).  Proven
+  by intercepting the test process's findmnt (two-line output at the
+  failing require) and by re-running the identical run-suite
+  invocation after `umount` of the shadow mount: **751 PASSES on
+  7.3 with a clean mount table.**  The 6.12 phase-2/3 round preps
+  (smoke + spot set) never ran test-runner on their boots, which is
+  why only this round tripped it.  Harness fix proposed; until it
+  lands, any boot that ran test-runner carries the shadow — check
+  `findmnt -rncv -T /sys/kernel/debug -o FSTYPE | wc -l` = 1 before
+  a suite round.
+- **538 FAIL->PASS** — the 29cee61 unaligned-DIO fix holds at
+  full-suite level on 7.3 (its 6.12-round failure was the 1-in-10
+  flake).
+- **777 NOTRUN->PASS** — exportfs open-by-handle test; the 6.12-round
+  NR reason is unrecorded (logs purged before the reason was
+  captured).  Improvement, environmental on the 6.12 side.
+
+Headline validations at 7.3: **563 PASSED in-suite with cgwb ON**
+(the phase-2 flag decision exercised on its ON kernel at suite
+level), **551 PASS** (ERTB quiet), **521+522 PASS** (fsx soak
+747 s — no DIO-serialization drag from the 29cee61 wait), **311**
+the lone accepted FAIL, unchanged.  dmesg over the round: the printk
+ring wrapped (5-h run), so the round-diff ADDED hunk no longer holds
+mid-round lines — the 083/269 WARNs above survive only in the
+per-test `.dmesg` files (preserved in the round's results dir).  What
+survived holds zero oops/lockdep splats, plus 26 benign
+"clocksource: Watchdog remote CPU 1 read timed out" lines (host-load
+artifact, no clocksource switch).
 
 **Subsequent run (2026-07-07, invalid):** After the `9385fc8` workaround, a full
 `./check -g auto -X .exclude` run completed without hanging or kernel oops, but it
