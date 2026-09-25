@@ -724,7 +724,12 @@ echo "=== Phase 11e: observability surfaces (-o debug) ==="
 DBG_IMG="${TMPDIR:-/tmp}/briefs-obs-$$.img"
 DBG_MNT="/tmp/briefs-obs-mnt-$$"
 # debugfs must be mounted for /sys/kernel/debug/briefs to be reachable.
-mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+# Only mount if not already mounted: mounting over an active debugfs mount
+# succeeds (overmount, not EBUSY) and stacks a second mount on the same
+# singleton superblock.  findmnt -T then emits two FSTYPE lines, which makes
+# xfstests' _require_debugfs exact-match check notrun generic/751 (the only
+# test that calls it) on any boot that ran this script first.
+mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
 "$MKBRIEFS" -s 5000 "$DBG_IMG" 2>/dev/null && pass "obs: mkfs image" || fail "obs: mkfs"
 mkdir -p "$DBG_MNT"
 # -o debug enables the per-sb debugfs tree + stat counters; sysfs/proc are on
