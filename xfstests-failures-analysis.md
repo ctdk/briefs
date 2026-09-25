@@ -305,13 +305,20 @@ generic_setlease`; `briefs_file_operations` (ops.c) does not.  On
 `fcntl(F_SETLEASE)` worked.  (The sysctl was also renamed
 `leases_enabled` -> `leases-enable` in the same window.)
 
-**Verdict:** real compat regression, not environmental.  **Fix
-proposed (A), not yet applied:** `.setlease = generic_setlease` in
-`briefs_file_operations`.  Open decision: unconditional vs
-compat-gated — unconditional changes 6.12 rodata/relocs, which the
-byte-identical 6.12 gate has not sanctioned for ops.c; a
-compat-gated `#if` initializer member would preserve 6.12 bytes
-(threshold version to be pinned via linux git log if gated).
+**Verdict:** real compat regression, not environmental.  **FIXED
+(ae523ee, 2026-09-25):** `.setlease = generic_setlease` on both the
+file and directory operations tables (ext4 and xfs declare it on
+both), gated on the new `BRIEFS_HAS_MANDATORY_SETLEASE` compat flag —
+the gated member preserves the 6.12 byte-identical gate (ops.o
+unchanged on 6.12.48), which settled the unconditional-vs-gated
+open decision in favor of gating.  The threshold was pinned from
+linux git: the fallback was removed by 2b10994be716 ("filelock:
+default to returning -EINVAL when ->setlease operation is NULL",
+Jeff Layton, v7.0-rc1), so the flag is `>= 7.0`.  The member needed
+`#include <linux/filelock.h>` (gated with the same flag — the
+declaration lives there, not in fs.h).  Validated on
+7.3.0-rc4-lockdep+: generic/571 notrun->PASS via run-suite
+(build-id ae523ee, "Ran:" + "Passed all 1 tests", dmesg clean).
 
 ### generic/751 — new NOTRUN: environmental (harness bug), root-caused post-round
 

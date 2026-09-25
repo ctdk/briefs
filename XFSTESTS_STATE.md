@@ -536,12 +536,16 @@ bucket):
   i_size), not yet applied — see xfstests-failures-analysis.md.
 - **571 PASS->NOTRUN** — real compat gap: 7.x made `->setlease` a
   mandatory f_op member (`kernel_setlease` lost its generic EINVAL
-  fallback; ext4/xfs/shmem/libfs all declare `generic_setlease`),
-  so `fcntl(F_SETLEASE)` returns EINVAL on BrieFS and
-  `_require_test_fcntl_setlease` gates the test out.  Worked on 6.12
-  via the removed fallback.  Fix proposed
-  (`.setlease = generic_setlease` in `briefs_file_operations`),
-  not yet applied.
+  fallback in 2b10994be716, v7.0-rc1; ext4/xfs/shmem/libfs all
+  declare `generic_setlease`), so `fcntl(F_SETLEASE)` returns EINVAL
+  on BrieFS and `_require_test_fcntl_setlease` gates the test out.
+  Worked on 6.12 via the removed fallback.  **FIXED ae523ee
+  (2026-09-25): `.setlease = generic_setlease` on the file and
+  directory operations tables, gated on the new
+  `BRIEFS_HAS_MANDATORY_SETLEASE` compat flag (>= 7.0) so the 6.12
+  codegen is untouched (byte gate: ops.o identical on 6.12.48).
+  Validated on 7.3.0-rc4-lockdep+: generic/571 notrun->PASS via
+  run-suite (build-id ae523ee, dmesg clean).**
 - **751 PASS->NOTRUN** — environmental, root-caused post-round, not
   BrieFS: the round prep ran `tests/test-runner.sh`, whose phase 11e
   "ensure mounted" line (`mount -t debugfs none /sys/kernel/debug
