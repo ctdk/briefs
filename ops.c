@@ -11,6 +11,9 @@
 #include <linux/mpage.h>
 #include <linux/seqlock.h>
 #include <linux/pagemap.h>
+#if BRIEFS_HAS_MANDATORY_SETLEASE
+#include <linux/filelock.h>	/* generic_setlease, for the ops tables below */
+#endif
 #include "briefs.h"
 #include "briefs_alloc.h"
 #include "briefs_journal.h"
@@ -63,6 +66,9 @@ const struct file_operations briefs_dir_operations = {
 	.fsync = briefs_fsync,
 	.unlocked_ioctl = briefs_ioctl,
 	.compat_ioctl = compat_ptr_ioctl,
+#if BRIEFS_HAS_MANDATORY_SETLEASE
+	.setlease = generic_setlease,
+#endif
 };
 
 /* File operations for regular files */
@@ -91,6 +97,18 @@ const struct file_operations briefs_file_operations = {
 	 */
 	.splice_read = filemap_splice_read,
 	.splice_write = iter_file_splice_write,
+#if BRIEFS_HAS_MANDATORY_SETLEASE
+	/*
+	 * 7.0 made ->setlease mandatory: kernel_setlease() returns -EINVAL
+	 * for a NULL member instead of falling back to generic_setlease()
+	 * (2b10994be716), which would silently drop fcntl(F_SETLEASE)
+	 * support -- xfstests _require_test_fcntl_setlease (generic/571)
+	 * probes exactly that.  Before 7.0 the fallback called
+	 * generic_setlease() itself, so gating the member keeps older
+	 * kernels' codegen unchanged (byte-identical 6.12 gate).
+	 */
+	.setlease = generic_setlease,
+#endif
 };
 
 /* briefs_shutdown_superop - surprise block-device removal callback.

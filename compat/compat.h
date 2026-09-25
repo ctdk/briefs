@@ -91,6 +91,22 @@
 #define BRIEFS_HAS_ACL_TO_XATTR_ALLOC 0
 #endif
 
+/*
+ * 7.0 made f_op->setlease mandatory: kernel_setlease() lost its
+ * generic fallback (2b10994be716, "filelock: default to returning
+ * -EINVAL when ->setlease operation is NULL"), so a filesystem
+ * without the member gets -EINVAL from fcntl(F_SETLEASE).  Before
+ * 7.0 the fallback called generic_setlease() itself, so the gated
+ * .setlease initializers in ops.c are a no-op change for older
+ * kernels.  ext4 and xfs declare the member on their file and
+ * directory tables alike.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+#define BRIEFS_HAS_MANDATORY_SETLEASE 1	/* f_op->setlease mandatory */
+#else
+#define BRIEFS_HAS_MANDATORY_SETLEASE 0
+#endif
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
 #define BRIEFS_HAS_BH_SUBMIT 1		/* buffer_head -> bio conversion */
 #else
