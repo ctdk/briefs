@@ -361,12 +361,18 @@ never judge pass/fail from that summary line alone.)
 
 **Verdict:** environmental, not BrieFS, not a kernel regression.
 751 (page-cache truncation / THP-split stress) passes on 7.3 with a
-clean mount table.  **Fix proposed (C), not yet applied:** guard the
-test-runner mount, e.g. `mountpoint -q /sys/kernel/debug ||
-mount -t debugfs none /sys/kernel/debug`.  GOTCHA for future rounds:
-any boot that ran test-runner carries the shadow mount — check
-`findmnt -rncv -T /sys/kernel/debug -o FSTYPE | wc -l` = 1 before a
-suite round.
+clean mount table.  **FIXED (4552829, 2026-09-25):** the phase 11e
+mount in test-runner.sh is now guarded — `mountpoint -q
+/sys/kernel/debug || mount -t debugfs none /sys/kernel/debug` — so
+the already-mounted case (the normal case, systemd's
+sys-kernel-debug.mount) is a no-op and the shadow mount is never
+stacked.  Validated on 7.3.0-rc4-lockdep+: the guarded line leaves
+the mount count at 1 when debugfs is mounted, and a full
+test-runner run passes 138/138 (all phase 11e observability checks
+green) with the mount count still 1 after the run, dmesg clean.
+GOTCHA for future rounds: any boot that ran the OLD script still
+carries the shadow — check `findmnt -rncv -T /sys/kernel/debug -o
+FSTYPE | wc -l` = 1 before a suite round.
 
 ### generic/538, generic/777 — moved to PASS (improvements)
 

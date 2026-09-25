@@ -47,11 +47,13 @@ Archive: `tests/xfstests/runs/run-20260924-234953-kernel.txt`.
 
 vs the 2026-09-24 6.12.101 phase-3 round 2 (443/2/344/4): six
 transitions, 100% accounted (per-test status join of both archives).
-**083 and 269** PASS->FAIL (new-in-6.17 iomap zeroing WARN, fix
-proposed); **571 and 751** PASS->NOTRUN (571 = the 7.x mandatory
-`->setlease` f_op member, fix proposed; 751 = environmental debugfs
-shadow mount, root-caused post-round, 751 passes with a clean mount
-table); **538** FAIL->PASS (the 29cee61 fix validated at suite
+**083 and 269** PASS->FAIL (new-in-6.17 iomap zeroing WARN; FIXED
+a7e2db3, both validated FAIL->PASS on 7.3); **571 and 751**
+PASS->NOTRUN (571 = the 7.x mandatory `->setlease` f_op member,
+FIXED ae523ee, validated notrun->PASS on 7.3; 751 = environmental
+debugfs shadow mount, root-caused post-round — 751 passes with a
+clean mount table, harness guard FIXED 4552829); **538** FAIL->PASS
+(the 29cee61 fix validated at suite
 level); **777** NOTRUN->PASS.  Full detail in the 7.3-rc4 addendum
 below and in xfstests-failures-analysis.md.  Every 6.12-round PASS
 except the six accounted transitions re-passed.
@@ -565,10 +567,16 @@ bucket):
   invocation after `umount` of the shadow mount: **751 PASSES on
   7.3 with a clean mount table.**  The 6.12 phase-2/3 round preps
   (smoke + spot set) never ran test-runner on their boots, which is
-  why only this round tripped it.  Harness fix proposed; until it
-  lands, any boot that ran test-runner carries the shadow — check
-  `findmnt -rncv -T /sys/kernel/debug -o FSTYPE | wc -l` = 1 before
-  a suite round.
+  why only this round tripped it.  **FIXED (4552829, 2026-09-25):**
+  the phase 11e mount is now guarded with `mountpoint -q
+  /sys/kernel/debug ||` — the already-mounted case (the normal
+  case, systemd's sys-kernel-debug.mount) is a no-op, so test-runner
+  no longer stacks the shadow.  Validated on 7.3.0-rc4-lockdep+:
+  full test-runner run 138/138 PASS including all phase 11e
+  observability checks, and the debugfs mount count stays at 1 after
+  the run (dmesg clean).  For boots that ran the OLD script, the
+  `findmnt -rncv -T /sys/kernel/debug -o FSTYPE | wc -l` = 1
+  pre-round check remains the guard.
 - **538 FAIL->PASS** — the 29cee61 unaligned-DIO fix holds at
   full-suite level on 7.3 (its 6.12-round failure was the 1-in-10
   flake).
