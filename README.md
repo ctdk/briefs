@@ -64,7 +64,7 @@ BrieFS recognizes the following filesystem-specific mount options:
 RELATED
 -------
 
-* [github.com/ctdk/briefs-utils](https://github.com/ctdk/briefs-utils): The briefs utilities, written in Golang, composed of `mkfs.briefs`, `fsck.briefs`, and `fuse.briefs`. `mkfs.briefs` creates BrieFS volumes, `fsck.briefs` checks and repairs BrieFS volumes, and `fuse.briefs` provides an **experimental** read-write FUSE bridge for those same BrieFS volumes. The FUSE bridge implements full kernel parity (all dir/file ops, xattrs, POSIX ACLs, fileattr/chattr, renameat2, fallocate/setattr/killpriv) with a Go port of the kernel journal, and has been validated across the full generic xfstests suite (793 tests; latest run 2026-09-15: 328 PASS / 32 FAIL / 0 HANG, every residual failure triaged). See the `xfstests-fuse-status.md` document in `briefs-utils` for the current xfstests pass/fail record and known issues.
+* [github.com/ctdk/briefs-utils](https://github.com/ctdk/briefs-utils): The briefs utilities, written in Golang, composed of `mkfs.briefs`, `fsck.briefs`, and `fuse.briefs`. `mkfs.briefs` creates BrieFS volumes, `fsck.briefs` checks and repairs BrieFS volumes, and `fuse.briefs` provides an **experimental** read-write FUSE bridge for those same BrieFS volumes. The FUSE bridge implements full kernel parity (all dir/file ops, xattrs, POSIX ACLs, fileattr/chattr, renameat2, fallocate/setattr/killpriv, XFS-style forced shutdown via `XFS_IOC_GOINGDOWN`) with a Go port of the kernel journal, and has been validated across the full generic xfstests suite (793 tests; latest run 2026-09-20: 349 PASS / 33 FAIL / 0 HANG, every residual failure triaged). See the `xfstests-fuse-status.md` document in `briefs-utils` for the current xfstests pass/fail record and known issues.
 * [github.com/ctdk/modern-xiafs](https://github.com/ctdk/modern-xiafs): Computer filesystem archaeology. A port of an ancient Linux filesystem to modern kernels, updated as I get around to it.
 
 RATIONALE
@@ -84,7 +84,7 @@ Since trying out AI assisted coding was part of the reason for this in the first
 SUPPORTED KERNEL VERSIONS
 -------------------------
 
-For certain values of "support", anyway. Primary development is done against the Debian trixie kernel, 6.12.x, and that kernel — built with lockdep — remains the one the full xfstests suite runs on. As of the 2026-09 compat work, however, the same source tree builds and runs on everything from 6.12 up through the current `linux` git master: all kernel-version conditionals are consolidated in one place, the `compat/` directory (feature flags plus static-inline wrapper functions with the `#if`s inside their bodies), so no `#ifdef LINUX_VERSION_CODE`s are scattered through the rest of the sources. See the build matrix section below for how that range is actually exercised.
+For certain values of "support", anyway. Primary development is done against the Debian trixie kernel, 6.12.x, and that kernel — built with lockdep — remains the one the full xfstests suite primarily runs on (a full suite round has also run on 7.3.0-rc4, which surfaced and led to fixes for the 7.x mandatory `->setlease` member and a 6.17+ iomap zeroing assertion). As of the 2026-09 compat work, however, the same source tree builds and runs on everything from 6.12 up through the current `linux` git master: all kernel-version conditionals are consolidated in one place, the `compat/` directory (feature flags plus static-inline wrapper functions with the `#if`s inside their bodies), so no `#ifdef LINUX_VERSION_CODE`s are scattered through the rest of the sources. See the build matrix section below for how that range is actually exercised.
 
 BUILD MATRIX
 ------------
@@ -125,7 +125,18 @@ WORKS
 * statfs
 * journal replay on mount
 * truncate
-* fallocate pre-allocation and punch-hole (FALLOC_FL_PUNCH_HOLE)
+* fallocate: pre-allocation with unwritten extents
+  (`FALLOC_FL_KEEP_SIZE`), punch-hole (`FALLOC_FL_PUNCH_HOLE`),
+  zero-range (`FALLOC_FL_ZERO_RANGE`, converted to an unwritten
+  middle so it reads back as zeroes without dirtying past-EOF
+  folios), collapse-range, and insert-range
+* file-range exchange (`FALLOC_FL_EXCHANGE_RANGE` / `XFS_IOC_SWAPEXT`),
+  whole-file and sub-range
+* file leases (`fcntl(F_SETLEASE)`/`F_GETLEASE)` via `generic_setlease`,
+  declared on both the file and directory operations tables (on 7.0+
+  kernels `->setlease` is a mandatory f_op member)
+* NFS export support (`export_operations`: generation-based file
+  handles, encode/decode, stale-reject)
 * cp -r works properly
 * symlinks and other special files
 * a set of tests
@@ -157,7 +168,7 @@ DEFINITELY MISSING OR BROKEN
 * No quotas, reflink/COW, fscrypt, fsverity, or online resize. Extended
   attributes (user, trusted, and security namespaces), POSIX ACLs, direct
   I/O, and chattr/lsattr inode flags are supported.
-* FUSE implementation (requires less commitment than the kernel module). An experimental read-write FUSE bridge exists via briefs-utils (`fuse.briefs`), with full kernel parity (all dir/file ops, xattrs, POSIX ACLs, fileattr/chattr, renameat2, fallocate/setattr/killpriv) and a Go port of the kernel journal. It has been validated across the full generic xfstests suite (793 tests; latest run 2026-09-15: 328 PASS / 32 FAIL / 0 HANG, every residual failure triaged). See the `xfstests-fuse-status.md` document in `briefs-utils` for the current pass/fail record and known issues.
+* FUSE implementation (requires less commitment than the kernel module). An experimental read-write FUSE bridge exists via briefs-utils (`fuse.briefs`), with full kernel parity (all dir/file ops, xattrs, POSIX ACLs, fileattr/chattr, renameat2, fallocate/setattr/killpriv, XFS-style forced shutdown via `XFS_IOC_GOINGDOWN`) and a Go port of the kernel journal. It has been validated across the full generic xfstests suite (793 tests; latest run 2026-09-20: 349 PASS / 33 FAIL / 0 HANG, every residual failure triaged). See the `xfstests-fuse-status.md` document in `briefs-utils` for the current pass/fail record and known issues.
 * Thorough annotations - Annotating the source code thoroughly will wait until things settle down. Right now everything's still in constant flux, so there's no point thoroughly annotating something that may change unrecognizably or flat out disappear soon.
 * Refactoring. Since BrieFS is partly a project to learn about using AI assistance while coding, even though I've been reviewing what it's doing there's definitely some weirdness and clunkiness that needs to be gussied up and organized so it's easier to understand. This will go nicely hand in hand with the annotation project above.
 
