@@ -118,10 +118,15 @@
 #define BRIEFS_LOCKDEP_ASSERT_EXTENT_BEFORE_ALLOC() do { } while (0)
 #endif
 
-/* Semantic versioning, yo */
+/* Semantic versioning, yo.  Keep in lockstep with the same three
+ * numbers in briefs-utils' briefs/briefs.go (BrieFSPatchVersion etc.):
+ * mkfs stamps them into the superblock, and only the minor is
+ * enforced anywhere (mount gate in super.c, ReadSuperblock in utils)
+ * -- the major and patch are declaration-only.
+ */
 #define _BRIEFS_MAJOR_VER 0
 #define _BRIEFS_MINOR_VER 9
-#define _BRIEFS_PATCH_VER 6
+#define _BRIEFS_PATCH_VER 7
 
 /* Journal magic */
 #define JOURNAL_MAGIC 0x4A4E4C5A  /* "JNLZ" */
