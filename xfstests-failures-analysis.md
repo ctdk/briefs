@@ -284,10 +284,22 @@ lockdep patterns and the XFS AGFL warning).
 **Verdict:** real, but caught by an assertion 6.12 could never make —
 the same tests are silent on 6.12.101.  Zeroing beyond EOF in the
 pagecache is a no-op under KEEP_SIZE semantics, so no data path is
-wrong; the fix is to stop doing it.  **Fix proposed (B), not yet
-applied:** clamp the pagecache zeroing to i_size in
-`briefs_do_zero_range` (mirror the inline path's
-`z_end = min_t(loff_t, end, inode->i_size)`).
+wrong; the fix is to stop doing it.  **FIXED (a7e2db3, 2026-09-25):**
+the pagecache pass in `briefs_do_zero_range` now clamps to
+[offset, min(end, i_size)) (mirroring the inline path's
+`z_end = min_t(loff_t, end, inode->i_size)`).  Past-EOF blocks are
+hole/unwritten and already read as zero; the !KEEP_SIZE growth past
+the old size is served by the unwritten middle conversion and the
+old-EOF tail zeroing, not this pass, so no data path changes — the
+clamp applies unconditionally (correct on all kernels; 6.17+ merely
+made the waste loud).  Validated on 7.3.0-rc4-lockdep+: 083 + 269
+FAIL->PASS via run-suite (build-id a7e2db3; "Ran:" + "Passed all 1
+tests"; dmesg zero WARNs — the `_check_dmesg` failure mode itself
+is the proof).  Byte gate on 6.12.48: file.o's delta decomposes to
+briefs_fallocate (the inlined clamp, -21 lines) plus address ripple
+on top of the 29cee61/`briefs_write_iter` delta; ops.o stays
+identical.  6.12 runtime revalidation deferred to the next 6.12
+boot round.
 
 ### generic/571 — new NOTRUN: `->setlease` is a mandatory f_op member in 7.x (REAL compat gap, fix proposed)
 

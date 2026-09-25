@@ -532,8 +532,15 @@ bucket):
   tests are fsstress/ENOSPC fill tests; the 6.17+ ioend error
   reporter's new "writeback error on inode ..." lines are expected
   ENOSPC-during-writeback noise, not the failure.  Silent on 6.12
-  (the assertion did not exist there).  Fix proposed (clamp to
-  i_size), not yet applied — see xfstests-failures-analysis.md.
+  (the assertion did not exist there).  **FIXED a7e2db3 (2026-09-25):
+  the pagecache pass is clamped to [offset, min(end, i_size)) —
+  past-EOF blocks are hole/unwritten and read as zero already, and
+  the !KEEP_SIZE growth is served by the unwritten conversion plus
+  the old-EOF tail zeroing, so no data path changes.  Validated on
+  7.3.0-rc4-lockdep+: 083 + 269 FAIL->PASS via run-suite (build-id
+  a7e2db3, dmesg zero WARNs).  Byte gate on 6.12.48: file.o delta =
+  briefs_fallocate (inlined clamp) + ripple; 6.12 runtime
+  revalidation deferred to the next 6.12 boot round.**
 - **571 PASS->NOTRUN** — real compat gap: 7.x made `->setlease` a
   mandatory f_op member (`kernel_setlease` lost its generic EINVAL
   fallback in 2b10994be716, v7.0-rc1; ext4/xfs/shmem/libfs all
