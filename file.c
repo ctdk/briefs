@@ -2876,11 +2876,13 @@ static int briefs_zero_alloc_hole(struct briefs_sb_info *bsi,
  * briefs_do_zero_range - FALLOC_FL_ZERO_RANGE.  Zero the contents of
  * [offset, offset+len), matching ext4/xfs semantics (generic/009):
  *
- *   - byte-granular pagecache zeroing over the whole range via
+ *   - byte-granular pagecache zeroing over [offset, min(end, i_size)) via
  *     iomap_zero_range with the read ops.  Written blocks are zeroed in
  *     place and stay "data"; holes/unwritten already read as zero.  This
  *     alone covers partial-block ranges, which must NOT convert to unwritten
  *     (generic/009 case 17: a partial-block zero keeps the block as "data").
+ *     Past-EOF blocks are never touched by this pass -- they read as zero
+ *     already, and 6.17+ iomap warns about zeroing folios beyond i_size.
  *
  *   - the block-aligned middle [ceil(offset), floor(end)) is converted to
  *     UNWRITTEN extents: written blocks have their flag flipped in place
@@ -2910,6 +2912,7 @@ static long briefs_do_zero_range(struct file *file, int mode, loff_t offset,
 	struct briefs_sb_info *bsi = sb->s_fs_info;
 	struct timespec64 now;
 	loff_t end = offset + len;
+	loff_t z_end;
 	loff_t old_size;
 	u64 s_full, e_full;
 	bool grew_size = false;
@@ -2959,11 +2962,23 @@ static long briefs_do_zero_range(struct file *file, int mode, loff_t offset,
 	/* Byte-granular zero of the pagecache over the whole range.  For
 	 * written blocks this zeroes and dirties the folio; for holes/unwritten
 	 * it is a no-op (they already read as zero).  This covers partial-block
-	 * ranges, which stay "data" (generic/009 case 17). */
-	ret = briefs_compat_zero_range(inode, offset, len, NULL,
-					&briefs_iomap_ops);
-	if (ret)
-		goto out;
+	 * ranges, which stay "data" (generic/009 case 17).
+	 *
+	 * The range is clamped to i_size, like the inline path above: blocks
+	 * past EOF are hole/unwritten and already read as zero, so zeroing
+	 * them is a no-op that only dirties folios which would never write
+	 * back -- which 6.17+ iomap_zero_iter WARNs about (generic/083,
+	 * generic/269).  Under !KEEP_SIZE the growth past the old size is
+	 * served by the unwritten conversion and the old-EOF tail zeroing
+	 * below, not by this pass.
+	 */
+	z_end = min_t(loff_t, end, inode->i_size);
+	if (offset < z_end) {
+		ret = briefs_compat_zero_range(inode, offset, z_end - offset,
+						NULL, &briefs_iomap_ops);
+		if (ret)
+			goto out;
+	}
 
 	/* Convert the block-aligned middle [s_full, e_full) to unwritten
 	 * extents.  Partial head/tail blocks (when offset/end are not
