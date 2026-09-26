@@ -8,6 +8,10 @@
 - Quotas
 - online resize (or any resize)
 - extend inode map/add inodes to existing volume
+- investigate and address issues found in performance testing
+- bare metal testing
+- large volume testing
+- identify more sysfs/debugfs/procfs variables worth exporting
 
 Much further down the list, if ever, items:
 - Optional data journaling
