@@ -52,12 +52,27 @@ Vagrant.configure(2) do |config|
   # View the documentation for the provider you are using for more
   # information on available options.
 
+  config.vm.define 'std', primary: true do |std|
+    std.vm.provider :libvirt do |lv|
+      lv.memory = '4096'
+      lv.cpus = 2
+    end
+  end
+
+  config.vm.define 'perf', autostart: false do |perf|
+    perf.vm.provider :libvirt do |lv|
+      lv.memory = '16384'
+      lv.cpus = 8
+      lv.storage :file, :size => '64G'
+    end
+  end
+
   config.vm.provider :libvirt do |libvirt|
     libvirt.driver = 'kvm'
     libvirt.uri = 'qemu:///system'
     libvirt.storage_pool_name = 'images'
-    libvirt.memory = '4096'
-    libvirt.cpus = 2
+#    libvirt.memory = '4096'
+#    libvirt.cpus = 2
     libvirt.cpu_mode = 'host-passthrough'
     libvirt.storage :file, :size => '64G'
     libvirt.storage :file, :size => '100G'
@@ -75,7 +90,7 @@ Vagrant.configure(2) do |config|
   # documentation for more information about their specific syntax and use.
   config.vm.provision "shell", inline: <<-SHELL
     sudo apt-get update
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install git fakeroot linux-headers-amd64 hexedit hexer linux-source debhelper-compat libdw-dev zstd -y
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install git fakeroot linux-headers-amd64 hexedit hexer linux-source debhelper-compat libdw-dev zstd btrfs-tools jfsutils zstd -y
     # xfstests build + runtime deps (for the BrieFS xfstests integration).
     sudo DEBIAN_FRONTEND=noninteractive apt-get install xfsprogs xfslibs-dev attr acl quota libgdbm-dev liburing-dev libcap-dev indent libaio-dev sqlite3 lvm2 parted gawk fuse3 fio -y
     cd /usr/local && sudo tar -zxvf /go/targz/go.linux-amd64.tar.gz
