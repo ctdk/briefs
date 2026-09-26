@@ -63,7 +63,15 @@ Vagrant.configure(2) do |config|
     perf.vm.provider :libvirt do |lv|
       lv.memory = '16384'
       lv.cpus = 8
-      lv.storage :file, :size => '64G'
+      # Dedicated perf disk (guest /dev/vdd). RAW, not qcow2 —
+      # vagrant-libvirt defaults to qcow2 — and cache=none takes the
+      # host page cache out of the data path (guest flushes go straight
+      # through). This disk is the one the perf-vs-other-fs round mkfs's
+      # each filesystem onto; vdb/vdc keep their default cache mode so
+      # xfstests device behavior stays unchanged. Note: storage options
+      # apply only when the domain/volume is CREATED — existing volumes
+      # are not retro-fitted (see virsh detach/attach for live changes).
+      lv.storage :file, :size => '64G', :type => 'raw', :cache => 'none'
     end
   end
 
