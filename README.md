@@ -99,6 +99,21 @@ Compiling against a kernel only proves it compiles, though, so each version has 
 
 On every one of those the module was built fresh against the running kernel, loaded, and put through the same acceptance bar: the 138-test module suite in `tests/test-runner.sh`, an xfstests spot set of generic tests (11 at the time of the boot rounds; the standing set is now 13 — `generic/563` joined as the cgroup-writeback guard and `generic/053` as the extended-ACL guard after the phase-3 suite rounds, both caught real regressions the old members could not see; the million-operation fsx soak `generic/522` among them), and a dmesg check for warnings and oopses. All rounds to date (2026-09) have come back green, which means each compat arm has been exercised at runtime on a kernel that genuinely has that API, not merely compiled against one. On 6.12 itself the compat layer is held to a stricter bar: the module objects are byte-identical (compiler counter labels aside) to what they were before the compat layer existed, so the development kernel's behavior is provably unchanged.
 
+TEST DOCUMENTATION
+------------------
+
+Three documents record where BrieFS stands:
+
+* [XFSTESTS_STATE.md](XFSTESTS_STATE.md) — the current full-suite xfstests
+  pass/fail record against the kernel module, per round, with the per-test
+  history of every failure and fix.
+* [xfstests-failures-analysis.md](xfstests-failures-analysis.md) — the
+  triage and root-cause analysis of individual xfstests failures over time.
+* [PERFORMANCE.md](PERFORMANCE.md) — BrieFS vs ext2/ext4/XFS/btrfs/JFS:
+  the fio comparison round (streaming, random, sync-write, metadata, and
+  parallel-scaling workloads), where BrieFS is at parity and where the
+  gaps are.
+
 BUGS
 ----
 
