@@ -90,7 +90,7 @@ Vagrant.configure(2) do |config|
   # documentation for more information about their specific syntax and use.
   config.vm.provision "shell", inline: <<-SHELL
     sudo apt-get update
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install git fakeroot linux-headers-amd64 hexedit hexer linux-source debhelper-compat libdw-dev zstd btrfs-tools jfsutils zstd -y
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install git fakeroot linux-headers-amd64 hexedit hexer linux-source debhelper-compat libdw-dev zstd btrfs-progs jfsutils zstd -y
     # xfstests build + runtime deps (for the BrieFS xfstests integration).
     sudo DEBIAN_FRONTEND=noninteractive apt-get install xfsprogs xfslibs-dev attr acl quota libgdbm-dev liburing-dev libcap-dev indent libaio-dev sqlite3 lvm2 parted gawk fuse3 fio -y
     cd /usr/local && sudo tar -zxvf /go/targz/go.linux-amd64.tar.gz
