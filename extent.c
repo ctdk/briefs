@@ -79,11 +79,11 @@ int briefs_read_extent(struct super_block *sb, struct briefs_inode *di,
  * Dispatches on InodeFlagIndexed: tree-backed inodes descend the B+ tree from a
  * freshly-snapped root (O(log E)); inline-only inodes snapshot the inline array
  * under extent_seq and scan it (<=8 entries). @trust_verified selects the
- * locking contract: true means the caller holds extent_lock exclusive and may
- * skip the CRC on cached, already-verified buffers (no concurrent modifier can
- * have torn them); false means this function takes extent_lock shared around
- * the whole read, root snapshot included, so the tree cannot change underneath
- * -- CRCs are still verified as defense-in-depth (and must now always pass).
+ * locking contract: true means the caller holds extent_lock exclusive (the
+ * dispatcher takes nothing); false means this function takes extent_lock
+ * shared around the whole read, root snapshot included, so the tree cannot
+ * change underneath.  Node verification is memoized via BH_Verified either
+ * way (see btree_read_node).
  *
  * Do not pass false while holding extent_lock: the rwsem is not
  * reader-recursive and would self-deadlock.

@@ -6,6 +6,7 @@
 #include <linux/fs.h>
 #include <linux/statfs.h>
 #include <linux/slab.h>
+#include <linux/percpu.h>
 #include <linux/buffer_head.h>
 #include <linux/mpage.h>
 #include <linux/seqlock.h>
@@ -302,6 +303,15 @@ int briefs_fill_super(struct super_block *sb, struct fs_context *fc) {
 	if (!bsi)
 		return -ENOMEM;
 	sb->s_fs_info = bsi;
+
+	/* Node-verify counters (see btree_read_node); percpu, freed in
+	 * briefs_put_super.  Must exist before any btree_read_node can run. */
+	bsi->verify_stats = alloc_percpu(struct briefs_verify_stats);
+	if (!bsi->verify_stats) {
+		kfree(bsi);
+		sb->s_fs_info = NULL;
+		return -ENOMEM;
+	}
 
 	/* Mount options were parsed by the fs_context layer before fill_super. */
 	bsi->mount_jiffies = get_jiffies_64();
@@ -615,6 +625,7 @@ out:
 			briefs_alloc_cleanup(&bsi->alloc);
 		if (bsi->inode_alloc.l0)
 			briefs_alloc_cleanup(&bsi->inode_alloc);
+		free_percpu(bsi->verify_stats);
 	}
 	sb->s_fs_info = NULL;
 	kfree(bsi);
@@ -774,6 +785,9 @@ void briefs_put_super(struct super_block *sb) {
 			bsi->sb_bh = NULL;
 			bsi->sb = NULL;
 		}
+
+		free_percpu(bsi->verify_stats);
+		bsi->verify_stats = NULL;
 	}
 
 	briefs_trie_cleanup_state(sb);

@@ -364,8 +364,8 @@ struct buffer_head *briefs_get_zero_block(struct super_block *sb, u64 block)
 
 	/* The reused block's buffer may still carry BH_Verified from its former
 	 * occupant; the memset below invalidates that content, so drop the bit
-	 * too -- otherwise a trust_verified=true reader could skip the CRC on a
-	 * node image that no longer matches the on-disk checksum.
+	 * too -- otherwise a later reader would skip the CRC on a node image
+	 * that no longer matches the on-disk checksum.
 	 */
 	clear_buffer_verified(bh);
 

@@ -777,13 +777,30 @@ static inline u32 briefs_xattr_hdr_size(u32 version)
 
 /*
  * Per-buffer_head "CRC already verified" bit, allocated from BH_PrivateStart
- * (the first bit reserved for filesystems). Once a chain block's CRC has been
- * checked, we memoize it here so cached re-reads skip the 4088-byte CRC32C.
- * The bit lives in bh->b_state, which is zeroed when a fresh buffer_head is
- * allocated, so it auto-clears on eviction -> a re-read after eviction (the
- * only window for a torn disk read) re-verifies. Only used on read paths that
- * hold a lock excluding concurrent chain-block modifiers (see
- * briefs_read_chain_extent's trust_verified argument).
+ * (the first bit reserved for filesystems).  Once a chain block's magic + CRC
+ * has been checked -- on any read path, locked or unlocked alike -- the
+ * result is memoized here so cached re-reads skip the 4088-byte CRC32C: a
+ * buffer pays for verification at most once per buffer_head lifetime.
+ *
+ * Protocol (the bit means: b_data holds a node image whose bytes [0,4080)
+ * matched its checksum at last verify or commit):
+ *
+ *   Set: btree_read_node() after magic + CRC pass, and btree_commit_node()
+ *        after writing the new checksum (the sole content finalizer).
+ *
+ *   Clear: buffer_head eviction -- b_state is zeroed on a fresh buffer_head,
+ *        so a re-read after eviction re-verifies (the only window for a torn
+ *        disk read) -- and briefs_get_zero_block() before memset, so a freed
+ *        block reallocated as a fresh node never inherits a stale
+ *        verification.
+ *
+ * Unlocked (extent_lock-shared) readers may set the bit: every in-place
+ * editor holds extent_lock exclusive across its modify+commit, so a buffer
+ * observed under the read lock always matches its checksum, and set_bit is
+ * atomic.  Freed-block corpse buffers that still pass the CRC did so under
+ * the always-verify code too (the check ran over the same cached bytes), so
+ * memoization introduces no new hazard; node frees never edit content and no
+ * kernel walk traverses next_leaf, so corpses are unreachable anyway.
  */
 enum { BH_Verified = BH_PrivateStart };
 BUFFER_FNS(Verified, verified)
@@ -1190,6 +1207,16 @@ struct briefs_stats {
 	atomic64_t punch_holes;
 };
 
+/* Per-CPU node-verification counters (-o debug observability, debugfs "stats"):
+ * full = magic+CRC verifications performed, skip = reads served by the
+ * BH_Verified memoization in btree_read_node().  Percpu because the skip
+ * increment sits on the DIO read hot path; debugfs sums across CPUs.
+ */
+struct briefs_verify_stats {
+	u64 full;
+	u64 skip;
+};
+
 struct briefs_sb_info {
 	__u64 data_blocks;
 	__u64 free_data_blocks;
@@ -1204,6 +1231,7 @@ struct briefs_sb_info {
 	struct list_head sb_list;        /* link on the global briefs_sb_list */
 	unsigned long mount_flags;      /* BRIEFS_MF_* */
 	struct briefs_stats stats;      /* -o debug counters */
+	struct briefs_verify_stats __percpu *verify_stats; /* node-verify counters */
 	struct dentry *debugfs_dir;     /* per-sb debugfs dir, NULL unless -o debug */
 	struct kobject s_kobj;          /* per-sb sysfs kobject, embedded in bsi */
 	u64 mount_jiffies;              /* time of mount, for debugfs/sysfs/proc */
@@ -1455,8 +1483,8 @@ int briefs_read_extent(struct super_block *sb, struct briefs_inode *di, int inde
 
 /* Find the extent covering logical block @iblock. Dispatches on InodeFlagIndexed
  * (B+ tree lookup) vs inline-only (inline array scan). @trust_verified forwards
- * to the tree node read: a caller holding extent_lock may skip CRCs on cached,
- * already-verified buffers; an unlocked scanner passes false to verify each read.
+ * the locking contract: true = the caller holds extent_lock exclusive; false =
+ * the extent.c dispatcher takes the lock shared around the descent.
  * Returns 0 and fills *ext, -ENOENT if no extent covers @iblock, -EIO on a
  * read/checksum failure. */
 int briefs_inode_lookup_iblock(struct super_block *sb, struct briefs_inode_info *binfo,
@@ -1513,9 +1541,9 @@ int briefs_inode_sync(struct inode *inode);
 
 /* Lookup the extent covering logical block @iblock. Returns 0 and fills *ext,
  * -ENOENT if no extent covers it, -EIO on read/checksum failure. trust_verified
- * selects the locking contract: true = caller holds extent_lock and may skip
- * the CRC on cached verified buffers; false = the extent.c dispatcher holds
- * the lock shared and CRCs are verified (defense-in-depth).
+ * selects the locking contract: true = caller holds extent_lock exclusive;
+ * false = the extent.c dispatcher holds the lock shared around the descent.
+ * Node verification is memoized via BH_Verified either way.
  */
 int briefs_btree_lookup(struct super_block *sb, u64 root_block, u64 iblock,
 			struct briefs_extent *ext, bool trust_verified);

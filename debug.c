@@ -15,6 +15,7 @@
 #include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/debugfs.h>
+#include <linux/percpu.h>
 #include <linux/seq_file.h>
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
@@ -267,6 +268,21 @@ static int briefs_df_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "truncate_calls=%lld\n", atomic64_read(&s->truncate_calls));
 	seq_printf(m, "fallocate_calls=%lld\n", atomic64_read(&s->fallocate_calls));
 	seq_printf(m, "punch_holes=%lld\n", atomic64_read(&s->punch_holes));
+
+	if (bsi->verify_stats) {
+		u64 vfull = 0, vskip = 0;
+		int cpu;
+
+		for_each_possible_cpu(cpu) {
+			struct briefs_verify_stats *vs =
+				per_cpu_ptr(bsi->verify_stats, cpu);
+
+			vfull += vs->full;
+			vskip += vs->skip;
+		}
+		seq_printf(m, "verify_full=%llu\n", vfull);
+		seq_printf(m, "verify_skip=%llu\n", vskip);
+	}
 	return 0;
 }
 

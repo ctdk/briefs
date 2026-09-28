@@ -39,6 +39,7 @@
 #include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
+#include <linux/percpu.h>
 #include <linux/buffer_head.h>
 #include <linux/seqlock.h>
 #include "briefs.h"
@@ -56,15 +57,23 @@ struct btree_split {
 };
 
 /*
- * Read a B-tree node, verifying magic + checksum.  trust_verified lets locked
- * callers skip the CRC on a buffer whose BH_Verified bit is set (no concurrent
- * modifier can have torn it).  Returns the buffer_head (caller brelse) and a
+ * Read a B-tree node.  A buffer whose BH_Verified bit is set skips the magic +
+ * checksum check outright: every successful verify memoizes in that bit, and
+ * btree_commit_node() sets it for nodes it just wrote, so a buffer pays for
+ * verification at most once per buffer_head lifetime (eviction and
+ * briefs_get_zero_block() clear the bit).  This is race-free because every
+ * in-place editor holds extent_lock exclusive and every unlocked read holds
+ * it shared: no reader can observe a buffer between a modification and its
+ * btree_commit_node() checksum update.  trust_verified is kept as caller
+ * documentation (true = caller holds extent_lock exclusive); it no longer
+ * changes what gets verified.  Returns the buffer_head (caller brelse) and a
  * pointer to the node, or NULL on failure.
  *
  * Checksum errors are rate-limited to avoid flooding dmesg (the generic/299
  * spiral).  A per-superblock circuit breaker counts errors; after
  * BRIEFS_BTREE_ERROR_LIMIT the filesystem is forced read-only to stop the
- * retry loop.
+ * retry loop.  verify_stats counts full verifications vs BH_Verified skips
+ * (-o debug observability).
  */
 static struct briefs_extent_btree_node *
 btree_read_node(struct super_block *sb, u64 block, bool trust_verified,
@@ -120,6 +129,10 @@ btree_read_node(struct super_block *sb, u64 block, bool trust_verified,
 	 * (taken by the extent.c dispatch layer), which excludes every
 	 * in-place editor outright: a torn node cannot be observed at all, and
 	 * the CRC check is pure defense-in-depth that must now always pass.
+	 * With BH_Verified memoization that defense fires once per buffer_head
+	 * lifetime -- on the first read after eviction (the only window for a
+	 * torn disk read), or after a get_zero_block realloc -- instead of on
+	 * every single read.
 	 * No fs lock is held across the will_modify wait itself: this is a
 	 * plain metadata buffer sync (no get_block, no extent_lock), so it
 	 * cannot trip the mmap/writeback AB-BA of generic/074.
@@ -129,7 +142,8 @@ btree_read_node(struct super_block *sb, u64 block, bool trust_verified,
 
 	node = (struct briefs_extent_btree_node *)bh->b_data;
 
-	if (!trust_verified || !buffer_verified(bh)) {
+	if (!buffer_verified(bh)) {
+		this_cpu_inc(bsi->verify_stats->full);
 		if (le32_to_cpu(node->hdr.magic) != BRIEFS_BTREE_MAGIC) {
 			pr_warn_ratelimited("briefs: btree: node %llu bad magic 0x%08x\n",
 			       block, le32_to_cpu(node->hdr.magic));
@@ -154,8 +168,9 @@ btree_read_node(struct super_block *sb, u64 block, bool trust_verified,
 			}
 			return NULL;
 		}
-		if (trust_verified)
-			set_buffer_verified(bh);
+		set_buffer_verified(bh);
+	} else {
+		this_cpu_inc(bsi->verify_stats->skip);
 	}
 
 	*bhp = bh;
