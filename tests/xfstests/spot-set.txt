@@ -1,0 +1,25 @@
+# The BrieFS spot set: a fixed 13-test cross-section of historically-broken
+# behaviors, run after any nontrivial change before touching the full suite.
+# One line per test, "generic/NNN" form; feed to run-suite.sh:
+#
+#   bash tests/xfstests/run-suite.sh $(grep -v '^#' tests/xfstests/spot-set.txt)
+#
+# Chosen to cover: btree lookup/descent + unwritten extents (092 299 363 616),
+# extent-tree integrity + dangling-node history (112), DIO/buffered coherence
+# and mmap interaction (053 074 551-class), punch-hole pagecache split
+# (522 616), seekdir/readdir iter state (471), xattr-backed ACL/permissions
+# (563), and io_uring DIO soak (617).  13/13 PASS is the gate for proceeding
+# to the full suite run.
+generic/053
+generic/074
+generic/092
+generic/112
+generic/263
+generic/299
+generic/300
+generic/363
+generic/471
+generic/522
+generic/563
+generic/616
+generic/617
