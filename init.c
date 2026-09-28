@@ -35,6 +35,9 @@ static int __init briefs_init(void) {
 	pr_debug("briefs: magic=0x%016llx, block_size=%d, inode_size=%d\n",
 		 (unsigned long long)_BRIEFS_SUPER_MAGIC, BRIEFS_BLOCK_SIZE, BRIEFS_INODE_SIZE);
 
+	/* Build the CRC32C slicing tables before any checksum can run */
+	briefs_crc32c_init();
+
 	/* Catch on-disk structure size drift vs. Go briefs-utils layout */
 	briefs_build_bug_on_sizes();
 

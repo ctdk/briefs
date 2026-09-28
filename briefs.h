@@ -283,8 +283,10 @@ struct jrn_checkpoint {
 	__le64 reserved2;
 };
 
-/* Compute CRC32C checksum */
+/* Compute CRC32C checksum (the frozen nonstandard variant -- see crc32c.c) */
 __u32 briefs_crc32c(__u32 crc, const void *data, size_t len);
+/* Build the slicing tables; called once from module init */
+void briefs_crc32c_init(void);
 
 /* Journal block header (16 bytes) */
 struct journal_block_header {
