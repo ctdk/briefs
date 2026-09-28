@@ -830,6 +830,16 @@ void briefs_umount_begin(struct super_block *sb) {
 }
 /* briefs_kill_sb - called when sb is being destroyed */
 void briefs_kill_sb(struct super_block *sb) {
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+
 	pr_debug("briefs: kill_sb\n");
 	kill_block_super(sb);
+
+	/* bsi was only ever freed on the fill_super failure path; every
+	 * successful mount leaked one.  put_super has already run, so
+	 * nothing else touches bsi past this point.  fill_super's error
+	 * path NULLs s_fs_info before failing, so bsi is NULL for mounts
+	 * that never came up.
+	 */
+	kfree(bsi);
 }
