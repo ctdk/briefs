@@ -142,11 +142,20 @@ get_timeout() {
         generic/017) echo 900 ;;    # 10k nested fcollapse ops (collect/rebuild O(E)/op)
         generic/011) echo 900 ;;    # dirstress (concurrent dir ops)
         generic/475) echo 900 ;;    # dm-error crash-replay
-        generic/299) echo 900 ;;    # fio AIO/DIO + falloc stress: test ~114s
+        generic/299) echo 1800 ;;   # fio AIO/DIO + falloc stress: test ~114s
                                     # but post-test unmount checkpoint of the
                                     # ENOSPC-full scratch fs adds ~170s; 300s
                                     # was marginal (intermittent HANGs on the
-                                    # ddcb7ef baseline too, 2026-09-01)
+                                    # ddcb7ef baseline too, 2026-09-01); 900s
+                                    # also marginal — the test loops
+                                    # device-sized fallocs that hit the known
+                                    # O(E^2) chain scan when fio's concurrent
+                                    # writers win the race, so total time
+                                    # swings ~220s..>900s (2026-09-28: solo
+                                    # PASS 262s, 2 of 3 guard runs 900s-HANG,
+                                    # io_uring-perf branch, Stage-3 code paths
+                                    # dormant in this test — libaio sets no
+                                    # IOCB_NOWAIT)
         generic/074) echo 900 ;;    # fsx 1M-op mmap writeback soak; 442s solo
                                     # (2026-09-10) vs 300s KILL in the 09-12
                                     # full run; solo PASS under the 900s budget

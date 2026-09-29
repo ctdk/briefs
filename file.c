@@ -186,7 +186,16 @@ int briefs_open(struct inode *inode, struct file *file) {
 	 * here.  The aops .direct_IO is noop_direct_IO, only there so dentry_open()
 	 * allows O_DIRECT opens; the iomap DIO path bypasses the aops
 	 * write_begin/end.
+	 *
+	 * FMODE_NOWAIT: every blocking point in the read/write paths honors
+	 * IOCB_NOWAIT (read: inode_trylock[_shared] + -EAGAIN; write: extent
+	 * DIO trylocks, buffered/inline refuse with -EOPNOTSUPP), so the file
+	 * may be declared nowait-capable.  Without this bit io_uring's
+	 * io_file_supports_nowait() fails and every io_uring DIO request is
+	 * punted to an io-wq worker instead of being submitted inline
+	 * (ext4_file_open sets the same bit for the same reason).
 	 */
+	file->f_mode |= FMODE_NOWAIT;
 	return 0;
 }
 /* Release file */
@@ -567,7 +576,14 @@ ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		size_t copied;
 		u8 tmp[BRIEFS_INODE_INLINE_DATA_SIZE];
 
-		inode_lock(inode);
+		/* IOCB_NOWAIT must not queue behind a writer (FMODE_NOWAIT was
+		 * declared at open, so io_uring submits these inline). */
+		if (iocb->ki_flags & IOCB_NOWAIT) {
+			if (!inode_trylock(inode))
+				return -EAGAIN;
+		} else {
+			inode_lock(inode);
+		}
 		if (pos >= inode->i_size) {
 			inode_unlock(inode);
 			return 0;
@@ -594,11 +610,23 @@ ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * manages the inode_dio count itself.  No dops: reads need no completion
 	 * work.  Inline-data inodes stay on the inline bypass above (their data
 	 * lives in the inode block, so a "direct" read is just the memcpy there).
+	 *
+	 * RWF_NOWAIT / IOCB_NOWAIT (io_uring sets it for every non-blocking
+	 * submission attempt) must not queue behind a writer: trylock and
+	 * return -EAGAIN so the submitter retries or punts, exactly like
+	 * ext4_dio_read_iter.  Without this, a -EAGAIN from iomap internals
+	 * (IOMAP_NOWAIT mappings) could never be avoided up front and the
+	 * whole read would block the io_uring submitter thread.
 	 */
 	if (iocb->ki_flags & IOCB_DIRECT) {
 		ssize_t ret;
 
-		inode_lock_shared(inode);
+		if (iocb->ki_flags & IOCB_NOWAIT) {
+			if (!inode_trylock_shared(inode))
+				return -EAGAIN;
+		} else {
+			inode_lock_shared(inode);
+		}
 		ret = iomap_dio_rw(iocb, to, &briefs_iomap_ops, NULL, 0, NULL, 0);
 		inode_unlock_shared(inode);
 		return ret;
@@ -620,7 +648,15 @@ ssize_t briefs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	{
 		ssize_t ret;
 
-		inode_lock_shared(inode);
+		/* Same NOWAIT contract as the direct-read branch above: refuse
+		 * to queue behind a writer (ext4_buffered_read_iter does the
+		 * same trylock dance for its buffered reads). */
+		if (iocb->ki_flags & IOCB_NOWAIT) {
+			if (!inode_trylock_shared(inode))
+				return -EAGAIN;
+		} else {
+			inode_lock_shared(inode);
+		}
 		ret = generic_file_read_iter(iocb, to);
 		inode_unlock_shared(inode);
 		return ret;
@@ -647,6 +683,14 @@ static ssize_t briefs_iomap_buffered_write(struct kiocb *iocb,
 	struct inode *inode = file_inode(iocb->ki_filp);
 	loff_t old_size;
 	ssize_t ret;
+
+	/* No non-blocking implementation exists for the buffered path
+	 * (page-cache copy + time/priv updates under the inode lock);
+	 * refuse like ext4_buffered_write_iter.  briefs_write_iter screens
+	 * NOWAIT writes out before dispatching here; this is defense for any
+	 * other caller. */
+	if (iocb->ki_flags & IOCB_NOWAIT)
+		return -EOPNOTSUPP;
 
 	inode_lock(inode);
 	ret = generic_write_checks(iocb, from);
@@ -716,7 +760,14 @@ static ssize_t briefs_dio_write(struct kiocb *iocb, struct iov_iter *from)
 	unsigned int dio_flags = 0;
 	ssize_t ret;
 
-	inode_lock(inode);
+	/* IOCB_NOWAIT: refuse to queue behind a concurrent writer instead of
+	 * blocking the submitter (ext4_dio_write_iter does the same). */
+	if (iocb->ki_flags & IOCB_NOWAIT) {
+		if (!inode_trylock(inode))
+			return -EAGAIN;
+	} else {
+		inode_lock(inode);
+	}
 	ret = generic_write_checks(iocb, from);
 	if (ret <= 0)
 		goto out_unlock;
@@ -803,6 +854,26 @@ ssize_t briefs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		pos = inode->i_size;
 
 	total_size = pos + count;
+
+	/*
+	 * RWF_NOWAIT / IOCB_NOWAIT must never block on the inode lock or on
+	 * metadata writes.  FMODE_NOWAIT was declared at open, so io_uring
+	 * submits these inline: every blocking path has to refuse instead.
+	 * Only the extent-backed DIO path has a non-blocking implementation
+	 * (inode_trylock in briefs_dio_write).  The buffered path has none --
+	 * ext4 returns -EOPNOTSUPP from ext4_buffered_write_iter -- and the
+	 * inline/promote section below allocates, journals, and truncates, so
+	 * both refuse the same way.  Skipping the locked pre-section is safe:
+	 * it only exists for the inline path, and briefs_dio_write does its
+	 * own file_remove_privs (killpriv-on-modify, generic/093).
+	 */
+	if (iocb->ki_flags & IOCB_NOWAIT) {
+		if (!(iocb->ki_flags & IOCB_DIRECT) ||
+		    (binfo->disk_inode.flags & InodeFlagInlineData) ||
+		    inode->i_size == 0)
+			return -EOPNOTSUPP;
+		return briefs_dio_write(iocb, from);
+	}
 
 	inode_lock(inode);
 
