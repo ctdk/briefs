@@ -5,7 +5,59 @@ measured by fresh full-suite and targeted runs on the VM.
 
 ## Overview
 
-**Current state (2026-09-24, branch `briefs-compat` at `29cee61`,
+**Current state (2026-10-01, branch `io_uring-perf` at `e1a4f15`,
+unpushed):** the io_uring W9b campaign's stage-5 functional gate is
+complete.  The full suite ran once, end-to-end, on
+`7.3.0-rc4-lockdep+` with the campaign content (Stage 1 BH_Verified
+read-path memoization, Stage 2 slice-by-8 CRC32C over the frozen poly,
+Stage 3 IOCB_NOWAIT/FMODE_NOWAIT): **443 / 6 / 340 not-run /
+4 skipped, zero hangs, zero resumes** — the first single-continuous
+full-suite result (no wedge, no resume).  The launch-3 476 wedge did
+not reproduce: 6/6 solos pass and 476 passed in-suite on the relaunch.
+
+**Latest full-suite run:** 2026-10-01/02, every generic test on the VM,
+kernel `7.3.0-rc4-lockdep+`, module `e1a4f15` content, cgroup writeback
+ON, fsck validation off, NFS-backed LOG_DIR.  All 793 tests ran fresh
+(RESUMED 0).  Archive:
+`tests/xfstests/runs/run-20261001-191536-kernel.txt`.
+
+| Bucket           | Count | Notes                                                    |
+|------------------|------:|----------------------------------------------------------|
+| Selected         |   793 | all generic tests                                        |
+| Pass             |   443 | 083 269 571 751 786 787 pass for the first time on 7.3   |
+| Fail             |     6 | all attributed; zero proven campaign regressions        |
+| Not run          |   340 | `_require_*` gate or unsupported feature                 |
+| Skipped          |     4 | 068 127 475 492 (skip list honored)                      |
+| Hang             |     0 | 476 launch-3 wedge not reproducible (6 solos + in-suite) |
+| Mount fail       |     0 | runner tears down DM targets before each test            |
+
+vs the 2026-09-24/25 7.3-rc4 baseline (441/3/345/4): 11 transitions,
+100% accounted (per-test status join of both archives).  **083, 269**
+FAIL->PASS (the `a7e2db3` fixes, validated); **571, 751** NOTRUN->PASS
+(validated at suite level for the first time); **786, 787** NOTRUN->PASS
+(newly runnable with the log-writes loop attached).  The six FAILs:
+
+- `311` — accepted dm-flakey flake (baseline FAIL too).
+- `740` — **environmental**: `btrfs-progs`/`jfsutils` were installed
+  2026-09-27 (after the baseline), so 740 reached its btrfs/jfs
+  overwrite checks for the first time; `mkfs.briefs`'s block-0-only
+  existing-fs detection cannot see magics written at btrfs's 64 KiB /
+  jfs's 32 KiB offsets.  Kernel-independent; small mkfs.briefs gap to
+  fix in briefs-utils.
+- `455` — first-ever-run on 7.3 (LOGWRITES loop attached).  Reproducible
+  md5 mismatch on log-writes replay verify, and **fails identically 3/3
+  on baseline content `080db0e`** — pre-existing on this kernel, not
+  campaign.  Likely the same flush-semantics class `82c9a61` fixed on
+  6.12.  Open triage item, tracked separately.
+- `388`, `471`, `547` — FAILed in-suite, never reproduced: 388 3/3
+  solos, 471 5/5 solos plus 20 direct `rewinddir-test` attempts on the
+  preserved TEST fs, 547 5/5 solos, all PASS.  No mechanism exists in
+  the campaign commits (none touch trie lookup, live create, or
+  replay); the suite ran with 92 clocksource watchdog timeouts (guest
+  CPU stalls) and 547 is already documented as a 475-family flake.
+  Accepted as flake-class with that caveat.
+
+**Prior state (2026-09-24, branch `briefs-compat` at `29cee61`,
 unpushed):** the kernel-compat campaign's phase 3 is complete.  The
 full suite ran twice on 6.12.101-lockdep with cgroup writeback
 re-enabled (`102b339`).  Round 1 aborted at the 05x tier and caught a
