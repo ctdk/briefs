@@ -37,13 +37,27 @@ static int briefs_dir_sync(struct inode *dir)
 	if (ret)
 		return ret;
 
-	if (bsi->journal && bsi->journal->dirty) {
+	/*
+	 * Sync the journal and drain the owned pinned-metadata set
+	 * unconditionally.  Gating on j->dirty races a concurrent checkpoint,
+	 * which can retire the covering records and clear the flag between
+	 * this directory's mutation and the check -- the sync (and its
+	 * metadata flush) would then be skipped, leaving pinned trie/inode
+	 * buffers unwritten at a durability point.  __briefs_journal_sync_
+	 * locked() early-outs on !j->dirty, so the explicit flush_owned() is
+	 * needed for the drained-but-dirty-cleared case (same shape as
+	 * briefs_fsync and briefs_sync_fs).
+	 */
+	if (bsi->journal) {
 		ret = briefs_journal_sync(bsi->journal);
+		if (ret)
+			return ret;
+		ret = briefs_journal_flush_owned(bsi->journal);
 		if (ret)
 			return ret;
 	}
 
-	return blkdev_issue_flush(dir->i_sb->s_bdev);
+	return briefs_order_flush(dir->i_sb);
 }
 
 /* briefs_readdir - enumerate directory contents

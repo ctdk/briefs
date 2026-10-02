@@ -29,6 +29,8 @@ struct briefs_journal {
 	u64 write_offset;                 /* byte offset for next record in cur_block */
 	u64 write_pos;                    /* current journal block number on disk */
 	u64 synced_pos;                   /* blocks before this (since last sync) are durably on disk */
+	u64 write_count;                  /* total ring steps taken by write_pos (monotonic, in-memory) */
+	u64 committed_count;              /* write_count value reflected in sb journal_log_end (monotonic, in-memory) */
 	u64 journal_start;                /* first journal block */
 	u64 journal_end;                  /* last journal block */
 	u64 checkpoint_block;             /* checkpoint area (last journal block) */
@@ -55,6 +57,47 @@ struct briefs_journal {
 	 * spinlock.
 	 */
 	struct mutex write_lock;
+
+	/*
+	 * Serializes briefs_journal_flush_owned() calls.  The owned-set drain is a
+	 * HANDOFF: flush A can drain a buffer that fsync B pinned moments earlier,
+	 * and B's own (later) flush then finds the owned set empty and returns
+	 * instantly -- without B's fsync being ordered against A's still-in-flight
+	 * write of the stolen buffer.  On a write-ordering-sensitive target (the
+	 * dm-log-writes replay of generic/455) the stolen buffer's write reaches
+	 * the log AFTER B's fsync returned and its mark was cut, so the replay at
+	 * the mark sees pre-fsync metadata while the journal records covering it
+	 * are already committed (or checkpoint-retired): stale inode table, empty
+	 * or short files, md5 mismatch.  Holding this mutex across the whole
+	 * drain -> PASS 1 -> PASS 2 wait makes the thief's write complete before
+	 * the victim's flush drains (an empty drain after waiting on the mutex is
+	 * then safe: anything stolen from us is already durable).  Never taken
+	 * while holding write_lock and never acquired inside flush_owned's
+	 * critical section, so no lock-order cycle with write_lock exists.
+	 */
+	struct mutex flush_lock;
+
+	/*
+	 * Serializes every device cache flush BrieFS issues
+	 * (briefs_order_flush()).  Crash-replay logging (dm-log-writes in
+	 * generic/455) assigns each plain data write the log slot of the first
+	 * flush that maps after the write completes, and splices the whole
+	 * captured batch into the log at that flush's COMPLETION.  Two
+	 * independent flushes can therefore invert through the lower stack
+	 * (dm-thin, virtio, host cache), stranding an older write to a
+	 * rewritten sector (superblock, journal ring, inode table, punch zero
+	 * image, freed-then-reallocated data block) in a batch that reaches
+	 * the log AFTER later images of the same sector -- replay then applies
+	 * stale content and the md5 comparison fails.  Issuing each flush only
+	 * after the previous one completed makes completion order equal issue
+	 * order, which makes the log order of same-sector writes equal their
+	 * device completion order regardless of stack reordering.  This is the
+	 * discipline jbd2 gets naturally from serialized commits; BrieFS
+	 * issues flushes from several unlocked paths (fsync, sync_fs, exchange,
+	 * directory sync, shutdown), so they need one common serialization
+	 * point.  Leaf lock: taken by no other BrieFS code path.
+	 */
+	struct mutex flush_order_lock;
 
 	/*
 	 * Replay context.  Set only while briefs_journal_replay() is re-deriving

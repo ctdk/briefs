@@ -2098,6 +2098,9 @@ long briefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 /* Journal helpers */
 int briefs_journal_sync_no_checkpoint(struct briefs_journal *j);
 
+/* Serialized device cache flush (ordering fix for generic/455). */
+int briefs_order_flush(struct super_block *sb);
+
 /* Directory operations */
 int briefs_readdir(struct file *file, struct dir_context *ctx);
 

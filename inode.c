@@ -181,7 +181,7 @@ int briefs_shutdown(struct super_block *sb, u32 flags)
 			ret = briefs_journal_sync_no_checkpoint(bsi->journal);
 			if (ret)
 				return ret;
-			ret = blkdev_issue_flush(sb->s_bdev);
+			ret = briefs_order_flush(sb);
 			if (ret)
 				return ret;
 		}

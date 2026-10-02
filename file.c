@@ -155,9 +155,27 @@ int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
 			return ret;
 	}
 
-	/* Flush journal to disk on explicit fsync */
-	if (bsi->journal && bsi->journal->dirty) {
+	/*
+	 * Flush the journal, then drain the journal-owned pinned metadata set.
+	 * Both unconditionally.  The old j->dirty gate was a race against a
+	 * concurrent checkpoint: the record write above sets j->dirty, but a
+	 * checkpoint running between that write and the check clears it -- and
+	 * the sync was skipped along with its metadata flush, returning with
+	 * this fsync's pinned btree nodes and inode-table block still
+	 * unwritten.  The checkpoint's SB write had meanwhile retired the
+	 * covering records (log_end advanced past them), so the mark cut at
+	 * this fsync's return shows a stale extent map next to an empty live
+	 * journal range: replay cannot reconstruct the state the fsync
+	 * promised (generic/455 md5 mismatch).  An explicit flush_owned() is
+	 * needed in addition to the sync because __briefs_journal_sync_locked()
+	 * itself early-outs on !j->dirty.  Both calls are cheap no-ops when
+	 * nothing is pending.
+	 */
+	if (bsi->journal) {
 		ret = briefs_journal_sync(bsi->journal);
+		if (ret)
+			return ret;
+		ret = briefs_journal_flush_owned(bsi->journal);
 		if (ret)
 			return ret;
 	}
@@ -170,8 +188,10 @@ int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
 	 * only logs writes once a flush/FUA moves them out of its unflushed queue)
 	 * can reorder or omit the data/metadata writes that fsync(2) is supposed
 	 * to make durable, causing generic/455 crash-replay md5 mismatches.
+	 * briefs_order_flush() serializes this with every other BrieFS flush so
+	 * the replay log order cannot invert (generic/455).
 	 */
-	ret = blkdev_issue_flush(inode->i_sb->s_bdev);
+	ret = briefs_order_flush(inode->i_sb);
 	if (ret)
 		return ret;
 
@@ -469,7 +489,7 @@ int briefs_inode_sync(struct inode *inode)
 	if (ret)
 		return ret;
 
-	return blkdev_issue_flush(inode->i_sb->s_bdev);
+	return briefs_order_flush(inode->i_sb);
 }
 
 /*
@@ -1616,6 +1636,17 @@ static bool briefs_block_mapped(struct inode *inode, u64 iblock)
  * The caller (punch-hole) is responsible for page-cache invalidation of the
  * logical range; this helper only touches the disk, mirroring the sb_bread
  * variant it replaces.
+ *
+ * The write-back bio is a plain REQ_OP_WRITE.  It needs no explicit
+ * pre-flush or FUA for crash-replay ordering (generic/455): every
+ * dm-log-writes carrier on this device is a flush BrieFS issued through
+ * briefs_order_flush(), and those are serialized so their completions
+ * cannot invert, which makes the log order of same-sector writes equal
+ * their completion order.  Durability is also covered: the punch's own
+ * journal records are only durable once briefs_journal_sync() commits
+ * them, and that path's flush settles this image at the same time, so a
+ * crash either loses both (replay reconstructs the pre-punch state) or
+ * keeps both.
  */
 static int briefs_zero_block_range(struct super_block *sb, u64 abs_block,
 				   u32 start, u32 end)
@@ -2701,7 +2732,7 @@ out_unlock_inodes:
 		if (!r2)
 			r2 = briefs_journal_sync(bsi->journal);
 		if (!r2)
-			r2 = blkdev_issue_flush(sb->s_bdev);
+			r2 = briefs_order_flush(sb);
 		if (r2 && ret == 0)
 			ret = r2;
 	}

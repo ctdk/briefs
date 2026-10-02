@@ -761,7 +761,7 @@ void briefs_put_super(struct super_block *sb) {
 		 * the crash-replay md5 check fails.
 		 */
 		{
-			int flush_ret = blkdev_issue_flush(sb->s_bdev);
+			int flush_ret = briefs_order_flush(sb);
 			if (flush_ret)
 				pr_err("briefs: unmount flush failed (err=%d)\n",
 				       flush_ret);

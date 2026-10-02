@@ -29,6 +29,36 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j);
 static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoint);
 
 /*
+ * briefs_order_flush - the single serialized path for every device cache
+ * flush BrieFS issues.  See struct briefs_journal::flush_order_lock for the
+ * full ordering argument (generic/455): each flush batch is spliced into the
+ * crash-replay log at the flush's COMPLETION, so two independently issued
+ * flushes can invert through the lower stack and strand an older write to a
+ * rewritten sector behind a newer image of the same sector.  Issuing each
+ * flush only after the previous one completed removes the inversion.  Every
+ * flush site in BrieFS must go through here; never call blkdev_issue_flush()
+ * directly.
+ */
+int briefs_order_flush(struct super_block *sb)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct briefs_journal *j = bsi ? bsi->journal : NULL;
+	int ret;
+
+	/*
+	 * No journal: nothing rotates sectors through rapid rewrite, and there
+	 * is no lock to serialize on.  A plain flush is fine.
+	 */
+	if (!j)
+		return blkdev_issue_flush(sb->s_bdev);
+
+	mutex_lock(&j->flush_order_lock);
+	ret = blkdev_issue_flush(sb->s_bdev);
+	mutex_unlock(&j->flush_order_lock);
+	return ret;
+}
+
+/*
  * briefs_journal_track_bh - pin a deferred metadata buffer_head in the owned set.
  *
  * Called from briefs_mark_buffer_dirty() at dirty time (the deferred path).
@@ -193,6 +223,18 @@ int briefs_journal_flush_owned(struct briefs_journal *j)
 		return 0;
 
 	/*
+	 * Serialize concurrent flushes across their whole drain -> PASS 1 ->
+	 * PASS 2 wait (see struct briefs_journal.flush_lock).  The mutex MUST be
+	 * taken before the drain: a buffer this fsync pinned may already sit in a
+	 * concurrent flush's in-flight batch, and waiting for that flush to
+	 * finish (submit + batch wait) is the only thing that makes its write
+	 * durable before OUR fsync returns.  Draining first and checking for an
+	 * empty set would silently skip exactly the stolen-buffer case that
+	 * loses the generic/455 mark cut.
+	 */
+	mutex_lock(&j->flush_lock);
+
+	/*
 	 * Drain the owned set into a local list under owned_lock.  Concurrent
 	 * briefs_journal_track_bh() callers now insert into the emptied table,
 	 * so the drained batch is exactly the pre-flush set -- the equivalent of
@@ -251,7 +293,7 @@ int briefs_journal_flush_owned(struct briefs_journal *j)
 	 * via the buffer_dirty() guard; an in-flight write (BH_Dirty cleared,
 	 * BH_Lock set) is also clean to the guard, but its durability is
 	 * guaranteed by the committed journal records (replay re-derives the
-	 * metadata) and, at unmount, by the blkdev_issue_flush() in
+	 * metadata) and, at unmount, by the briefs_order_flush() in
 	 * briefs_put_super.  The buffer_uptodate() guard + EIO quiesce is
 	 * preserved so the generic/475 umount-redirty-EIO hang stays fixed: each
 	 * buffer gets exactly one sync write and is then quiesced.
@@ -303,6 +345,16 @@ int briefs_journal_flush_owned(struct briefs_journal *j)
 
 			if (bh) {
 				if (buffer_uptodate(bh)) {
+					/*
+					 * Wait out a concurrent pdflush write that may
+					 * have grabbed the PASS 1-dirtied buffer and be
+					 * mid-flight: the buffer shows clean to the
+					 * dirty guard below, but our caller's sync
+					 * contract requires the write COMPLETED here,
+					 * not merely submitted.  On an idle buffer
+					 * this is a no-op.
+					 */
+					wait_on_buffer(bh);
 					briefs_meta_batch_add(&mb, bh);
 				} else {
 					ret = -EIO;	/* sb_bread read failure (expected on dm-error) */
@@ -320,6 +372,7 @@ int briefs_journal_flush_owned(struct briefs_journal *j)
 
 	if (ret)
 		briefs_handle_meta_write_error(j->vfs_sb, "owned flush");
+	mutex_unlock(&j->flush_lock);
 	return ret;
 }
 
@@ -331,6 +384,8 @@ int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb) 
 
 	memset(j, 0, sizeof(*j));
 	mutex_init(&j->write_lock);
+	mutex_init(&j->flush_lock);
+	mutex_init(&j->flush_order_lock);
 	spin_lock_init(&j->owned_lock);
 	hash_init(j->owned_blocks);
 	j->sb = sb;
@@ -540,8 +595,11 @@ static int briefs_journal_flush_cur_block_locked(struct briefs_journal *j)
 		return ret;
 
 	j->write_pos = briefs_journal_next_block(j, j->write_pos);
-	if (j->write_pos == j->checkpoint_block)
+	j->write_count++;
+	if (j->write_pos == j->checkpoint_block) {
 		j->write_pos = briefs_journal_next_block(j, j->write_pos);
+		j->write_count++;
+	}
 
 	memset(j->cur_block, 0, JOURNAL_BLOCK_SIZE);
 	j->cur_hdr->magic = cpu_to_le32(JOURNAL_MAGIC);
@@ -716,22 +774,36 @@ int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_ty
  */
 static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	struct briefs_sb_info *bsi;
+	u64 retire_pos, retire_count;
 
 	if (!j) return -EINVAL;
 
 	briefs_stat_inc(briefs_sb(j->vfs_sb), journal_checkpoints);
 
-	/* Flush any pending records first */
+	/*
+	 * Flush any pending records first.  checkpoint must be false here:
+	 * the periodic checkpoint in the sync tail (records_since_checkpoint
+	 * check) has no in_checkpoint reentrancy guard, and that counter only
+	 * resets when a checkpoint COMPLETES -- so a checkpoint=true here
+	 * re-enters __briefs_journal_checkpoint_locked from every level.  The
+	 * re-dirty window each sync's unlocked I/O opens lets concurrent
+	 * writers keep j->dirty set, so the nesting never unwinds and the
+	 * kernel stack overflows (generic/269 128-thread fsstress wedge).  An
+	 * in-progress checkpoint retires the same records itself; it must not
+	 * spawn another one.  Back-pressure checkpoints stay enabled: both
+	 * call sites (sync entry and tail) are guarded by in_checkpoint, so
+	 * nesting through them is bounded at one level.
+	 */
 	if (j->dirty) {
-		int ret = __briefs_journal_sync_locked(j, true);
+		int ret = __briefs_journal_sync_locked(j, false);
 		if (ret) return ret;
 	}
 
 	/*
 	 * Flush all dirty metadata buffers (inode blocks, trie blocks) to disk
 	 * BEFORE discarding the journal records that reference them.  The records
-	 * in [journal_log_start, write_pos) are about to be discarded by setting
-	 * log_start = log_end = write_pos below.  briefs_write_inode() only
+	 * in [journal_log_start, retire_pos) are about to be discarded by setting
+	 * log_start = log_end = retire_pos below.  briefs_write_inode() only
 	 * briefs_mark_buffer_dirty()s the inode block -- it does NOT sync it, but
 	 * the dirty block is now in the journal-owned set.
 	 *
@@ -753,6 +825,17 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	 *
 	 * We also release before briefs_alloc_sync() to avoid the AB-BA deadlock
 	 * with alloc->lock (LOCK ORDER FIX).
+	 */
+	/*
+	 * Retire boundary mechanics, part 1: the boundary is captured below,
+	 * AFTER the re-acquire of write_lock, from j->synced_pos -- the last
+	 * journal-block boundary every prior sync has forced durably to disk.
+	 * It is deliberately NOT the live j->write_pos read at SB time:
+	 * records appended by concurrent writers while write_lock is released
+	 * below (their journal blocks unforced, their pinned buffers possibly
+	 * attached after the drain -- pin-before-record holds on every edit
+	 * path, so a post-drain pin always belongs to a record appended after
+	 * it) would be retired without being durable.
 	 */
 	mutex_unlock(&j->write_lock);
 
@@ -800,6 +883,30 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	mutex_lock(&j->write_lock);
 
 	/*
+	 * Retire boundary mechanics, part 2: sync any records appended while
+	 * write_lock was released above so the durable boundary (j->synced_pos)
+	 * covers everything appended so far, then retire only to that boundary.
+	 * Without this, retiring to the live j->write_pos made replay's live
+	 * range empty while those records' journal blocks were unforced and
+	 * their pinned buffers unwritten -- a crash in the window (or a
+	 * dm-log-writes mark cut inside it, generic/455) replayed a stale
+	 * on-disk state the journal could no longer reconstruct.  Records
+	 * appended after the re-sync land beyond the boundary and stay live
+	 * and replayable until a later checkpoint proves them durable.
+	 * in_checkpoint is deliberately left clear so a ring-full here runs the
+	 * sync's own back-pressure checkpoint instead of clobbering the oldest
+	 * live records.  retire_count is the ring-step count at the same
+	 * instant, for the committed_count monotonic guard.
+	 */
+	if (j->dirty) {
+		int ret = __briefs_journal_sync_locked(j, false);
+
+		if (ret) return ret;
+	}
+	retire_pos = j->synced_pos;
+	retire_count = j->write_count;
+
+	/*
 	 * Refresh superblock free counts from the authoritative allocator state
 	 * before writing the checkpoint.
 	 */
@@ -814,7 +921,7 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	memset(&cp, 0, sizeof(cp));
 	cp.checkpoint_seq = cpu_to_le64(++j->checkpoint_seq);
 	cp.record_count = cpu_to_le32(le32_to_cpu(j->cur_hdr->record_count));
-	cp.log_sequence_end = cpu_to_le64(j->write_pos);
+	cp.log_sequence_end = cpu_to_le64(retire_pos);
 	cp.trie_root_node = j->sb->trie_root_block;
 	cp.free_data_count = j->sb->free_data_blocks;
 	cp.free_inode_count = j->sb->free_inodes;
@@ -865,11 +972,18 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	}
 
 	pr_debug("briefs: checkpoint written (seq=%llu, records=%u, log_end=%llu)\n",
-		j->checkpoint_seq, cp.record_count, j->write_pos);
+		j->checkpoint_seq, cp.record_count, retire_pos);
 
 	j->sb->checkpoint_seq = cpu_to_le64(j->checkpoint_seq);
-	j->sb->journal_log_start = cpu_to_le64(j->write_pos);
-	j->sb->journal_log_end = cpu_to_le64(j->write_pos);
+	j->sb->journal_log_start = cpu_to_le64(retire_pos);
+	j->sb->journal_log_end = cpu_to_le64(retire_pos);
+	/* Retire only to the durable boundary captured above (retire_pos), not
+	 * the live tail.  committed_count is the ring-step count at the same
+	 * capture instant: a racing sync that captured a narrower range before
+	 * the checkpoint and finishes its commit afterwards must not "advance"
+	 * log_end past the checkpoint's (older) boundary; its records stay
+	 * live and are committed by the next sync that captures past them. */
+	j->committed_count = retire_count;
 
 
 	j->dirty = false;
@@ -2203,6 +2317,12 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	 * briefs_journal_init(), so only the position cursors need resetting. */
 	j->write_pos = le64_to_cpu(j->sb->journal_log_end);
 	j->synced_pos = j->write_pos;
+	/* Fresh monotonic bookkeeping for the cleared journal: every future
+	 * sync's ring-step count starts from zero, so the own_count vs
+	 * committed_count comparison below is well-ordered from the first
+	 * post-replay sync on. */
+	j->write_count = 0;
+	j->committed_count = 0;
 
 	/*
 	 * Replay may have changed the allocator free counts.  Copy the current
@@ -2442,6 +2562,8 @@ void briefs_journal_cleanup(struct briefs_journal *j) {
 	j->cur_hdr = NULL;
 
 	mutex_destroy(&j->write_lock);
+	mutex_destroy(&j->flush_lock);
+	mutex_destroy(&j->flush_order_lock);
 	memset(j, 0, sizeof(*j));
 }
 
@@ -2459,18 +2581,23 @@ void briefs_journal_cleanup(struct briefs_journal *j) {
  * Called under j->write_lock.  @checkpoint controls whether a periodic
  * checkpoint may be triggered after the sync.
  *
- * The function uses a commit-before-flush ordering: the journal commit point
- * (journal_log_end) is advanced BEFORE the metadata flush runs, and the
- * metadata flush (sync_blockdev + per-block journal sync) runs OUTSIDE
+ * Ordering: the journal blocks in the sync range are durable-written BEFORE
+ * the commit point (journal_log_end) is persisted, and the commit advances
+ * only to this sync's own boundary (own_next) -- never to the racing
+ * j->write_pos, which concurrent record appends may have pushed past
+ * flush-on-full blocks that no sync has forced yet.  This guarantees the
+ * crash-consistency contract a committed record implies: everything
+ * journal_log_end makes discoverable to replay is already on disk
+ * (generic/455).  Both the block force and the metadata flush run OUTSIDE
  * j->write_lock so other threads can write journal records concurrently.
- * This is safe because journal replay is idempotent: if a crash occurs after
- * the commit point is written but before the metadata flush completes, the
- * next mount replays the journal records and re-derives the correct on-disk
- * state (briefs_trie_insert tolerates -EEXIST, replay_inode_full overwrites,
- * *_alloc set bitmap bits).
+ * This is safe because journal replay is idempotent: a crash after the commit
+ * point but before the metadata flush lets the next mount replay the records
+ * and re-derive the correct on-disk state (briefs_trie_insert tolerates
+ * -EEXIST, replay_inode_full overwrites, *_alloc set bitmap bits).
  */
 static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoint) {
-	u64 sync_start, sync_end, pos;
+	u64 sync_start, sync_end, pos, own_next;
+	u64 own_count;
 	int ret;
 	bool io_err = false;
 
@@ -2513,10 +2640,27 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 
 	/* Advance write position */
 	j->write_pos = briefs_journal_next_block(j, j->write_pos);
+	j->write_count++;
 
 	/* Don't clobber the checkpoint block */
-	if (j->write_pos == j->checkpoint_block)
+	if (j->write_pos == j->checkpoint_block) {
 		j->write_pos = briefs_journal_next_block(j, j->write_pos);
+		j->write_count++;
+	}
+
+	/* The first journal block this sync has NOT taken responsibility for.
+	 * Everything below own_next is either inside the range we are about to
+	 * force ([sync_start..sync_end]) or was forced by an earlier sync whose
+	 * heuristic already ran.  It MUST be captured here, under write_lock --
+	 * by the time the force finishes, racing record appends may have filled
+	 * whole further blocks via briefs_journal_flush_cur_block_locked()
+	 * (mark-dirty only) and pushed j->write_pos past them; those blocks
+	 * belong to whichever sync next captures them in its range, not to us.
+	 * own_count is the monotonic ring-step count at that same instant, used
+	 * below to keep the commit point from ever moving backwards on the
+	 * wrap-around ring (raw block numbers cannot be compared directly). */
+	own_next = j->write_pos;
+	own_count = j->write_count;
 
 	/* Reset for next block */
 	memset(j->cur_block, 0, JOURNAL_BLOCK_SIZE);
@@ -2527,25 +2671,81 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 	j->dirty = false;
 
 	/*
-	 * Commit point FIRST: advance journal_log_end so crash recovery can
-	 * find these records.  Replay is idempotent, so it is safe to commit
-	 * before the metadata flush: if we crash before the flush completes,
-	 * the next mount replays the journal and re-derives the correct on-disk
-	 * state.  This lets us release write_lock before the slow metadata
-	 * flush, so other threads can write journal records concurrently.
+	 * Durable-write the journal blocks BEFORE the commit point.  The commit
+	 * (superblock journal_log_end) is what makes a record discoverable to
+	 * replay, so it must never reach disk ahead of the blocks it commits:
+	 * a crash -- or, under concurrent fsyncs, a dm-log-writes mark cut by
+	 * another process -- between the superblock write and the block writes
+	 * would leave replay walking a live range whose tail blocks were never
+	 * written (generic/455).  The force range was captured above and is
+	 * stable: no other thread modifies already-written journal blocks.
+	 * Release j->write_lock for the wait so other threads can append
+	 * records while we wait for I/O.
 	 */
-	j->sb->journal_log_end = cpu_to_le64(j->write_pos);
-	ret = briefs_journal_sync_superblock(j);
-	if (ret) {
-		pr_err("briefs: failed to persist journal tail after sync: %d\n", ret);
-		return ret;
+	mutex_unlock(&j->write_lock);
+
+	{
+		struct briefs_meta_batch mb;
+
+		briefs_meta_batch_init(&mb, j->vfs_sb, "journal sync block");
+		for (pos = sync_start; ; pos = briefs_journal_next_block(j, pos)) {
+			struct buffer_head *bh = sb_bread(j->vfs_sb, pos);
+
+			if (!bh) {
+				/* A failed read leaves the block's dirty
+				 * buffer unwritten; treat it like a write
+				 * failure below so neither synced_pos nor
+				 * the commit point advances past it. */
+				pr_err("briefs: journal block read failed at block=%llu during sync\n",
+				       pos);
+				io_err = true;
+				break;
+			}
+			briefs_meta_batch_add(&mb, bh);
+			if (pos == sync_end)
+				break;
+		}
+		if (briefs_meta_batch_wait(&mb))
+			io_err = true;
+	}
+
+	/* Re-acquire write_lock for the commit point and state updates. */
+	mutex_lock(&j->write_lock);
+
+	if (io_err) {
+		/* Leave synced_pos and committed_count where they are: the
+		 * blocks in our range were not proven durable, so a later
+		 * sync must re-force them before committing past them. */
+		return -EIO;
+	}
+
+	/*
+	 * Commit point: advance journal_log_end so crash recovery can find
+	 * these records.  Only our own boundary (own_next), never the racing
+	 * j->write_pos: blocks flushed past our sync_end by a concurrent
+	 * briefs_journal_flush_cur_block_locked() have not been forced by any
+	 * sync yet, so committing to the current write_pos would make their
+	 * records discoverable while their blocks are still only in the
+	 * buffer cache.  The own_count vs committed_count comparison keeps the
+	 * commit from moving backwards when a wider concurrent sync has
+	 * already committed past us (ring block numbers are not orderable).
+	 * Replay is idempotent, so the metadata flush below may safely run
+	 * after the commit: a crash in between replays the now-durable
+	 * records and re-derives the on-disk state.
+	 */
+	if (own_count > j->committed_count) {
+		j->sb->journal_log_end = cpu_to_le64(own_next);
+		ret = briefs_journal_sync_superblock(j);
+		if (ret) {
+			pr_err("briefs: failed to persist journal tail after sync: %d\n", ret);
+			return ret;
+		}
+		j->committed_count = own_count;
 	}
 
 	/*
 	 * Release j->write_lock before the slow metadata flush.  Other threads
-	 * can now write journal records while we wait for I/O.  The sync range
-	 * (sync_start..sync_end) was captured above and is stable: no other
-	 * thread modifies already-written journal blocks.
+	 * can now write journal records while we wait for I/O.
 	 */
 	mutex_unlock(&j->write_lock);
 
@@ -2566,46 +2766,22 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 		}
 	}
 
-	/*
-	 * Force every journal block in the sync range to disk.  Journal record
-	 * blocks are written by briefs_journal_write_block() (not tracked in the
-	 * owned set, which holds metadata only), so this loop is their durable
-	 * flush; the batched adds are no-ops on already-clean blocks and an
-	 * explicit barrier on any still-dirty one.  Batched (briefs_meta_batch)
-	 * so the range's serial per-block round trips collapse into ~1: journal
-	 * blocks are typically adjacent and the plug merges them.
-	 */
-	{
-		struct briefs_meta_batch mb;
-
-		briefs_meta_batch_init(&mb, j->vfs_sb, "journal sync block");
-		for (pos = sync_start; ; pos = briefs_journal_next_block(j, pos)) {
-			struct buffer_head *bh = sb_bread(j->vfs_sb, pos);
-
-			if (bh)
-				briefs_meta_batch_add(&mb, bh);
-			if (pos == sync_end)
-				break;
-		}
-		if (briefs_meta_batch_wait(&mb))
-			io_err = true;
-	}
-
 	/* Re-acquire write_lock for state updates and checkpoint. */
 	mutex_lock(&j->write_lock);
 
-	if (io_err) {
-		j->synced_pos = j->write_pos;
-		return -EIO;
-	}
-
 	/*
-	 * Advance synced_pos to at least our sync_end.  Another thread may
-	 * have synced past us while we were flushing; don't move it backwards.
+	 * Advance synced_pos to the first block this sync did NOT force.
+	 * Only own_next, never the racing j->write_pos: blocks flushed by a
+	 * concurrent briefs_journal_flush_cur_block_locked() past our sync_end
+	 * are still unclaimed -- no sync has captured them in a force range
+	 * yet -- so skipping to write_pos would let the next sync start
+	 * forcing past them and they would never reach disk (generic/455).
+	 * The condition keeps the "don't move backwards" property: only a
+	 * sync whose range started where synced_pos still stands may claim.
 	 */
 	if (j->synced_pos == sync_start ||
 	    briefs_journal_next_block(j, j->synced_pos) == sync_start)
-		j->synced_pos = j->write_pos;
+		j->synced_pos = own_next;
 
 	pr_debug("briefs: journal synced, write_pos=%llu\n", j->write_pos);
 
