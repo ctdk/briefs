@@ -44,7 +44,7 @@ Vagrant.configure(2) do |config|
   config.vm.synced_folder "../../go", "/go", :disabled => false, type: "nfs", nfs_version: 4, nfs_udp: false
   config.vm.synced_folder "../xfstests-dev", "/xfstests", :disabled => false, type: "nfs", nfs_version: 4, nfs_udp: false
   # a place to store custom kernel packages to use later if the VM is destroyed
-  config.vm.synced_folder "../vm-kernels", "/xfstests", :disabled => false, type: "nfs", nfs_version: 4, nfs_udp: false
+  config.vm.synced_folder "../vm-kernels", "/vm-kernels", :disabled => false, type: "nfs", nfs_version: 4, nfs_udp: false
 
   # Provider-specific configuration so you can fine-tune various
   # backing providers for Vagrant. These expose provider-specific options.
