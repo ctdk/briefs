@@ -132,6 +132,9 @@ get_timeout() {
     local testname="$1"
     case "$testname" in
         generic/089) echo 3600 ;;   # bulk fsx + many small files (~65 min)
+        generic/068) echo 1200 ;;   # xfs_freeze+fsstress+fstest-m; silent-wedge
+                                    # family (127/521) can stall ~13 min and
+                                    # self-resolve (521, 10-02) - leave room
         generic/127) echo 1200 ;;   # 6x concurrent fsx (mmap variants)
         generic/521) echo 1200 ;;   # 1M-op DIO fsx soak
         generic/522) echo 1200 ;;   # 1M-op buffered fsx soak
@@ -346,20 +349,18 @@ write_archive() {
 # un-skipped. 074 = mmap writeback extent leak + AB-BA deadlock (fb649e8 +
 # truncate_setsize fix); 464 = trie_iter_grow double-free (4ef6ccb);
 # 476 = all-writes fsstress.
-# generic/068: RE-SKIPPED 2026-09-18.  Was skipped for an xfs_freeze hang
-# (FIFREEZE/FITHAW c274292), un-skipped 2026-08-18 on 4/4 PASS - but the
-# hang was still there at a flake rate of roughly 1 wedge per 3-5 looped
-# runs: solo-068 loops wedged the VM hard (network dead, console blank
-# and unresponsive, no panic text; reboot-only) during 2026-09-17 full
-# suite + repro loops and a 2026-09-18 module bisect.  Bisect verdict:
-# PRE-EXISTING - the wedge reproduces at 875ec08 (write path identical
-# to the 456/3 baseline), so it is not a P1 (05ad8d8) / P2 (1df9a9d)
-# regression.  All wedge-run check logs end at "generic/068 44-46s ..."
-# (~2/3 through the run, in the xfs_freeze cycles interleaved with
-# fsstress + fstest -m mmap loops, ITERATIONS=10).  Silent family, zero
-# lockdep splats, same class as 127/521.  Evidence and driver:
-# ~/src/briefs-notes/068-freeze-wedge/.  Re-verify with LOOPED runs
-# (>=8), not 3-4 solo passes, before un-skipping again.
+# generic/068: skipped 2026-09-18 (xfs_freeze hang, FIFREEZE/FITHAW
+# c274292), then UN-SKIPPED 2026-10-03.  The silent wedge (network dead,
+# console blank, no panic text, reboot-only; zero lockdep splats, same
+# family as 127/521) reproduced at a flake rate of roughly 1 wedge per
+# 3-5 looped runs through 2026-09-18, including at 875ec08 (write path
+# identical to the 456/3 baseline, so PRE-EXISTING, not a P1/P2
+# regression; evidence in ~/src/briefs-notes/068-freeze-wedge/).  After
+# the generic/455 flush-ordering fix (2d9bd51, all device flushes now
+# serialize through briefs_order_flush) the flake did not reappear in a
+# looped verification: 8/8 solo PASS, zero wedges, zero splats (44s per
+# run, past the historical 44-46s freeze window; solo-loop.sh results
+# 10-03).  Back on the skip list if it wedges a round again.
 # generic/051/461/753: previously skipped for hangs (notes from 2026-08-04,
 # pre-Phase-1). Re-verified 2026-08-18 on current code (3x iterations each,
 # SKIP_TESTS="" TIMEOUT_SECS=1800): 051 3/3, 461 3/3, 753 3/3 PASS, zero
@@ -400,18 +401,26 @@ write_archive() {
 # add a libblkid superblocks probe (magic 0x504C434E "PLCN" at dev off 0; uuid
 # at sb off 152; label[64] at sb off 312) to util-linux and install it in the VM
 # - deferred as out-of-tree-upstream-unlikely work in a different project.
-# generic/127: skipped 2026-09-19.  The fsx/mmap silent-msync wedge class has
-# been documented as pre-existing since 2026-08 (unpinned, VM-reboot-only,
-# zero lockdep splats); it wedged the 2026-09-17 full suite at 068 and the
-# 2026-09-19 full suite at 127 (check log frozen at "generic/127 237s ...").
-# Like 068, it passes most single exposures, so a suite-scale un-skip needs
-# looped solo verification (>= 8 runs), not a handful of passes.
+# generic/127: skipped 2026-09-19, UN-SKIPPED 2026-10-03.  The fsx/mmap
+# silent-msync wedge class (msync -> briefs_order_flush ->
+# blkdev_issue_flush -> bio_await, unpinned, VM-reboot-only, zero lockdep
+# splats) was documented as pre-existing since 2026-08; it wedged the
+# 2026-09-17 full suite at 068 and the 2026-09-19 full suite at 127 (check
+# log frozen at "generic/127 237s ...").  Like 068, it passes most single
+# exposures, so the un-skip bar was looped solo verification (>= 8 runs):
+# after the generic/455 flush-ordering fix (2d9bd51) 8/8 solo PASS, zero
+# wedges, zero splats (230s per run, past the historical 237s freeze
+# point; solo-loop.sh results 10-03).  A close relative (521, 1M-op fsx
+# soak) did stall ~13 min in the same flush path during the 10-02 suite
+# round but SELF-RESOLVED and passed - keep 1200s timeouts here (below)
+# so a long stall can still complete.  Back on the skip list if it wedges
+# a round again.
 # Tests to skip due to known hangs or unsupported features.  Overridable via the
 # environment (e.g. run-fuse-subset.sh exports SKIP_TESTS="" to run the FUSE
 # subset, which includes generic/475, in full).  Use the "+set" test so an
 # explicitly empty SKIP_TESTS is honored (a plain := would re-apply this default
 # to an empty value).
-[ -n "${SKIP_TESTS+set}" ] || SKIP_TESTS="generic/475 generic/492 generic/068 generic/127"
+[ -n "${SKIP_TESTS+set}" ] || SKIP_TESTS="generic/475 generic/492"
 
 should_skip() {
     local test="$1"
