@@ -1976,13 +1976,23 @@ int briefs_btree_drain(struct super_block *sb, u64 root_block, u64 max_nodes)
  * acquires this same lock in softirq context at eviction. A process-context
  * holder with softirqs enabled could be preempted by that callback on the
  * same CPU and spin forever waiting for the lock it already holds.
+ *
+ * The store must also allocate with GFP_NOWAIT, never GFP_KERNEL: it runs
+ * under binfo->btree_dirty_lock, and reclaim context takes that same mutex
+ * via super_cache_scan -> prune_icache_sb -> briefs_evict_inode ->
+ * briefs_btree_drain_dirty (kswapd holding fs_reclaim, first seen as a
+ * lockdep circular from generic/051). A reclaim-capable allocation here
+ * closes that cycle, and the allocation also runs inside xa_store_irq's
+ * irq-disabled region, where GFP_KERNEL may not sleep. Failure is safe:
+ * xa_store_irq does not record the entry and the degraded path below
+ * falls back to the full-tree walk.
  */
 void briefs_btree_track_dirty(struct briefs_inode_info *binfo,
 			      struct buffer_head *bh)
 {
 	mutex_lock(&binfo->btree_dirty_lock);
 	if (xa_err(xa_store_irq(&binfo->btree_dirty_nodes, bh->b_blocknr,
-				 XA_ZERO_ENTRY, GFP_KERNEL))) {
+				 XA_ZERO_ENTRY, GFP_NOWAIT))) {
 		/*
 		 * Allocation failure: the entry was NOT recorded, so the set
 		 * may under-report. Mark degraded; the next drain falls back
