@@ -72,6 +72,22 @@ die() { echo "FATAL: $*" >> "$LOG"; echo "FATAL: $*" >&2; ABORTED=1; exit 1; }
 
 drop_caches() {
     sync
+    # drop_caches cannot evict DIRTY pages, and sync alone does not
+    # reliably drain them.  Right after a write-heavy phase (W7 untar)
+    # a lazy-writeback filesystem holds GBs of dirty data whose reads
+    # then come from memory, not the device: in the 2026-09-25 round the
+    # ext4 traverse ran 0.088s with ZERO device reads this way, while
+    # BrieFS (whose journal pushes metadata out during untar) ran cold
+    # at 2.58s -- an apparent 30x gap that was really ~2x.  Drain
+    # writeback fully first so every filesystem gets the same
+    # genuinely-cold start.
+    local i=0 dirty
+    while [ "$i" -lt 300 ]; do
+        dirty=$(awk '/^(Dirty|Writeback):/ {s+=$2} END {print s+0}' /proc/meminfo)
+        [ "$dirty" -le 1024 ] && break
+        sleep 1
+        i=$((i+1))
+    done
     echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 }
 
