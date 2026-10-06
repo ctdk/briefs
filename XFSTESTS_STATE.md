@@ -5,7 +5,98 @@ measured by fresh full-suite and targeted runs on the VM.
 
 ## Overview
 
-**Current state (2026-10-01, branch `io_uring-perf` at `e1a4f15`,
+**Current state (2026-10-05, branch `io_uring-perf` at `bd2c269`
+(+ round-archive commits), unpushed):** the 6.12 validation gate for
+the generic/455 journal-durability fix (`2d9bd51`) and the generic/051
+lockdep fix (`bd2c269`) is complete — both fixes are now validated on
+both bookend kernels: 7.3.0-rc4-lockdep+ (449/2, below) and stock
+6.12.111 (448/1, the gate round).  The accepted FAIL set on both
+kernels is down to `311` alone (plus the standing 475/492 skips).  The
+068/127 un-skips held at full-suite scale on both; 740 passes with the
+extended mkfs.briefs refuse-overwrite probe live (briefs-utils
+`119136f`); 751 passes with the guarded debugfs mount.  Note: the std
+VM wedged irrecoverably during the 6.12 reboot on 2026-10-05 (no DHCP
+lease, empty serial console) and was destroyed and recreated; the gate
+round ran on the new machine.
+
+**Latest full-suite run (the 6.12 gate):** 2026-10-05, every generic
+test on the recreated VM, kernel `6.12.111+deb13-amd64` (stock distro,
+no lockdep), module build-id `bd2c269`, cgroup writeback ON (6.12.111
+is past the 6.12.96 threshold), fsck validation off, NFS-backed
+LOG_DIR, serial console wired to the host libvirt log for wedge
+capture.  All 793 tests ran fresh (RESUMED 0).  A pre-suite 13-member
+spot round passed 13/13 on the same kernel
+(`tests/xfstests/runs/run-20261005-201813-kernel.txt`).
+Archive: `tests/xfstests/runs/run-20261005-203737-kernel.txt`.
+
+| Bucket           | Count | Notes                                                    |
+|------------------|------:|----------------------------------------------------------|
+| Selected         |   793 | all generic tests                                        |
+| Pass             |   448 | best 6.12 tally ever (prior 6.12 rounds: 443/2, 455/4)   |
+| Fail             |     1 | 311 only (accepted dm-flakey flake)                       |
+| Not run          |   342 | 777 786 787 version-gated (7.3-only probes, see below)    |
+| Skipped          |     2 | 475 492 (skip list honored)                              |
+| Hang             |     0 |                                                           |
+| Mount fail       |     0 | runner tears down DM targets before each test            |
+
+vs the same-day 7.3-rc4 post-unskip round (449/2/340/2): five
+transitions, 100% accounted (per-test status join of both archives).
+**051** FAIL->PASS (the 7.3 FAIL was the lockdep circular itself,
+fixed by `bd2c269`; behavioral PASS on 6.12, with the lockdep
+verification banked on 7.3-lockdep); **241** NOTRUN->PASS (`dbench`
+was missing on the old VM — the 7.3 round NR'd it "dbench not found" —
+and was reinstalled on the recreated VM); **777, 786, 787**
+PASS->NOTRUN (version-gated probes — connectable file handles and
+fcntl setdeleg exist on 7.3 but not on stock 6.12, matching every
+earlier 6.12 round).  Zero unaccounted transitions, zero regressions.
+dmesg clean apart from expected dm-error injection noise (the 311
+class).
+
+**Prior state (2026-10-05, branch `io_uring-perf` at `70d52d0`,
+unpushed):** the post-unskip 7.3 round — **449 / 2 / 340 not-run /
+2 skipped, zero hangs, RESUMED 0** on `7.3.0-rc4-lockdep+`, the best
+tally to date on that kernel.  `generic/068` and `generic/127` (the
+fsx/mmap wedge family, skip-listed since Phase 1) were un-skipped
+after looped solo verification on the 455-fixed build — 8/8 PASS each,
+zero wedges, zero splats (`70d52d0`; the flush serialization plausibly
+removed the wedge condition, though it was never root-caused) — and
+both PASS at full-suite scale, on 7.3 and again on 6.12.
+`generic/740` PASSES (first round with the extended mkfs.briefs
+refuse-overwrite probe: block-0 check plus canonical-offset magics for
+btrfs/jfs/udf/reiserfs, briefs-utils `119136f`), dropping out of the
+accepted set.  The two FAILs: `311` (accepted flake) and `051` — a
+NEW lockdep circular, exposure-timing dependent and latent since the
+per-inode dirty-node set: kswapd's `fs_reclaim` -> `super_cache_scan`
+-> `evict` -> `drain_dirty` (takes `btree_dirty_lock`) versus the
+write path's `track_dirty` holding that lock across a `GFP_KERNEL`
+`xa_store_irq` (acquiring `fs_reclaim` inside the irqs-off region).
+**FIXED by `bd2c269`**: `GFP_NOWAIT` at the single allocation site;
+failure falls back to the existing `btree_dirty_degraded` full-tree
+walk.  Verified 8/8 looped solo PASS, no splat, on 7.3-rc4-lockdep;
+the 6.12 gate round above confirms the behavioral PASS.  Archive:
+`tests/xfstests/runs/run-20261005-043341-kernel.txt`.
+
+**Prior state (2026-10-02, branch `io_uring-perf` at `2d9bd51`,
+unpushed):** the generic/455 crash-replay campaign is closed.  Root
+cause was four interlocking journal durability/ordering gaps (the
+commit point persisted before the journal blocks were forced;
+checkpoint retiring to the live tail; a flush_owned steal race; and
+unserialized device flushes inverting through dm-log-writes/dm-thin/
+virtio — the jbd2-discipline gap), plus, discovered mid-campaign, an
+unbounded `checkpoint -> sync -> checkpoint` mutual recursion that
+wedged generic/269 to stack exhaustion.  The fix (`2d9bd51`) forces
+blocks before committing to per-caller boundaries (monotonic ring-step
+counters), retires checkpoint only to `synced_pos`, serializes
+flush_owned under `flush_lock`, routes every BrieFS device flush
+through the `briefs_order_flush` mutex, and bounds the recursion
+(`checkpoint=false` at the checkpoint-internal sync).  Validated by a
+20/20 clean generic/269 loop and the full suite at 445/3 (311, 547
+flakes + 740 environmental) / 0 hang / 0 RESUMED, archive
+`tests/xfstests/runs/run-20261002-165254-kernel.txt`; 455 itself
+passes standalone post-reboot.  The 521 self-resolving stall and the
+068/127 loop successes on this build motivated the 10-03 un-skip.
+
+**Prior state (2026-10-01, branch `io_uring-perf` at `e1a4f15`,
 unpushed):** the io_uring W9b campaign's stage-5 functional gate is
 complete.  The full suite ran once, end-to-end, on
 `7.3.0-rc4-lockdep+` with the campaign content (Stage 1 BH_Verified
@@ -15,7 +106,8 @@ Stage 3 IOCB_NOWAIT/FMODE_NOWAIT): **443 / 6 / 340 not-run /
 full-suite result (no wedge, no resume).  The launch-3 476 wedge did
 not reproduce: 6/6 solos pass and 476 passed in-suite on the relaunch.
 
-**Latest full-suite run:** 2026-10-01/02, every generic test on the VM,
+**Full-suite run:** 2026-10-01/02 (superseded by the three rounds
+above), every generic test on the VM,
 kernel `7.3.0-rc4-lockdep+`, module `e1a4f15` content, cgroup writeback
 ON, fsck validation off, NFS-backed LOG_DIR.  All 793 tests ran fresh
 (RESUMED 0).  Archive:
