@@ -46,6 +46,27 @@ struct briefs_alloc {
 	 * contiguous; see alloc.c. */
 	u64 rover_w2_high;
 	/*
+	 * Lower bound on the first L2 word that may contain a free bit
+	 * (in-memory only, like rover_w0).  briefs_alloc_blocks' first-fit
+	 * scan starts here instead of word 0, skipping the fully-allocated
+	 * low prefix of the data region; it is advanced only across a
+	 * contiguous observed-zero prefix (under alloc->lock, so it can
+	 * never skip a nonzero word) and lowered by briefs_free_block(s).
+	 * First-fit allocation order is unchanged.
+	 */
+	u64 first_free_w2;
+	/*
+	 * Dirty-word tracking for briefs_alloc_sync: a bitmap over l2_words
+	 * (bit i set = l2[i] differs from its last-synced on-disk block).
+	 * The L2 sync pass reads and rewrites only blocks containing dirty
+	 * words instead of re-reading the whole bitmap every checkpoint;
+	 * on a write error the whole map is re-marked dirty.  NULL until
+	 * briefs_alloc_init_at() allocates it (sync falls back to a full
+	 * scan).  Protected by lock.
+	 */
+	u64 *l2_dirty;
+	u64 l2_dirty_words;		/* words in the l2_dirty bitmap */
+	/*
 	 * meta_shield: count of data blocks reserved for future B+tree metadata
 	 * (unwritten-extent fragmentation reserves, ext4-style).  In-memory only
 	 * (not persisted, like rover_w0).  Data allocations treat the effective

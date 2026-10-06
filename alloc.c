@@ -8,6 +8,7 @@
 #include <linux/stddef.h>
 #include <linux/types.h>
 #include <linux/buffer_head.h>
+#include <linux/bitmap.h>
 #include <linux/blkdev.h>
 #include <linux/math64.h>
 
@@ -28,6 +29,20 @@
  * Each level is a flat array of u64 words. A set bit = "has free blocks".
  * A cleared bit = "fully allocated".
  */
+
+/*
+ * Mark one L2 word as differing from its last-synced on-disk copy, so
+ * briefs_alloc_sync's L2 pass can skip re-reading every bitmap block on
+ * every checkpoint (on a mostly-free device that is hundreds of block
+ * reads per checkpoint).  Caller holds alloc->lock.  NULL-safe: without
+ * the map (init failure) sync falls back to a full scan.
+ */
+static inline void briefs_mark_l2_dirty(struct briefs_alloc *alloc, u64 w2)
+{
+	if (alloc->l2_dirty)
+		alloc->l2_dirty[w2 >> 6] |= 1ULL << (w2 & 63);
+}
+
 int briefs_alloc_init(struct briefs_alloc *alloc, struct super_block *sb,
                       struct briefs_superblock *sb_disk)
 {
@@ -173,6 +188,22 @@ int briefs_alloc_init_at(struct briefs_alloc *alloc, struct super_block *sb,
 		 pool_block, alloc->block_count, alloc->free_count);
 
 	/*
+	 * Dirty-word map for the L2 sync pass (briefs_alloc_sync).  Allocated
+	 * last so no earlier failure path leaks it, but before the block-0
+	 * reserve below, which marks word 0 dirty.  Small enough for kmalloc
+	 * on typical sizes (one bit per L2 word).
+	 */
+	alloc->l2_dirty_words = (alloc->l2_words + 63) / 64;
+	alloc->l2_dirty = kvcalloc(alloc->l2_dirty_words, sizeof(u64), GFP_KERNEL);
+	if (!alloc->l2_dirty) {
+		pr_err("briefs: failed to allocate allocator dirty-word map\n");
+		vfree(alloc->l0);
+		vfree(alloc->l1);
+		vfree(alloc->l2);
+		return -ENOMEM;
+	}
+
+	/*
 	 * Reserve relative block 0.  The allocator API uses 0 as the ENOSPC
 	 * sentinel: callers compare the returned block to 0 and treat it as
 	 * "no space".  Make sure the bitmap never hands out block 0, so a
@@ -232,6 +263,7 @@ static u64 __briefs_alloc_block(struct briefs_alloc *alloc, bool for_meta)
 	if (alloc->l2[0] & 1ULL) {
 		alloc->l2[0] &= ~1ULL;
 		alloc->free_count--;
+		briefs_mark_l2_dirty(alloc, 0);
 		if (alloc->l2[0] == 0) {
 			alloc->l1[0] &= ~1ULL;
 			if (alloc->l1[0] == 0)
@@ -288,6 +320,7 @@ static u64 __briefs_alloc_block(struct briefs_alloc *alloc, bool for_meta)
 		/* Clear the bit */
 		alloc->l2[w2_idx] &= ~(1ULL << b2);
 		alloc->free_count--;
+		briefs_mark_l2_dirty(alloc, w2_idx);
 
 		/* Propagate upward if word went to zero */
 		if (alloc->l2[w2_idx] == 0) {
@@ -392,6 +425,7 @@ u64 briefs_alloc_block_high(struct briefs_alloc *alloc)
 
 		alloc->l2[w2] &= ~(1ULL << b2);
 		alloc->free_count--;
+		briefs_mark_l2_dirty(alloc, w2);
 		if (alloc->l2[w2] == 0)
 			briefs_propagate_l2_zero(alloc, w2);
 
@@ -469,6 +503,7 @@ u64 briefs_alloc_blocks(struct briefs_alloc *alloc, u64 n)
 	if (alloc->l2[0] & 1ULL) {
 		alloc->l2[0] &= ~1ULL;
 		alloc->free_count--;
+		briefs_mark_l2_dirty(alloc, 0);
 		if (alloc->l2[0] == 0) {
 			alloc->l1[0] &= ~1ULL;
 			if (alloc->l1[0] == 0)
@@ -476,7 +511,16 @@ u64 briefs_alloc_blocks(struct briefs_alloc *alloc, u64 n)
 		}
 	}
 
-	for (w2 = 0; w2 < alloc->l2_words; w2++) {
+	/*
+	 * First-fit scan with a lower-bound hint: words below first_free_w2
+	 * are known (observed under this lock) to be fully allocated, so start
+	 * at the hint and skip the prefix instead of rescanning it on every
+	 * call -- on a mostly-full device that prefix is most of the bitmap.
+	 * The hint only ever advances across a contiguous observed-zero run
+	 * (w2 == hint), so it can never skip a word with free bits, and frees
+	 * lower it again; allocation order is identical to a scan from 0.
+	 */
+	for (w2 = alloc->first_free_w2; w2 < alloc->l2_words; w2++) {
 		u64 word = alloc->l2[w2];
 		u64 base = w2 * 64;
 		u64 bits, b, s, cnt;
@@ -489,6 +533,8 @@ u64 briefs_alloc_blocks(struct briefs_alloc *alloc, u64 n)
 		}
 
 		if (word == 0) {
+			if (w2 == alloc->first_free_w2)
+				alloc->first_free_w2++;
 			run_len = 0;
 			continue;
 		}
@@ -536,6 +582,13 @@ found:
 		alloc->l2[blk / 64] &= ~(1ULL << (blk % 64));
 	}
 	alloc->free_count -= n;
+	{
+		u64 w2_first = run_start / 64;
+		u64 w2_last = (run_start + n - 1) / 64;
+
+		for (w2 = w2_first; w2 <= w2_last; w2++)
+			briefs_mark_l2_dirty(alloc, w2);
+	}
 
 	/* propagate L2 -> L1 -> L0 for every L2 word that became all-zero */
 	{
@@ -717,6 +770,7 @@ void briefs_reserve_block(struct briefs_alloc *alloc, u64 rel_block)
 	/* Clear the bit = mark allocated, update free count */
 	alloc->l2[w2] &= ~(1ULL << b2);
 	alloc->free_count--;
+	briefs_mark_l2_dirty(alloc, w2);
 
 	/* Propagate upward if word becomes all-zero */
 	if (alloc->l2[w2] == 0) {
@@ -809,6 +863,9 @@ void briefs_free_block(struct briefs_alloc *alloc, u64 rel_block)
 
 	alloc->l2[w2] |= (1ULL << b2);
 	alloc->free_count++;
+	briefs_mark_l2_dirty(alloc, w2);
+	if (w2 < alloc->first_free_w2)
+		alloc->first_free_w2 = w2;
 
 	/* Propagate upward if word was all-zero */
 	if (alloc->l2[w2] == (1ULL << b2)) {
@@ -886,6 +943,9 @@ void briefs_free_blocks(struct briefs_alloc *alloc, u64 rel_start, u64 n)
 		freed += hweight64(~before & mask);
 
 		alloc->l2[w2] |= mask;
+		briefs_mark_l2_dirty(alloc, w2);
+		if (w2 < alloc->first_free_w2)
+			alloc->first_free_w2 = w2;
 
 		/* propagate upward iff this word was fully allocated and is now
 		 * not (mirrors briefs_free_block's == (1<<b2) check generalized
@@ -1101,6 +1161,88 @@ static int briefs_alloc_sync_level(struct briefs_alloc *alloc, u64 *array,
 }
 
 /*
+ * Sync only the L2 blocks containing words the dirty-word map says changed
+ * since the last successful sync (briefs_mark_l2_dirty).  Equivalent to
+ * briefs_alloc_sync_level(level=2) -- the same words end up on disk -- minus
+ * the per-checkpoint re-read of every clean bitmap block, which on a
+ * mostly-free device is hundreds of block reads for a handful of changes.
+ * Dirty bits are cleared as their words are copied into the block buffer;
+ * if the batch write fails, briefs_alloc_sync re-marks the whole map so no
+ * change is lost to a later "clean" sync.
+ */
+static int briefs_alloc_sync_level2_dirty(struct briefs_alloc *alloc,
+					   u64 words_per_block,
+					   u64 l0_blocks, u64 l1_blocks,
+					   struct briefs_meta_batch *mb)
+{
+	u64 l2_blocks = (alloc->l2_words + words_per_block - 1) / words_per_block;
+	unsigned long *block_dirty;
+	u64 i, blk;
+	int ret = 0;
+
+	block_dirty = bitmap_zalloc(l2_blocks, GFP_KERNEL);
+	if (!block_dirty)
+		/* No scratch: fall back to the full scan (correct, slower). */
+		return briefs_alloc_sync_level(alloc, alloc->l2, alloc->l2_words,
+					       2, words_per_block, l0_blocks,
+					       l1_blocks, mb);
+
+	/* Fold the per-word dirty map into a per-block map. */
+	for (i = 0; i < alloc->l2_dirty_words; i++) {
+		u64 wm = alloc->l2_dirty[i];
+
+		while (wm) {
+			u64 w2 = i * 64 + __builtin_ctzll(wm);
+
+			wm &= wm - 1;
+			if (w2 < alloc->l2_words)
+				set_bit(w2 / words_per_block, block_dirty);
+		}
+	}
+
+	for_each_set_bit(blk, block_dirty, l2_blocks) {
+		u64 first_word = blk * words_per_block;
+		u64 n = min_t(u64, alloc->l2_words - first_word, words_per_block);
+		struct buffer_head *bh;
+		bool dirty = false;
+		u64 j, offset;
+
+		offset = alloc_level_block_offset(alloc, words_per_block,
+						  l0_blocks, l1_blocks, 2,
+						  blk);
+		bh = sb_bread(alloc->sb, offset);
+		if (!bh) {
+			pr_err("briefs: failed to read L2 block %llu during sync\n",
+			       offset);
+			ret = -EIO;
+			break;
+		}
+
+		for (j = 0; j < n; j++) {
+			u64 w2 = first_word + j;
+			u64 dw = alloc->l2_dirty[w2 >> 6];
+
+			if (!(dw & (1ULL << (w2 & 63))))
+				continue;
+			((__le64 *)bh->b_data)[j] =
+				cpu_to_le64(alloc->l2[w2]);
+			alloc->l2_dirty[w2 >> 6] &= ~(1ULL << (w2 & 63));
+			dirty = true;
+		}
+
+		if (dirty) {
+			mark_buffer_dirty(bh);
+			briefs_meta_batch_add(mb, bh);
+		} else {
+			brelse(bh);
+		}
+	}
+
+	bitmap_free(block_dirty);
+	return ret;
+}
+
+/*
  * Sync the in-memory bitmap back to disk.
  * Only writes blocks that have changed.
  */
@@ -1140,13 +1282,33 @@ int briefs_alloc_sync(struct briefs_alloc *alloc)
 		ret = briefs_alloc_sync_level(alloc, alloc->l1, alloc->l1_words, 1,
 		                               words_per_block, l0_blocks, l1_blocks,
 		                               &mb);
-	if (!ret)
-		ret = briefs_alloc_sync_level(alloc, alloc->l2, alloc->l2_words, 2,
-		                               words_per_block, l0_blocks, l1_blocks,
-		                               &mb);
+	if (!ret) {
+		/* Level 2 syncs only blocks with dirty words (see
+		 * briefs_alloc_sync_level2_dirty); without the map fall back
+		 * to the full compare-everything scan.
+		 */
+		if (alloc->l2_dirty)
+			ret = briefs_alloc_sync_level2_dirty(alloc,
+							     words_per_block,
+							     l0_blocks, l1_blocks,
+							     &mb);
+		else
+			ret = briefs_alloc_sync_level(alloc, alloc->l2,
+						       alloc->l2_words, 2,
+						       words_per_block, l0_blocks,
+						       l1_blocks, &mb);
+	}
 	if (briefs_meta_batch_wait(&mb))
 		ret = ret ?: -EIO;
 	if (ret) {
+		/* A failed sync may have cleared dirty bits for words staged
+		 * into buffers whose write then failed; re-mark everything so
+		 * the next sync resubmits them rather than trusting a
+		 * "clean" map.
+		 */
+		if (alloc->l2_dirty)
+			memset(alloc->l2_dirty, 0xff,
+			       alloc->l2_dirty_words * sizeof(u64));
 		mutex_unlock(&alloc->lock);
 		return ret;
 	}
@@ -1188,6 +1350,17 @@ void briefs_alloc_recompute_summaries(struct briefs_alloc *alloc)
 		mutex_unlock(&alloc->lock);
 		return;
 	}
+
+	/*
+	 * The caller treats the in-memory state as authoritative and the
+	 * on-disk bitmap as arbitrary (journal replay applied records through
+	 * the marking APIs, but the sentinel and trailing-mask edits below
+	 * touch L2 words directly).  Mark every word dirty so the sync that
+	 * follows rewrites the whole bitmap instead of trusting a clean map.
+	 */
+	if (alloc->l2_dirty)
+		memset(alloc->l2_dirty, 0xff,
+		       alloc->l2_dirty_words * sizeof(u64));
 
 	/* Clear summary levels; they will be rebuilt from L2. */
 	memset(alloc->l0, 0, alloc->l0_words * sizeof(u64));
@@ -1270,9 +1443,13 @@ void briefs_alloc_cleanup(struct briefs_alloc *alloc)
 		vfree(alloc->l1);
 	if (alloc->l2 && is_vmalloc_addr(alloc->l2))
 		vfree(alloc->l2);
+	if (alloc->l2_dirty)
+		kvfree(alloc->l2_dirty);
 	alloc->l0 = NULL;
 	alloc->l1 = NULL;
 	alloc->l2 = NULL;
+	alloc->l2_dirty = NULL;
+	alloc->l2_dirty_words = 0;
 	alloc->l0_words = 0;
 	alloc->l1_words = 0;
 	alloc->l2_words = 0;
