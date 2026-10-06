@@ -80,6 +80,79 @@ struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
 }
 
 /*
+ * Speculative readahead of the on-disk inode block for @ino.  A directory
+ * walk (fts/find) reads a directory's entries and then opens each listed
+ * subdirectory; by the time the Nth subdirectory is actually opened, the
+ * walk has usually spent a long time in earlier siblings' subtrees, so a
+ * readahead issued at dirent-emit time hides the inode-block read entirely.
+ * Read-only and race-free: it populates the same buffer a later
+ * briefs_read_inode_block() would hit.
+ */
+void briefs_readahead_inode(struct super_block *sb, u64 ino)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	u64 inodeTableBlock, inodeBlock;
+
+	if (!bsi || !bsi->sb || ino == 0)
+		return;
+
+	inodeTableBlock = briefs_inode_table_start(bsi->sb);
+	inodeBlock = (ino - 1) / (sb->s_blocksize / BRIEFS_INODE_SIZE);
+
+	if (briefs_block_in_range(sb, inodeTableBlock + inodeBlock))
+		sb_breadahead(sb, inodeTableBlock + inodeBlock);
+}
+
+/*
+ * Speculative trie-root readahead for a directory inode whose inode block
+ * is expected to already sit in the buffer cache.  briefs_readdir() emits
+ * a subdirectory's dirent and then (same getdents call, at return) calls
+ * this for it: by then the readahead issued at emit time
+ * (briefs_readahead_inode) has usually completed, so the block is warm and
+ * the dir_trie_root reference can be read out of it without any I/O.  The
+ * subdirectory's first readdir then finds its trie root page already in
+ * flight instead of paying a cold serialized read.
+ *
+ * Never issues I/O of its own beyond the readahead itself: sb_getblk()
+ * only maps the buffer, and a not-uptodate buffer (readahead still in
+ * flight, or the entry was not prefetched) is skipped -- the iget-time
+ * trie-root readahead in briefs_read_and_fill_inode() covers that case.
+ * Reading a torn/stale dir_trie_root under a concurrent creator is
+ * harmless: at worst a stale page is readahead'd.
+ */
+void briefs_readahead_dir_trie_root(struct super_block *sb, u64 ino)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct briefs_disk_inode *di;
+	struct buffer_head *bh;
+	u64 inodeTableBlock, inodeIndex, inodeBlock, inodeOffset, root;
+
+	if (!bsi || !bsi->sb || ino == 0)
+		return;
+
+	inodeTableBlock = briefs_inode_table_start(bsi->sb);
+	inodeIndex = ino - 1;
+	inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
+	inodeOffset = (inodeIndex % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+
+	if (!briefs_block_in_range(sb, inodeTableBlock + inodeBlock))
+		return;
+
+	bh = sb_getblk(sb, inodeTableBlock + inodeBlock);
+	if (!bh)
+		return;
+
+	if (buffer_uptodate(bh)) {
+		di = (struct briefs_disk_inode *)(bh->b_data + inodeOffset);
+		root = le64_to_cpu(di->dir_trie_root);
+		if (root != 0 &&
+		    briefs_block_in_range(sb, TRIE_REF_BLOCK(root)))
+			sb_breadahead(sb, TRIE_REF_BLOCK(root));
+	}
+	brelse(bh);
+}
+
+/*
  * Detect and clear a failed synchronous metadata-buffer write, returning true
  * if the just-completed sync_dirty_buffer() reported an I/O error.
  *
@@ -965,6 +1038,12 @@ static int briefs_read_and_fill_inode(struct inode *inode)
 	if (S_ISDIR(inode->i_mode)) {
 		inode->i_op = &briefs_dir_inode_ops;
 		inode->i_fop = &briefs_dir_operations;
+		/* A freshly loaded directory is usually getdents()ed right
+		 * after it is looked up; start reading its trie root page
+		 * now so the first readdir does not stall on it cold. */
+		if (!TRIE_REF_IS_NULL(cpu_di.dir_trie_root) &&
+		    briefs_block_in_range(sb, TRIE_REF_BLOCK(cpu_di.dir_trie_root)))
+			sb_breadahead(sb, TRIE_REF_BLOCK(cpu_di.dir_trie_root));
 	} else if (S_ISREG(inode->i_mode)) {
 		inode->i_op = &briefs_file_inode_ops;
 		inode->i_fop = &briefs_file_operations;

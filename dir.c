@@ -15,6 +15,12 @@
 #include "briefs_journal.h"
 #include "briefs_debug.h"
 
+/* Cap on the subdirectories a single getdents(2) call collects for the
+ * end-of-call trie-root readahead pass.  A full 32K-byte getdents buffer
+ * holds ~200+ dirents, so a large directory can overflow this; entries
+ * beyond the cap fall back to the iget-time trie-root readahead. */
+#define BRIEFS_READAHEAD_SUBDIRS	32
+
 /*
  * briefs_dir_sync - make a directory mutation durable when required.
  *
@@ -83,6 +89,9 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 	struct briefs_inode_info *binfo = briefs_i(dir);
 	struct trie_iter *iter;
 	u64 target;
+	u64 subdirs[BRIEFS_READAHEAD_SUBDIRS];
+	int n_subdirs = 0;
+	int i;
 
 	pr_debug("briefs: readdir offset=%llu (trie)\n", ctx->pos);
 
@@ -161,13 +170,44 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 			iter->pending_type = entry_type;
 			iter->pending_name_len = entry_name_len;
 			memcpy(iter->pending_name_buf, entry_name_buf, entry_name_len);
-			return 0;
+			goto out;
 		}
 
 		ctx->pos++;
 		iter->emit_idx++;
 		briefs_trie_ckpt_record(iter);
+
+		/* Directory walkers (fts/find, du, tar) open each listed
+		 * subdirectory after they finish with earlier siblings'
+		 * subtrees, so a readahead issued here hides that
+		 * subdirectory's inode-block read behind the work still
+		 * to come.  Files are skipped: they are not opened by a
+		 * plain traversal, and their inode blocks warm on the
+		 * lookup path if something stats them. */
+		if (S_ISDIR(file_type)) {
+			briefs_readahead_inode(dir->i_sb, entry_ino);
+			/* Also remember the subdirectory: by the time this
+			 * getdents call returns, the inode-block readahead
+			 * above has usually completed, so the end-of-call
+			 * pass can pull the dir_trie_root out of the (now
+			 * cached) inode block and readahead the
+			 * subdirectory's trie root page too. */
+			if (n_subdirs < BRIEFS_READAHEAD_SUBDIRS)
+				subdirs[n_subdirs++] = entry_ino;
+		}
 	}
+
+	/* Second-stage readahead: probe the emitted subdirectories' inode
+	 * blocks and, when the readahead from the emit loop has already
+	 * landed, readahead their trie root pages.  Only warm blocks are
+	 * used — sb_getblk + buffer_uptodate, never a blocking read — so
+	 * this costs nothing on a cold cache beyond a handful of hash
+	 * lookups.  Runs on both exit paths: the buffer-full case returns
+	 * mid-loop, and those early subdirectories are the next ones the
+	 * walker will descend into. */
+out:
+	for (i = 0; i < n_subdirs; i++)
+		briefs_readahead_dir_trie_root(dir->i_sb, subdirs[i]);
 
 	return 0;
 }

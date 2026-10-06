@@ -1707,6 +1707,8 @@ void briefs_drop_unwritten_reserve(struct inode *inode);
 /* Disk inode I/O helpers (briefs_inode.c) */
 struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
                                              struct briefs_disk_inode **di);
+void briefs_readahead_inode(struct super_block *sb, u64 ino);
+void briefs_readahead_dir_trie_root(struct super_block *sb, u64 ino);
 bool briefs_check_meta_write_error(struct buffer_head *bh);
 void briefs_handle_meta_write_error(struct super_block *sb, const char *ctx);
 
