@@ -1050,6 +1050,14 @@ void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di);
 struct buffer_head *briefs_trie_read_page(struct super_block *sb, u64 node_ref,
                                           struct briefs_trie_page **page,
                                           struct briefs_trie_node **node);
+/* Read a node through a caller-held buffer reference, reusing it when the
+ * page does not change (walk hops mostly stay on one clustered page; see
+ * trie_page.c).  *cbh pins the target page; caller brelse()s it once.
+ */
+int briefs_trie_read_page_cached(struct super_block *sb, u64 node_ref,
+				 struct buffer_head **cbh,
+				 struct briefs_trie_page **page,
+				 struct briefs_trie_node **node);
 struct buffer_head *briefs_trie_get_page(struct super_block *sb, u64 node_ref,
                                           struct briefs_trie_page **page,
                                           struct briefs_trie_node **node);

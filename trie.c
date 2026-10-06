@@ -176,38 +176,40 @@ static void trie_readahead_ref(struct super_block *sb, u64 ref)
  * matching child reference and *prev_ref with the previous sibling (0 if the
  * child is the first child).  Returns 0 on success, -ENOENT if not found.
  */
-static int trie_find_child_with_prev(struct super_block *sb, u64 parent_ref,
-                                      u8 byte_val, u64 *child_ref,
-                                      u64 *prev_ref)
+/*
+ * Walk the sibling chain of @pnode's first_child looking for @byte_val.
+ * The walk's buffer reference is carried across hops in a local @cbh:
+ * clustered siblings mostly share one page, so after the first hop the
+ * chain walk rarely returns to the buffer cache.  Returns 0 with
+ * *@child_ref and *@prev_ref set, -ENOENT, or -EIO (unreadable sibling
+ * with a broken chain is -ENOENT, preserving the historic behaviour; the
+ * per-call cap turns a corrupt/cyclic chain into -EIO instead of an
+ * unkillable 100%-CPU loop -- generic/475 live path under dm-error).
+ */
+static int trie_find_child_in_chain(struct super_block *sb,
+				     struct briefs_trie_node *pnode,
+				     u8 byte_val, u64 *child_ref,
+				     u64 *prev_ref)
 {
-	struct buffer_head *pbh, *cbh;
-	struct briefs_trie_page *ppage, *cpage;
-	struct briefs_trie_node *pnode, *cnode;
-	/* Per-call cap mirroring seed_pool/trie_iter_next: a healthy sibling
-	 * chain (children of one node, at most 256 by byte_val) is far shorter
-	 * than the whole-trie slot count, but a stale on-disk trie with a
-	 * back-edge in next_sibling would otherwise loop here forever reading
-	 * cached pages with no cond_resched, wedging the box unkillably at
-	 * 100% CPU (generic/475 live-path under dm-error).  Abort with -EIO.
-	 */
+	struct buffer_head *cbh = NULL;
+	struct briefs_trie_page *cpage;
+	struct briefs_trie_node *cnode;
 	u64 cap = BRIEFS_TRIE_SIBLING_MAX;
 	u64 visited = 0;
 	u64 prev = 0;
 	u64 child;
-
-	if (trie_read_node(sb, parent_ref, &pbh, &ppage, &pnode) != 0)
-		return -EIO;
+	int ret = -ENOENT;
 
 	child = trie_node_first_child(pnode);
 	while (!TRIE_REF_IS_NULL(child)) {
 		if (++visited > cap) {
 			pr_warn("briefs: trie sibling walk exceeded %llu nodes (corrupt/cyclic trie), aborting\n",
 				cap);
-			brelse(pbh);
-			return -EIO;
+			ret = -EIO;
+			break;
 		}
-		cbh = briefs_trie_read_page(sb, child, &cpage, &cnode);
-		if (IS_ERR(cbh))
+		if (briefs_trie_read_page_cached(sb, child, &cbh, &cpage,
+						  &cnode) != 0)
 			break;
 		if (cnode->byte_val == byte_val) {
 			*child_ref = child;
@@ -215,9 +217,8 @@ static int trie_find_child_with_prev(struct super_block *sb, u64 parent_ref,
 			/* The descent will read this child's first_child page
 			 * next; get it in flight while we still hold the CPU. */
 			trie_readahead_ref(sb, trie_node_first_child(cnode));
-			brelse(cbh);
-			brelse(pbh);
-			return 0;
+			ret = 0;
+			break;
 		}
 		prev = child;
 		child = trie_node_next_sibling(cnode);
@@ -225,11 +226,41 @@ static int trie_find_child_with_prev(struct super_block *sb, u64 parent_ref,
 		 * scan below is a serial one-read-per-sibling chain on a
 		 * cold cache. */
 		trie_readahead_ref(sb, child);
-		brelse(cbh);
 	}
 
-	brelse(pbh);
-	return -ENOENT;
+	brelse(cbh);
+	return ret;
+}
+
+static int trie_find_child_with_prev(struct super_block *sb, u64 parent_ref,
+				     u8 byte_val, u64 *child_ref,
+				     u64 *prev_ref,
+				     /* optional: parent page, held for the
+				      * caller on success so a descent does
+				      * not read the same page twice
+				      */
+				     struct buffer_head **pbh_out,
+				     struct briefs_trie_page **ppage_out,
+				     struct briefs_trie_node **pnode_out)
+{
+	struct buffer_head *pbh;
+	struct briefs_trie_page *ppage;
+	struct briefs_trie_node *pnode;
+	int ret;
+
+	if (trie_read_node(sb, parent_ref, &pbh, &ppage, &pnode) != 0)
+		return -EIO;
+
+	ret = trie_find_child_in_chain(sb, pnode, byte_val, child_ref,
+				       prev_ref);
+	if (ret == 0 && pbh_out) {
+		*pbh_out = pbh;
+		*ppage_out = ppage;
+		*pnode_out = pnode;
+	} else {
+		brelse(pbh);
+	}
+	return ret;
 }
 
 /*
@@ -240,7 +271,8 @@ static u64 briefs_trie_find_child(struct super_block *sb, u64 parent_ref,
                                    u8 byte_val)
 {
 	u64 child, prev;
-	if (trie_find_child_with_prev(sb, parent_ref, byte_val, &child, &prev) == 0)
+	if (trie_find_child_with_prev(sb, parent_ref, byte_val, &child,
+				      &prev, NULL, NULL, NULL) == 0)
 		return child;
 	return 0;
 }
@@ -793,10 +825,10 @@ int briefs_trie_lookup(struct super_block *sb, struct briefs_inode *di,
                         const char *name, int name_len,
                         u64 *found_ino, u8 *found_type)
 {
-	struct buffer_head *cbh;
-	struct briefs_trie_page *cpage;
-	struct briefs_trie_node *cnode;
-	u64 cur, child;
+	struct buffer_head *cbh = NULL, *kbh = NULL;
+	struct briefs_trie_page *cpage, *kpage;
+	struct briefs_trie_node *cnode, *knode;
+	u64 cur, child, prev;
 	int pos;
 
 	if (TRIE_REF_IS_NULL(di->dir_trie_root))
@@ -806,51 +838,76 @@ int briefs_trie_lookup(struct super_block *sb, struct briefs_inode *di,
 
 	for (pos = 0; pos < name_len; pos++) {
 		u8 bval = (u8)name[pos];
+		int ret;
 
-		child = briefs_trie_find_child(sb, cur, bval);
-		if (TRIE_REF_IS_NULL(child))
-			return -ENOENT;
-
-		if (trie_read_node(sb, child, &cbh, &cpage, &cnode) != 0)
+		/* cbh pins cur's page across iterations: it is the child page
+		 * from the previous level, so this hop is a cached no-op.
+		 */
+		if (briefs_trie_read_page_cached(sb, cur, &cbh, &cpage,
+						  &cnode) != 0)
 			return -EIO;
 
+		ret = trie_find_child_in_chain(sb, cnode, bval, &child,
+					       &prev);
+		if (ret == -ENOENT) {
+			brelse(cbh);
+			return -ENOENT;
+		}
+		if (ret != 0) {
+			brelse(cbh);
+			return -EIO;
+		}
+
+		if (briefs_trie_read_page_cached(sb, child, &kbh, &kpage,
+						  &knode) != 0) {
+			brelse(cbh);
+			return -EIO;
+		}
+
 		if (pos == name_len - 1) {
-			if (TRIE_IS_LEAF(cnode)) {
-				char *ename = trie_node_name(cbh->b_data, cnode);
-				int elen = trie_node_name_len(cnode) - 2;
+			if (TRIE_IS_LEAF(knode)) {
+				char *ename = trie_node_name(kbh->b_data, knode);
+				int elen = trie_node_name_len(knode) - 2;
 
 				if (elen == name_len && memcmp(ename, name, name_len) == 0) {
-					*found_ino = trie_node_inode(cnode);
-					*found_type = TRIE_NODE_FTYPE(cnode);
+					*found_ino = trie_node_inode(knode);
+					*found_type = TRIE_NODE_FTYPE(knode);
+					brelse(kbh);
 					brelse(cbh);
 					return 0;
 				}
 			}
+			brelse(kbh);
 			brelse(cbh);
 			return -ENOENT;
 		}
 
-		if (!(cnode->node_type & NODE_TYPE_INTERM)) {
+		if (!(knode->node_type & NODE_TYPE_INTERM)) {
 			/* Pure leaf where we need an INTERM.  Check full name. */
-			char *ename = trie_node_name(cbh->b_data, cnode);
-			int elen = trie_node_name_len(cnode) - 2;
+			char *ename = trie_node_name(kbh->b_data, knode);
+			int elen = trie_node_name_len(knode) - 2;
 
+			brelse(kbh);
 			brelse(cbh);
 			if (elen == name_len && memcmp(ename, name, name_len) == 0) {
-				*found_ino = trie_node_inode(cnode);
-				*found_type = TRIE_NODE_FTYPE(cnode);
+				*found_ino = trie_node_inode(knode);
+				*found_type = TRIE_NODE_FTYPE(knode);
 				return 0;
 			}
 			return -ENOENT;
 		}
 
-		/* Next byte's find_child() will descend into this child's
-		 * first_child page; start that read while we loop. */
-		trie_readahead_ref(sb, trie_node_first_child(cnode));
+		/* Descend: the child page becomes the next level's cur page.
+		 * find_child_in_chain already put the grandchild page in
+		 * flight at match time.
+		 */
 		brelse(cbh);
+		cbh = kbh;
+		kbh = NULL;
 		cur = child;
 	}
 
+	brelse(cbh);
 	return -ENOENT;
 }
 
@@ -1284,14 +1341,15 @@ int briefs_trie_remove(struct super_block *sb, struct briefs_inode *di,
 	ancestry[anc++] = cur;
 
 	for (pos = 0; pos < name_len; pos++) {
-		ret = trie_find_child_with_prev(sb, cur, (u8)name[pos], &child, &child_prev);
+		/* find_child_with_prev hands us cur's page still pinned
+		 * (bh/page/pnode), so the descent reads each level exactly
+		 * once instead of once inside find_child and once again
+		 * right after.
+		 */
+		ret = trie_find_child_with_prev(sb, cur, (u8)name[pos], &child,
+						&child_prev, &bh, &page, &pnode);
 		if (ret != 0) {
 			ret = (ret == -ENOENT) ? -ENOENT : -EIO;
-			goto out;
-		}
-
-		if (trie_read_node(sb, cur, &bh, &page, &pnode) != 0) {
-			ret = -EIO;
 			goto out;
 		}
 

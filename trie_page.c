@@ -254,6 +254,53 @@ struct buffer_head *briefs_trie_get_page(struct super_block *sb, u64 node_ref,
 }
 
 /*
+ * Read a node through a caller-held buffer reference: when @ref's page is
+ * the page @*cbh already pins, reuse it instead of going back to the
+ * buffer cache for another lookup.  Trie walks visit a node's siblings and
+ * descendants in tight sequence, and since pages are clustered a walk's
+ * hops mostly stay on one page, so this skips the bulk of the walk's
+ * find_get_block traffic.  The buffer's magic was validated when it was
+ * first read; reuse does not re-validate (a pinned page cannot change
+ * block).  On return *cbh pins the target page (the old reference is
+ * released when the page changes); the caller brelse()s it exactly once.
+ * On error *cbh is NULL (any held reference is released).
+ */
+int briefs_trie_read_page_cached(struct super_block *sb, u64 node_ref,
+				 struct buffer_head **cbh,
+				 struct briefs_trie_page **page,
+				 struct briefs_trie_node **node)
+{
+	struct buffer_head *bh;
+	u64 slot;
+
+	slot = TRIE_REF_SLOT(node_ref);
+	if (slot >= TRIE_SLOTS_PER_BLOCK || TRIE_REF_IS_NULL(node_ref)) {
+		brelse(*cbh);
+		*cbh = NULL;
+		return -EINVAL;
+	}
+
+	if (*cbh && (*cbh)->b_blocknr == TRIE_REF_BLOCK(node_ref)) {
+		*page = (struct briefs_trie_page *)(*cbh)->b_data;
+		*node = trie_slot_at((*cbh)->b_data, slot);
+		return 0;
+	}
+
+	bh = briefs_trie_read_page(sb, node_ref, page, node);
+	if (IS_ERR(bh)) {
+		/* briefs_trie_read_page released nothing of ours; drop the
+		 * caller's old reference so the error path is uniform.
+		 */
+		brelse(*cbh);
+		*cbh = NULL;
+		return PTR_ERR(bh);
+	}
+	brelse(*cbh);
+	*cbh = bh;
+	return 0;
+}
+
+/*
  * Allocate a data block and initialize it as a new trie page with the
  * first slot set up as requested.  Returns the node reference for slot 0,
  * or 0 on failure.
