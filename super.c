@@ -12,6 +12,7 @@
 #include <linux/seqlock.h>
 #include <linux/pagemap.h>
 #include <linux/fs_context.h>
+#include <linux/workqueue.h>
 #include <linux/fs_parser.h>
 #include <linux/string.h>
 #include "briefs.h"
@@ -308,6 +309,28 @@ int briefs_fill_super(struct super_block *sb, struct fs_context *fc) {
 	 * briefs_put_super.  Must exist before any btree_read_node can run. */
 	bsi->verify_stats = alloc_percpu(struct briefs_verify_stats);
 	if (!bsi->verify_stats) {
+		kfree(bsi);
+		sb->s_fs_info = NULL;
+		return -ENOMEM;
+	}
+
+	/* Whole-directory trie prefetch workqueue (cold-walk cascade; see
+	 * briefs_trie_prefetch_dir_async in trie.c).  max_active is the
+	 * module param trie_prefetch_depth (default 16): each worker issues
+	 * one trie-page read at a time, so this bounds the prefetch read
+	 * storm's queue depth.  Too high and a cache=none rotational-backed
+	 * device thrashes, delaying the foreground walker's own demand
+	 * reads behind speculative ones; too low and the cascade cannot
+	 * keep ahead of the walk.  Drained by destroy_workqueue() at the
+	 * top of put_super, which waits for in-flight workers before any
+	 * fs state is torn down.  NULL on allocation failure: every
+	 * queueing site checks and skips the cascade. */
+	if (trie_prefetch_depth > 0)
+		bsi->trie_prefetch_wq = alloc_workqueue("briefs_trie_prefetch",
+							WQ_UNBOUND,
+							trie_prefetch_depth);
+	if (trie_prefetch_depth > 0 && !bsi->trie_prefetch_wq) {
+		free_percpu(bsi->verify_stats);
 		kfree(bsi);
 		sb->s_fs_info = NULL;
 		return -ENOMEM;
@@ -621,6 +644,8 @@ out_bad_sb:
 out:
 	/* Clean up allocators if initialized */
 	if (bsi) {
+		if (bsi->trie_prefetch_wq)
+			destroy_workqueue(bsi->trie_prefetch_wq);
 		if (bsi->alloc.l0)
 			briefs_alloc_cleanup(&bsi->alloc);
 		if (bsi->inode_alloc.l0)
@@ -640,6 +665,14 @@ void briefs_put_super(struct super_block *sb) {
 	pr_debug("briefs: put_super enter\n");
 
 	if (bsi) {
+		/* Drain the trie-prefetch cascade FIRST: its workers
+		 * blocking-read trie pages through the sb, so they must
+		 * all complete before any teardown below. */
+		if (bsi->trie_prefetch_wq) {
+			destroy_workqueue(bsi->trie_prefetch_wq);
+			bsi->trie_prefetch_wq = NULL;
+		}
+
 		/* Quiesce observability surfaces before tearing bsi down so no
 		 * debugfs/sysfs/proc reader races with the journal/alloc/sb_bh
 		 * cleanup below. sysfs kobject_del drains in-flight kernfs show

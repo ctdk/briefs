@@ -186,6 +186,16 @@ int briefs_readdir(struct file *file, struct dir_context *ctx) {
 		 * lookup path if something stats them. */
 		if (S_ISDIR(file_type)) {
 			briefs_readahead_inode(dir->i_sb, entry_ino);
+			/* Queue the whole-directory trie prefetch now, at the
+			 * earliest moment the subdirectory is known.  The
+			 * kworker resolves the trie root with its own
+			 * blocking read (the inode-block readahead above is
+			 * still in flight, so the readdir path itself cannot
+			 * read dir_trie_root yet) and then walks the
+			 * directory's trie into the buffer cache while the
+			 * foreground walker is still working on earlier
+			 * entries and siblings. */
+			briefs_trie_prefetch_ino_async(dir->i_sb, entry_ino);
 			/* Also remember the subdirectory: by the time this
 			 * getdents call returns, the inode-block readahead
 			 * above has usually completed, so the end-of-call

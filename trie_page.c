@@ -33,6 +33,7 @@ struct briefs_trie_pages {
 	struct list_head partial;       /* pages with at least one free slot */
 	struct mutex lock;                /* protects the list and page metadata */
 	u64 hot_block;                  /* recently used partial page (fast path) */
+	u64 hot_hint;                   /* cluster anchor of the hot page */
 };
 
 /*
@@ -51,6 +52,16 @@ struct briefs_trie_sb_state {
 struct briefs_trie_page_entry {
 	struct list_head list;
 	u64 block;
+	/*
+	 * Cluster tag of this page: the owning directory's trie root block
+	 * (0 when unknown, e.g. re-added by the free path).
+	 * briefs_trie_alloc_node() prefers pages whose tag
+	 * matches the inserting directory's root so a directory's nodes stay
+	 * on its own cluster; without the tag the LIFO pool would hand every
+	 * new directory the previous one's leftover pages first, scattering
+	 * its trie across other directories' clusters.
+	 */
+	u64 hint;
 };
 
 static LIST_HEAD(briefs_trie_states);
@@ -107,6 +118,7 @@ static struct briefs_trie_sb_state *briefs_trie_ensure_state(struct super_block 
 	INIT_LIST_HEAD(&st->pages.partial);
 	mutex_init(&st->pages.lock);
 	st->pages.hot_block = 0;
+	st->pages.hot_hint = 0;
 
 	spin_lock(&briefs_trie_states_lock);
 	list_add(&st->list, &briefs_trie_states);
@@ -238,7 +250,7 @@ struct buffer_head *briefs_trie_get_page(struct super_block *sb, u64 node_ref,
  * or 0 on failure.
  */
 int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
-                          u8 node_type, u64 *out_ref)
+                          u8 node_type, u64 *out_ref, u64 hint_abs)
 {
 	struct briefs_sb_info *bsi = sb->s_fs_info;
 	struct buffer_head *bh;
@@ -266,7 +278,24 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 	    briefs_journal_replay_pop_trie_block(bsi->journal, &rel) == 0) {
 		/* reused a reserved trie block */
 	} else {
-		rel = briefs_alloc_block(&bsi->alloc);
+		/*
+		 * Take this page from the top of the data region
+		 * (briefs_alloc_block_high, a top-down next-fit scan) so trie
+		 * pages have their own allocation frontier, disjoint from the
+		 * upward-growing data-run region.  A tar/cp stream creates a
+		 * directory's pages consecutively in time, so consecutive
+		 * top-down allocations come out contiguous: each directory's
+		 * trie is one short run, and a cold readdir walk (or its
+		 * prefetch kworker) reads it with a few merged 8-16K requests
+		 * instead of one 4K read per page.  @hint_abs now only tags
+		 * the partial-page pool entry (see briefs_trie_alloc_node's
+		 * two-pass scan), not the placement.  Fall back to the global
+		 * allocator when the high region has nothing free, so this is
+		 * policy only -- ENOSPC behaviour is unchanged.
+		 */
+		rel = briefs_alloc_block_high(&bsi->alloc);
+		if (rel == 0)
+			rel = briefs_alloc_block(&bsi->alloc);
 	}
 	if (rel == 0)
 		return -ENOSPC;
@@ -560,8 +589,12 @@ static inline bool trie_page_has_name_heap(struct briefs_trie_page *page, u16 na
 
 /*
  * Add a page to the partial list.  Caller must hold pages->lock.
+ * @hint is the page's cluster anchor; an entry that already exists keeps
+ * its original anchor (a page belongs to the cluster it was allocated in,
+ * not to whoever happens to reference it later).
  */
-static void __trie_page_add_partial_locked(struct briefs_trie_pages *pages, u64 block)
+static void __trie_page_add_partial_locked(struct briefs_trie_pages *pages,
+					   u64 block, u64 hint)
 {
 	struct briefs_trie_page_entry *entry;
 	bool found = false;
@@ -576,6 +609,7 @@ static void __trie_page_add_partial_locked(struct briefs_trie_pages *pages, u64 
 		entry = kmalloc(sizeof(*entry), GFP_KERNEL);
 		if (entry) {
 			entry->block = block;
+			entry->hint = hint;
 			list_add(&entry->list, &pages->partial);
 		}
 	}
@@ -585,7 +619,7 @@ static void __trie_page_add_partial_locked(struct briefs_trie_pages *pages, u64 
  * Add a page to the partial list so future allocations can reuse its slots.
  * Safe to call multiple times.
  */
-void briefs_trie_page_add_partial(struct super_block *sb, u64 block)
+void briefs_trie_page_add_partial(struct super_block *sb, u64 block, u64 hint)
 {
 	struct briefs_trie_sb_state *st = briefs_trie_ensure_state(sb);
 	struct briefs_trie_pages *pages;
@@ -595,9 +629,11 @@ void briefs_trie_page_add_partial(struct super_block *sb, u64 block)
 	pages = &st->pages;
 
 	mutex_lock(&pages->lock);
-	__trie_page_add_partial_locked(pages, block);
-	if (pages->hot_block == 0)
+	__trie_page_add_partial_locked(pages, block, hint);
+	if (pages->hot_block == 0) {
 		pages->hot_block = block;
+		pages->hot_hint = hint;
+	}
 	mutex_unlock(&pages->lock);
 }
 
@@ -667,7 +703,15 @@ static u64 trie_alloc_from_block(struct super_block *sb, struct briefs_trie_page
 	return ref;
 }
 
-u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len)
+/*
+ * briefs_trie_alloc_node - allocate a trie node (a slot + name-heap space).
+ * Reuses a partial page from the pool when one has room; otherwise takes a
+ * fresh page (briefs_trie_page_init), from the top-down trie region
+ * allocator.  @hint_abs only tags the pool entry created for a fresh page
+ * (the owning directory's trie root block) so the two-pass pool scan keeps
+ * a directory's nodes on its own pages; callers without a tag pass 0.
+ */
+u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len, u64 hint_abs)
 {
 	struct briefs_trie_sb_state *st;
 	struct briefs_trie_pages *pages;
@@ -689,62 +733,77 @@ u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len)
 
 	/*
 	 * Fast path: try the cached hot page first.  Most allocations reuse
-	 * the same page repeatedly, so this avoids a full list scan.
+	 * the same page repeatedly, so this avoids a full list scan.  Only
+	 * when its cluster anchor matches the caller's (or the caller brought
+	 * no anchor) - the hot page is frequently the previous directory's
+	 * leftover, and taking it would scatter this directory's nodes.
 	 */
-	if (pages->hot_block != 0) {
+	if (pages->hot_block != 0 &&
+	    (hint_abs == 0 || pages->hot_hint == hint_abs)) {
 		ref = trie_alloc_from_block(sb, pages, pages->hot_block, name_size);
 		if (ref != 0) {
 			if (ref & (1ULL << 63)) {
 				/* Hot page became full. */
 				pages->hot_block = 0;
+				pages->hot_hint = 0;
 				ref &= ~(1ULL << 63);
 			}
 			mutex_unlock(&pages->lock);
 			return ref;
 		}
 		pages->hot_block = 0;
+		pages->hot_hint = 0;
 	}
 
 	/*
-	 * Scan the partial page list for a page with both a free slot and
-	 * enough name heap.  Bound the scan so a very long partial list does
-	 * not stall every allocation; if no candidate is found within the
-	 * limit, allocate a fresh page.
+	 * Two-pass scan of the partial page list.  Pass 1 only considers
+	 * pages clustered at the caller's anchor, so a directory's nodes
+	 * prefer its own pages; pass 2 accepts any page, preserving the
+	 * old behaviour (and the pool's density - leftover pages are still
+	 * consumed eventually, just not ahead of a directory's own cluster).
+	 *
+	 * Each pass is bounded so a very long partial list does not stall
+	 * every allocation.  During journal replay the pool is seeded from
+	 * the on-disk trie and the scan must be UNBOUNDED: a large directory
+	 * can have more than 64 partial pages, and a bounded scan could miss
+	 * the page live reused (forcing a fresh page_init -> re-alloc ->
+	 * -ENOSPC on a full fs, generic/475).  Replay is one-shot and
+	 * single-threaded, so an unbounded scan is acceptable.
 	 */
 	{
-		int scanned = 0;
-		/*
-		 * Bound the scan so a very long partial list does not stall every
-		 * allocation.  During journal replay the pool is seeded from the
-		 * on-disk trie and the scan must be UNBOUNDED: a large directory can
-		 * have more than 64 partial pages, and a bounded scan could miss the
-		 * page live reused (forcing a fresh page_init -> re-alloc -> -ENOSPC on
-		 * a full fs, generic/475).  Replay is one-shot and single-threaded, so
-		 * an unbounded scan is acceptable.
-		 */
 		struct briefs_sb_info *bsi = sb->s_fs_info;
 		const int max_scan = (bsi && bsi->journal && bsi->journal->in_replay)
 				     ? INT_MAX : 64;
+		int scanned;
+		int pass;
 
-		list_for_each_entry_safe(entry, tmp, &pages->partial, list) {
-			if (scanned++ >= max_scan)
-				break;
+		for (pass = 0; pass < 2; pass++) {
+			scanned = 0;
+			list_for_each_entry_safe(entry, tmp, &pages->partial, list) {
+				if (scanned++ >= max_scan)
+					break;
 
-			ref = trie_alloc_from_block(sb, pages, entry->block, name_size);
-			if (ref == 0)
-				continue;
+				if (pass == 0 && hint_abs != 0 &&
+				    entry->hint != hint_abs)
+					continue;
 
-			if (ref & (1ULL << 63)) {
-				/* Page became full. */
-				list_del(&entry->list);
-				kfree(entry);
-				ref &= ~(1ULL << 63);
-			} else {
-				pages->hot_block = entry->block;
+				ref = trie_alloc_from_block(sb, pages, entry->block, name_size);
+				if (ref == 0)
+					continue;
+
+				if (ref & (1ULL << 63)) {
+					/* Page became full. */
+					list_del(&entry->list);
+					kfree(entry);
+					ref &= ~(1ULL << 63);
+				} else {
+					pages->hot_block = entry->block;
+					pages->hot_hint = entry->hint;
+				}
+
+				mutex_unlock(&pages->lock);
+				return ref;
 			}
-
-			mutex_unlock(&pages->lock);
-			return ref;
 		}
 	}
 
@@ -752,7 +811,7 @@ u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len)
 
 	/* No partial page had room.  Allocate a fresh page where slot 0 is the
 	 * requested new node.  Add it to the partial list for future reuse. */
-	if (briefs_trie_page_init(sb, 0, 0, 0, &ref) != 0)
+	if (briefs_trie_page_init(sb, 0, 0, 0, &ref, hint_abs) != 0)
 		return 0;
 
 	if (name_size > 0) {
@@ -767,9 +826,10 @@ u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len)
 		brelse(bh);
 	}
 
-	briefs_trie_page_add_partial(sb, TRIE_REF_BLOCK(ref));
+	briefs_trie_page_add_partial(sb, TRIE_REF_BLOCK(ref), hint_abs);
 	mutex_lock(&pages->lock);
 	pages->hot_block = TRIE_REF_BLOCK(ref);
+	pages->hot_hint = hint_abs;
 	mutex_unlock(&pages->lock);
 	return ref;
 }
@@ -878,7 +938,7 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 
 	if (pages) {
 		if (!page_empty && trie_page_free_slots(page) != 0)
-			__trie_page_add_partial_locked(pages, block);
+			__trie_page_add_partial_locked(pages, block, 0);
 
 		if (page_empty) {
 			list_for_each_entry_safe(entry, tmp, &pages->partial, list) {
@@ -888,8 +948,10 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 					break;
 				}
 			}
-			if (pages->hot_block == block)
+			if (pages->hot_block == block) {
 				pages->hot_block = 0;
+				pages->hot_hint = 0;
+			}
 		}
 
 		mutex_unlock(&pages->lock);

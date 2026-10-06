@@ -318,6 +318,95 @@ u64 briefs_alloc_block_meta(struct briefs_alloc *alloc)
 	return __briefs_alloc_block(alloc, true);
 }
 
+static void briefs_propagate_l2_zero(struct briefs_alloc *alloc, u64 w2);
+
+/*
+ * briefs_alloc_block_high - allocate a single free block from the TOP of
+ * the data region, scanning downward (top-down next-fit).
+ *
+ * Directory trie pages want a private allocation region.  Data runs
+ * (briefs_alloc_blocks) grow upward from block 0 by first-fit, so a
+ * low-address trie region is forced to share the data frontier: a
+ * directory's pages interleave with file extents at 4K granularity and
+ * nothing is adjacent (measured: 0 merged reads on a cold kernel-tree
+ * walk).  Allocating trie singles from the top of the disk instead
+ * gives them their own downward-growing frontier: a tar/cp stream
+ * creates a directory's pages consecutively in time, so consecutive
+ * top-down allocations come out contiguous, and each directory's trie
+ * becomes one short contiguous run.  A cold traversal of such a trie
+ * is a few merged 8-16K reads instead of one 4K read per page (the
+ * trie-prefetch kworker in trie.c batches them under a plug).
+ *
+ * A downward rover keeps the scan O(1) in the common case: it stays on
+ * the frontier word and takes its highest free bit, so sequential
+ * allocations descend monotonically.  Freed blocks above the rover are
+ * left for the global next-fit allocator to reuse.  The shield is
+ * respected exactly like briefs_alloc_block; the data-allocation rover
+ * is untouched.  Returns 0 when the scan reaches the bottom of the
+ * region without finding a free block -- the caller falls back to
+ * briefs_alloc_block, preserving today's behaviour.
+ *
+ * Allocation policy only: on-disk format, journal records (which carry
+ * whatever block number was chosen) and fsck are unaffected.
+ */
+u64 briefs_alloc_block_high(struct briefs_alloc *alloc)
+{
+	struct briefs_sb_info *bsi = briefs_sb(alloc->sb);
+	u64 w2, l2_word, b2, block, avail, valid_bits;
+
+	mutex_lock(&alloc->lock);
+
+	/* Same ENOSPC discipline as __briefs_alloc_block(for_meta=false):
+	 * data-class allocations stop at the metadata shield. */
+	avail = alloc->free_count;
+	if (avail > alloc->meta_shield)
+		avail -= alloc->meta_shield;
+	else
+		avail = 0;
+	if (avail == 0 || !alloc->l0) {
+		mutex_unlock(&alloc->lock);
+		return 0;
+	}
+
+	w2 = alloc->rover_w2_high;
+	if (w2 == 0 || w2 >= alloc->l2_words)
+		w2 = alloc->l2_words - 1;
+
+	for (; w2 >= 1; w2--) {
+		l2_word = alloc->l2[w2];
+		if (!l2_word)
+			continue;
+		/* The top word may track bits past block_count (its
+		 * valid prefix); never take those. */
+		valid_bits = alloc->block_count - w2 * 64;
+		if (valid_bits < 64)
+			l2_word &= (1ULL << valid_bits) - 1;
+		if (!l2_word)
+			continue;
+		b2 = 63 - __builtin_clzll(l2_word);
+		block = w2 * 64 + b2;
+
+		if (bsi && (bsi->mount_flags & BRIEFS_MF_DEBUG) &&
+		    alloc == &bsi->alloc)
+			atomic64_inc(&bsi->stats.data_alloc_calls);
+
+		alloc->l2[w2] &= ~(1ULL << b2);
+		alloc->free_count--;
+		if (alloc->l2[w2] == 0)
+			briefs_propagate_l2_zero(alloc, w2);
+
+		alloc->rover_w2_high = w2;
+		mutex_unlock(&alloc->lock);
+		return block;
+	}
+
+	/* Region exhausted downward: reset the rover so later frees in the
+	 * high region are retried after a remount or further allocations. */
+	alloc->rover_w2_high = alloc->l2_words - 1;
+	mutex_unlock(&alloc->lock);
+	return 0;
+}
+
 /*
  * Clear the L1/L0 summary bits for a single L2 word that just became all-zero.
  * Caller holds alloc->lock and has already verified alloc->l2[w2] == 0.

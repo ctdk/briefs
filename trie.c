@@ -14,6 +14,8 @@
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/buffer_head.h>
+#include <linux/blkdev.h>
+#include <linux/workqueue.h>
 #include <linux/vmalloc.h>
 #include <linux/unaligned.h>
 #include "briefs.h"
@@ -134,13 +136,16 @@ static int trie_get_node(struct super_block *sb, u64 ref,
  *
  * Cold directory walks are serialized by discovery: a node's
  * first_child / next_sibling references live in the node's own page, so
- * the next page of the walk is unknown until the current one has been
+ * the next page of the walk is unknown until the current page has been
  * read, and reads issue strictly one at a time (~120 us each on a cold
  * cache=none device).  A cold kernel-tree find spends essentially its
  * whole wall time in that chain: 16k unmerged 4K reads, zero merging,
  * no readahead.  Submitting the read for the pages a freshly parsed
  * node points at lets the device pipeline the walk down to roughly the
- * trie's dependency depth instead of its node count.
+ * trie's dependency depth instead of its node count.  The deeper chain
+ * hops (a page's own next/sibling pages, discovered only after that
+ * page arrives) are covered by the whole-directory prefetch cascade
+ * below, not by this depth-1 readahead.
  *
  * Read-only and safe against concurrent modification: the readahead
  * populates the same buffer a later sb_bread() would hit, and a
@@ -305,17 +310,19 @@ static int trie_link_child(struct super_block *sb, u64 parent_ref, u64 child_ref
 
 /*
  * Create a child node of the given parent.  Returns child ref, or 0 on failure.
+ * @hint_abs is the partial-page pool's cluster tag (the owning directory's
+ * trie root block; 0 when unknown).
  */
 static u64 briefs_trie_create_child(struct super_block *sb, u64 parent_ref,
                                      u8 depth, u8 byte_val, u8 node_type,
-                                     size_t name_len)
+                                     size_t name_len, u64 hint_abs)
 {
 	u64 child_ref;
 	struct buffer_head *cbh;
 	struct briefs_trie_page *cpage;
 	struct briefs_trie_node *cnode;
 
-	child_ref = briefs_trie_alloc_node(sb, name_len);
+	child_ref = briefs_trie_alloc_node(sb, name_len, hint_abs);
 	if (TRIE_REF_IS_NULL(child_ref))
 		return 0;
 
@@ -342,14 +349,16 @@ static u64 briefs_trie_create_child(struct super_block *sb, u64 parent_ref,
  * Find or create a child by byte_val.
  */
 static u64 briefs_trie_find_or_create_child(struct super_block *sb, u64 parent_ref,
-                                             u8 depth, u8 byte_val, u8 node_type)
+                                             u8 depth, u8 byte_val, u8 node_type,
+                                             u64 hint_abs)
 {
 	u64 child;
 
 	child = briefs_trie_find_child(sb, parent_ref, byte_val);
 	if (!TRIE_REF_IS_NULL(child))
 		return child;
-	return briefs_trie_create_child(sb, parent_ref, depth, byte_val, node_type, 0);
+	return briefs_trie_create_child(sb, parent_ref, depth, byte_val, node_type,
+	                                0, hint_abs);
 }
 
 /*
@@ -369,14 +378,17 @@ int briefs_trie_create_root(struct super_block *sb, struct briefs_inode *di)
 	u64 root_ref;
 	int ret;
 
-	ret = briefs_trie_page_init(sb, 0, 0, NODE_TYPE_INTERM, &root_ref);
+	ret = briefs_trie_page_init(sb, 0, 0, NODE_TYPE_INTERM, &root_ref, 0);
 	if (ret)
 		return ret;
 
 	/* Add the root page to the partial list immediately so future
-	 * allocations can reuse its free slots.
+	 * allocations can reuse its free slots.  The root page anchors its
+	 * own cluster: pass its block so this directory's later pages
+	 * (and nodes) prefer it over another directory's leftover pages.
 	 */
-	briefs_trie_page_add_partial(sb, TRIE_REF_BLOCK(root_ref));
+	briefs_trie_page_add_partial(sb, TRIE_REF_BLOCK(root_ref),
+	                              TRIE_REF_BLOCK(root_ref));
 	di->dir_trie_root = root_ref;
 	return 0;
 }
@@ -456,7 +468,13 @@ int briefs_trie_seed_pool(struct super_block *sb, u64 root_ref)
 		visited++;
 
 		if (briefs_trie_page_has_room(page)) {
-			briefs_trie_page_add_partial(sb, TRIE_REF_BLOCK(ref));
+			/* Tag with this trie's root: replay re-derives each
+			 * directory's entries with the same cluster anchor, so
+			 * its re-allocated nodes prefer its own pages here
+			 * too.  Pages shared across directories keep the
+			 * first tag (add_partial dedups by block). */
+			briefs_trie_page_add_partial(sb, TRIE_REF_BLOCK(ref),
+			                              TRIE_REF_BLOCK(root_ref));
 			added++;
 		}
 
@@ -485,6 +503,287 @@ int briefs_trie_seed_pool(struct super_block *sb, u64 root_ref)
 out:
 	briefs_trie_iter_free(iter);
 	return ret;
+}
+
+/*
+ * Max concurrent whole-directory trie-prefetch workers (see
+ * briefs_trie_prefetch_ino_async below).  Each worker issues trie-page
+ * readahead one window at a time, so this bounds the prefetch read
+ * storm's queue depth.  0 disables the cascade entirely (no workqueue
+ * is created).  Measured insensitive from 4 to 64 on a cache=none
+ * device; 16 is the default.
+ */
+unsigned int trie_prefetch_depth = 16;
+module_param(trie_prefetch_depth, uint, 0444);
+MODULE_PARM_DESC(trie_prefetch_depth,
+	"max concurrent trie prefetch workers (0 = disable whole-directory prefetch)");
+
+/*
+ * Whole-directory trie prefetch (cold-walk cascade).
+ *
+ * The cross-directory readdir pipeline (briefs_readahead_inode /
+ * briefs_readahead_dir_trie_root in inode.c) overlaps each directory's
+ * trie-root read with the walk's time in earlier siblings' subtrees, but
+ * the in-directory walk stays serialized: a page's first_child /
+ * next_sibling references live in the page itself, so the Nth page of a
+ * directory is unknown until the (N-1)th has arrived, and depth-1
+ * readahead is consumed within microseconds.  A cold kernel-tree find
+ * spends essentially its whole wall time in those chains (~16k
+ * unmerged 4K reads at ~120 us each).
+ *
+ * The chain is only serial for a reader that must return entries in
+ * order.  A background thread can walk the same dependency graph while
+ * the foreground walker is busy elsewhere -- earlier siblings'
+ * subtrees, or simply the getdents/fts bookkeeping between a
+ * subdirectory's dirent being emitted and the walker descending into
+ * it.  So briefs_readdir() queues a prefetch work item at dirent-emit
+ * time for every subdirectory it lists; the kworker resolves the
+ * directory's trie root (reading the inode block, which the readdir
+ * path only readahead'd and so cannot yet read itself) and
+ * blocking-reads every page reachable from the root into the buffer
+ * cache.  The foreground walk later finds those pages warm.
+ *
+ * Once a page is parsed the walker immediately readaheads every
+ * distinct page its nodes point at, so the next discovery level
+ * arrives in parallel instead of depth-first; with trie pages packed
+ * in their own top-of-disk region (briefs_alloc_block_high) each
+ * window is all trie pages, and the plug around the walk lets the
+ * window's adjacent submissions merge at the elevator.
+ *
+ * Safety mirrors briefs_trie_seed_pool(): the walk is read-only, and
+ * trie_read_node() validates page magic and reference bounds, so a
+ * stale or torn reference under a concurrent creator/destroyer at
+ * worst ends that branch.  Termination is bounded by the node and
+ * page caps regardless of on-disk cycles, and destroy_workqueue() at
+ * put_super drains every worker before any fs state is torn down.
+ *
+ * Both caps are comfortably above the largest real directories (a
+ * kernel tree tops out around 3000 entries ~= 10k nodes): a walk that
+ * hits them simply stops prefetching and the foreground walk falls
+ * back to its own depth-1 readahead for the remainder.  A walk whose
+ * root page is already cached is skipped entirely, so repeat
+ * traversals of a warm tree cost one buffer probe per directory.
+ */
+#define TRIE_PREFETCH_MAX_NODES	16384
+#define TRIE_PREFETCH_MAX_PAGES	512
+
+struct trie_prefetch_work {
+	struct work_struct work;
+	struct super_block *sb;
+	u64 root_ref;		/* 0: resolve from ino below */
+	u64 ino;
+};
+
+/*
+ * sb_breadahead a trie page exactly once per walk.  @seen is the walk's
+ * set of already-handled blocks; it doubles as the backstop that keeps a
+ * corrupt cycle from re-reading the same pages forever.
+ *
+ * Each handled page is issued as a small downward window of
+ * trie_prefetch_window blocks (1 = the page alone).  Trie pages are
+ * allocated top-down (briefs_alloc_block_high), so a directory's later
+ * pages sit below its earlier ones; with every block in the region
+ * being some directory's trie page, the window is all-but-free -- the
+ * pages it pulls in are the ones neighbouring walks are about to ask
+ * for anyway.  The walk's plug batches the window into one merged
+ * request, collapsing a directory's scattered pages into a few 8-16K
+ * reads instead of one 4K read per page.
+ *
+ * Volume stays bounded by the trie region itself: a block whose buffer
+ * is already uptodate (another walk fetched it) or in flight (another
+ * walk just issued it) is never resubmitted -- sb_breadahead would
+ * happily re-read an in-flight buffer -- so overlapping windows from
+ * thousands of concurrent walks converge on reading each page once.
+ * Measured on a cold kernel-tree find (64G RAW cache=none): window 512
+ * reads the 63MB of trie pages as ~7.7k requests (8.8k merged) in
+ * ~650ms vs ~16k unmerged requests in ~1500ms with the cascade off.
+ *
+ * The window assumes the high-region layout: with trie pages scattered
+ * through the data region (images populated by older kernels) a window
+ * pulls in file data the walks never ask for.  Set 1 to disable.
+ */
+static unsigned int trie_prefetch_window = 512;
+module_param(trie_prefetch_window, uint, 0644);
+MODULE_PARM_DESC(trie_prefetch_window,
+	"readahead window in 4K blocks issued per trie page during whole-directory prefetch (1 = off)");
+
+static void trie_prefetch_issue(struct super_block *sb, u64 *seen,
+				int *n_seen, u64 block)
+{
+	u64 b, first;
+	int i;
+
+	for (i = 0; i < *n_seen; i++)
+		if (seen[i] == block)
+			return;
+	if (*n_seen >= TRIE_PREFETCH_MAX_PAGES)
+		return;
+	seen[(*n_seen)++] = block;
+
+	first = block + 1 >= trie_prefetch_window ?
+		block + 1 - trie_prefetch_window : 0;
+	for (b = first; b <= block; b++) {
+		struct buffer_head *bh;
+
+		if (!briefs_block_in_range(sb, b))
+			continue;
+		bh = sb_getblk(sb, b);
+		if (bh) {
+			bool skip = buffer_uptodate(bh) || buffer_locked(bh);
+
+			brelse(bh);
+			if (skip)
+				continue;
+		}
+		sb_breadahead(sb, b);
+	}
+}
+
+static void briefs_trie_prefetch_subtree(struct super_block *sb, u64 root_ref)
+{
+	struct trie_iter *iter;
+	struct buffer_head *bh;
+	struct briefs_trie_page *page;
+	struct briefs_trie_node *node;
+	struct blk_plug plug;
+	u64 ref, child, sib, nodes = 0;
+	u64 *seen;
+	int n_seen = 0;
+
+	if (TRIE_REF_IS_NULL(root_ref) ||
+	    TRIE_REF_SLOT(root_ref) >= TRIE_SLOTS_PER_BLOCK ||
+	    !briefs_block_in_range(sb, TRIE_REF_BLOCK(root_ref)))
+		return;
+
+	/* Warm root: the tree was walked or prefetched recently and its
+	 * pages are still cached -- the foreground walk will hit cache on
+	 * its own, so do not burn a worker on it. */
+	bh = sb_getblk(sb, TRIE_REF_BLOCK(root_ref));
+	if (bh) {
+		bool warm = buffer_uptodate(bh);
+
+		brelse(bh);
+		if (warm)
+			return;
+	}
+
+	iter = briefs_trie_iter_alloc();
+	if (!iter)
+		return;
+	seen = kmalloc_array(TRIE_PREFETCH_MAX_PAGES, sizeof(u64),
+			    GFP_KERNEL);
+	if (!seen) {
+		briefs_trie_iter_free(iter);
+		return;
+	}
+
+	if (trie_iter_push(iter, root_ref, 0))
+		goto out;
+
+	blk_start_plug(&plug);
+	while (iter->sp > 0) {
+		if (nodes >= TRIE_PREFETCH_MAX_NODES)
+			break;
+		ref = iter->stack[--iter->sp];
+		if (TRIE_REF_IS_NULL(ref) ||
+		    TRIE_REF_SLOT(ref) >= TRIE_SLOTS_PER_BLOCK ||
+		    !briefs_block_in_range(sb, TRIE_REF_BLOCK(ref)))
+			continue;
+		trie_prefetch_issue(sb, seen, &n_seen, TRIE_REF_BLOCK(ref));
+		if (trie_read_node(sb, ref, &bh, &page, &node) != 0)
+			/* Unreadable page (bad magic under a concurrent
+			 * mutation, or a real I/O error): drop this branch
+			 * and keep prefetching the rest. */
+			continue;
+		nodes++;
+
+		child = trie_node_first_child(node);
+		sib = trie_node_next_sibling(node);
+		brelse(bh);
+
+		/* Burst every distinct page this node's links point at
+		 * before descending, so one level arrives in parallel;
+		 * a failed push (iterator stack OOM) just drops that
+		 * branch -- the prefetch covers less, the foreground
+		 * walk stays correct. */
+		if (!TRIE_REF_IS_NULL(child) &&
+		    TRIE_REF_SLOT(child) < TRIE_SLOTS_PER_BLOCK &&
+		    briefs_block_in_range(sb, TRIE_REF_BLOCK(child))) {
+			trie_prefetch_issue(sb, seen, &n_seen,
+					    TRIE_REF_BLOCK(child));
+			trie_iter_push(iter, child, 0);
+		}
+		if (!TRIE_REF_IS_NULL(sib) &&
+		    TRIE_REF_SLOT(sib) < TRIE_SLOTS_PER_BLOCK &&
+		    briefs_block_in_range(sb, TRIE_REF_BLOCK(sib))) {
+			trie_prefetch_issue(sb, seen, &n_seen,
+					    TRIE_REF_BLOCK(sib));
+			trie_iter_push(iter, sib, 0);
+		}
+
+		if ((nodes & 1023) == 0)
+			cond_resched();
+	}
+	blk_finish_plug(&plug);
+out:
+	kfree(seen);
+	briefs_trie_iter_free(iter);
+}
+
+static void trie_prefetch_work_fn(struct work_struct *work)
+{
+	struct trie_prefetch_work *pw =
+		container_of(work, struct trie_prefetch_work, work);
+	u64 root = pw->root_ref;
+
+	/* Root not yet known: the readdir path only readahead'd the inode
+	 * block, so resolve the trie root here, off the critical path. */
+	if (root == 0)
+		root = briefs_load_dir_trie_root(pw->sb, pw->ino);
+	if (root != 0)
+		briefs_trie_prefetch_subtree(pw->sb, root);
+	kfree(pw);
+}
+
+static void trie_prefetch_queue(struct super_block *sb, u64 root_ref, u64 ino)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct trie_prefetch_work *pw;
+
+	if (!bsi || !bsi->trie_prefetch_wq)
+		return;
+	if (root_ref == 0 && ino == 0)
+		return;
+	pw = kmalloc(sizeof(*pw), GFP_KERNEL);
+	if (!pw)
+		return;
+	INIT_WORK(&pw->work, trie_prefetch_work_fn);
+	pw->sb = sb;
+	pw->root_ref = root_ref;
+	pw->ino = ino;
+	queue_work(bsi->trie_prefetch_wq, &pw->work);
+}
+
+void briefs_trie_prefetch_dir_async(struct super_block *sb, u64 root_ref)
+{
+	if (TRIE_REF_IS_NULL(root_ref) ||
+	    TRIE_REF_SLOT(root_ref) >= TRIE_SLOTS_PER_BLOCK ||
+	    !briefs_block_in_range(sb, TRIE_REF_BLOCK(root_ref)))
+		return;
+	trie_prefetch_queue(sb, root_ref, 0);
+}
+
+/*
+ * Queue a whole-directory prefetch keyed by inode number.  Called from
+ * the readdir emit path, where the directory's trie root is not yet
+ * readable (the inode block readahead issued moments earlier is still
+ * in flight); the worker resolves it with a blocking read.
+ */
+void briefs_trie_prefetch_ino_async(struct super_block *sb, u64 ino)
+{
+	if (ino == 0)
+		return;
+	trie_prefetch_queue(sb, 0, ino);
 }
 
 /*
@@ -603,7 +902,7 @@ static void trie_unlink_child(struct super_block *sb, u64 parent_ref,
  */
 static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
                            int pos, u8 bval, const char *name, int name_len,
-                           u64 ino, u8 type, u64 *cur_out)
+                           u64 ino, u8 type, u64 *cur_out, u64 hint_abs)
 {
 	struct buffer_head *lbh, *ibh, *gbh;
 	struct briefs_trie_page *lpage, *ipage, *gpage;
@@ -630,7 +929,7 @@ static int trie_split_leaf(struct super_block *sb, u64 cur, u64 child,
 	brelse(lbh);
 
 	internal = briefs_trie_create_child(sb, cur, pos + 1, bval,
-	                                     NODE_TYPE_INTERM, 0);
+	                                     NODE_TYPE_INTERM, 0, hint_abs);
 	if (TRIE_REF_IS_NULL(internal))
 		return -ENOSPC;
 
@@ -719,7 +1018,7 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 	struct buffer_head *bh, *cbh;
 	struct briefs_trie_page *page, *cpage;
 	struct briefs_trie_node *node, *cnode;
-	u64 cur, child, new_leaf, existing;
+	u64 cur, child, new_leaf, existing, hint;
 	int pos, ret;
 
 	if (TRIE_REF_IS_NULL(di->dir_trie_root)) {
@@ -729,6 +1028,17 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 	}
 
 	cur = di->dir_trie_root;
+
+	/*
+	 * Cluster tag: the directory's root block.  It labels the
+	 * partial-page pool entries this insert creates
+	 * (briefs_trie_alloc_node's tag-pass prefers a directory's own
+	 * pages, so its nodes do not scatter onto other directories'
+	 * leftovers) and nothing else -- fresh pages come from the
+	 * top-down trie region allocator regardless (see
+	 * briefs_trie_page_init).
+	 */
+	hint = TRIE_REF_BLOCK(di->dir_trie_root);
 
 	if (name_len > TRIE_MAX_NAME_LEN)
 		return -ENAMETOOLONG;
@@ -796,7 +1106,8 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 				brelse(cbh);
 
 				ret = trie_split_leaf(sb, cur, existing, pos, bval,
-				                     name, name_len, ino, type, &cur);
+				                     name, name_len, ino, type, &cur,
+				                     hint);
 				if (ret != 0)
 					return ret;
 				continue;
@@ -804,7 +1115,7 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 
 			/* No existing child: create a new pure leaf. */
 			new_leaf = briefs_trie_create_child(sb, cur, pos, bval, 0,
-			                                   name_len);
+			                                   name_len, hint);
 			if (TRIE_REF_IS_NULL(new_leaf))
 				return -ENOSPC;
 
@@ -837,7 +1148,7 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 
 		/* Middle byte: find or create an INTERM child. */
 		child = briefs_trie_find_or_create_child(sb, cur, pos + 1, bval,
-		                                         NODE_TYPE_INTERM);
+		                                         NODE_TYPE_INTERM, hint);
 		if (TRIE_REF_IS_NULL(child))
 			return -ENOSPC;
 
@@ -846,7 +1157,8 @@ int briefs_trie_insert(struct super_block *sb, struct briefs_inode *di,
 		if (!(cnode->node_type & NODE_TYPE_INTERM)) {
 			brelse(cbh);
 			ret = trie_split_leaf(sb, cur, child, pos, bval,
-			                     name, name_len, ino, type, &cur);
+			                     name, name_len, ino, type, &cur,
+			                     hint);
 			if (ret != 0)
 				return ret;
 			continue;

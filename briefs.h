@@ -1053,16 +1053,34 @@ struct buffer_head *briefs_trie_read_page(struct super_block *sb, u64 node_ref,
 struct buffer_head *briefs_trie_get_page(struct super_block *sb, u64 node_ref,
                                           struct briefs_trie_page **page,
                                           struct briefs_trie_node **node);
-u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len);
+/* Whole-directory trie prefetch worker concurrency (defined in trie.c;
+ * consumed by fill_super when creating bsi->trie_prefetch_wq). */
+extern unsigned int trie_prefetch_depth;
+
+/* @hint_abs: cluster tag for the partial-page pool entry (the owning
+ * directory's trie root block; 0 when unknown); fresh pages themselves
+ * always come from the top-down trie region allocator. */
+u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len,
+                           u64 hint_abs);
 void briefs_trie_free_node(struct super_block *sb, u64 node_ref);
 int briefs_trie_node_store_name(struct super_block *sb, u64 node_ref,
                                 const char *name, size_t name_len);
 int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
-                          u8 node_type, u64 *out_ref);
+                          u8 node_type, u64 *out_ref, u64 hint_abs);
 void briefs_trie_cleanup_state(struct super_block *sb);
-void briefs_trie_page_add_partial(struct super_block *sb, u64 block);
+/* @hint: cluster tag of the page (the owning directory's trie root
+ * block; 0 when unknown) - node allocation prefers same-tag pages. */
+void briefs_trie_page_add_partial(struct super_block *sb, u64 block, u64 hint);
 bool briefs_trie_page_has_room(struct briefs_trie_page *page);
 int briefs_trie_seed_pool(struct super_block *sb, u64 root_ref);
+/* Whole-directory trie prefetch (cold-walk cascade): blocking-read every
+ * page reachable from @root_ref into the buffer cache on the per-sb
+ * prefetch workqueue, off the readdir critical path.  Read-only and
+ * validated like seed_pool; silently bounded. */
+void briefs_trie_prefetch_dir_async(struct super_block *sb, u64 root_ref);
+/* Same, keyed by inode number: the kworker resolves the trie root with a
+ * blocking inode-block read (the readdir emit path cannot yet read it). */
+void briefs_trie_prefetch_ino_async(struct super_block *sb, u64 ino);
 int briefs_trie_update_entry(struct super_block *sb, struct briefs_inode *di,
                             const char *name, size_t name_len,
                             u64 new_ino, u8 new_type);
@@ -1239,6 +1257,13 @@ struct briefs_sb_info {
 	u64 mount_jiffies;              /* time of mount, for debugfs/sysfs/proc */
 	struct mutex inode_block_locks[BRIEFS_INODE_BLOCK_LOCKS]; /* serialize RMW on shared inode blocks */
 	atomic_t btree_error_count;     /* circuit breaker for btree checksum errors */
+	/* Whole-directory trie prefetch workqueue (cold-walk cascade; see
+	 * briefs_trie_prefetch_dir_async in trie.c).  Allocated at mount,
+	 * destroyed at put_super BEFORE any fs state teardown so its workers
+	 * -- which blocking-read trie pages via the sb -- always complete
+	 * first.  NULL when allocation failed or the sb is being torn down;
+	 * every queueing site checks for NULL. */
+	struct workqueue_struct *trie_prefetch_wq;
 };
 
 /* briefs_inode_info - our inode info */
@@ -1709,6 +1734,8 @@ struct buffer_head *briefs_read_inode_block(struct super_block *sb, u64 ino,
                                              struct briefs_disk_inode **di);
 void briefs_readahead_inode(struct super_block *sb, u64 ino);
 void briefs_readahead_dir_trie_root(struct super_block *sb, u64 ino);
+/* Blocking trie-root resolve for the prefetch kworker (returns 0 = none). */
+u64 briefs_load_dir_trie_root(struct super_block *sb, u64 ino);
 bool briefs_check_meta_write_error(struct buffer_head *bh);
 void briefs_handle_meta_write_error(struct super_block *sb, const char *ctx);
 

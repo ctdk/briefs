@@ -148,8 +148,54 @@ void briefs_readahead_dir_trie_root(struct super_block *sb, u64 ino)
 		if (root != 0 &&
 		    briefs_block_in_range(sb, TRIE_REF_BLOCK(root)))
 			sb_breadahead(sb, TRIE_REF_BLOCK(root));
+		/* No cascade here: the readdir emit path already queued a
+		 * whole-directory prefetch for every subdirectory (see
+		 * briefs_trie_prefetch_ino_async); this probe only gives
+		 * the walker's immediate descent a head start on the root
+		 * page when the inode block read finished in time. */
 	}
 	brelse(bh);
+}
+
+/*
+ * Blocking counterpart of briefs_readahead_dir_trie_root: read the
+ * on-disk inode block for @ino and return its dir_trie_root reference
+ * (0 on any failure, which cancels that directory's prefetch).  Used
+ * only by the trie-prefetch kworker, which runs off the readdir
+ * critical path; the readdir emit path has only readahead'd the inode
+ * block and so cannot read dir_trie_root itself yet.
+ */
+u64 briefs_load_dir_trie_root(struct super_block *sb, u64 ino)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct briefs_disk_inode *di;
+	struct buffer_head *bh;
+	u64 inodeTableBlock, inodeIndex, inodeBlock, inodeOffset, root;
+
+	if (!bsi || !bsi->sb || ino == 0)
+		return 0;
+
+	inodeTableBlock = briefs_inode_table_start(bsi->sb);
+	inodeIndex = ino - 1;
+	inodeBlock = inodeIndex / (sb->s_blocksize / BRIEFS_INODE_SIZE);
+	inodeOffset = (inodeIndex % (sb->s_blocksize / BRIEFS_INODE_SIZE)) * BRIEFS_INODE_SIZE;
+
+	if (!briefs_block_in_range(sb, inodeTableBlock + inodeBlock))
+		return 0;
+
+	bh = sb_bread(sb, inodeTableBlock + inodeBlock);
+	if (!bh)
+		return 0;
+
+	di = (struct briefs_disk_inode *)(bh->b_data + inodeOffset);
+	root = le64_to_cpu(di->dir_trie_root);
+	brelse(bh);
+
+	if (root == 0 ||
+	    TRIE_REF_SLOT(root) >= TRIE_SLOTS_PER_BLOCK ||
+	    !briefs_block_in_range(sb, TRIE_REF_BLOCK(root)))
+		return 0;
+	return root;
 }
 
 /*
@@ -1040,10 +1086,15 @@ static int briefs_read_and_fill_inode(struct inode *inode)
 		inode->i_fop = &briefs_dir_operations;
 		/* A freshly loaded directory is usually getdents()ed right
 		 * after it is looked up; start reading its trie root page
-		 * now so the first readdir does not stall on it cold. */
+		 * now so the first readdir does not stall on it cold, and
+		 * schedule the whole-directory prefetch cascade in case the
+		 * readdir pipeline never fired for this directory (direct
+		 * open of a deep path, or a pipeline miss). */
 		if (!TRIE_REF_IS_NULL(cpu_di.dir_trie_root) &&
-		    briefs_block_in_range(sb, TRIE_REF_BLOCK(cpu_di.dir_trie_root)))
+		    briefs_block_in_range(sb, TRIE_REF_BLOCK(cpu_di.dir_trie_root))) {
 			sb_breadahead(sb, TRIE_REF_BLOCK(cpu_di.dir_trie_root));
+			briefs_trie_prefetch_dir_async(sb, cpu_di.dir_trie_root);
+		}
 	} else if (S_ISREG(inode->i_mode)) {
 		inode->i_op = &briefs_file_inode_ops;
 		inode->i_fop = &briefs_file_operations;

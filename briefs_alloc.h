@@ -39,6 +39,12 @@ struct briefs_alloc {
 	u64 rover_w0;                   /* next-fit hint: L0 word to start the next
 					 * single-block scan at (in-memory only,
 					 * not persisted; wraps around) */
+	/* Next-fit hint for briefs_alloc_block_high: L2 word the top-down
+	 * single-block scan resumes at (in-memory only, not persisted; 0 =
+	 * start from the top of the region).  Trie pages allocate from the
+	 * top of the data region downward so a directory's pages stay
+	 * contiguous; see alloc.c. */
+	u64 rover_w2_high;
 	/*
 	 * meta_shield: count of data blocks reserved for future B+tree metadata
 	 * (unwritten-extent fragmentation reserves, ext4-style).  In-memory only
@@ -72,6 +78,16 @@ u64 briefs_alloc_block(struct briefs_alloc *alloc);
  * allocation left behind at the shield floor.  Returns 0 on true ENOSPC.
  */
 u64 briefs_alloc_block_meta(struct briefs_alloc *alloc);
+
+/*
+ * Allocate a single free block from the top of the data region, scanning
+ * downward (top-down next-fit; used by the trie page allocator to give
+ * directory tries their own contiguous region).  Respects meta_shield
+ * exactly like briefs_alloc_block and leaves the global rover alone.
+ * Returns 0 when nothing is free above the data frontier -- caller falls
+ * back to briefs_alloc_block.
+ */
+u64 briefs_alloc_block_high(struct briefs_alloc *alloc);
 
 /*
  * Allocate a contiguous run of @n free data blocks under one alloc->lock
