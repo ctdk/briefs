@@ -767,7 +767,7 @@ bulk `./check` invocation.
 
 ## Formerly excluded test
 
-### generic/388 — shutdown-recovery stress wedge (now PASSING)
+### generic/388 — shutdown-recovery stress wedge (passing since 2026-08)
 
 - **Status:** **PASSING** as of the 2026-08-13 full-suite run (in the PASS
   list; no longer in the skip list). The earlier `XFS_IOC_GOINGDOWN
@@ -785,7 +785,7 @@ bulk `./check` invocation.
 
 ---
 
-## Failing tests (2026-08-30 full-suite run — current)
+## Failing tests (2026-08-30 full-suite run — superseded by the Overview)
 
 The 2026-08-30 run at the `ddcb7ef` fix content (archive
 `run-20260830-161504`) reported **5 failures, 0 hangs**. All five are accepted
@@ -1128,7 +1128,7 @@ were read and grouped; all gates are legitimate.
 
 ---
 
-## Passing tests (456)
+## Passing tests (456 in the 2026-08-30 run — superseded by the Overview)
 
 From the 2026-08-30 run archive (`run-20260830-161504-kernel.txt`, the
 `ddcb7ef` fix content, master). Delta vs the 2026-08-18 list: `299` (partial
@@ -1222,7 +1222,7 @@ previous run). `482` and `757` are correctly not-run because BrieFS does not
 issue FUA writes. Size failures `133` and `465` passed after enlarging the loop
 images.
 
-### Recent fix highlights (this campaign)
+### Fix highlights (2026-06 → 08 campaign)
 
 A large cluster of previously-failing tests now passes. Notable fixes:
 
