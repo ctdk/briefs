@@ -20,6 +20,7 @@
 #include <linux/buffer_head.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/xarray.h>
 #include <linux/unaligned.h>
 #include "briefs.h"
 #include "briefs_alloc.h"
@@ -34,6 +35,12 @@ struct briefs_trie_pages {
 	struct mutex lock;                /* protects the list and page metadata */
 	u64 hot_block;                  /* recently used partial page (fast path) */
 	u64 hot_hint;                   /* cluster anchor of the hot page */
+	/* O(1) membership index for @partial: block -> its list entry.
+	 * add_partial runs once per fresh page and once per node freed onto
+	 * a page that still has room, so with thousands of partial pages an
+	 * O(list) existence scan dominates create and unlink profiles.
+	 */
+	struct xarray entry_by_block;
 };
 
 /*
@@ -119,6 +126,7 @@ static struct briefs_trie_sb_state *briefs_trie_ensure_state(struct super_block 
 	mutex_init(&st->pages.lock);
 	st->pages.hot_block = 0;
 	st->pages.hot_hint = 0;
+	xa_init(&st->pages.entry_by_block);
 
 	spin_lock(&briefs_trie_states_lock);
 	list_add(&st->list, &briefs_trie_states);
@@ -145,6 +153,7 @@ void briefs_trie_cleanup_state(struct super_block *sb)
 		list_del(&entry->list);
 		kfree(entry);
 	}
+	xa_destroy(&st->pages.entry_by_block);
 	mutex_unlock(&st->pages.lock);
 
 	kfree(st);
@@ -597,22 +606,29 @@ static void __trie_page_add_partial_locked(struct briefs_trie_pages *pages,
 					   u64 block, u64 hint)
 {
 	struct briefs_trie_page_entry *entry;
-	bool found = false;
 
-	list_for_each_entry(entry, &pages->partial, list) {
-		if (entry->block == block) {
-			found = true;
-			break;
-		}
+	entry = xa_load(&pages->entry_by_block, block);
+	if (entry) {
+		/* Already listed: keep its original anchor (a page belongs
+		 * to the cluster it was allocated in, not to whoever
+		 * happens to reference it later).
+		 */
+		return;
 	}
-	if (!found) {
-		entry = kmalloc(sizeof(*entry), GFP_KERNEL);
-		if (entry) {
-			entry->block = block;
-			entry->hint = hint;
-			list_add(&entry->list, &pages->partial);
-		}
+	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry)
+		return;
+	entry->block = block;
+	entry->hint = hint;
+	/* Index first: on xa_store failure the entry stays off the list,
+	 * keeping the index and the list consistent (worst case the page
+	 * is simply not reusable until the next add).
+	 */
+	if (xa_err(xa_store(&pages->entry_by_block, block, entry, GFP_KERNEL))) {
+		kfree(entry);
+		return;
 	}
+	list_add(&entry->list, &pages->partial);
 }
 
 /*
@@ -793,6 +809,8 @@ u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len, u64 hint_abs
 
 				if (ref & (1ULL << 63)) {
 					/* Page became full. */
+					xa_erase(&pages->entry_by_block,
+						 entry->block);
 					list_del(&entry->list);
 					kfree(entry);
 					ref &= ~(1ULL << 63);
@@ -892,7 +910,7 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 	struct briefs_trie_page *page;
 	struct briefs_trie_node *node;
 	struct briefs_trie_pages *pages;
-	struct briefs_trie_page_entry *entry, *tmp;
+	struct briefs_trie_page_entry *entry;
 	u64 block, slot;
 	bool page_empty;
 
@@ -941,12 +959,10 @@ void briefs_trie_free_node(struct super_block *sb, u64 node_ref)
 			__trie_page_add_partial_locked(pages, block, 0);
 
 		if (page_empty) {
-			list_for_each_entry_safe(entry, tmp, &pages->partial, list) {
-				if (entry->block == block) {
-					list_del(&entry->list);
-					kfree(entry);
-					break;
-				}
+			entry = xa_erase(&pages->entry_by_block, block);
+			if (entry) {
+				list_del(&entry->list);
+				kfree(entry);
 			}
 			if (pages->hot_block == block) {
 				pages->hot_block = 0;
