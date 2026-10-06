@@ -130,6 +130,43 @@ static int trie_get_node(struct super_block *sb, u64 ref,
 }
 
 /*
+ * Speculative non-blocking readahead for a node's page.
+ *
+ * Cold directory walks are serialized by discovery: a node's
+ * first_child / next_sibling references live in the node's own page, so
+ * the next page of the walk is unknown until the current one has been
+ * read, and reads issue strictly one at a time (~120 us each on a cold
+ * cache=none device).  A cold kernel-tree find spends essentially its
+ * whole wall time in that chain: 16k unmerged 4K reads, zero merging,
+ * no readahead.  Submitting the read for the pages a freshly parsed
+ * node points at lets the device pipeline the walk down to roughly the
+ * trie's dependency depth instead of its node count.
+ *
+ * Read-only and safe against concurrent modification: the readahead
+ * populates the same buffer a later sb_bread() would hit, and a
+ * concurrent writer dirties that same buffer, so no stale copy can be
+ * served.  Worst case a prefetched page is never needed (a failed
+ * lookup) and stays cached like any other read.
+ */
+static void trie_readahead_ref(struct super_block *sb, u64 ref)
+{
+	u64 block;
+
+	if (TRIE_REF_IS_NULL(ref))
+		return;
+
+	/* Mirror briefs_trie_read_page()'s guards: never hand the block
+	 * layer a block the walker itself would have rejected. */
+	if (TRIE_REF_SLOT(ref) >= TRIE_SLOTS_PER_BLOCK)
+		return;
+	block = TRIE_REF_BLOCK(ref);
+	if (!briefs_block_in_range(sb, block))
+		return;
+
+	sb_breadahead(sb, block);
+}
+
+/*
  * Find a child node by byte value.  On success, fills *child_ref with the
  * matching child reference and *prev_ref with the previous sibling (0 if the
  * child is the first child).  Returns 0 on success, -ENOENT if not found.
@@ -170,12 +207,19 @@ static int trie_find_child_with_prev(struct super_block *sb, u64 parent_ref,
 		if (cnode->byte_val == byte_val) {
 			*child_ref = child;
 			*prev_ref = prev;
+			/* The descent will read this child's first_child page
+			 * next; get it in flight while we still hold the CPU. */
+			trie_readahead_ref(sb, trie_node_first_child(cnode));
 			brelse(cbh);
 			brelse(pbh);
 			return 0;
 		}
 		prev = child;
 		child = trie_node_next_sibling(cnode);
+		/* Prefetch the rest of the sibling chain: without this the
+		 * scan below is a serial one-read-per-sibling chain on a
+		 * cold cache. */
+		trie_readahead_ref(sb, child);
 		brelse(cbh);
 	}
 
@@ -501,6 +545,9 @@ int briefs_trie_lookup(struct super_block *sb, struct briefs_inode *di,
 			return -ENOENT;
 		}
 
+		/* Next byte's find_child() will descend into this child's
+		 * first_child page; start that read while we loop. */
+		trie_readahead_ref(sb, trie_node_first_child(cnode));
 		brelse(cbh);
 		cur = child;
 	}
@@ -1483,6 +1530,10 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 				}
 
 				if (!TRIE_REF_IS_NULL(trie_node_first_child(node))) {
+					/* This leaf is re-pushed to descend into
+					 * its children later; start reading the
+					 * first child's page now. */
+					trie_readahead_ref(sb, trie_node_first_child(node));
 					ret = trie_iter_push(iter, ref, 1);
 					if (ret) {
 						brelse(bh);
@@ -1499,6 +1550,10 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 		if (!TRIE_REF_IS_NULL(trie_node_first_child(node))) {
 			u64 child = trie_node_first_child(node);
 			int pushed = 0;
+
+			/* First read of the loop below would block on a cold
+			 * cache; get it started before we go around. */
+			trie_readahead_ref(sb, child);
 
 			while (!TRIE_REF_IS_NULL(child)) {
 				ret = trie_iter_push(iter, child, 0);
@@ -1523,6 +1578,14 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 						return -EIO;
 					}
 					child = trie_node_next_sibling(cn);
+					/* Keep the sibling chain AND the subtree
+					 * descent in flight: each parsed node
+					 * speculatively starts the read for
+					 * the two pages it points at.  Without
+					 * this a cold walk serializes on every
+					 * trie page in the directory. */
+					trie_readahead_ref(sb, child);
+					trie_readahead_ref(sb, trie_node_first_child(cn));
 					brelse(cbh);
 				}
 			}
