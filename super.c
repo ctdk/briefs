@@ -469,13 +469,14 @@ int briefs_fill_super(struct super_block *sb, struct fs_context *fc) {
 	 * Enable cgroup-aware writeback: per-inode wb ownership is
 	 * charged to the dirtier's cgroup, making io.stat and
 	 * generic/563 work.  Disabled before BRIEFS_HAS_CGROUPWB_FIX
-	 * (see compat/compat.h): two upstream wb-switch bugs -- the wb
-	 * use-after-free in inode_switch_wbs_work_fn() (CVE-2026-31703)
-	 * and the cgroup_writeback_umount() vs inode_switch_wbs() umount
-	 * race (CVE-2026-64378) -- crashed the 6.12 test VM at unmount
-	 * (9385fc8).  Must be set before any inode is allocated: journal
-	 * replay below creates inodes and inode_cgwb_enabled() is
-	 * consulted at inode creation.
+	 * (see compat/compat.h): the stable trees carry only the v1
+	 * wb-switch race fix (cba38ec4cbd3), which the 2026-10-07 gate
+	 * round proved insufficient on 6.12.111 -- the cgwb-offline path
+	 * UAF'd a freed BrieFS dir inode and wedged every umount; the
+	 * per-sb isw drain rework is mainline 7.2+ only.  Must be set
+	 * before any inode is allocated: journal replay below creates
+	 * inodes and inode_cgwb_enabled() is consulted at inode
+	 * creation.
 	 */
 	sb->s_iflags |= SB_I_CGROUPWB;
 #endif

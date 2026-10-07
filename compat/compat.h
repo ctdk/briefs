@@ -27,14 +27,16 @@
  * series, and the cross-kernel build matrix (tests/build-matrix.sh) turns
  * a wrong boundary into a compile error, never a silent break.
  *
- * BRIEFS_HAS_CGROUPWB_FIX below is the one deliberate exception: it is
- * keyed to stable-bugfix backport patchlevels (6.12.96, 6.18.39, 7.1.4),
- * not an API-shape boundary.  Debian ships upstream stable point
- * releases, so LINUX_VERSION_CODE still answers the question exactly.
- * If Debian ever cherry-picked the fix into a lower patchlevel, the
- * flag would stay 0 there -- conservative: generic/563 keeps failing
- * but no crash risk.  The build-matrix flag probe asserts the boundary
- * per target.
+ * BRIEFS_HAS_CGROUPWB_FIX below is a bugfix-presence gate, not an
+ * API-shape boundary: it tracks whether the kernel's inode_switch_wbs
+ * machinery is safe enough for BrieFS to opt into cgroup writeback
+ * (SB_I_CGROUPWB).  Since 2026-10-07 it is a plain >= 7.2 boundary:
+ * the per-sb isw rework (31c1d19ead2c) is mainline-only from 7.2-rc1
+ * onward, and the v1-only stable backports (6.12.96, 6.18.39, 7.1.4)
+ * were proven insufficient by the 6.12.111 gate crash.  If Debian ever
+ * cherry-picked the rework into a lower patchlevel, the flag would stay
+ * 0 there -- conservative: generic/563 keeps failing but no crash
+ * risk.  The build-matrix flag probe asserts the boundary per target.
  */
 
 #include <linux/version.h>
@@ -120,34 +122,40 @@
 #endif
 
 /*
- * Cgroup-writeback wb-switch bugfixes.  Both upstream bugs below must
- * be fixed in a kernel before BrieFS sets SB_I_CGROUPWB (see the
- * consumer in super.c, which follows the iomap.c writeback-arm
- * precedent for a #if BRIEFS_HAS_* region outside compat/):
+ * Cgroup-writeback wb-switch bugfixes.  BrieFS must not set
+ * SB_I_CGROUPWB unless the kernel's inode_switch_wbs machinery is
+ * safe, because the cgwb-offline path can otherwise queue or run an
+ * isw against freed BrieFS inode memory and wedge the whole VM
+ * (every umount then hangs in cgroup_writeback_umount()'s
+ * flush_workqueue).
  *
- *   CVE-2026-31703: wb use-after-free in inode_switch_wbs_work_fn()
- *     (upstream 6689f01d6740, mainline 7.1-rc1; stable 6.12.94 via
- *     156cc63691c1, 6.18.25, 7.0.2, 6.1.178, 6.6.147)
- *   CVE-2026-64378: cgroup_writeback_umount() vs inode_switch_wbs()
- *     umount race (upstream cba38ec4cbd3 + follow-ups, mainline
- *     7.2-rc1; stable 6.12.96 via c923cc3cb5cd, 6.18.39, 7.1.4,
- *     6.6.145, 6.1.178)
+ * History (as of 2026-10-07): the wb-switch race fix generation that
+ * reached the stable trees is only v1 -- cba38ec4cbd3 ("writeback: fix
+ * race between cgroup_writeback_umount() and inode_switch_wbs()":
+ * counter-before-grab ordering + rcu extensions + synchronize_rcu()
+ * in cgroup_writeback_umount; backported 6.12.96 c923cc3cb5cd,
+ * 6.18.39, 7.1.4, 6.6.145, 6.1.178, 5.10.y).  The follow-up per-sb
+ * rework of the same series (31c1d19ead2c "writeback: use a per-sb
+ * counter to drain inode wb switches at umount", plus its 1/3-2/3
+ * siblings) was deliberately mainline-only: merged 7.2-rc1 via
+ * vfs-7.2-rc1.writeback, never backported.  CVE-2026-31703
+ * (6689f01d6740, stable 6.12.94 via 156cc63691c1) predates v1.
  *
- * Both-fixed: >= 7.2, 7.1.y >= 7.1.4, 6.18.y >= 6.18.39,
- * 6.12.y >= 6.12.96.  7.0.y is excluded entirely: it received only
- * CVE-2026-31703 (7.0.2) before the tree EOL'd -- no CVE-2026-64378
- * backport ever existed.  6.16/6.17 predate the CVE-2026-31703
- * introducing commit (e1b849cfa6b6, v6.18) but never got the
- * umount-race backport either (EOL first); 6.19.y likewise EOL'd
- * unfixed.  6.1.y/6.6.y carry both fixes but sit below BrieFS's 6.12
- * floor.
+ * The 2026-10-07 full-suite gate on stock Debian 6.12.111 proved v1
+ * insufficient for the cgwb-offline (memcg teardown) path: an isw
+ * referencing an already-freed BrieFS dir inode and its freed
+ * super_block crashed inode_switch_wbs_work_fn (GPF in down_read on
+ * garbage from the freed sb's s_bdi slot) even though v1 is fully
+ * present in that kernel (verified by disassembly).  Forensics in
+ * ~/src/briefs-notes/gate-oops-6.12.111-cgwb-isw-forensics.md.
+ *
+ * Therefore the gate is conservative: only kernels >= 7.2, which have
+ * the complete per-sb rework (empirically validated by the clean
+ * 2026-10-05 7.3 full-suite round with cgwb enabled), may set
+ * SB_I_CGROUPWB.  generic/563 stays an accepted FAIL everywhere else.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 4) ||			\
-	(LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 39) &&		\
-	 LINUX_VERSION_CODE <  KERNEL_VERSION(6, 19, 0)) ||		\
-	(LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 96) &&		\
-	 LINUX_VERSION_CODE <  KERNEL_VERSION(6, 13, 0))
-#define BRIEFS_HAS_CGROUPWB_FIX 1	/* both wb-switch bugs fixed */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+#define BRIEFS_HAS_CGROUPWB_FIX 1	/* per-sb isw drain present */
 #else
 #define BRIEFS_HAS_CGROUPWB_FIX 0
 #endif

@@ -38,8 +38,9 @@
 # result is compared against an independent boundary computation from
 # the target's own utsrelease.h -- the two disagreeing is a FAIL,
 # because that means the flag's version range and the bugfix record
-# have drifted apart (see compat/compat.h: keyed to stable-backport
-# patchlevels, 6.12.96/6.18.39/7.1.4+).
+# have drifted apart (see compat/compat.h: >= 7.2 only; the v1-only
+# stable backports were proven insufficient by the 2026-10-07
+# 6.12.111 gate crash).
 #
 # One-time host prep, recorded for reproducibility:
 #   - trixie-backports enabled in /etc/apt/sources.list.
@@ -149,24 +150,22 @@ cgwb_flag() {
 
 # expected_cgwb KDIR — the value BRIEFS_HAS_CGROUPWB_FIX must have on
 # this kernel, computed independently of compat.h: the shell re-derives
-# the both-bugs-fixed boundaries (>= 7.2, 7.1.y >= 7.1.4,
-# 6.18.y >= 6.18.39, 6.12.y >= 6.12.96) from UTS_RELEASE.  Agreement of
-# the two implementations is the assert; keep in sync with compat.h.
+# the >= 7.2 boundary (per-sb isw drain rework present; v1-only stable
+# backports proven insufficient by the 2026-10-07 6.12.111 gate crash)
+# from UTS_RELEASE.  Agreement of the two implementations is the
+# assert; keep in sync with compat.h.
 expected_cgwb() {
-    local uts x y z
+    local uts x y
     uts="$(sed -n 's/^#define UTS_RELEASE "\(.*\)"/\1/p' \
         "$1/include/generated/utsrelease.h" 2>/dev/null)"
     [ -n "$uts" ] || return 2
     x="$(echo "$uts" | sed -E 's/^([0-9]+)\..*/\1/')"
     y="$(echo "$uts" | sed -E 's/^[0-9]+\.([0-9]+)\..*/\1/')"
-    z="$(echo "$uts" | sed -E 's/^[0-9]+\.[0-9]+\.([0-9]+).*/\1/')"
-    if [ "$x" -ge 7 ] 2>/dev/null; then
-        { [ "$y" -ge 2 ] || { [ "$y" -eq 1 ] && [ "$z" -ge 4 ]; }; } && { echo 1; return; }
-    elif [ "$x" -eq 6 ] 2>/dev/null; then
-        { { [ "$y" -eq 18 ] && [ "$z" -ge 39 ]; } || \
-          { [ "$y" -eq 12 ] && [ "$z" -ge 96 ]; }; } && { echo 1; return; }
+    if [ "$x" -ge 7 ] 2>/dev/null && [ "$y" -ge 2 ] 2>/dev/null; then
+        echo 1
+    else
+        echo 0
     fi
-    echo 0
 }
 
 run_target() {  # NAME KDIR — clean + modules build; echo "NAME STATUS"
