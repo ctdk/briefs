@@ -610,6 +610,83 @@ static int briefs_journal_flush_cur_block_locked(struct briefs_journal *j)
 }
 
 /*
+ * Back-pressure room check (generic/320).  The caller has just flushed a
+ * block and advanced j->write_pos, so write_pos == journal_log_start means
+ * the ring has wrapped completely full.  Run checkpoints until the next
+ * block advance is safe, and only then return -ENOSPC.
+ *
+ * Neither a one-shot checkpoint nor a bounded retry guarantees room: the
+ * checkpoint releases j->write_lock while it drains (the AB-BA fix), and
+ * concurrent journal writers refill the ring through that window -- the
+ * 100-thread rm of generic/320 sustains a full 128-block lap per
+ * checkpoint window, so the original one-shot re-check (and a 16x retry,
+ * the first fix attempt) handed -ENOSPC straight back to unlink/create.
+ * Wait like jbd2's log_wait_for_space() instead: each pass checkpoints
+ * (retiring at least everything appended up to the moment it re-acquired
+ * write_lock, so durable progress is monotonic), re-checks, and if the
+ * ring is still full drops the lock and yields so the finite burst can
+ * drain.  BRIEFS_JOURNAL_RING_WAIT bounds the total wait so a genuinely
+ * sustained append rate can never wedge a writer here forever -- it gets
+ * the old -ENOSPC, a minute later.
+ */
+#define BRIEFS_JOURNAL_RING_WAIT	(64 * HZ)
+
+static int briefs_journal_ring_room_locked(struct briefs_journal *j)
+{
+	unsigned long giveup = jiffies + BRIEFS_JOURNAL_RING_WAIT;
+	u64 log_start = le64_to_cpu(j->sb->journal_log_start);
+
+	if (j->write_pos != log_start)
+		return 0;			/* ring is not wrapped-full */
+
+	if (j->journal_end - j->journal_start < 2) {
+		/* Only a degenerate 1-block ring stays collidable; refuse
+		 * rather than corrupt the log. */
+		pr_err("briefs: journal ring exhausted (size=%llu blocks)\n",
+		       j->journal_end - j->journal_start);
+		return -ENOSPC;
+	}
+
+	for (;;) {
+		int ret = __briefs_journal_checkpoint_locked(j);
+
+		if (ret) {
+			pr_err("briefs: journal back-pressure checkpoint failed: %d\n",
+			       ret);
+			return ret;
+		}
+		/*
+		 * A ring with >= 2 usable blocks whose next block advance is
+		 * clear: journal_log_start was retired to the durable
+		 * boundary, and write_pos no longer sits one block short of
+		 * it.  Still collidable means concurrent writers refilled the
+		 * ring during the checkpoint's write_lock release window.
+		 */
+		if (briefs_journal_next_block(j, j->write_pos) !=
+		    le64_to_cpu(j->sb->journal_log_start))
+			return 0;
+		if (time_after(jiffies, giveup)) {
+			pr_err("briefs: journal ring still full after %d seconds of back-pressure checkpoints (size=%llu blocks)\n",
+			       BRIEFS_JOURNAL_RING_WAIT / HZ,
+			       j->journal_end - j->journal_start);
+			return -ENOSPC;
+		}
+		/*
+		 * Still wrapped-full.  Yield the lock and sleep briefly so
+		 * concurrent writers drain their burst, then re-check the
+		 * cheap condition first -- another waiter's checkpoint may
+		 * have freed the ring while we slept.
+		 */
+		mutex_unlock(&j->write_lock);
+		schedule_timeout_interruptible(msecs_to_jiffies(20));
+		mutex_lock(&j->write_lock);
+		if (j->write_pos !=
+		    le64_to_cpu(j->sb->journal_log_start))
+			return 0;
+	}
+}
+
+/*
  * Write a record to the journal.
  * Records are appended sequentially within the current block.
  * If a record doesn't fit, the current block is flushed to disk,
@@ -673,28 +750,16 @@ static int __briefs_journal_write_record_locked(struct briefs_journal *j,
 		 * releases j->write_lock before calling briefs_alloc_sync(),
 		 * so it is safe to call from within any write_record caller
 		 * (including under alloc->lock).
+		 *
+		 * briefs_journal_ring_room_locked() waits the concurrent-writer
+		 * refill out with checkpoint + yield passes.
 		 */
 		if (j->write_pos == le64_to_cpu(j->sb->journal_log_start)) {
 			pr_debug("briefs: journal ring full (back-pressure), checkpointing at write_pos=%llu\n",
 				j->write_pos);
-			ret = __briefs_journal_checkpoint_locked(j);
-			if (ret) {
-				pr_err("briefs: journal back-pressure checkpoint failed: %d\n",
-				       ret);
+			ret = briefs_journal_ring_room_locked(j);
+			if (ret)
 				return ret;
-			}
-			/*
-			 * A ring with >= 2 usable blocks is now clear
-			 * (journal_log_start == write_pos, next_block != write_pos).
-			 * Only a degenerate 1-block ring stays collidable; refuse
-			 * rather than corrupt the log.
-			 */
-			if (briefs_journal_next_block(j, j->write_pos) ==
-			    le64_to_cpu(j->sb->journal_log_start)) {
-				pr_err("briefs: journal ring exhausted (size=%llu blocks)\n",
-				       j->journal_end - j->journal_start);
-				return -ENOSPC;
-			}
 		}
 		/*
 		 * The back-pressure checkpoint above released j->write_lock while
@@ -703,28 +768,40 @@ static int __briefs_journal_write_record_locked(struct briefs_journal *j,
 		 * the value our bounds check at the top of this flush branch saw (it
 		 * was reset to the block-header size, then grown by other threads).
 		 * Re-verify the record still fits; if the block filled while we were
-		 * away, flush it again.  This runs under write_lock with no further
-		 * lock release, so the record write below is now atomic w.r.t.
-		 * write_offset -- closing the race that caused the kmalloc-4k
-		 * slab-out-of-bounds in this function under concurrent fsstress
-		 * (e.g. generic/411): the check saw a small write_offset, the
-		 * lock-releasing checkpoint let another writer grow it, and the
-		 * memcpy then ran past the 4096-byte cur_block.
+		 * away, flush it again.  Between passes j->write_lock is only
+		 * released inside the ring-room checkpoint, so each pass
+		 * re-validates against whatever write_offset concurrent writers
+		 * grew it to in that window -- closing the race that caused the
+		 * kmalloc-4k slab-out-of-bounds in this function under concurrent
+		 * fsstress (e.g. generic/411): the check saw a small write_offset,
+		 * the lock-releasing checkpoint let another writer grow it, and
+		 * the memcpy then ran past the 4096-byte cur_block.
 		 *
 		 * A single record always fits in an empty block (every record's
 		 * data_len is <= JOURNAL_BLOCK_SIZE - 2 * sizeof(record header)),
-		 * so this loop runs at most once and cannot itself wrap the ring;
-		 * the post-flush wrap guard is retained for safety against a future
-		 * oversized record type.
+		 * so against valid records this loop runs at most once per
+		 * concurrent refill; the reflush bound keeps a hypothetical
+		 * oversized record from spinning now that ring_room no longer
+		 * fails it with -ENOSPC.
 		 */
-		while (j->write_offset + total_size > JOURNAL_BLOCK_SIZE) {
-			ret = briefs_journal_flush_cur_block_locked(j);
-			if (ret)
-				return ret;
-			if (j->write_pos ==
-			    le64_to_cpu(j->sb->journal_log_start)) {
-				pr_err("briefs: journal ring exhausted after back-pressure checkpoint\n");
-				return -ENOSPC;
+		{
+			int reflushes = 0;
+
+			while (j->write_offset + total_size > JOURNAL_BLOCK_SIZE) {
+				if (++reflushes > 4) {
+					pr_err("briefs: journal record (type=%d len=%u) does not fit in a block\n",
+					       type, total_size);
+					return -ENOSPC;
+				}
+				ret = briefs_journal_flush_cur_block_locked(j);
+				if (ret)
+					return ret;
+				if (j->write_pos ==
+				    le64_to_cpu(j->sb->journal_log_start)) {
+					ret = briefs_journal_ring_room_locked(j);
+					if (ret)
+						return ret;
+				}
 			}
 		}
 	}
