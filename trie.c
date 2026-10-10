@@ -23,6 +23,21 @@
 
 #define TRIE_ANCESTRY_LIMIT 256
 
+/*
+ * Iterator stack ceiling (generic/388).  A healthy trie walk's frontier is
+ * bounded by ~BRIEFS_TRIE_SIBLING_MAX remaining-siblings per level times
+ * ~BRIEFS_NAME_LEN levels of name depth (plus one re-push per level for
+ * emitted interior nodes), i.e. a worst case of roughly 65K entries.  A
+ * CYCLIC trie instead re-pushes a node once per corrupt parent and grows
+ * the stack 1:1 with visits, doubling the buffer without bound until the
+ * kmalloc order exceeds the allocator's MAX_ORDER (the order-11 page-
+ * allocator WARN at 8 MiB).  128K entries (a 1 MiB u64 stack) sits well
+ * above every legitimate frontier and far below any dangerous allocation;
+ * hitting it means the trie is corrupt/cyclic, so abort with -EIO rather
+ * than try to allocate our way through.
+ */
+#define TRIE_ITER_MAX_SP	(128 * 1024)
+
 /* Checkpoint policy for readdir seeks: snapshot the settled post-emit
  * iterator state every TRIE_CKPT_STRIDE emitted entries; keep at most
  * TRIE_CKPT_MAX checkpoints or TRIE_CKPT_BUDGET bytes of blob state per
@@ -1740,7 +1755,8 @@ void briefs_trie_iter_free(struct trie_iter *iter)
 
 /*
  * Grow the iterator stack to fit at least need more entries.
- * Returns 0 on success, -ENOMEM on failure.
+ * Returns 0 on success, -EIO past TRIE_ITER_MAX_SP (corrupt/cyclic trie),
+ * -ENOMEM on allocation failure.
  */
 static int trie_iter_grow(struct trie_iter *iter, int need)
 {
@@ -1751,6 +1767,18 @@ static int trie_iter_grow(struct trie_iter *iter, int need)
 
 	if (new_cap == iter->cap)
 		return 0;
+
+	/*
+	 * Corrupt/cyclic-trie backstop (see TRIE_ITER_MAX_SP above):
+	 * abort with -EIO before attempting the multi-order kmalloc, so a
+	 * replay-time cycle cannot push the stack toward 8 MiB and the
+	 * page-allocator WARN that generic/388 tripped.
+	 */
+	if (new_cap > TRIE_ITER_MAX_SP) {
+		pr_warn("briefs: trie iterator stack exceeded %d entries (corrupt/cyclic trie), aborting\n",
+			TRIE_ITER_MAX_SP);
+		return -EIO;
+	}
 
 	/*
 	 * Grow both arrays atomically: allocate the two replacements first, copy,
