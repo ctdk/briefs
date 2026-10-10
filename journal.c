@@ -2102,6 +2102,14 @@ int briefs_journal_replay_pop_trie_block(struct briefs_journal *j, u64 *rel)
  *
  * This is a pure recovery-time fix: no on-disk format change, no mkfs/fsck
  * updates.
+ *
+ * Walk errors are NOT tolerated: briefs_trie_iter_next() returns -ENOENT at
+ * normal end-of-walk but -EIO/-ENOMEM on a corrupt (cyclic) or unreadable
+ * trie.  A truncated walk yields partial counts, and patching from them
+ * would write under-counted nlinks to the disk (generic/388's swallowed
+ * -ENOMEM did exactly that).  On any walk error the reconcile is abandoned
+ * and pass 3b never runs -- the mount proceeds with the nlinks exactly as
+ * replay left them rather than with wrong values.
  */
 static int replay_reconcile_nlinks(struct super_block *sb)
 {
@@ -2129,6 +2137,7 @@ static int replay_reconcile_nlinks(struct super_block *sb)
 		u8 ftype;
 		char name_buf[BRIEFS_NAME_LEN + 1];
 		int name_len;
+		int walk_ret;
 
 		if (!replay_inode_allocated(bsi, ino))
 			continue;
@@ -2156,8 +2165,9 @@ static int replay_reconcile_nlinks(struct super_block *sb)
 		}
 
 		briefs_trie_iter_init(iter, &dir_di, 0);
-		while (briefs_trie_iter_next(sb, iter, 0, &child_ino, &ftype,
-		                             name_buf, &name_len) == 0) {
+		while ((walk_ret = briefs_trie_iter_next(sb, iter, 0, &child_ino,
+		                                        &ftype, name_buf,
+		                                        &name_len)) == 0) {
 			int ret;
 
 			if (child_ino != 0 && replay_inode_allocated(bsi, child_ino)) {
@@ -2183,6 +2193,21 @@ static int replay_reconcile_nlinks(struct super_block *sb)
 
 		briefs_trie_iter_free(iter);
 		brelse(bh);
+
+		if (walk_ret != -ENOENT) {
+			/*
+			 * Corrupt/cyclic trie or an unreadable block: the
+			 * counts are incomplete, so patching pass 3b below
+			 * would write under-counted nlinks onto the disk.
+			 * Leave every on-disk nlink as replay left it and
+			 * skip the patching entirely; still return 0 so the
+			 * mount can proceed (generic/388, generic/475).
+			 */
+			pr_err("briefs: nlink reconcile: directory %llu trie walk aborted (%d), leaving on-disk nlinks unpatched\n",
+			       ino, walk_ret);
+			replay_nlink_free_all(j);
+			return 0;
+		}
 
 		if ((ino & 4095) == 0)
 			cond_resched();
