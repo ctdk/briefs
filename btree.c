@@ -173,6 +173,42 @@ btree_read_node(struct super_block *sb, u64 block, bool trust_verified,
 		this_cpu_inc(bsi->verify_stats->skip);
 	}
 
+	/*
+	 * num_keys bounds (generic/388 fortify BUG), checked on EVERY read --
+	 * a buffer can reach the cache verified without passing through the
+	 * magic/checksum gates above (replay writes node buffers directly),
+	 * and every tree walk sizes its work directly off hdr.num_keys:
+	 * leaf extent compaction memsets (n - out) * sizeof(extent), internal
+	 * idx rebuilds index idx[n], and the range delete zeroes a 254-bit
+	 * child_empty bitmap sized for at most BRIEFS_BTREE_IDX_KEYS + 1
+	 * children.  A replay-reconstructed node can carry a checksummed-
+	 * but-insane num_keys, which the delete path turned into a
+	 * 3848-byte memset of the 32-byte stack bitmap (__fortify BUG in
+	 * fsstress context, run-20261010-020358).  Reject the node like any
+	 * other corrupt read: the callers' conservative handling (don't
+	 * drop, don't edit) is the one they already take for checksum
+	 * failures.
+	 */
+	{
+		int num_keys = le16_to_cpu(node->hdr.num_keys);
+		int max_keys = (le32_to_cpu(node->hdr.flags) &
+				BRIEFS_BTREE_LEAF) ?
+			BRIEFS_BTREE_LEAF_FANOUT : BRIEFS_BTREE_IDX_KEYS;
+
+		if (num_keys > max_keys) {
+			pr_warn_ratelimited("briefs: btree: node %llu num_keys %d exceeds capacity %d\n",
+					   block, num_keys, max_keys);
+			brelse(bh);
+			count = atomic_inc_return(&bsi->btree_error_count);
+			if (count >= BRIEFS_BTREE_ERROR_LIMIT) {
+				pr_err("briefs: btree: %d errors, forcing read-only\n",
+				       count);
+				bsi->mount_flags |= BRIEFS_MF_ERROR_FS;
+			}
+			return NULL;
+		}
+	}
+
 	*bhp = bh;
 	return node;
 }
