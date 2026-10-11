@@ -1107,6 +1107,13 @@ struct trie_ckpt {
 	u8 *flags;	/* kmalloc'd copy of leaf_emitted[0..sp) */
 };
 
+/* One direct-mapped slot of the trie iterator's revisit table. */
+struct trie_visit_slot {
+	u64 ref;
+	u32 visits;
+	u32 pad;
+};
+
 /* Trie iterator for readdir - depth-first walk yielding leaves */
 struct trie_iter {
 	u64 *stack;
@@ -1134,6 +1141,19 @@ struct trie_iter {
 				* backstop; see briefs_trie_iter_next)
 				*/
 	u64 visit_cap;         /* 0 = unset; lazily computed on first _next call */
+	/* Ref-keyed revisit backstop (see trie_iter_note_visit in trie.c):
+	 * a healthy walk segment visits any node ref at most 3 times, so a
+	 * ref seen TRIE_REF_MAX_VISITS times is corrupt/cyclic trie
+	 * amplification -- detected here in microseconds instead of
+	 * burning down the fs-size-proportional visit_cap above (~66s on a
+	 * large fs; the stack stays bounded during the burn, so the
+	 * iterator-stack cap cannot catch it).  Lazily allocated once a
+	 * walk segment exceeds TRIE_VISIT_ENGAGE node reads; dropped
+	 * wherever iter->visited resets, since a seek or re-init
+	 * legitimately revisits refs.
+	 */
+	struct trie_visit_slot *vslots;
+	bool vtbl_failed;      /* table allocation failed: counting disabled */
 	/* Checkpoints of the settled post-emit walk state, captured every
 	 * ckpt_stride emitted entries so briefs_trie_iter_seek() can restore
 	 * the nearest one below a seekdir target and skip < ckpt_stride

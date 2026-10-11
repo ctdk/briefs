@@ -53,6 +53,11 @@
  */
 static int trie_iter_push(struct trie_iter *iter, u64 ref, u8 emitted);
 
+/* Forward decl: seed_pool also counts node visits through the iterator's
+ * revisit backstop (see trie_iter_note_visit below).
+ */
+static int trie_iter_note_visit(struct trie_iter *iter, u64 ref);
+
 /*
  * Initialize a deferred free list. Must be freed with trie_free_list_destroy.
  */
@@ -513,6 +518,12 @@ int briefs_trie_seed_pool(struct super_block *sb, u64 root_ref)
 			continue;
 		}
 		visited++;
+		if (trie_iter_note_visit(iter, ref)) {
+			/* Corrupt/cyclic trie: stop seeding, keep what was
+			 * added (the local cap above aborts the same way).
+			 */
+			break;
+		}
 
 		if (briefs_trie_page_has_room(page)) {
 			/* Tag with this trie's root: replay re-derives each
@@ -1705,6 +1716,87 @@ void briefs_trie_free_all(struct super_block *sb, struct briefs_inode *di)
 }
 
 /*
+ * Revisit-table geometry.  The table is a direct-mapped open-addressing
+ * array of (ref, visits) slots: a probe either finds the same ref and
+ * bumps its count, or overwrites the slot with the new ref.  The
+ * overwrite-on-collision keeps a healthy walk safe under any aliasing:
+ * a ref's count only grows when that same ref is seen again before a
+ * different aliasing ref resets the slot, and a healthy walk sees any
+ * single ref at most 3 times in total (one push-loop sibling pre-read,
+ * one pop, plus one re-push pop for a leaf with children), so the
+ * TRIE_REF_MAX_VISITS threshold cannot fire on a healthy trie.
+ *
+ * A corrupt trie amplifies revisits (a cycle in first_child/next_sibling
+ * re-descends the same subgraph; a corrupt DAG re-pushes shared subtrees)
+ * without necessarily growing the stack, so neither the stack cap nor the
+ * fs-size-proportional visit_cap catches it before it burns seconds of
+ * CPU.  A ref reaching TRIE_REF_MAX_VISITS is proof of amplification
+ * (generic/388: each replay mount of the persistent corrupt trie burned
+ * ~66s against a 1.65-billion-visit cap).
+ *
+ * The table is allocated lazily (kvcalloc: 2 MiB would stress the page
+ * allocator as a single order-9 kmalloc) once a walk segment exceeds
+ * TRIE_VISIT_ENGAGE node reads, so ordinary iterators never pay for it;
+ * it is dropped wherever iter->visited resets (seek or re-init), since
+ * those legitimately revisit refs.  On allocation failure counting is
+ * disabled and the visit_cap backstop still bounds the walk.
+ */
+#define TRIE_VISIT_BITS		17
+#define TRIE_VISIT_SLOTS	BIT(TRIE_VISIT_BITS)
+#define TRIE_VISIT_ENGAGE	65536
+#define TRIE_REF_MAX_VISITS	16
+
+/*
+ * Count one node visit against the revisit backstop.  Returns 0, or
+ * -EIO once any single ref has been seen more than TRIE_REF_MAX_VISITS
+ * times (corrupt/cyclic trie amplification).
+ */
+static int trie_iter_note_visit(struct trie_iter *iter, u64 ref)
+{
+	struct trie_visit_slot *slot;
+	u32 idx;
+
+	iter->visited++;
+	if (iter->visited <= TRIE_VISIT_ENGAGE)
+		return 0;
+	if (iter->vtbl_failed)
+		return 0;
+	if (!iter->vslots) {
+		iter->vslots = kvcalloc(TRIE_VISIT_SLOTS,
+					sizeof(*iter->vslots), GFP_KERNEL);
+		if (!iter->vslots) {
+			iter->vtbl_failed = true;
+			return 0;
+		}
+	}
+	idx = (ref * 0x9E3779B97F4A7C15ULL) >> (64 - TRIE_VISIT_BITS);
+	slot = &iter->vslots[idx];
+	if (slot->visits && slot->ref == ref) {
+		if (++slot->visits > TRIE_REF_MAX_VISITS) {
+			pr_warn("briefs: trie walk revisited node ref %llu %u times (corrupt/cyclic trie), aborting\n",
+				(unsigned long long)ref, slot->visits);
+			return -EIO;
+		}
+	} else {
+		slot->ref = ref;
+		slot->visits = 1;
+	}
+	return 0;
+}
+
+/*
+ * Drop the revisit table: a seek or re-init resets iter->visited, and
+ * the resumed segment legitimately re-reads refs the previous segment
+ * already counted.
+ */
+static void trie_iter_visit_reset(struct trie_iter *iter)
+{
+	kvfree(iter->vslots);
+	iter->vslots = NULL;
+	iter->vtbl_failed = false;
+}
+
+/*
  * briefs_trie_iter_alloc - allocate a trie iterator with a dynamically
  * growing stack.  The returned iterator must be freed with
  * briefs_trie_iter_free().
@@ -1736,6 +1828,8 @@ struct trie_iter *briefs_trie_iter_alloc(void)
 	iter->ckpt_cap = 0;
 	iter->ckpt_stride = TRIE_CKPT_STRIDE;
 	iter->ckpt_bytes = 0;
+	iter->vslots = NULL;
+	iter->vtbl_failed = false;
 	return iter;
 }
 
@@ -1748,6 +1842,7 @@ void briefs_trie_iter_free(struct trie_iter *iter)
 		return;
 	briefs_trie_ckpt_clear(iter);
 	kfree(iter->ckpts);
+	kvfree(iter->vslots);
 	kfree(iter->stack);
 	kfree(iter->leaf_emitted);
 	kfree(iter);
@@ -1845,6 +1940,7 @@ void briefs_trie_iter_init(struct trie_iter *iter, struct briefs_inode *di, u64 
 	iter->emit_idx = 0;
 	iter->visited = 0;
 	iter->visit_cap = 0;
+	trie_iter_visit_reset(iter);
 	if (!TRIE_REF_IS_NULL(di->dir_trie_root)) {
 		if (iter->cap > 0) {
 			iter->stack[0] = di->dir_trie_root;
@@ -1909,7 +2005,10 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 
 		if (trie_read_node(sb, ref, &bh, &page, &node) != 0)
 			continue;
-		iter->visited++;
+		if (trie_iter_note_visit(iter, ref)) {
+			brelse(bh);
+			return -EIO;
+		}
 
 		if (emitted) {
 			goto push_children;
@@ -1967,7 +2066,11 @@ int briefs_trie_iter_next(struct super_block *sb, struct trie_iter *iter,
 					struct briefs_trie_node *cn;
 					if (trie_read_node(sb, child, &cbh, &cpage, &cn) != 0)
 						break;
-					iter->visited++;
+					if (trie_iter_note_visit(iter, child)) {
+						brelse(cbh);
+						brelse(bh);
+						return -EIO;
+					}
 					if (iter->visited > iter->visit_cap) {
 						pr_warn("briefs: trie iter push exceeded %llu visited nodes (corrupt/cyclic trie), aborting\n",
 							iter->visit_cap);
@@ -2205,6 +2308,7 @@ void briefs_trie_iter_seek(struct trie_iter *iter, struct super_block *sb,
 	 * many seeks would otherwise ratchet it toward visit_cap across
 	 * calls and abort a healthy trie with a bogus -EIO. */
 	iter->visited = 0;
+	trie_iter_visit_reset(iter);
 
 	if (iter->gen != current_gen) {
 		/* Rewinddir-after-growth (generic/471) or any add/remove/
