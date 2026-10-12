@@ -488,7 +488,6 @@ void briefs_free_inode_data(struct inode *inode)
 {
 	struct briefs_inode_info *binfo = briefs_i(inode);
 	struct briefs_sb_info *bsi = inode->i_sb->s_fs_info;
-	struct briefs_disk_inode disk_di;
 
 	/*
 	 * Free the xattr block (if any) before extents/trie -- clear the
@@ -497,6 +496,25 @@ void briefs_free_inode_data(struct inode *inode)
 	 * lock-free) when the inode has no xattrs.
 	 */
 	briefs_xattr_free(inode);
+
+	/*
+	 * briefs_xattr_free_block_locked journals the cleared-xattr_offset
+	 * inode snapshot, which QUEUES this inode on the journal's pending
+	 * list.  This inode is dying (nlink-0 evict or create-abort) and the
+	 * evict path's pending-snapshot flush has already run, so leaving
+	 * the re-queued node linked past clear_inode would free it with the
+	 * node in the journal's pending_snapshots list -- the next
+	 * sync-entry drain would trip list-debug on the reused slab node
+	 * (the generic/066 umount BUG).  Flush it here instead: the record
+	 * lands at this window position, before the extent/trie frees and
+	 * free_inode_num's JRN_INODE_FREE, so replay never sees the inode
+	 * pointing at the freed xattr chain.  On the live set/replace path
+	 * (xattr.c) the same snapshot is intermediate and superseded by the
+	 * caller's own final persist+journal, so it is not missed there.
+	 */
+	if (bsi->journal)
+		briefs_flush_inode_pending_journal_snapshot(bsi->journal,
+							    inode);
 
 	/* For directories, free the trie instead of file extents */
 	if (S_ISDIR(inode->i_mode)) {
@@ -507,13 +525,31 @@ void briefs_free_inode_data(struct inode *inode)
 		old_root = binfo->disk_inode.dir_trie_root;
 
 		/*
-		 * Zero dir_trie_root and persist+log the cleared inode before freeing
-		 * any trie pages.  This guarantees replay never sees an inode pointing
-		 * at blocks that are about to be marked free.
+		 * Zero dir_trie_root and persist the cleared inode before freeing
+		 * any trie pages.  This keeps the on-disk slot (which the 417
+		 * NOLOGFLUSH shutdown path reads) consistent with the frees below.
+		 *
+		 * Persist ONLY: never briefs_journal_inode_full here.  This inode
+		 * is dying (nlink 0 evict or create-abort): the evict path's
+		 * pending-snapshot flush (briefs_evict_inode) has already run or
+		 * will run before free_inode_num, so a snapshot queued here would
+		 * either dangle past clear_inode -- the inode leaves memory with
+		 * its pending_snap_list node still linked, and the journal's next
+		 * sync-entry drain trips list-debug on the freed node (the
+		 * generic/066 umount BUG) -- or, from the create-abort path,
+		 * replay after this window's JRN_INODE_FREE, resurrecting the
+		 * on-disk slot of a freed inode number (replay_inode_full skips
+		 * only magic-0/stale-generation slots, and JRN_INODE_FREE frees
+		 * just the bitmap bit).  The pre-fix code was equivalent: its
+		 * deferred snapshot was a dead store in the dying inode's slot
+		 * that no flush ever materialized.  The JRN_TRIE_FREE/EXTENT_FREE
+		 * and JRN_INODE_FREE records below carry replay.
 		 */
 		binfo->disk_inode.dir_trie_root = 0;
-		briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
-				&binfo->disk_inode);
+		if (briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+					      &binfo->disk_inode, false))
+			pr_warn_ratelimited("briefs: inode %lu persist failed\n",
+					    (unsigned long)inode->i_ino);
 
 		/*
 		 * Free the trie pages using the saved root.  briefs_trie_free_all
@@ -530,7 +566,11 @@ void briefs_free_inode_data(struct inode *inode)
 		return;
 	}
 
-	/* Inline-data files have no allocated data blocks to free. */
+	/*
+	 * Inline-data files have no allocated data blocks to free.
+	 * Persist only, no journal snapshot: dying inode (see the dir branch
+	 * above for the dangling-node / replay-after-INODE_FREE analysis).
+	 */
 	if (binfo->disk_inode.flags & InodeFlagInlineData) {
 		briefs_extent_write_begin(binfo);
 		binfo->disk_inode.flags &= ~InodeFlagInlineData;
@@ -539,8 +579,10 @@ void briefs_free_inode_data(struct inode *inode)
 		binfo->disk_inode.filesize = 0;
 		briefs_extent_write_end(binfo);
 
-		briefs_persist_and_journal_inode_warn(inode->i_sb, inode,
-				&binfo->disk_inode);
+		if (briefs_persist_disk_inode(inode->i_sb, inode->i_ino,
+					      &binfo->disk_inode, false))
+			pr_warn_ratelimited("briefs: inode %lu persist failed\n",
+					    (unsigned long)inode->i_ino);
 		return;
 	}
 
@@ -576,7 +618,12 @@ void briefs_free_inode_data(struct inode *inode)
 	briefs_extent_write_end(binfo);
 	up_write(&binfo->extent_lock);
 
-	/* Log the cleared inode so replay does not resurrect old extent pointers. */
-	briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
-	briefs_journal_inode_full(bsi->journal, inode, &disk_di);
+	/*
+	 * No journal snapshot of the cleared inode: it is dying (see the dir
+	 * branch above for the dangling-node / replay-after-INODE_FREE
+	 * analysis).  Replay is carried by the JRN_EXTENT_FREE records
+	 * briefs_btree_free_all journaled above plus free_inode_num's
+	 * JRN_INODE_FREE; the on-disk slot is refreshed by free_inode_num's
+	 * zero persist.
+	 */
 }

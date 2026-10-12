@@ -1339,13 +1339,29 @@ struct briefs_inode_info {
 	 * Pending journal snapshot for write batching (Phase 3a).
 	 * When briefs_journal_inode_full() is called, the snapshot is copied here
 	 * and has_pending_journal_snapshot is set, rather than immediately writing
-	 * to the journal. The pending snapshot is flushed at syscall boundaries
-	 * (e.g., end of setattr/fallocate/punch_hole) or when briefs_journal_sync()
-	 * is called (fsync/syncfs). This coalesces multiple JRN_INODE_FULL records
-	 * for the same inode into a single journal write.
+	 * to the journal. The pending snapshot is flushed when this inode is
+	 * fsynced with O_SYNC/DIRSYNC (briefs_journal_inode_sync()), when it is
+	 * evicted, and -- critically -- at the top of every journal sync,
+	 * which drains the whole queue (see struct briefs_journal's
+	 * pending_snapshots list). Without the sync-entry flush, a snapshot
+	 * queued by one inode's metadata op could sit unflushed while a
+	 * DIFFERENT inode's fsync commits the op's other records
+	 * (extent frees, xattr data); replay would then rebuild that window
+	 * from a stale pre-op inode_full or none at all, resurrecting freed
+	 * xattr chains (generic/066 family). This coalesces multiple
+	 * JRN_INODE_FULL records for the same inode into one journal write.
+	 *
+	 * While the flag is set, pending_snap_list links this inode into the
+	 * journal's pending_snapshots list. The slot, the flag and the list
+	 * membership are all owned by the journal's pending_snap_lock: the
+	 * sync-entry flush copies the snapshot and unlinks under that lock
+	 * (so the inode cannot be freed underneath it -- briefs_free_inode
+	 * takes the same lock) and only then writes the record, holding no
+	 * inode pointer across the sleeping write.
 	 */
 	struct briefs_disk_inode pending_journal_snapshot;
 	bool has_pending_journal_snapshot;
+	struct list_head pending_snap_list;
 	/*
 	 * Per-inode dirty-node tracking (P1): the set of this inode's B+tree
 	 * node blocks dirtied since the last drain. btree_commit_node() records

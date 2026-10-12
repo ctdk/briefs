@@ -27,6 +27,7 @@ static int __briefs_journal_write_record_locked(struct briefs_journal *j,
 	enum journal_record_type type, void *data, u32 data_len);
 static int __briefs_journal_checkpoint_locked(struct briefs_journal *j);
 static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoint);
+static int __briefs_journal_flush_pending_locked(struct briefs_journal *j);
 
 /*
  * briefs_order_flush - the single serialized path for every device cache
@@ -387,6 +388,9 @@ int briefs_journal_init(struct briefs_journal *j, struct briefs_superblock *sb) 
 	mutex_init(&j->flush_lock);
 	mutex_init(&j->flush_order_lock);
 	spin_lock_init(&j->owned_lock);
+	spin_lock_init(&j->pending_snap_lock);
+	INIT_LIST_HEAD(&j->pending_snapshots);
+	j->pending_snap_count = 0;
 	hash_init(j->owned_blocks);
 	j->sb = sb;
 	j->journal_start = le64_to_cpu(sb->journal_offset);
@@ -2704,7 +2708,32 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 	int ret;
 	bool io_err = false;
 
-	if (!j || !j->dirty)
+	if (!j)
+		return 0;
+
+	/*
+	 * Phase 3a queue drain (BEFORE the dirty check -- flushing pendings
+	 * dirties the journal).  Metadata ops journal their immediate records
+	 * (extent alloc/free, xattr data) as they go and defer only the
+	 * JRN_INODE_FULL snapshot to the pending queue, so the ring can hold
+	 * a committed window of immediate records whose snapshot is still
+	 * queued: replay would rebuild that inode from stale pre-op state and
+	 * resurrect freed xattr chains (the generic/066 family).  Draining
+	 * here means EVERY commit -- the sync's own as well as any back-
+	 * pressure checkpoint's internal one -- covers the snapshots of every
+	 * op whose records it covers.  Skipped during replay (no producers).
+	 * Reentrancy is safe: entries are unlinked as they are copied, so a
+	 * checkpoint fired from inside a drain's record write re-drains only
+	 * whatever producers queued in the meantime, never the batch in
+	 * flight.
+	 */
+	if (!j->in_replay) {
+		ret = __briefs_journal_flush_pending_locked(j);
+		if (ret)
+			return ret;
+	}
+
+	if (!j->dirty)
 		return 0;
 
 	/*
@@ -3045,10 +3074,12 @@ int briefs_journal_trie_free(struct briefs_journal *j, u64 abs_block)
  * Log a complete 512-byte on-disk inode snapshot.
  *
  * Phase 3a (per-inode journal batching): Instead of immediately writing the
- * snapshot to the journal, we copy it to binfo->pending_journal_snapshot and
- * set has_pending_journal_snapshot = true. The actual journal write is deferred
- * until briefs_flush_pending_journal_snapshots() is called at syscall boundaries
- * or by briefs_journal_sync() for fsync/syncfs. This coalesces multiple
+ * snapshot to the journal, we copy it to binfo->pending_journal_snapshot,
+ * set has_pending_journal_snapshot = true and queue the inode on the
+ * journal's pending_snapshots list. The actual journal write happens at the
+ * next journal sync entry (which drains the whole queue), at
+ * briefs_flush_inode_pending_journal_snapshot() (O_SYNC/DIRSYNC path, evict)
+ * or at briefs_journal_sync() for fsync/syncfs. This coalesces multiple
  * JRN_INODE_FULL records for the same inode into a single journal write.
  */
 int briefs_journal_inode_full(struct briefs_journal *j, struct inode *inode,
@@ -3057,6 +3088,18 @@ int briefs_journal_inode_full(struct briefs_journal *j, struct inode *inode,
 	struct briefs_inode_info *binfo = briefs_i(inode);
 
 	if (!j)
+		return 0;
+
+	/*
+	 * Never journal during replay: the ring is being read, and queueing
+	 * an inode whose eviction may still happen inside replay would leave
+	 * a dangling pending_snapshots node behind (the evict-path flush is
+	 * itself replay-guarded), which the first post-replay sync drain
+	 * would trip over. The old pre-queue code memcpy'd into the slot
+	 * here harmlessly; a clean no-op is strictly safer. Replay constructs
+	 * the on-disk state itself -- there is no snapshot to defer.
+	 */
+	if (j->in_replay)
 		return 0;
 
 	/*
@@ -3087,20 +3130,39 @@ int briefs_journal_inode_full(struct briefs_journal *j, struct inode *inode,
 			return err;
 	}
 
-	/* Phase 3a: Defer the journal write by storing the snapshot in the
-	 * per-inode pending field. The actual write will happen when
-	 * briefs_flush_pending_journal_snapshots() is called.
+	/*
+	 * Phase 3a: Defer the journal write by storing the snapshot in the
+	 * per-inode pending slot and queueing the inode on the journal's
+	 * pending_snapshots list. The actual write happens at the next
+	 * journal sync entry (which drains the whole queue -- see the
+	 * pending_snapshots comment in struct briefs_journal), at
+	 * O_SYNC/DIRSYNC inode sync, or at evict. Re-queueing an already
+	 * queued inode just overwrites the slot: the latest snapshot wins.
 	 */
-	memcpy(&binfo->pending_journal_snapshot, di, sizeof(struct briefs_disk_inode));
+	spin_lock(&j->pending_snap_lock);
+	memcpy(&binfo->pending_journal_snapshot, di,
+	       sizeof(struct briefs_disk_inode));
 	binfo->has_pending_journal_snapshot = true;
+	if (list_empty(&binfo->pending_snap_list)) {
+		list_add_tail(&binfo->pending_snap_list,
+			      &j->pending_snapshots);
+		j->pending_snap_count++;
+	}
+	spin_unlock(&j->pending_snap_lock);
 
 	return 0;
 }
 
 /*
  * Flush a specific inode's pending journal snapshot.
- * Called at syscall boundaries to ensure the deferred JRN_INODE_FULL
- * record is written to the journal before the syscall returns.
+ * Called from briefs_inode_sync (the IS_SYNC/IS_DIRSYNC write path) and at
+ * evict (so an inode leaving cache never leaves a stale snapshot behind).
+ *
+ * The dequeue runs under pending_snap_lock so it cannot race the sync-entry
+ * flush or briefs_free_inode; the inode cannot be freed underneath us because
+ * free_inode serializes on the same lock. The record write happens after the
+ * lock is dropped, from the local copy, so no inode pointer survives into
+ * the sleeping write.
  *
  * LOCKING FIX: this used to call __briefs_journal_write_record_locked()
  * directly, but its caller (briefs_inode_sync, the IS_SYNC/IS_DIRSYNC
@@ -3117,33 +3179,155 @@ int briefs_flush_inode_pending_journal_snapshot(struct briefs_journal *j,
 {
 	struct briefs_inode_info *binfo = briefs_i(inode);
 	struct jrn_inode_full rec;
+	bool pending = false;
 
 	if (!j)
 		return 0;
-	if (!binfo->has_pending_journal_snapshot)
+
+	spin_lock(&j->pending_snap_lock);
+	if (binfo->has_pending_journal_snapshot) {
+		/*
+		 * During replay, DROP the queued entry instead of writing
+		 * it: the ring is being read. Replay constructs the on-disk
+		 * state itself, so there is no record to materialize -- and
+		 * dequeueing (rather than leaving the entry queued) keeps a
+		 * producer that slipped past the journal_inode_full replay
+		 * guard from leaving a node dangling past the replayed
+		 * inode's cache eviction.
+		 */
+		if (j->in_replay) {
+			binfo->has_pending_journal_snapshot = false;
+			if (!list_empty(&binfo->pending_snap_list)) {
+				list_del_init(&binfo->pending_snap_list);
+				j->pending_snap_count--;
+			}
+		} else {
+			memset(&rec, 0, sizeof(rec));
+			rec.ino = cpu_to_le64(inode->i_ino);
+			memcpy(rec.inode_data, &binfo->pending_journal_snapshot,
+			       sizeof(struct briefs_disk_inode));
+			binfo->has_pending_journal_snapshot = false;
+			if (!list_empty(&binfo->pending_snap_list)) {
+				list_del_init(&binfo->pending_snap_list);
+				j->pending_snap_count--;
+			}
+			pending = true;
+		}
+	}
+	spin_unlock(&j->pending_snap_lock);
+
+	if (!pending)
 		return 0;
 
-	memset(&rec, 0, sizeof(rec));
-	rec.ino = cpu_to_le64(inode->i_ino);
-	memcpy(rec.inode_data, &binfo->pending_journal_snapshot,
-	       sizeof(struct briefs_disk_inode));
-
-	binfo->has_pending_journal_snapshot = false;
-
-	return briefs_journal_write_record(j, JRN_INODE_FULL, &rec, sizeof(rec));
+	return briefs_journal_write_record(j, JRN_INODE_FULL, &rec,
+					    sizeof(rec));
 }
 
 /*
- * Flush pending inode snapshots to the journal.
+ * Drain every queued pending snapshot, writing one JRN_INODE_FULL record
+ * per inode. Must be called with j->write_lock held (mutex, so the record
+ * writes may sleep); uses the _locked record writer directly.
  *
- * For now, this is a no-op since pending snapshots are flushed explicitly
- * by callers at syscall boundaries. A future implementation could maintain
- * a per-sb list of inodes with pending snapshots and iterate that list here.
+ * Two-phase batch, per iteration: (1) one pending_snap_lock critical
+ * section copies up to `count` snapshots out of their slots and unlinks
+ * the inodes -- the single critical section is what makes it safe to touch
+ * the slots: producers and briefs_free_inode serialize on the same
+ * spinlock, so every inode we unlink is still alive. (2) the lock dropped,
+ * write the records from the local copies, holding no inode pointer across
+ * the sleeping writes.
+ *
+ * The loop picks up producers that raced in during phase 2 of the previous
+ * iteration; it is bounded (a sustained producer storm must not livelock
+ * the sync) and the queue is drained fully on the next sync entry at the
+ * latest. Same loss-on-error semantics as the pre-existing single-inode
+ * flush: a snapshot is cleared from its slot as it is copied, so if this
+ * journal write fails the record is dropped and the error propagates -- a
+ * failed sync promises no durability anyway.
+ */
+static int __briefs_journal_flush_pending_locked(struct briefs_journal *j)
+{
+	struct jrn_inode_full *batch;
+	int ret = 0;
+	int round;
+
+	for (round = 0; round < 8; round++) {
+		u32 count = READ_ONCE(j->pending_snap_count);
+		u32 n = 0, k;
+
+		if (count == 0)
+			break;
+
+		/* Cap the batch so the scratch array stays a modest kmalloc
+		 * even for a pathological queue; whatever does not fit this
+		 * round is picked up by the next round/next sync entry.
+		 */
+		if (count > 4096)
+			count = 4096;
+
+		batch = kmalloc_array(count, sizeof(*batch), GFP_KERNEL);
+		if (!batch)
+			return ret ? ret : -ENOMEM;
+
+		spin_lock(&j->pending_snap_lock);
+		while (n < count && !list_empty(&j->pending_snapshots)) {
+			struct briefs_inode_info *binfo =
+				list_first_entry(&j->pending_snapshots,
+						 struct briefs_inode_info,
+						 pending_snap_list);
+
+			batch[n].ino = cpu_to_le64(binfo->vfs_inode.i_ino);
+			memcpy(batch[n].inode_data,
+			       &binfo->pending_journal_snapshot,
+			       sizeof(struct briefs_disk_inode));
+			memset(batch[n].reserved, 0,
+			       sizeof(batch[n].reserved));
+			binfo->has_pending_journal_snapshot = false;
+			list_del_init(&binfo->pending_snap_list);
+			j->pending_snap_count--;
+			n++;
+		}
+		spin_unlock(&j->pending_snap_lock);
+
+		for (k = 0; k < n; k++) {
+			struct jrn_inode_full *rec = &batch[k];
+			int err;
+
+			err = __briefs_journal_write_record_locked(j, JRN_INODE_FULL,
+								   rec, sizeof(*rec));
+
+			if (err && !ret)
+				ret = err;
+		}
+		kfree(batch);
+		if (ret)
+			return ret;
+	}
+
+	return ret;
+}
+
+/*
+ * Flush pending inode snapshots to the journal: the whole queue, under the
+ * journal's write serialization. This is the cross-inode drain -- an fsync
+ * of file B commits file A's deferred snapshot alongside A's immediate
+ * records, which is what keeps A's replay window self-consistent (the
+ * generic/066 resurrect family). Called from the DSYNC exchange path, which
+ * must not return until every snapshot whose op records are about to be
+ * committed is in the ring.
  */
 int briefs_flush_pending_journal_snapshots(struct briefs_journal *j,
                                             struct super_block *sb)
 {
-	return 0;
+	int ret;
+
+	if (!j)
+		return 0;
+
+	mutex_lock(&j->write_lock);
+	ret = __briefs_journal_flush_pending_locked(j);
+	mutex_unlock(&j->write_lock);
+
+	return ret;
 }
 
 /*

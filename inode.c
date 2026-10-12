@@ -737,8 +737,18 @@ void briefs_create_abort(struct super_block *sb, struct inode *dir,
 						name->name, name->len, 1, 0);
 	}
 
-	briefs_journal_inode_free(bsi->journal, inode->i_ino);
+	/*
+	 * Free the data/xattrs (free_inode_data flushes the xattr-cleared
+	 * inode snapshot its xattr free queues) BEFORE logging
+	 * JRN_INODE_FREE: replay applies ring records in order, and an
+	 * INODE_FULL for the freed ino arriving after INODE_FREE would
+	 * rewrite the on-disk slot of a freed inode number (replay_inode_full
+	 * skips only magic-0/stale-generation slots; JRN_INODE_FREE frees
+	 * just the bitmap bit).  JRN_INODE_FREE still precedes the actual
+	 * number recycling in briefs_free_inode_num below.
+	 */
 	briefs_free_inode_data(inode);
+	briefs_journal_inode_free(bsi->journal, inode->i_ino);
 	briefs_free_inode_num(sb, inode->i_ino);
 	iput(inode);
 }
@@ -1007,11 +1017,49 @@ struct inode *briefs_alloc_vfs_inode(struct super_block *sb) {
 	 * live path reused a free slot -> -ENOSPC on a full fs (generic/475).
 	 */
 	binfo->trie_pool_seeded = false;
+	/*
+	 * Same slab-reuse hazard: the pending-snapshot state must start clean.
+	 * A stale has_pending_journal_snapshot=true from a previous occupant
+	 * would make flush paths memcpy garbage from the stale slot into a
+	 * JRN_INODE_FULL record, and a stale (non-self) pending_snap_list node
+	 * would corrupt the journal's pending_snapshots list at the first
+	 * list_add/list_del. Producers re-init the slot contents themselves;
+	 * only the flag and the list node need zeroing here.
+	 */
+	binfo->has_pending_journal_snapshot = false;
+	INIT_LIST_HEAD(&binfo->pending_snap_list);
 	return &binfo->vfs_inode;
 }
 /* briefs_free_inode - free a VFS inode (called by VFS inode cache) */
 void briefs_free_inode(struct inode *inode) {
 	struct briefs_inode_info *binfo = briefs_i(inode);
+
+	/*
+	 * Deliberately does NOT touch the journal: this runs in the inode
+	 * cache's RCU callback, which can outlive briefs_kill_sb's kfree of
+	 * s_fs_info (mainline free_inode callbacks follow the same rule).
+	 * The pending-snapshot lifecycle is handled entirely upstream of
+	 * here: briefs_evict_inode -- which always runs before free_inode in
+	 * the VFS dispose path -- dequeues and writes any pending snapshot,
+	 * and the only no-evict destroy path (iget_failed) disposes inodes
+	 * that were never handed to a producer and whose pending state was
+	 * cleared by briefs_alloc_vfs_inode.
+	 *
+	 * Tripwire: a queued pending_snap_list node surviving to here means
+	 * some producer journalized the inode AFTER the evict-time flush --
+	 * the node is about be re-initialized by slab reuse while still linked
+	 * in the journal's pending_snapshots list, and the next sync-entry
+	 * drain will trip list-debug on it (the generic/066 umount BUG).
+	 * Nothing here can fix it (the journal may already be freed); scream
+	 * so the offending producer path is findable from dmesg.
+	 */
+	if (binfo->has_pending_journal_snapshot ||
+	    !list_empty(&binfo->pending_snap_list))
+		pr_emerg_ratelimited(
+			"briefs: inode %lu freed with pending snapshot (flag=%d linked=%d)\n",
+			(unsigned long)binfo->vfs_inode.i_ino,
+			binfo->has_pending_journal_snapshot,
+			!list_empty(&binfo->pending_snap_list));
 
 	xa_destroy(&binfo->btree_dirty_nodes);
 	mutex_destroy(&binfo->btree_dirty_lock);
@@ -1278,6 +1326,24 @@ void briefs_evict_inode(struct inode *inode) {
 	 */
 	if (briefs_sb(inode->i_sb)->journal)
 		briefs_btree_drain_dirty(briefs_i(inode), inode->i_sb);
+
+	/*
+	 * Flush any pending JRN_INODE_FULL snapshot before the inode leaves
+	 * cache, and BEFORE free_inode_data journals the INODE_FREE/extent
+	 * records: for a deleted inode the window must read
+	 * [final snapshot ... INODE_FREE] in that order, so replay applies the
+	 * snapshot and then removes the inode rather than resurrecting it from
+	 * stale pre-op state (generic/066 family). For an evicted-but-still-
+	 * linked inode this writes the snapshot its producer deferred, so a
+	 * later sync cannot commit the op's immediate records without it.
+	 * Errors are ignored like the drain above: the evict cannot fail, and
+	 * a journal write failure is terminal for the fs anyway.
+	 */
+	if (briefs_sb(inode->i_sb)->journal) {
+		struct briefs_journal *j = briefs_sb(inode->i_sb)->journal;
+
+		briefs_flush_inode_pending_journal_snapshot(j, inode);
+	}
 
 	/*
 	 * Truncate the page cache first — this releases all folios and

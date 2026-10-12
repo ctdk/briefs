@@ -124,52 +124,44 @@ int briefs_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
 	if (ret)
 		return ret;
 
-	/* Phase 3a: Capture and write a fresh inode snapshot after data writeback
-	 * completes. This ensures the JRN_INODE_FULL record reflects the current
-	 * state (extent list + size) after writeback, not any stale pending state.
-	 * We write directly instead of using the pending mechanism to avoid races
-	 * with concurrent operations.
+	/* Phase 3a: Capture a fresh inode snapshot after data writeback completes
+	 * so the JRN_INODE_FULL record reflects the current state (extent list +
+	 * size), not any stale pending state. Queue it through the standard
+	 * pending mechanism (briefs_journal_inode_full updates the slot under
+	 * pending_snap_lock, superseding any stale snapshot, and drains this
+	 * inode's dirtied B-tree index blocks first); the journal sync below
+	 * flushes the whole pending queue at its entry, so this fsync's commit
+	 * covers the snapshot. Writing the record directly here would race the
+	 * pending-slot producers, leaving the slot stale and replaying a stale
+	 * inode over this fsync's state.
 	 */
 	{
 		struct briefs_disk_inode disk_di;
 		struct briefs_inode_info *binfo = briefs_i(inode);
-		struct jrn_inode_full rec;
 
 		briefs_cpu_inode_to_disk(&binfo->disk_inode, &disk_di);
 
-		/* Drain this inode's dirtied B-tree index blocks before writing
-		 * the snapshot (P1: the per-inode dirty-node set -- every
-		 * node a mutator dirtied since the last drain -- instead of
-		 * the old whole-tree walk). Empty set: nothing was dirtied,
-		 * every referenced node is already durable. */
-		ret = briefs_btree_drain_dirty(binfo, inode->i_sb);
-		if (ret)
-			return ret;
-
-		memset(&rec, 0, sizeof(rec));
-		rec.ino = cpu_to_le64(inode->i_ino);
-		memcpy(rec.inode_data, &disk_di, sizeof(struct briefs_disk_inode));
-
-		ret = briefs_journal_write_record(bsi->journal, JRN_INODE_FULL, &rec, sizeof(rec));
+		ret = briefs_journal_inode_full(bsi->journal, inode, &disk_di);
 		if (ret)
 			return ret;
 	}
 
 	/*
 	 * Flush the journal, then drain the journal-owned pinned metadata set.
-	 * Both unconditionally.  The old j->dirty gate was a race against a
-	 * concurrent checkpoint: the record write above sets j->dirty, but a
-	 * checkpoint running between that write and the check clears it -- and
-	 * the sync was skipped along with its metadata flush, returning with
-	 * this fsync's pinned btree nodes and inode-table block still
-	 * unwritten.  The checkpoint's SB write had meanwhile retired the
-	 * covering records (log_end advanced past them), so the mark cut at
-	 * this fsync's return shows a stale extent map next to an empty live
-	 * journal range: replay cannot reconstruct the state the fsync
-	 * promised (generic/455 md5 mismatch).  An explicit flush_owned() is
-	 * needed in addition to the sync because __briefs_journal_sync_locked()
-	 * itself early-outs on !j->dirty.  Both calls are cheap no-ops when
-	 * nothing is pending.
+	 * Both unconditionally.  The queued snapshot above is written into the
+	 * ring by the sync's entry drain, so it is covered by this fsync's
+	 * commit.  The old j->dirty gate was a race against a concurrent
+	 * checkpoint: the record writes set j->dirty, but a checkpoint running
+	 * between that write and the check clears it -- and the sync was
+	 * skipped along with its metadata flush, returning with this fsync's
+	 * pinned btree nodes and inode-table block still unwritten.  The
+	 * checkpoint's SB write had meanwhile retired the covering records
+	 * (log_end advanced past them), so the mark cut at this fsync's return
+	 * shows a stale extent map next to an empty live journal range: replay
+	 * cannot reconstruct the state the fsync promised (generic/455 md5
+	 * mismatch).  An explicit flush_owned() is needed in addition to the
+	 * sync because __briefs_journal_sync_locked() itself early-outs on
+	 * !j->dirty.  Both calls are cheap no-ops when nothing is pending.
 	 */
 	if (bsi->journal) {
 		ret = briefs_journal_sync(bsi->journal);

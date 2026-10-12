@@ -59,6 +59,33 @@ struct briefs_journal {
 	struct mutex write_lock;
 
 	/*
+	 * Pending-snapshot queue (Phase 3a write batching).  Inodes whose
+	 * briefs_journal_inode_full() call was deferred into the per-inode
+	 * pending slot (struct briefs_inode_info->pending_journal_snapshot)
+	 * wait here until a journal sync entry drains them.  The drain is
+	 * not optional polish: metadata ops journal their low-level records
+	 * (extent alloc/free, xattr data) IMMEDIATELY and defer only the
+	 * JRN_INODE_FULL snapshot, so an fsync of a DIFFERENT file can commit
+	 * a window holding the op's immediate records without the snapshot
+	 * -- replay then rebuilds the inode from stale state and resurrects
+	 * freed xattr chains (the generic/066 family).  Every sync entry
+	 * therefore flushes the whole queue before its own commit logic.
+	 *
+	 * Nodes are the inodes' embedded pending_snap_list members; the
+	 * slot contents, the has_pending flag, list membership and the
+	 * counter below are all owned by pending_snap_lock.  Producers
+	 * (journal_inode_full) and the dequeue side (sync-entry flush,
+	 * single-inode flush, briefs_free_inode) serialize on that
+	 * spinlock, so the copy-out critical section can safely touch the
+	 * inode's slot without holding a reference: an inode can only be
+	 * freed after free_inode takes the same lock.  The sleeping record
+	 * writes happen after the lock is dropped, from local copies.
+	 */
+	struct list_head pending_snapshots;	/* see pending_snap_lock */
+	spinlock_t pending_snap_lock;		/* guards the queue + inode slots */
+	u32 pending_snap_count;			/* queue depth, under the lock */
+
+	/*
 	 * Serializes briefs_journal_flush_owned() calls.  The owned-set drain is a
 	 * HANDOFF: flush A can drain a buffer that fsync B pinned moments earlier,
 	 * and B's own (later) flush then finds the owned set empty and returns
@@ -355,11 +382,14 @@ int briefs_journal_trie_free(struct briefs_journal *j, u64 abs_block);
 
 /* Log a complete 512-byte on-disk inode snapshot.
  *
- * Phase 3a (per-inode journal batching): This function now defers the journal
- * write by copying the snapshot to binfo->pending_journal_snapshot and setting
- * has_pending_journal_snapshot. The actual journal write is deferred until
- * briefs_flush_pending_journal_snapshots() is called at syscall boundaries or
- * by briefs_journal_sync() for fsync/syncfs.
+ * Phase 3a (per-inode journal batching): This function defers the journal
+ * write by copying the snapshot to binfo->pending_journal_snapshot, setting
+ * has_pending_journal_snapshot and queueing the inode on the journal's
+ * pending_snapshots list. The actual journal write happens at the next
+ * journal sync entry (which drains the whole queue -- every commit covers
+ * every snapshot whose op records it covers), at the O_SYNC/DIRSYNC inode
+ * sync (briefs_flush_inode_pending_journal_snapshot), at evict, or at the
+ * DSYNC exchange path (briefs_flush_pending_journal_snapshots).
  */
 int briefs_journal_inode_full(struct briefs_journal *j, struct inode *inode,
                               const struct briefs_disk_inode *di);
