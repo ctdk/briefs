@@ -2700,6 +2700,7 @@ void briefs_journal_cleanup(struct briefs_journal *j) {
 static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoint) {
 	u64 sync_start, sync_end, pos, own_next;
 	u64 own_count;
+	u64 nxt;
 	int ret;
 	bool io_err = false;
 
@@ -2709,12 +2710,43 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 	/*
 	 * Back-pressure: a long stream of fsyncs can advance write_pos around
 	 * the ring while journal_log_start stays fixed.  If the current block
-	 * we are about to write is also the oldest uncheckpointed block, force
-	 * a checkpoint first to retire it; otherwise this sync would overwrite
-	 * live records before they were checkpointed away.
+	 * we are about to write is also the oldest uncheckpointed block, or
+	 * this sync's advance would land on it, force a checkpoint first to
+	 * retire it; otherwise this sync would overwrite live records before
+	 * they were checkpointed away.
+	 *
+	 * journal_log_start == journal_log_end (in-memory superblock fields)
+	 * holds iff the replay window is EMPTY: a checkpoint retire sets both
+	 * equal, sync commit points move only log_end, and replay cleanup
+	 * sets log_start = log_end.  A genuinely wrapped-full ring always has
+	 * a committed window, so the inequality tells empty from full without
+	 * having to order raw ring positions.  Without it, every fsync after
+	 * a checkpoint re-trips this test (retire leaves write_pos exactly on
+	 * log_start with an empty window) and pays a whole-filesystem
+	 * checkpoint per fsync.
+	 *
+	 * The nxt disjunct fires pre-advance: this sync's write_pos may sit on
+	 * the block BEFORE journal_log_start, either because fresh mkfs aligns
+	 * log_start on the journal start (so the previous position is the
+	 * checkpoint block, which both advance paths skip past and write_pos
+	 * can therefore never equal log_start from below), or because a
+	 * writer-side flush_cur_block advance landed there.  If the sync then
+	 * advanced and committed, it would persist log_end = own_next =
+	 * log_start -- an EMPTY window overwriting the tail of the previous
+	 * lap's live records, which replay would then silently skip.  Firing
+	 * the checkpoint here instead lets its internal sync do that final
+	 * write+advance as a transient that the retire heals in the same
+	 * call (flush_owned, allocator sync, then log_start = log_end).
 	 */
+	nxt = briefs_journal_next_block(j, j->write_pos);
+	if (nxt == j->checkpoint_block)
+		nxt = briefs_journal_next_block(j, nxt);
+
 	if (!j->in_checkpoint &&
-	    j->write_pos == le64_to_cpu(j->sb->journal_log_start)) {
+	    ((j->write_pos == le64_to_cpu(j->sb->journal_log_start) &&
+	      le64_to_cpu(j->sb->journal_log_end) !=
+	      le64_to_cpu(j->sb->journal_log_start)) ||
+	     nxt == le64_to_cpu(j->sb->journal_log_start))) {
 		pr_debug("briefs: journal ring full at sync start, back-pressure checkpoint at write_pos=%llu\n",
 			 j->write_pos);
 		j->in_checkpoint = true;
@@ -2834,8 +2866,23 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 	 * Replay is idempotent, so the metadata flush below may safely run
 	 * after the commit: a crash in between replays the now-durable
 	 * records and re-derives the on-disk state.
+	 *
+	 * own_next == journal_log_start is the transient inside a
+	 * checkpoint's internal sync (the back-pressure entry above fires the
+	 * checkpoint pre-advance precisely so this is the only shape that
+	 * reaches the commit point there): the sync wrote and advanced onto
+	 * the oldest live block, and committing log_end = own_next would
+	 * persist an EMPTY window -- clobbering the discoverable tail of the
+	 * previous lap if we crashed between this superblock write and the
+	 * retire moments later.  The retire's own superblock persist is the
+	 * authoritative one: it first flushes all owned metadata and the
+	 * allocator bitmaps (making the just-written block's records
+	 * unnecessary), then sets log_start = log_end = write_pos.  Skip the
+	 * commit here so only the retire ever moves the tail across a lap
+	 * boundary.
 	 */
-	if (own_count > j->committed_count) {
+	if (own_count > j->committed_count &&
+	    own_next != le64_to_cpu(j->sb->journal_log_start)) {
 		j->sb->journal_log_end = cpu_to_le64(own_next);
 		ret = briefs_journal_sync_superblock(j);
 		if (ret) {
