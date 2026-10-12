@@ -303,3 +303,147 @@ ld_readback:  0.365 s  1369.9 MiB/s
 # but modest. The remaining ~10% fsync-shape gap to ext4 is the
 # structural per-fsync whole-FS checkpoint (narrowed per-inode commit
 # semantics), which is explicitly deferred as a journal redesign.
+== briefs perf-write: device /dev/vdc1, 10240 MiB
+### briefs (device /dev/vdc1, 10240 MiB, 2026-10-11T21:27:34Z)
+--- stats after mount
+data_alloc_calls=0
+data_free_calls=0
+inode_alloc_calls=0
+inode_free_calls=0
+journal_records=0
+journal_checkpoints=0
+journal_replay_records=0
+btree_splits=0
+btree_extents_added=0
+btree_extents_freed=0
+dir_adds=0
+dir_dels=0
+truncate_calls=0
+fallocate_calls=0
+punch_holes=0
+verify_full=0
+verify_skip=0
+seq_buffered: 14.014 s  730.7 MiB/s
+--- stats after seq_buffered (delta from mount)
+> data_alloc_calls=10241
+> inode_alloc_calls=1
+> journal_records=10243
+> journal_checkpoints=3
+> btree_extents_added=10240
+> dir_adds=1
+seq_fsync:    153.155 s  66.9 MiB/s
+--- stats after seq_fsync (delta)
+> data_alloc_calls=20482
+> data_free_calls=3
+> inode_alloc_calls=2
+> inode_free_calls=1
+> journal_records=30732
+> journal_checkpoints=10236
+> btree_extents_added=20480
+> dir_adds=2
+> dir_dels=1
+seq_osync:    157.572 s  65.0 MiB/s
+--- stats after seq_osync (delta)
+> data_alloc_calls=30723
+> data_free_calls=5
+> inode_alloc_calls=3
+> inode_free_calls=2
+> journal_records=51220
+> journal_checkpoints=20477
+> btree_extents_added=30720
+> dir_adds=3
+> dir_dels=2
+ld_shape:     7.621 s  65.6 MiB/s  (500 files)
+--- stats after ld_shape (delta)
+> data_alloc_calls=31231
+> data_free_calls=7
+> inode_alloc_calls=503
+> inode_free_calls=3
+> journal_records=53233
+> journal_checkpoints=20978
+> btree_extents_added=31220
+> dir_adds=503
+> dir_dels=3
+ld_readback:  0.456 s  1096.5 MiB/s
+--- stats after ld_readback (delta)
+
+### ext4 (device /dev/vdc1, 10240 MiB, 2026-10-11T21:33:09Z)
+seq_buffered: 21.415 s  478.2 MiB/s
+seq_fsync:    146.231 s  70.0 MiB/s
+seq_osync:    149.537 s  68.5 MiB/s
+ld_shape:     7.146 s  70.0 MiB/s  (500 files)
+ld_readback:  0.305 s  1639.3 MiB/s
+
+== done 2026-10-11T21:38:35Z
+== briefs perf-write: device /dev/vdc1, 10240 MiB
+### briefs (device /dev/vdc1, 10240 MiB, 2026-10-12T23:27:50Z)
+--- stats after mount
+data_alloc_calls=0
+data_free_calls=0
+inode_alloc_calls=0
+inode_free_calls=0
+journal_records=0
+journal_checkpoints=0
+journal_replay_records=0
+btree_splits=0
+btree_extents_added=0
+btree_extents_freed=0
+dir_adds=0
+dir_dels=0
+truncate_calls=0
+fallocate_calls=0
+punch_holes=0
+verify_full=0
+verify_skip=0
+seq_buffered: 10.054 s  1018.5 MiB/s
+--- stats after seq_buffered (delta from mount)
+> data_alloc_calls=10241
+> inode_alloc_calls=1
+> journal_records=10245
+> journal_checkpoints=3
+> btree_extents_added=10240
+> dir_adds=1
+seq_fsync:    140.051 s  73.1 MiB/s
+--- stats after seq_fsync (delta)
+> data_alloc_calls=20482
+> data_free_calls=3
+> inode_alloc_calls=2
+> inode_free_calls=1
+> journal_records=30736
+> journal_checkpoints=166
+> btree_extents_added=20480
+> dir_adds=2
+> dir_dels=1
+seq_osync:    136.841 s  74.8 MiB/s
+--- stats after seq_osync (delta)
+> data_alloc_calls=30723
+> data_free_calls=5
+> inode_alloc_calls=3
+> inode_free_calls=2
+> journal_records=51226
+> journal_checkpoints=329
+> btree_extents_added=30720
+> dir_adds=3
+> dir_dels=2
+ld_shape:     7.340 s  68.1 MiB/s  (500 files)
+--- stats after ld_shape (delta)
+> data_alloc_calls=31231
+> data_free_calls=7
+> inode_alloc_calls=503
+> inode_free_calls=3
+> journal_records=53740
+> journal_checkpoints=336
+> btree_extents_added=31220
+> dir_adds=503
+> dir_dels=3
+ld_readback:  0.209 s  2392.3 MiB/s
+--- stats after ld_readback (delta)
+
+### ext4 (device /dev/vdc1, 10240 MiB, 2026-10-12T23:32:46Z)
+seq_buffered: 21.150 s  484.2 MiB/s
+seq_fsync:    141.304 s  72.5 MiB/s
+seq_osync:    139.505 s  73.4 MiB/s
+ld_shape:     6.957 s  71.9 MiB/s  (500 files)
+ld_readback:  0.218 s  2293.6 MiB/s
+
+== done 2026-10-12T23:37:57Z
