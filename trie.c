@@ -19,6 +19,7 @@
 #include <linux/vmalloc.h>
 #include <linux/unaligned.h>
 #include "briefs.h"
+#include "briefs_journal.h"
 #include "briefs_alloc.h"
 
 #define TRIE_ANCESTRY_LIMIT 256
@@ -446,6 +447,110 @@ int briefs_trie_create_root(struct super_block *sb, struct briefs_inode *di)
 }
 
 /*
+ * trie_walk_reachable - visit every node reachable from @root_ref via the
+ * first_child/next_sibling graph, calling @visit for each readable node with
+ * the node's page and node structs (buffer is held across the call).
+ * @visit returns 0 to continue or a negative error to abort the walk (which
+ * is propagated).  Unreadable pages are skipped; a hard visit cap
+ * (block_count * TRIE_SLOTS_PER_BLOCK + margin, which no legitimate trie can
+ * exceed) and the iterator's per-ref revisit guard guarantee termination even
+ * when the on-disk trie is corrupt with a cycle in the first_child /
+ * next_sibling graph (dm-error partial sync can leave stale pointers forming
+ * a back-edge) -- hitting either aborts the walk, keeping what was visited so
+ * far, so a corrupt trie surfaces in a later replay step instead of wedging
+ * the mount.
+ *
+ * Returns 0 (with *@visited_out set) or -ENOMEM.  Shared by the two
+ * replay-only trie scans: briefs_trie_seed_pool() (partial-page pool seeding)
+ * and briefs_trie_mark_referenced_blocks() (excluded-block marking).
+ */
+typedef int (*trie_walk_visit_fn)(struct super_block *sb, u64 ref,
+				  struct briefs_trie_page *page,
+				  struct briefs_trie_node *node,
+				  void *arg);
+
+static int trie_walk_reachable(struct super_block *sb, u64 root_ref,
+			       trie_walk_visit_fn visit, void *arg,
+			       u64 *visited_out)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	struct trie_iter *iter;
+	int ret = 0;
+	u64 visited = 0;
+	u64 cap = bsi->alloc.block_count * TRIE_SLOTS_PER_BLOCK + 1024;
+
+	*visited_out = 0;
+	if (TRIE_REF_IS_NULL(root_ref))
+		return 0;
+
+	iter = briefs_trie_iter_alloc();
+	if (!iter)
+		return -ENOMEM;
+
+	ret = trie_iter_push(iter, root_ref, 0);
+	if (ret)
+		goto out;
+
+	while (iter->sp > 0) {
+		struct buffer_head *bh;
+		struct briefs_trie_page *page;
+		struct briefs_trie_node *node;
+		u64 ref, child, sib;
+
+		if (visited >= cap) {
+			pr_warn("briefs: replay trie walk: visited cap %llu hit (corrupt trie? root=%llu); aborting walk\n",
+				(unsigned long long)cap, (unsigned long long)root_ref);
+			break;
+		}
+
+		ref = iter->stack[--iter->sp];
+
+		if (trie_read_node(sb, ref, &bh, &page, &node) != 0) {
+			/* Unreadable page: skip it, keep walking the rest.  A
+			 * later step will surface the error.
+			 */
+			continue;
+		}
+		visited++;
+		if (trie_iter_note_visit(iter, ref)) {
+			/* Corrupt/cyclic trie: stop, keep what was visited. */
+			brelse(bh);
+			break;
+		}
+
+		ret = visit(sb, ref, page, node, arg);
+
+		child = trie_node_first_child(node);
+		sib = trie_node_next_sibling(node);
+		brelse(bh);
+
+		if (ret)
+			goto out;
+
+		if (!TRIE_REF_IS_NULL(child)) {
+			ret = trie_iter_push(iter, child, 0);
+			if (ret)
+				goto out;
+		}
+		if (!TRIE_REF_IS_NULL(sib)) {
+			ret = trie_iter_push(iter, sib, 0);
+			if (ret)
+				goto out;
+		}
+
+		if ((visited & 4095) == 0)
+			cond_resched();
+	}
+
+	*visited_out = visited;
+	ret = 0;
+
+out:
+	briefs_trie_iter_free(iter);
+	return ret;
+}
+
+/*
  * briefs_trie_seed_pool - populate the partial-page pool from the on-disk trie.
  *
  * During journal replay, replay_dir_update() re-derives a directory trie by
@@ -466,103 +571,90 @@ int briefs_trie_create_root(struct super_block *sb, struct briefs_inode *di)
  * directory (gated by binfo->trie_pool_seeded) and only while the journal's
  * in_replay flag is set, so the live post-mount path is unaffected.
  */
+struct trie_seed_ctx {
+	u64 root_block;
+	u64 added;
+};
+
+static int trie_seed_visit(struct super_block *sb, u64 ref,
+			   struct briefs_trie_page *page,
+			   struct briefs_trie_node *node, void *arg)
+{
+	struct trie_seed_ctx *ctx = arg;
+
+	if (briefs_trie_page_has_room(page)) {
+		/* Tag with this trie's root: replay re-derives each
+		 * directory's entries with the same cluster anchor, so
+		 * its re-allocated nodes prefer its own pages here
+		 * too.  Pages shared across directories keep the
+		 * first tag (add_partial dedups by block).
+		 */
+		briefs_trie_page_add_partial(sb, TRIE_REF_BLOCK(ref),
+					     ctx->root_block);
+		ctx->added++;
+	}
+	return 0;
+}
+
 int briefs_trie_seed_pool(struct super_block *sb, u64 root_ref)
 {
-	struct briefs_sb_info *bsi = sb->s_fs_info;
-	struct trie_iter *iter;
-	int ret = 0;
-	u64 visited = 0, added = 0;
-	/*
-	 * A valid trie has at most block_count trie pages (one per data block),
-	 * each holding TRIE_SLOTS_PER_BLOCK nodes, so it can never contain more
-	 * than block_count * TRIE_SLOTS_PER_BLOCK reachable nodes.  Use that as a
-	 * hard visit cap (plus a small margin): it never truncates a legitimate
-	 * trie, but it guarantees termination if the on-disk trie is corrupt with a
-	 * cycle in the first_child/next_sibling graph (dm-error partial sync can
-	 * leave stale pointers forming a back-edge), which would otherwise spin
-	 * here forever and wedge the mount.  Hitting the cap aborts seeding; re-
-	 * derivation then falls back to briefs_alloc_block() (today's behaviour),
-	 * which may -ENOSPC but never hangs.
-	 */
-	u64 cap = bsi->alloc.block_count * TRIE_SLOTS_PER_BLOCK + 1024;
+	struct trie_seed_ctx ctx = {
+		.root_block = TRIE_REF_BLOCK(root_ref),
+	};
+	u64 visited = 0;
+	int ret;
 
-	if (TRIE_REF_IS_NULL(root_ref))
-		return 0;
-
-	iter = briefs_trie_iter_alloc();
-	if (!iter)
-		return -ENOMEM;
-
-	ret = trie_iter_push(iter, root_ref, 0);
-	if (ret)
-		goto out;
-
-	while (iter->sp > 0) {
-		struct buffer_head *bh;
-		struct briefs_trie_page *page;
-		struct briefs_trie_node *node;
-		u64 ref, child, sib;
-
-		if (visited >= cap) {
-			pr_warn("briefs: replay pool seed: visited cap %llu hit (corrupt trie? root=%llu); aborting seed\n",
-				cap, (unsigned long long)root_ref);
-			break;
-		}
-
-		ref = iter->stack[--iter->sp];
-
-		if (trie_read_node(sb, ref, &bh, &page, &node) != 0) {
-			/* Unreadable page during replay: skip it, keep seeding the
-			 * rest.  A later re-derivation step will surface the error.
-			 */
-			continue;
-		}
-		visited++;
-		if (trie_iter_note_visit(iter, ref)) {
-			/* Corrupt/cyclic trie: stop seeding, keep what was
-			 * added (the local cap above aborts the same way).
-			 */
-			break;
-		}
-
-		if (briefs_trie_page_has_room(page)) {
-			/* Tag with this trie's root: replay re-derives each
-			 * directory's entries with the same cluster anchor, so
-			 * its re-allocated nodes prefer its own pages here
-			 * too.  Pages shared across directories keep the
-			 * first tag (add_partial dedups by block). */
-			briefs_trie_page_add_partial(sb, TRIE_REF_BLOCK(ref),
-			                              TRIE_REF_BLOCK(root_ref));
-			added++;
-		}
-
-		child = trie_node_first_child(node);
-		sib = trie_node_next_sibling(node);
-		brelse(bh);
-
-		if (!TRIE_REF_IS_NULL(child)) {
-			ret = trie_iter_push(iter, child, 0);
-			if (ret)
-				goto out;
-		}
-		if (!TRIE_REF_IS_NULL(sib)) {
-			ret = trie_iter_push(iter, sib, 0);
-			if (ret)
-				goto out;
-		}
-
-		if ((visited & 4095) == 0)
-			cond_resched();
-	}
-
+	ret = trie_walk_reachable(sb, root_ref, trie_seed_visit, &ctx, &visited);
 	pr_debug("briefs: replay seed_pool root=%llu: visited=%llu added=%llu\n",
-		 (unsigned long long)root_ref, visited, added);
-
-out:
-	briefs_trie_iter_free(iter);
+		 (unsigned long long)root_ref, visited, ctx.added);
 	return ret;
 }
 
+/*
+ * briefs_trie_mark_referenced_blocks - mark every trie-page block reachable
+ * from @root_ref in the journal's replay_trie_excluded set, so the pass-2
+ * pool pop (briefs_journal_replay_pop_trie_block) never hands a
+ * still-referenced block to briefs_trie_page_init() for zeroing.  Called
+ * between replay pass-1 and pass-2, on the crash-time page content before
+ * any pass-2 mutation, so the marks cover exactly the references the
+ * JRN_INODE_FULL restores and the crash-time tries will make.  See
+ * replay_trie_excluded in briefs_journal.h for the full rationale
+ * (generic/335 family).  A corrupt/cyclic trie aborts marking for that trie
+ * only; the partial mark is kept and the corruption surfaces in pass-2
+ * anyway.  Only meaningful while in_replay is set.
+ */
+static int trie_mark_visit(struct super_block *sb, u64 ref,
+			   struct briefs_trie_page *page,
+			   struct briefs_trie_node *node, void *arg)
+{
+	struct briefs_sb_info *bsi = sb->s_fs_info;
+	void *old;
+
+	/*
+	 * Store a non-NULL, aligned kernel pointer as the set marker: the
+	 * normal xa_load() API returns NULL for slots holding XA_ZERO_ENTRY
+	 * ("The normal API will return NULL as the contents of a slot
+	 * containing a zero entry"), which would make the membership test in
+	 * briefs_journal_replay_pop_trie_block() miss every mark.  The
+	 * xarray's own address doubles as the marker; nothing dereferences it.
+	 */
+	old = xa_store(&bsi->journal->replay_trie_excluded,
+		       TRIE_REF_BLOCK(ref),
+		       &bsi->journal->replay_trie_excluded, GFP_KERNEL);
+	if (xa_is_err(old))
+		return xa_err(old);
+	pr_debug("briefs: replay mark excluded trie block %llu\n",
+		 (unsigned long long)TRIE_REF_BLOCK(ref));
+	return 0;
+}
+
+int briefs_trie_mark_referenced_blocks(struct super_block *sb, u64 root_ref)
+{
+	u64 visited = 0;
+
+	return trie_walk_reachable(sb, root_ref, trie_mark_visit, NULL,
+				   &visited);
+}
 /*
  * Max concurrent whole-directory trie-prefetch workers (see
  * briefs_trie_prefetch_ino_async below).  Each worker issues trie-page

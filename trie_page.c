@@ -333,6 +333,8 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 	if (bsi->journal && bsi->journal->in_replay &&
 	    briefs_journal_replay_pop_trie_block(bsi->journal, &rel) == 0) {
 		/* reused a reserved trie block */
+		pr_debug("briefs: replay page_init reusing reserved trie block %llu (depth=%u byte=%u)\n",
+			 (unsigned long long)rel, depth, byte_val);
 	} else {
 		/*
 		 * Take this page from the top of the data region

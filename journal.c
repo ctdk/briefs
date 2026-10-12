@@ -1111,6 +1111,10 @@ static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
 	u64 child_ino = le64_to_cpu(rec->child_ino);
 	u32 name_len = le32_to_cpu(rec->name_len);
 
+	pr_debug("briefs: replay dir_update parent=%llu child=%llu op=%u name=%.*s\n",
+		 parent_ino, child_ino, rec->op,
+		 name_len < 64 ? (int)name_len : 64, rec->name);
+
 	parent = briefs_iget(sb, parent_ino);
 	if (IS_ERR(parent)) {
 		ret = PTR_ERR(parent);
@@ -1193,6 +1197,12 @@ static int replay_dir_update(struct super_block *sb, struct jrn_dir_update *rec)
 	 * inode is iput() after replay, leaving post-mount lookups unable to find the
 	 * entry (generic/737 O_DIRECT+NOLOGFLUSH shutdown loses a file). */
 	if (!ret) {
+		struct briefs_inode_info *pbinfo = briefs_i(parent);
+
+		pr_debug("briefs: replay dir_update %s ino=%llu name=%.*s ret=%d trie_root=%llu\n",
+			 rec->op == 0 ? "add" : "del", parent_ino,
+			 name_len < 64 ? (int)name_len : 64, rec->name, ret,
+			 (unsigned long long)pbinfo->disk_inode.dir_trie_root);
 		int pret = briefs_persist_disk_inode(sb, parent_ino, &binfo->disk_inode, false);
 		if (pret) {
 			pr_err("briefs: replay failed to persist parent inode %llu: %d\n",
@@ -1561,6 +1571,36 @@ static int replay_xattr_final_set(struct briefs_journal *j, u64 ino,
 }
 
 /*
+ * Pass-1 helper: collect one distinct dir_trie_root seen in a JRN_INODE_FULL
+ * record.  After pass-1, briefs_journal_replay() walks each collected trie
+ * read-only (crash-time pages, before any pass-2 mutation) and marks every
+ * reachable block in replay_trie_excluded, so briefs_trie_page_init()'s pool
+ * pop never hands a still-referenced block to re-derivation -- zeroing it
+ * would corrupt the directory whose snapshot or crash-time trie points at it
+ * (generic/335 family; see replay_trie_excluded).  Single-threaded at mount,
+ * no locking.  Dedup by root_ref: drain batches repeat a directory's snapshot
+ * many times over a window, and the walk only needs to run once per trie.
+ * Returns 0 or -ENOMEM; a NULL root (empty directory / file inode) is a
+ * no-op.
+ */
+static int replay_trie_root_add(struct briefs_journal *j, u64 root_ref)
+{
+	struct briefs_replay_trie_root *r;
+
+	if (TRIE_REF_IS_NULL(root_ref))
+		return 0;
+	list_for_each_entry(r, &j->replay_trie_roots, list)
+		if (r->root_ref == root_ref)
+			return 0;
+	r = kmalloc(sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return -ENOMEM;
+	r->root_ref = root_ref;
+	list_add_tail(&r->list, &j->replay_trie_roots);
+	return 0;
+}
+
+/*
  * Extract the next_block pointer from a JRN_XATTR_DATA content record.
  * v1 blocks have no next pointer; v2 blocks carry it when the record is
  * large enough to include the full v2 header.
@@ -1882,8 +1922,19 @@ static int apply_record(struct super_block *sb, u32 rec_type, void *rec_data,
 		u64 xo = le64_to_cpu(di->xattr_offset);
 
 		if (reserve_only) {
-			if (bsi->journal)
+			if (bsi->journal) {
 				replay_xattr_final_set(bsi->journal, ino, xo);
+				/*
+				 * Collect the snapshot's dir_trie_root so the
+				 * pass boundary can mark its trie's blocks
+				 * as off-limits for pool reuse (see
+				 * replay_trie_excluded).  Dedup by root ref:
+				 * drain batches repeat a directory's snapshot
+				 * many times over a window.
+				 */
+				ret = replay_trie_root_add(bsi->journal,
+							   le64_to_cpu(di->dir_trie_root));
+			}
 		} else {
 			ret = replay_inode_full(sb, rec_data);
 		}
@@ -2021,6 +2072,10 @@ static int walk_journal(struct briefs_journal *j, struct super_block *sb,
 				continue;
 			}
 
+			pr_debug("briefs: replay %s record type=%u len=%u block=%llu rec=%u\n",
+				 reserve_only ? "pass1" : "pass2",
+				 rec_type, rec_data_len, cur, i);
+
 			int apply_ret = apply_record(sb, rec_type, rec_data,
 						     rec_data_len, reserve_only);
 			if (apply_ret) {
@@ -2064,25 +2119,61 @@ static int walk_journal(struct briefs_journal *j, struct super_block *sb,
  * ones hit -EEXIST), so it must reuse ORPHANS, not referenced blocks --
  * overwriting a referenced block would clobber a -EEXIST record's page.
  *
- * Popping LIFO (tail-first) yields the orphans (last-pushed), and because
- * seeding + the unbounded scan keep the re-derivation page_init count M <= the
- * orphan count N_tail, we stop before reaching the referenced blocks.  If M
- * ever exceeds N_tail (imperfect seeding), the pool empties and
- * briefs_trie_page_init() falls back to briefs_alloc_block(), which can only
- * pick non-referenced free blocks -- so no referenced block is ever clobbered.
+ * Popping LIFO (tail-first) yields the orphans (last-pushed) for the 475
+ * reuse case.  The M <= N_tail bound above is NOT airtight, though: a record
+ * can demand a page even though its effect was later REVERSED on disk (a
+ * cross-directory rename deletes the entry an ADD re-derives, and live
+ * persisted the post-rename state before the crash), so the on-disk parent
+ * trie regresses and re-derivation re-creates a page live allocated in the
+ * synced era -- with N_tail == 0 the pop reaches the referenced blocks and
+ * briefs_trie_page_init() zeroes a live page (generic/335: the re-derived
+ * a/b trie reuses the mv target directory's root page; the later INODE_FULL
+ * restore points the target at the zeroed/dismantled page -> cyclic sibling
+ * chain, nlink reconcile aborts, directory lost).  Blocks marked in
+ * replay_trie_excluded (reachable from any JRN_INODE_FULL dir_trie_root in
+ * the window, walked at crash-time content between the passes) are therefore
+ * skipped here and freed to the pool consumer; if only excluded blocks
+ * remain, the pool returns -ENOENT and briefs_trie_page_init() falls back
+ * to briefs_alloc_block(), which pass-1's reservations guarantee cannot
+ * alias anything -- so no referenced block is ever clobbered.
  */
 int briefs_journal_replay_pop_trie_block(struct briefs_journal *j, u64 *rel)
 {
 	struct briefs_replay_trie_block *rb;
 
-	if (list_empty(&j->replay_trie_blocks))
-		return -ENOENT;
-	rb = list_last_entry(&j->replay_trie_blocks,
-			     struct briefs_replay_trie_block, list);
-	*rel = rb->rel;
-	list_del(&rb->list);
-	kfree(rb);
-	return 0;
+	while (!list_empty(&j->replay_trie_blocks)) {
+		struct super_block *sb = j->vfs_sb;
+		struct briefs_sb_info *bsi = sb ? sb->s_fs_info : NULL;
+
+		rb = list_last_entry(&j->replay_trie_blocks,
+				     struct briefs_replay_trie_block, list);
+		*rel = rb->rel;
+		list_del(&rb->list);
+		kfree(rb);
+
+		/*
+		 * Skip blocks still referenced by a snapshot the window will
+		 * restore or by the crash-time trie content: zeroing one
+		 * would corrupt the directory that points at it.  The entry
+		 * is consumed (the block stays reserved by pass-1; it is in
+		 * use, not an orphan).
+		 */
+		if (bsi) {
+			u64 abs = data_to_abs(bsi->sb, *rel);
+
+			if (xa_load(&j->replay_trie_excluded, abs)) {
+				pr_debug("briefs: replay pool pop skipping excluded trie block abs=%llu (rel=%llu)\n",
+					 (unsigned long long)abs,
+					 (unsigned long long)*rel);
+				continue;
+			}
+			pr_debug("briefs: replay pool pop NOT excluded abs=%llu (rel=%llu)\n",
+				 (unsigned long long)abs,
+				 (unsigned long long)*rel);
+		}
+		return 0;
+	}
+	return -ENOENT;
 }
 
 /*
@@ -2321,6 +2412,8 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	 * writable, so the pool needs no locking.
 	 */
 	INIT_LIST_HEAD(&j->replay_trie_blocks);
+	INIT_LIST_HEAD(&j->replay_trie_roots);
+	xa_init(&j->replay_trie_excluded);
 	hash_init(j->replay_xattr_final);
 	hash_init(j->replay_xattr_next);
 	hash_init(j->replay_nlink_hash);
@@ -2345,6 +2438,38 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	if (ret) {
 		pr_err("briefs: journal replay failed to build xattr live set: %d\n", ret);
 		goto replay_done;
+	}
+
+	/*
+	 * Mark every trie-page block reachable from the JRN_INODE_FULL snapshots'
+	 * dir_trie_roots as off-limits for the pass-2 pool pop.  The walk reads
+	 * crash-time page content, which no pass-2 mutation has touched yet, so
+	 * it sees exactly the references the restores and the crash-time tries
+	 * will make: pass-1 has reserved every in-window allocation, and an
+	 * in-window-allocated block can only be referenced via a trie mutation
+	 * (whose directory necessarily has a snapshot in the window).  Skipped
+	 * blocks free the pool to the fallback allocator instead of being
+	 * zeroed over a live trie (generic/335 family).  Walk failures abort
+	 * marking for that trie only (corrupt content surfaces in pass-2 anyway).
+	 */
+	{
+		struct briefs_replay_trie_root *r, *rtmp;
+		u64 marked = 0;
+
+		list_for_each_entry_safe(r, rtmp, &j->replay_trie_roots, list) {
+			int mret = briefs_trie_mark_referenced_blocks(sb, r->root_ref);
+
+			if (mret) {
+				pr_warn("briefs: replay excluded-block marking for root %llu failed: %d\n",
+					(unsigned long long)r->root_ref, mret);
+			} else {
+				marked++;
+			}
+			list_del(&r->list);
+			kfree(r);
+		}
+		pr_debug("briefs: replay marked %llu snapshot tries' blocks excluded from pool reuse\n",
+			 marked);
 	}
 
 	/* Pass 2: apply all records (writes + trie re-derivation). */
@@ -2469,6 +2594,16 @@ replay_done:
 		list_del(&rb->list);
 		kfree(rb);
 	}
+	/* Any roots left un-walked (early error) still need freeing. */
+	while (!list_empty(&j->replay_trie_roots)) {
+		struct briefs_replay_trie_root *r =
+			list_first_entry(&j->replay_trie_roots,
+					 struct briefs_replay_trie_root, list);
+		list_del(&r->list);
+		kfree(r);
+	}
+	/* The excluded-block set holds no allocations of its own. */
+	xa_destroy(&j->replay_trie_excluded);
 	/* Free the pass-1 xattr replay maps (blocks stay as pass-1 left them). */
 	{
 		struct briefs_replay_xattr_final *f;

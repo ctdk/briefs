@@ -1081,6 +1081,10 @@ void briefs_trie_cleanup_state(struct super_block *sb);
 void briefs_trie_page_add_partial(struct super_block *sb, u64 block, u64 hint);
 bool briefs_trie_page_has_room(struct briefs_trie_page *page);
 int briefs_trie_seed_pool(struct super_block *sb, u64 root_ref);
+/* Replay-only: mark every trie-page block reachable from @root_ref in the
+ * journal's replay_trie_excluded set (see briefs_journal.h).
+ */
+int briefs_trie_mark_referenced_blocks(struct super_block *sb, u64 root_ref);
 /* Whole-directory trie prefetch (cold-walk cascade): blocking-read every
  * page reachable from @root_ref into the buffer cache on the per-sb
  * prefetch workqueue, off the readdir critical path.  Read-only and

@@ -161,6 +161,29 @@ struct briefs_journal {
 	struct list_head replay_trie_blocks;
 
 	/*
+	 * Replay pass-1 collection: every distinct dir_trie_root that appears in
+	 * a JRN_INODE_FULL record (list of struct briefs_replay_trie_root), and
+	 * the set of trie-page blocks reachable from those roots at crash time
+	 * (xarray keyed by absolute block number).  Populated between pass-1 and
+	 * pass-2 by walking the crash-time tries read-only.  briefs_trie_page_init()
+	 * pool pops SKIP excluded blocks: a block referenced by a snapshot the
+	 * window will restore (or by the crash-time trie content) must never be
+	 * zeroed, because re-derivation can demand a page beyond the unsynced-tail
+	 * orphans -- e.g. a cross-directory rename window where a directory's
+	 * on-disk trie root has already regressed (the mv cleared it) while its
+	 * snapshot still points at the live root page; popping that page for
+	 * ANOTHER directory's re-derived trie zeroes it and the later INODE_FULL
+	 * restore points the first directory at garbage (generic/335 family:
+	 * cyclic sibling chain, nlink reconcile abort, lost directory).  Only
+	 * unreferenced (orphan) pool blocks are ever handed out; when the pool
+	 * holds only excluded blocks page_init falls back to briefs_alloc_block(),
+	 * which pass-1's reservations guarantee cannot alias anything.  Valid only
+	 * while in_replay is set.
+	 */
+	struct list_head replay_trie_roots;
+	struct xarray replay_trie_excluded;
+
+	/*
 	 * Replay pass-1 map: ino -> that inode's final xattr_offset, taken from
 	 * the last JRN_INODE_FULL for the inode in journal order (last-wins).  Pass-2
 	 * replay_xattr_data() restores a JRN_XATTR_DATA block only when the owning
@@ -258,6 +281,15 @@ struct briefs_replay_xattr_live {
 struct briefs_replay_trie_block {
 	struct list_head list;
 	u64 rel;		/* data-relative block number */
+};
+
+/*
+ * One distinct dir_trie_root collected from a JRN_INODE_FULL record during
+ * replay pass-1 (see replay_trie_roots above).  Lives only during replay.
+ */
+struct briefs_replay_trie_root {
+	struct list_head list;
+	u64 root_ref;		/* on-disk trie ref, 0 = empty */
 };
 
 /*
