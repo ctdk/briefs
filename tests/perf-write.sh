@@ -72,7 +72,19 @@ prepare_fs() {
 	mkdir -p "$MNT"
 	case $type in
 	briefs)
-		if ! grep -qw briefs /proc/filesystems; then
+		if grep -qw briefs /proc/filesystems; then
+			# The resident module must be the staged build we intend
+			# to measure: modprobe/insmod no-ops while loaded, so a
+			# stale resident module silently benchmarks old code.
+			if [ -f "$MOD" ]; then
+				live=$(cat /sys/module/briefs_fs/srcversion 2>/dev/null)
+				want=$(modinfo -F srcversion "$MOD" 2>/dev/null)
+				if [ -n "$live" ] && [ -n "$want" ] && \
+				   [ "$live" != "$want" ]; then
+					fail "loaded briefs_fs (srcversion $live) != $MOD (srcversion $want); unmount, rmmod briefs_fs, re-run"
+				fi
+			fi
+		else
 			[ -f "$MOD" ] || fail "no $MOD and module not loaded"
 			insmod "$MOD" || fail "insmod"
 		fi

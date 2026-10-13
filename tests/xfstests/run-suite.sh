@@ -70,6 +70,30 @@ case "$MOUNT_CMD" in
 *) modprobe briefs_fs 2>/dev/null || insmod "/lib/modules/$(uname -r)/extra/briefs/briefs_fs.ko" 2>/dev/null || true ;;
 esac
 
+# Ensure the module in memory is the module on disk.  modprobe no-ops
+# while any briefs_fs is resident, so a stale module from an earlier
+# insmod silently survives and a whole suite can run against an
+# out-of-date build (2026-10-13: a full gate "failed" four tests the
+# loaded fix had already fixed because an intermediate build was
+# resident).  srcversion pins the in-memory module to the installed
+# file; on mismatch fail loudly rather than test the wrong code.
+check_loaded_module() {
+    local modpath="/lib/modules/$(uname -r)/extra/briefs/briefs_fs.ko"
+    local live want
+    [ -f "$modpath" ] || return 0
+    live=$(cat /sys/module/briefs_fs/srcversion 2>/dev/null)
+    want=$(modinfo -F srcversion "$modpath" 2>/dev/null)
+    if [ -n "$live" ] && [ -n "$want" ] && [ "$live" != "$want" ]; then
+        echo "ERROR: loaded briefs_fs srcversion $live != installed $modpath srcversion $want" >&2
+        echo "ERROR: unmount all briefs filesystems, rmmod briefs_fs, and re-run" >&2
+        exit 1
+    fi
+}
+case "$MOUNT_CMD" in
+*fuse*) : ;;
+*) grep -qw briefs /proc/filesystems && check_loaded_module ;;
+esac
+
 # Remove any device-mapper devices that wrap TEST_DEV or SCRATCH_DEV.  Tests
 # such as generic/475 create dm-error/dm-thin-pool/dm-log-writes stacks on top
 # of the scratch device; if the test is interrupted they stay behind and make
