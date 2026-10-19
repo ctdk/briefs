@@ -635,6 +635,27 @@ static int briefs_journal_flush_cur_block_locked(struct briefs_journal *j)
  */
 #define BRIEFS_JOURNAL_RING_WAIT	(64 * HZ)
 
+/*
+ * briefs_journal_needs_room_locked - true when the next block flush would
+ * collide with the oldest live record.  Used by the sync-entry back-pressure
+ * test: write_pos sitting exactly on journal_log_start is a wrapped-full ring
+ * (unless the live window is EMPTY -- a retire leaves log_start == log_end ==
+ * write_pos, which must not re-trip), and next-block == journal_log_start is
+ * the one-block-shy shape a multi-block append inside one sync reaches on
+ * its second flush.
+ */
+static bool briefs_journal_needs_room_locked(struct briefs_journal *j)
+{
+	u64 log_start = le64_to_cpu(j->sb->journal_log_start);
+	u64 log_end = le64_to_cpu(j->sb->journal_log_end);
+	u64 nxt = briefs_journal_next_block(j, j->write_pos);
+
+	if (nxt == j->checkpoint_block)
+		nxt = briefs_journal_next_block(j, nxt);
+	return (j->write_pos == log_start && log_end != log_start) ||
+	       nxt == log_start;
+}
+
 static int briefs_journal_ring_room_locked(struct briefs_journal *j)
 {
 	unsigned long giveup = jiffies + BRIEFS_JOURNAL_RING_WAIT;
@@ -652,12 +673,31 @@ static int briefs_journal_ring_room_locked(struct briefs_journal *j)
 	}
 
 	for (;;) {
-		int ret = __briefs_journal_checkpoint_locked(j);
+		int ret;
 
-		if (ret) {
-			pr_err("briefs: journal back-pressure checkpoint failed: %d\n",
-			       ret);
-			return ret;
+		/*
+		 * Never nest checkpoints (generic/269, generic/273).  While a
+		 * checkpoint is in flight every other spawn site is guarded,
+		 * and the in-flight one never blocks on ring room itself (its
+		 * pending-records sync runs only after its retire, so room
+		 * always exists before anything it appends), so its tail
+		 * retire is guaranteed to free the ring.  Wait it out instead
+		 * of spawning: the old unguarded spawn here recursed
+		 * checkpoint -> sync -> write_record -> ring_room ->
+		 * checkpoint once per lap-refill until the kernel stack guard
+		 * page (the 2026-10-13 full-gate freeze under generic/273's
+		 * 200-thread cp).
+		 */
+		if (j->in_checkpoint) {
+			pr_warn_once("briefs: journal ring full inside in-flight checkpoint; waiting for its retire\n");
+		} else {
+			ret = __briefs_journal_checkpoint_locked(j);
+
+			if (ret) {
+				pr_err("briefs: journal back-pressure checkpoint failed: %d\n",
+				       ret);
+				return ret;
+			}
 		}
 		/*
 		 * A ring with >= 2 usable blocks whose next block advance is
@@ -756,7 +796,8 @@ static int __briefs_journal_write_record_locked(struct briefs_journal *j,
 		 * (including under alloc->lock).
 		 *
 		 * briefs_journal_ring_room_locked() waits the concurrent-writer
-		 * refill out with checkpoint + yield passes.
+		 * refill out with checkpoint + yield passes, and never nests
+		 * while a checkpoint is already in flight.
 		 */
 		if (j->write_pos == le64_to_cpu(j->sb->journal_log_start)) {
 			pr_debug("briefs: journal ring full (back-pressure), checkpointing at write_pos=%llu\n",
@@ -851,34 +892,142 @@ int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_ty
 }
 
 /*
+ * briefs_journal_retire_locked - write a checkpoint record at the reserved
+ * j->checkpoint_block and advance journal_log_start/journal_log_end to
+ * @retire_pos, the durable boundary captured by the caller (never a live
+ * tail).  Everything before the boundary is proven durable; everything after
+ * it stays live and replayable until a later sync commits and a later
+ * checkpoint retires past it.  The checkpoint record never passes through the
+ * ring, so a retire itself needs no ring room -- the property that lets the
+ * checkpoint retire early while the ring is still wrapped-full.
+ *
+ * Called under j->write_lock (its block I/O runs there, exactly like the
+ * tail always has).  Does not touch j->dirty or records_since_checkpoint:
+ * the pending block's records are beyond the boundary and still owed a
+ * flush, so the checkpoint flow leaves both to its pending-records sync
+ * and resets records_since_checkpoint only after that succeeds.
+ */
+static int briefs_journal_retire_locked(struct briefs_journal *j,
+					u64 retire_pos, u64 retire_count)
+{
+	struct briefs_sb_info *bsi;
+	struct jrn_checkpoint cp;
+	unsigned char *cp_buf;
+	struct journal_record_hdr *rec_hdr;
+	struct journal_block_header *cp_hdr;
+	struct buffer_head *cpbh;
+	int ret;
+
+	/* Refresh superblock free counts from the authoritative allocator
+	 * state before writing the checkpoint. */
+	bsi = j->vfs_sb->s_fs_info;
+	if (bsi) {
+		j->sb->free_data_blocks = cpu_to_le64(bsi->alloc.free_count);
+		j->sb->free_inodes = cpu_to_le64(bsi->inode_alloc.free_count);
+	}
+
+	/* Create checkpoint record */
+	memset(&cp, 0, sizeof(cp));
+	cp.checkpoint_seq = cpu_to_le64(++j->checkpoint_seq);
+	cp.record_count = cpu_to_le32(le32_to_cpu(j->cur_hdr->record_count));
+	cp.log_sequence_end = cpu_to_le64(retire_pos);
+	cp.trie_root_node = j->sb->trie_root_block;
+	cp.free_data_count = j->sb->free_data_blocks;
+	cp.free_inode_count = j->sb->free_inodes;
+
+	/* Write checkpoint record into a fresh buffer */
+	cp_buf = kzalloc(JOURNAL_BLOCK_SIZE, GFP_NOFS);
+	if (!cp_buf) return -ENOMEM;
+
+	cp_hdr = (struct journal_block_header *)cp_buf;
+	cp_hdr->magic = cpu_to_le32(CHECKPOINT_MAGIC);
+	cp_hdr->block_seq = j->cur_hdr->block_seq;
+	cp_hdr->record_count = cpu_to_le32(1);
+
+	rec_hdr = (struct journal_record_hdr *)(cp_buf + sizeof(struct journal_block_header));
+	rec_hdr->type = cpu_to_le32(JRN_CHECKPOINT);
+	rec_hdr->flags = cpu_to_le32(0);
+	rec_hdr->data_len = cpu_to_le32(sizeof(cp));
+	rec_hdr->checksum = cpu_to_le32(compute_record_checksum(JRN_CHECKPOINT, 0, sizeof(cp), &cp));
+
+	memcpy(cp_buf + sizeof(struct journal_block_header) + sizeof(*rec_hdr), &cp, sizeof(cp));
+
+	/* Write checkpoint block to disk */
+	ret = briefs_journal_write_block(j, j->checkpoint_block, cp_buf);
+	kfree(cp_buf);
+	if (ret) {
+		briefs_handle_meta_write_error(j->vfs_sb, "checkpoint write");
+		return ret;
+	}
+
+	/*
+	 * Force the checkpoint block to disk before the superblock records the
+	 * new log boundaries below, so recovery never sees a superblock whose
+	 * checkpoint_seq / log_end run past an unwritten checkpoint block.
+	 * briefs_journal_write_block() only marks it dirty.
+	 */
+	cpbh = sb_bread(j->vfs_sb, j->checkpoint_block);
+	if (cpbh) {
+		if (buffer_dirty(cpbh)) {
+			if (briefs_sync_dirty_buffer(cpbh, j->vfs_sb,
+						      "checkpoint block sync")) {
+				brelse(cpbh);
+				return -EIO;
+			}
+		}
+		brelse(cpbh);
+	}
+
+	pr_debug("briefs: checkpoint written (seq=%llu, records=%u, log_end=%llu)\n",
+		j->checkpoint_seq, cp.record_count, retire_pos);
+
+	j->sb->checkpoint_seq = cpu_to_le64(j->checkpoint_seq);
+	j->sb->journal_log_start = cpu_to_le64(retire_pos);
+	j->sb->journal_log_end = cpu_to_le64(retire_pos);
+	/* Retire only to the durable boundary (retire_pos), not the live
+	 * tail.  committed_count is the ring-step count at the same capture
+	 * instant: a racing sync that captured a narrower range before the
+	 * checkpoint and finishes its commit afterwards must not "advance"
+	 * log_end past the checkpoint's (older) boundary; its records stay
+	 * live and are committed by the next sync that captures past them. */
+	j->committed_count = retire_count;
+
+	/* Persist the updated superblock so free counts are not stale. */
+	return briefs_journal_sync_superblock(j);
+}
+
+/*
  * Write a checkpoint
  */
 static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	struct briefs_sb_info *bsi;
 	u64 retire_pos, retire_count;
+	int ret = 0;
 
 	if (!j) return -EINVAL;
 
-	briefs_stat_inc(briefs_sb(j->vfs_sb), journal_checkpoints);
-
 	/*
-	 * Flush any pending records first.  checkpoint must be false here:
-	 * the periodic checkpoint in the sync tail (records_since_checkpoint
-	 * check) has no in_checkpoint reentrancy guard, and that counter only
-	 * resets when a checkpoint COMPLETES -- so a checkpoint=true here
-	 * re-enters __briefs_journal_checkpoint_locked from every level.  The
-	 * re-dirty window each sync's unlocked I/O opens lets concurrent
-	 * writers keep j->dirty set, so the nesting never unwinds and the
-	 * kernel stack overflows (generic/269 128-thread fsstress wedge).  An
-	 * in-progress checkpoint retires the same records itself; it must not
-	 * spawn another one.  Back-pressure checkpoints stay enabled: both
-	 * call sites (sync entry and tail) are guarded by in_checkpoint, so
-	 * nesting through them is bounded at one level.
+	 * Re-entrancy guard (generic/269, generic/273).  in_checkpoint is
+	 * journal state set here at entry and cleared on every exit, so every
+	 * re-entrant path sees it: the sync-entry and sync-tail back-pressure
+	 * spawns skip while it is set, and briefs_journal_ring_room_locked()
+	 * waits for the in-flight checkpoint instead of spawning another one.
+	 * The 269-era fix guarded only the two sync spawn sites; the generic/320
+	 * wait loop added a third spawn inside ring_room outside the guard, and
+	 * the old retire-after-sync flow relied on it -- under generic/273's
+	 * 200-thread refill every nesting level re-spawned instead of
+	 * unwinding and the recursion blew the kernel stack (2026-10-13
+	 * full-gate freeze).  A re-entrant arrival must not spawn anything:
+	 * the in-flight checkpoint retires the same records, so 0 is the
+	 * truthful result.
 	 */
-	if (j->dirty) {
-		int ret = __briefs_journal_sync_locked(j, false);
-		if (ret) return ret;
+	if (j->in_checkpoint) {
+		pr_warn_once("briefs: nested checkpoint suppressed (in-flight checkpoint retires the same records)\n");
+		return 0;
 	}
+	j->in_checkpoint = true;
+
+	briefs_stat_inc(briefs_sb(j->vfs_sb), journal_checkpoints);
 
 	/*
 	 * Flush all dirty metadata buffers (inode blocks, trie blocks) to disk
@@ -889,9 +1038,9 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	 * the dirty block is now in the journal-owned set.
 	 *
 	 * Release j->write_lock before the flush so other threads can write
-	 * journal records while we wait for I/O.  The __briefs_journal_sync_locked
-	 * call above already committed the records and flushed metadata once; this
-	 * second flush is an extra safety barrier before discarding.
+	 * journal records while we wait for I/O.  The records being retired
+	 * below were committed and metadata-flushed by their own earlier
+	 * syncs; this flush is an extra safety barrier before discarding.
 	 *
 	 * briefs_journal_flush_owned() writes each tracked block back per-buffer
 	 * (loop-free, quiesce-on-EIO) instead of the coarse looping sync_blockdev()
@@ -907,24 +1056,13 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	 * We also release before briefs_alloc_sync() to avoid the AB-BA deadlock
 	 * with alloc->lock (LOCK ORDER FIX).
 	 */
-	/*
-	 * Retire boundary mechanics, part 1: the boundary is captured below,
-	 * AFTER the re-acquire of write_lock, from j->synced_pos -- the last
-	 * journal-block boundary every prior sync has forced durably to disk.
-	 * It is deliberately NOT the live j->write_pos read at SB time:
-	 * records appended by concurrent writers while write_lock is released
-	 * below (their journal blocks unforced, their pinned buffers possibly
-	 * attached after the drain -- pin-before-record holds on every edit
-	 * path, so a post-drain pin always belongs to a record appended after
-	 * it) would be retired without being durable.
-	 */
 	mutex_unlock(&j->write_lock);
 
 	{
-		int ret = briefs_journal_flush_owned(j);
+		ret = briefs_journal_flush_owned(j);
 		if (ret) {
 			mutex_lock(&j->write_lock);
-			return ret;
+			goto out;
 		}
 	}
 
@@ -951,12 +1089,14 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 		int r2 = briefs_alloc_sync(&bsi->alloc);
 		if (r2) {
 			mutex_lock(&j->write_lock);
-			return r2;
+			ret = r2;
+			goto out;
 		}
 		r2 = briefs_alloc_sync(&bsi->inode_alloc);
 		if (r2) {
 			mutex_lock(&j->write_lock);
-			return r2;
+			ret = r2;
+			goto out;
 		}
 	}
 
@@ -964,114 +1104,61 @@ static int __briefs_journal_checkpoint_locked(struct briefs_journal *j) {
 	mutex_lock(&j->write_lock);
 
 	/*
-	 * Retire boundary mechanics, part 2: sync any records appended while
-	 * write_lock was released above so the durable boundary (j->synced_pos)
-	 * covers everything appended so far, then retire only to that boundary.
-	 * Without this, retiring to the live j->write_pos made replay's live
-	 * range empty while those records' journal blocks were unforced and
-	 * their pinned buffers unwritten -- a crash in the window (or a
-	 * dm-log-writes mark cut inside it, generic/455) replayed a stale
-	 * on-disk state the journal could no longer reconstruct.  Records
-	 * appended after the re-sync land beyond the boundary and stay live
-	 * and replayable until a later checkpoint proves them durable.
-	 * in_checkpoint is deliberately left clear so a ring-full here runs the
-	 * sync's own back-pressure checkpoint instead of clobbering the oldest
-	 * live records.  retire_count is the ring-step count at the same
-	 * instant, for the committed_count monotonic guard.
+	 * Retire boundary: captured here, AFTER the write_lock-release
+	 * window, from j->synced_pos -- the last journal-block boundary
+	 * every prior sync forced durably (each of those syncs also flushed
+	 * the owned metadata buffers its records reference before advancing
+	 * it).  Capturing after the window matters: a concurrent sync may
+	 * have committed and advanced synced_pos while write_lock was
+	 * released above, and retiring to an entry-time boundary would
+	 * regress journal_log_end below durable, discoverable records.
+	 * It is deliberately NOT the live j->write_pos: records appended by
+	 * concurrent writers during the window (their blocks unforced, their
+	 * pinned buffers possibly attached after the drain) would be
+	 * retired without being durable (generic/455).  They stay live and
+	 * replayable, committed by the next sync and retired by the next
+	 * checkpoint.
+	 *
+	 * Retire BEFORE the pending-records sync, not after it
+	 * (generic/273).  The old flow re-synced the window's records here
+	 * to extend the boundary over them, then retired last.  The sync
+	 * must append records -- drained pending snapshots, flushed blocks
+	 * -- to the ring, but a wrapped-full ring's only source of room is
+	 * this retire, and the retire itself needs no room: the checkpoint
+	 * record goes to the reserved j->checkpoint_block, never through
+	 * the ring.  Retiring last made the re-sync ask ring_room for room
+	 * mid-checkpoint, whose nested spawn recursed checkpoint -> sync ->
+	 * write_record -> ring_room -> checkpoint once per lap-refill
+	 * under generic/273's 200-thread cp until the kernel stack guard
+	 * page (the 2026-10-13 full-gate freeze).  Retiring first frees
+	 * the lap; the sync below then appends into it, and whatever it
+	 * appends stays beyond the boundary for the next checkpoint.
 	 */
-	if (j->dirty) {
-		int ret = __briefs_journal_sync_locked(j, false);
-
-		if (ret) return ret;
-	}
 	retire_pos = j->synced_pos;
 	retire_count = j->write_count;
 
-	/*
-	 * Refresh superblock free counts from the authoritative allocator state
-	 * before writing the checkpoint.
-	 */
-	bsi = j->vfs_sb->s_fs_info;
-	if (bsi) {
-		j->sb->free_data_blocks = cpu_to_le64(bsi->alloc.free_count);
-		j->sb->free_inodes = cpu_to_le64(bsi->inode_alloc.free_count);
-	}
-
-	/* Create checkpoint record */
-	struct jrn_checkpoint cp;
-	memset(&cp, 0, sizeof(cp));
-	cp.checkpoint_seq = cpu_to_le64(++j->checkpoint_seq);
-	cp.record_count = cpu_to_le32(le32_to_cpu(j->cur_hdr->record_count));
-	cp.log_sequence_end = cpu_to_le64(retire_pos);
-	cp.trie_root_node = j->sb->trie_root_block;
-	cp.free_data_count = j->sb->free_data_blocks;
-	cp.free_inode_count = j->sb->free_inodes;
-
-	/* Write checkpoint record into a fresh buffer */
-	unsigned char *cp_buf = kzalloc(JOURNAL_BLOCK_SIZE, GFP_NOFS);
-	if (!cp_buf) return -ENOMEM;
-
-	struct journal_block_header *cp_hdr = (struct journal_block_header *)cp_buf;
-	cp_hdr->magic = cpu_to_le32(CHECKPOINT_MAGIC);
-	cp_hdr->block_seq = j->cur_hdr->block_seq;
-	cp_hdr->record_count = cpu_to_le32(1);
-
-	struct journal_record_hdr *rec_hdr = (struct journal_record_hdr *)(cp_buf + sizeof(struct journal_block_header));
-	rec_hdr->type = cpu_to_le32(JRN_CHECKPOINT);
-	rec_hdr->flags = cpu_to_le32(0);
-	rec_hdr->data_len = cpu_to_le32(sizeof(cp));
-	rec_hdr->checksum = cpu_to_le32(compute_record_checksum(JRN_CHECKPOINT, 0, sizeof(cp), &cp));
-
-	memcpy(cp_buf + sizeof(struct journal_block_header) + sizeof(*rec_hdr), &cp, sizeof(cp));
-
-	/* Write checkpoint block to disk */
-	int ret = briefs_journal_write_block(j, j->checkpoint_block, cp_buf);
-	kfree(cp_buf);
-	if (ret) {
-		briefs_handle_meta_write_error(j->vfs_sb, "checkpoint write");
-		return ret;
-	}
+	ret = briefs_journal_retire_locked(j, retire_pos, retire_count);
+	if (ret)
+		goto out;
 
 	/*
-	 * Force the checkpoint block to disk before the superblock records the
-	 * new log boundaries below, so recovery never sees a superblock whose
-	 * checkpoint_seq / log_end run past an unwritten checkpoint block.
-	 * briefs_journal_write_block() only marks it dirty.
+	 * Flush any pending records and commit them into the freed ring.
+	 * They stay live beyond the retire boundary until the next
+	 * checkpoint retires past them.  checkpoint must be false here: the
+	 * periodic tail spawn fires on j->dirty state this checkpoint has
+	 * not yet settled, and a nested spawn would be suppressed by the
+	 * entry guard anyway.
 	 */
-	{
-		struct buffer_head *cpbh = sb_bread(j->vfs_sb, j->checkpoint_block);
-		if (cpbh) {
-			if (buffer_dirty(cpbh)) {
-				if (briefs_sync_dirty_buffer(cpbh, j->vfs_sb,
-							      "checkpoint block sync")) {
-					brelse(cpbh);
-					return -EIO;
-				}
-			}
-			brelse(cpbh);
-		}
+	if (j->dirty) {
+		ret = __briefs_journal_sync_locked(j, false);
+		if (ret)
+			goto out;
 	}
 
-	pr_debug("briefs: checkpoint written (seq=%llu, records=%u, log_end=%llu)\n",
-		j->checkpoint_seq, cp.record_count, retire_pos);
-
-	j->sb->checkpoint_seq = cpu_to_le64(j->checkpoint_seq);
-	j->sb->journal_log_start = cpu_to_le64(retire_pos);
-	j->sb->journal_log_end = cpu_to_le64(retire_pos);
-	/* Retire only to the durable boundary captured above (retire_pos), not
-	 * the live tail.  committed_count is the ring-step count at the same
-	 * capture instant: a racing sync that captured a narrower range before
-	 * the checkpoint and finishes its commit afterwards must not "advance"
-	 * log_end past the checkpoint's (older) boundary; its records stay
-	 * live and are committed by the next sync that captures past them. */
-	j->committed_count = retire_count;
-
-
-	j->dirty = false;
 	j->records_since_checkpoint = 0;
-
-	/* Persist the updated superblock so free counts are not stale. */
-	return briefs_journal_sync_superblock(j);
+out:
+	j->in_checkpoint = false;
+	return ret;
 }
 
 /*
@@ -2839,7 +2926,6 @@ void briefs_journal_cleanup(struct briefs_journal *j) {
 static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoint) {
 	u64 sync_start, sync_end, pos, own_next;
 	u64 own_count;
-	u64 nxt;
 	int ret;
 	bool io_err = false;
 
@@ -2902,20 +2988,10 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 	 * write+advance as a transient that the retire heals in the same
 	 * call (flush_owned, allocator sync, then log_start = log_end).
 	 */
-	nxt = briefs_journal_next_block(j, j->write_pos);
-	if (nxt == j->checkpoint_block)
-		nxt = briefs_journal_next_block(j, nxt);
-
-	if (!j->in_checkpoint &&
-	    ((j->write_pos == le64_to_cpu(j->sb->journal_log_start) &&
-	      le64_to_cpu(j->sb->journal_log_end) !=
-	      le64_to_cpu(j->sb->journal_log_start)) ||
-	     nxt == le64_to_cpu(j->sb->journal_log_start))) {
+	if (!j->in_checkpoint && briefs_journal_needs_room_locked(j)) {
 		pr_debug("briefs: journal ring full at sync start, back-pressure checkpoint at write_pos=%llu\n",
 			 j->write_pos);
-		j->in_checkpoint = true;
 		ret = __briefs_journal_checkpoint_locked(j);
-		j->in_checkpoint = false;
 		if (ret)
 			return ret;
 		if (!j->dirty)
@@ -3121,9 +3197,7 @@ static int __briefs_journal_sync_locked(struct briefs_journal *j, bool checkpoin
 	    le64_to_cpu(j->sb->journal_log_start)) {
 		pr_debug("briefs: journal ring full, back-pressure checkpoint at write_pos=%llu\n",
 			 j->write_pos);
-		j->in_checkpoint = true;
 		ret = __briefs_journal_checkpoint_locked(j);
-		j->in_checkpoint = false;
 		if (ret)
 			pr_warn("briefs: back-pressure checkpoint failed: %d\n", ret);
 	}
