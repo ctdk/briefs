@@ -343,6 +343,11 @@ int briefs_journal_write_record(struct briefs_journal *j, enum journal_record_ty
 /* Write a checkpoint */
 int briefs_journal_checkpoint(struct briefs_journal *j);
 
+/* True when the persisted journal window is empty (log_start == log_end):
+ * the next mount replays nothing.  Callers quiesced (e.g. put_super) use
+ * it to re-checkpoint until the on-disk journal is actually clean. */
+bool briefs_journal_is_clean(struct briefs_journal *j);
+
 /* Mount/recovery: replay journal from last checkpoint */
 int briefs_journal_replay(struct briefs_journal *j);
 

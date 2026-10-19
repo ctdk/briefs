@@ -757,6 +757,40 @@ void briefs_put_super(struct super_block *sb) {
 			if (!(bsi->mount_flags & BRIEFS_MF_SHUTDOWN)) {
 				int ckret = briefs_journal_checkpoint(bsi->journal);
 
+				/*
+				 * One checkpoint call may not empty the
+				 * journal: since the generic/273 reorder
+				 * (retire before the pending-records sync),
+				 * the checkpoint's own pending sync runs
+				 * after its retire and can commit one more
+				 * block past it -- typically the evict-time
+				 * inode writeback records that arrive after
+				 * sync_fs already ran (generic/052: shutdown
+				 * -> mount with replay -> ls atime -> unmount
+				 * left log_end = log_start + 1, a "dirty log"
+				 * on a clean unmount whose record range then
+				 * replays at the next mount exactly like the
+				 * 029/030/032 family this checkpoint exists
+				 * to prevent).  There are no concurrent
+				 * journal writers under put_super, and every
+				 * checkpoint call drains metadata and the
+				 * allocator bitmaps before it retires, so
+				 * re-checkpointing until the persisted window
+				 * is empty converges in one extra call and
+				 * never retires anything unflushed.
+				 */
+				if (!ckret) {
+					int tries;
+
+					for (tries = 0; tries < 4 && !ckret; tries++) {
+						if (briefs_journal_is_clean(bsi->journal))
+							break;
+						ckret = briefs_journal_checkpoint(bsi->journal);
+					}
+					if (ckret || !briefs_journal_is_clean(bsi->journal))
+						pr_err("briefs: journal still not clean after unmount checkpoints; next mount will replay\n");
+				}
+
 				if (ckret)
 					pr_err("briefs: unmount checkpoint failed (err=%d); journal may replay on next mount\n",
 					       ckret);

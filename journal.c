@@ -1175,6 +1175,29 @@ int briefs_journal_checkpoint(struct briefs_journal *j) {
 	return ret;
 }
 
+/*
+ * briefs_journal_is_clean - true when the persisted journal window is
+ * empty (journal_log_start == journal_log_end): the next mount replays
+ * nothing.  The in-memory sb mirrors disk here because every retire and
+ * every commit point persists the superblock before returning.
+ *
+ * One checkpoint call does NOT guarantee this even on a quiesced fs:
+ * the generic/273 reorder runs the checkpoint's pending-records sync
+ * AFTER its retire, so records that arrive late (evict-time inode
+ * writeback after sync_fs) are committed one block PAST the retire.
+ * Mid-load that is normal -- live records are retired by the next
+ * checkpoint -- but a terminal consumer (put_super) must re-checkpoint
+ * until clean, or the unmount leaves un-replayed records behind
+ * (generic/052, the 029/030/032 replay-clobber family).
+ */
+bool briefs_journal_is_clean(struct briefs_journal *j)
+{
+	if (!j || !j->sb)
+		return true;
+	return le64_to_cpu(j->sb->journal_log_start) ==
+	       le64_to_cpu(j->sb->journal_log_end);
+}
+
 /**********************************************************************
  * Replay helpers — operate on raw disk blocks, no VFS inode context.
  **********************************************************************/
