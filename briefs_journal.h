@@ -161,27 +161,43 @@ struct briefs_journal {
 	struct list_head replay_trie_blocks;
 
 	/*
-	 * Replay pass-1 collection: every distinct dir_trie_root that appears in
-	 * a JRN_INODE_FULL record (list of struct briefs_replay_trie_root), and
-	 * the set of trie-page blocks reachable from those roots at crash time
-	 * (xarray keyed by absolute block number).  Populated between pass-1 and
-	 * pass-2 by walking the crash-time tries read-only.  briefs_trie_page_init()
-	 * pool pops SKIP excluded blocks: a block referenced by a snapshot the
-	 * window will restore (or by the crash-time trie content) must never be
-	 * zeroed, because re-derivation can demand a page beyond the unsynced-tail
-	 * orphans -- e.g. a cross-directory rename window where a directory's
-	 * on-disk trie root has already regressed (the mv cleared it) while its
-	 * snapshot still points at the live root page; popping that page for
-	 * ANOTHER directory's re-derived trie zeroes it and the later INODE_FULL
-	 * restore points the first directory at garbage (generic/335 family:
-	 * cyclic sibling chain, nlink reconcile abort, lost directory).  Only
-	 * unreferenced (orphan) pool blocks are ever handed out; when the pool
-	 * holds only excluded blocks page_init falls back to briefs_alloc_block(),
-	 * which pass-1's reservations guarantee cannot alias anything.  Valid only
-	 * while in_replay is set.
+	 * Replay pass-1 collection: every distinct dir_trie_root that appears
+	 * in a JRN_INODE_FULL record (list of struct briefs_replay_trie_root)
+	 * and the exclusion set of trie-page blocks reachable from those roots
+	 * at crash time (replay_trie_excluded, xarray keyed by absolute block
+	 * number; the stored marker is the tagged owning ino, never 0 and
+	 * never NULL/XA_ZERO_ENTRY).  Populated between pass-1 and pass-2 by
+	 * walking the crash-time tries read-only.  The pass-2 pool pop skips
+	 * every marked block: zeroing one would corrupt the directory whose
+	 * snapshot or crash-time trie points at it (generic/335 family --
+	 * cross-directory rename window, cyclic sibling chain, lost
+	 * directory).  When the pool holds only marked blocks it returns
+	 * -ENOENT and briefs_trie_page_init() falls back to
+	 * briefs_alloc_block(), which pass-1's reservations guarantee cannot
+	 * alias anything.  Valid only while in_replay is set.
 	 */
 	struct list_head replay_trie_roots;
 	struct xarray replay_trie_excluded;
+
+	/*
+	 * Replay pass-1 pin map: ino -> that directory's FINAL dir_trie_root
+	 * from the last JRN_INODE_FULL in journal order (last-wins, and a
+	 * final NULL root WINS -- an emptied directory pins NULL; its earlier
+	 * roots are stale).  Pass-2's briefs_trie_create_root() uses it to
+	 * ADOPT the pinned page when a re-derivation rebuilds an empty trie:
+	 * claim a free slot on the crash-time page and place the new root
+	 * node there WITHOUT zeroing, so the rebuilt trie lands exactly
+	 * where the window's restore will re-point dir_trie_root.  Building
+	 * anywhere else leaves the restored ref aimed at the old page's
+	 * stale content (generic/392: rm + fresh create across a forced
+	 * shutdown -> cyclic trie -> fsynced file lost).  Adoption must not
+	 * zero: re-derivation packs nodes into other directories' pages
+	 * with room (the hint tag is preferential, not exclusive), so any
+	 * pop-and-zero of a "looked free" page can destroy nodes placed
+	 * there earlier in the same replay (generic/336).  Valid only while
+	 * in_replay is set.
+	 */
+	DECLARE_HASHTABLE(replay_pin_map, 6);
 
 	/*
 	 * Replay pass-1 map: ino -> that inode's final xattr_offset, taken from
@@ -293,6 +309,16 @@ struct briefs_replay_trie_root {
 };
 
 /*
+ * One entry in the replay pin map above: the directory's FINAL
+ * dir_trie_root (last-wins, NULL included).  Lives only during replay.
+ */
+struct briefs_replay_pin {
+	struct hlist_node node;
+	u64 ino;
+	u64 root_ref;		/* on-disk trie ref, 0 = empty */
+};
+
+/*
  * One entry in the replay nlink-reconciliation map (above).  Lives only
  * during replay.  link_count counts directory entries across all dirs pointing
  * to ino; subdir_count counts how many child-directory entries exist inside
@@ -353,11 +379,21 @@ int briefs_journal_replay(struct briefs_journal *j);
 
 /*
  * Pop the next data-relative trie-block number from the replay pool (LIFO:
- * unsynced-tail orphans first).  Returns 0 and sets *@rel on success, -ENOENT
+ * unsynced-tail orphans first, own-ino blocks FIFO first -- see
+ * replay_trie_owner).  Returns 0 and sets *@rel on success, -ENOENT
  * if the pool is empty (caller falls back to briefs_alloc_block).  Only
  * meaningful while in_replay is set.
  */
 int briefs_journal_replay_pop_trie_block(struct briefs_journal *j, u64 *rel);
+
+/*
+ * Replay pin-map lookup: the directory's FINAL dir_trie_root collected
+ * from the last JRN_INODE_FULL for @ino in journal order (0 = no entry
+ * or a final empty root).  Only meaningful while in_replay is set; used
+ * by briefs_trie_create_root() to adopt the pinned page instead of
+ * building the rebuilt trie elsewhere (see replay_pin_map).
+ */
+u64 briefs_journal_replay_pin_get(struct briefs_journal *j, u64 ino);
 
 /* Cleanup journal */
 void briefs_journal_cleanup(struct briefs_journal *j);

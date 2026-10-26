@@ -333,7 +333,7 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 	if (bsi->journal && bsi->journal->in_replay &&
 	    briefs_journal_replay_pop_trie_block(bsi->journal, &rel) == 0) {
 		/* reused a reserved trie block */
-		pr_debug("briefs: replay page_init reusing reserved trie block %llu (depth=%u byte=%u)\n",
+		pr_debug("briefs: replay page_init pool rel=%llu (depth=%u byte=%u)\n",
 			 (unsigned long long)rel, depth, byte_val);
 	} else {
 		/*
@@ -354,6 +354,10 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 		rel = briefs_alloc_block_high(&bsi->alloc);
 		if (rel == 0)
 			rel = briefs_alloc_block(&bsi->alloc);
+		if (bsi->journal && bsi->journal->in_replay)
+			pr_debug("briefs: replay page_init %s rel=%llu (depth=%u byte=%u)\n",
+				rel ? "alloc-high" : "ALLOC-FAILED",
+				(unsigned long long)rel, depth, byte_val);
 	}
 	if (rel == 0)
 		return -ENOSPC;
@@ -442,6 +446,91 @@ int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
 	brelse(bh);
 
 	*out_ref = TRIE_MAKE_REF(block, 0);
+	return 0;
+}
+
+/*
+ * briefs_trie_adopt_root - rebuild a directory trie root on the page the
+ * window's final JRN_INODE_FULL snapshot pins, WITHOUT zeroing it.
+ *
+ * Replay re-derivation calls briefs_trie_create_root() when a directory's
+ * trie is empty at a DIR_ADD; the window's last INODE_FULL for that
+ * directory will restore dir_trie_root to its recorded final ref, so the
+ * rebuilt root MUST land exactly there -- building on any other block
+ * leaves the restored ref aimed at the old page's stale content
+ * (generic/392: rm + fresh create across a forced shutdown, exclusion
+ * pushed the rebuild to an alloc-high page, cyclic trie, fsynced file
+ * lost).  Adoption claims the pinned slot on the crash-time page and
+ * builds the root node in place, exactly like trie_page_alloc_slot() plus
+ * the node fields briefs_trie_page_init() would set.  It never zeroes
+ * the page: re-derivation packs nodes into other directories' pages with
+ * room (the hint tag is preferential, not exclusive), so a pop-and-zero
+ * of a pool block can destroy nodes earlier replay records placed there
+ * (generic/336: the mv target's page also held the root directory's
+ * freshly re-derived leaf).  The rest of the page -- other nodes, the
+ * name heap, the free-slot map -- is preserved.
+ *
+ * Fails soft (returns 0 with *@adopted = false) whenever the pinned page
+ * cannot serve: unreadable, bad magic/version, or the pinned slot not
+ * free (crash-time root node still present, or already adopted by an
+ * earlier rebuild in this replay) -- the caller falls back to the normal
+ * briefs_trie_page_init() path.  Replay-only; the live path never pins.
+ */
+int briefs_trie_adopt_root(struct super_block *sb, u64 pin_ref, bool *adopted)
+{
+	struct buffer_head *bh;
+	struct briefs_trie_page *page;
+	struct briefs_trie_node *node;
+	u64 block = TRIE_REF_BLOCK(pin_ref);
+	u64 slot = pin_ref & TRIE_SLOT_MASK;
+	u64 free_slots;
+
+	*adopted = false;
+
+	bh = sb_bread(sb, block);
+	if (!bh)
+		return 0;		/* unreadable: fall back */
+	page = (struct briefs_trie_page *)bh->b_data;
+	if (trie_page_magic(page) != BRIEFS_TRIE_PAGE_MAGIC ||
+	    trie_page_version(page) != 1) {
+		brelse(bh);
+		return 0;		/* not a valid trie page: fall back */
+	}
+	free_slots = trie_page_free_slots(page);
+	if (!(free_slots & (1ULL << slot))) {
+		brelse(bh);
+		return 0;		/* slot in use: fall back */
+	}
+
+	/* Claim the slot (same discipline as trie_page_alloc_slot()). */
+	trie_page_set_free_slots(page, free_slots & ~(1ULL << slot));
+	trie_page_set_live_count(page, trie_page_live_count(page) + 1);
+
+	/* Root node, exactly as briefs_trie_page_init() builds slot 0. */
+	node = trie_slot_at(bh->b_data, slot);
+	memset(node, 0, sizeof(*node));
+	node->depth = 0;
+	node->byte_val = 0;
+	node->node_type = NODE_TYPE_INTERM;
+
+	mark_buffer_dirty(bh);
+	/*
+	 * Same durability rule as briefs_trie_page_init(): during replay the
+	 * page must be on disk before replay continues, so later records
+	 * that traverse into it read a valid root node; route the sync
+	 * through briefs_sync_dirty_buffer() so a write failure is quiesced
+	 * and handled per the errors= policy.  The live path never adopts.
+	 */
+	if (briefs_sync_dirty_buffer(bh, sb, "trie root adopt")) {
+		/* Undo the in-page claim; the buffer is quiesced, not
+		 * redirtied. */
+		brelse(bh);
+		return -EIO;
+	}
+	brelse(bh);
+
+	briefs_trie_page_add_partial(sb, block, block);
+	*adopted = true;
 	return 0;
 }
 

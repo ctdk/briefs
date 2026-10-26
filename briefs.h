@@ -1073,6 +1073,11 @@ u64 briefs_trie_alloc_node(struct super_block *sb, size_t name_len,
 void briefs_trie_free_node(struct super_block *sb, u64 node_ref);
 int briefs_trie_node_store_name(struct super_block *sb, u64 node_ref,
                                 const char *name, size_t name_len);
+/* Replay-only: rebuild a trie root on the page the window's final snapshot
+ * pins, claiming the pinned slot without zeroing (see briefs_journal.h's
+ * replay_pin_map).  Returns 0; *@adopted says whether the page served.
+ */
+int briefs_trie_adopt_root(struct super_block *sb, u64 pin_ref, bool *adopted);
 int briefs_trie_page_init(struct super_block *sb, u8 depth, u8 byte_val,
                           u8 node_type, u64 *out_ref, u64 hint_abs);
 void briefs_trie_cleanup_state(struct super_block *sb);

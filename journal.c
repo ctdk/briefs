@@ -1711,6 +1711,46 @@ static int replay_trie_root_add(struct briefs_journal *j, u64 root_ref)
 }
 
 /*
+ * Pass-1 helper: record @ino's FINAL dir_trie_root for the pin map
+ * (last-wins, NULL included -- an emptied directory pins NULL, and its
+ * earlier roots are stale).  briefs_trie_create_root() adopts the pinned
+ * page when the re-derivation rebuilds an empty trie (see
+ * replay_pin_map in briefs_journal.h).
+ */
+static int replay_pin_set(struct briefs_journal *j, u64 ino, u64 root_ref)
+{
+	struct briefs_replay_pin *e;
+
+	hash_for_each_possible(j->replay_pin_map, e, node, ino)
+		if (e->ino == ino) {
+			e->root_ref = root_ref;
+			return 0;
+		}
+	e = kmalloc(sizeof(*e), GFP_KERNEL);
+	if (!e)
+		return -ENOMEM;
+	e->ino = ino;
+	e->root_ref = root_ref;
+	hash_add(j->replay_pin_map, &e->node, ino);
+	return 0;
+}
+
+/*
+ * Pin-map lookup for briefs_trie_create_root(): the directory's final
+ * dir_trie_root, or 0 when the directory has no snapshot in the window
+ * or its final root is empty.
+ */
+u64 briefs_journal_replay_pin_get(struct briefs_journal *j, u64 ino)
+{
+	struct briefs_replay_pin *e;
+
+	hash_for_each_possible(j->replay_pin_map, e, node, ino)
+		if (e->ino == ino)
+			return e->root_ref;
+	return 0;
+}
+
+/*
  * Extract the next_block pointer from a JRN_XATTR_DATA content record.
  * v1 blocks have no next pointer; v2 blocks carry it when the record is
  * large enough to include the full v2 header.
@@ -2036,14 +2076,23 @@ static int apply_record(struct super_block *sb, u32 rec_type, void *rec_data,
 				replay_xattr_final_set(bsi->journal, ino, xo);
 				/*
 				 * Collect the snapshot's dir_trie_root so the
-				 * pass boundary can mark its trie's blocks
-				 * as off-limits for pool reuse (see
+				 * pass boundary can mark its trie's blocks as
+				 * off-limits for pool reuse (see
 				 * replay_trie_excluded).  Dedup by root ref:
 				 * drain batches repeat a directory's snapshot
 				 * many times over a window.
 				 */
 				ret = replay_trie_root_add(bsi->journal,
 							   le64_to_cpu(di->dir_trie_root));
+				/*
+				 * The pin map is last-wins per ino and records
+				 * NULL finals too: an emptied directory pins
+				 * NULL, and adopting its earlier root would
+				 * aim the rebuilt trie at a stale page.
+				 */
+				if (!ret)
+					ret = replay_pin_set(bsi->journal, ino,
+							     le64_to_cpu(di->dir_trie_root));
 			}
 		} else {
 			ret = replay_inode_full(sb, rec_data);
@@ -2144,6 +2193,14 @@ static int walk_journal(struct briefs_journal *j, struct super_block *sb,
 		u64 rec_off = sizeof(struct journal_block_header);
 		bool legacy_checksum_warned = false;
 		u32 rec_count = le32_to_cpu(hdr->record_count);
+
+		/* 392 evidence pass: per-block, unconditional.  block_seq must
+		 * increase monotonically around the window; a stale (previous-lap)
+		 * block breaks the sequence. */
+		pr_debug("briefs: replay %s block=%llu seq=%u recs=%u\n",
+			reserve_only ? "pass1" : "pass2",
+			(unsigned long long)cur,
+			le32_to_cpu(hdr->block_seq), rec_count);
 		for (u32 i = 0; i < rec_count && rec_off < JOURNAL_BLOCK_SIZE; i++) {
 			struct journal_record_hdr *rh = (struct journal_record_hdr *)(bh->b_data + rec_off);
 			u32 rec_type = le32_to_cpu(rh->type);
@@ -2192,7 +2249,12 @@ static int walk_journal(struct briefs_journal *j, struct super_block *sb,
 				/* -EINVAL/-ENOENT means freed inode - skippable, don't count as error.
 				 * -EIO or other errors mean real I/O failure - should fail mount. */
 				if (apply_ret == -EINVAL || apply_ret == -ENOENT) {
-					/* Skippable - freed inode, already logged at debug level */
+					/* Skippable - freed inode, already logged at debug level.
+					 * 392 evidence pass: unconditional — a swallowed
+					 * error here is invisible everywhere else. */
+					pr_info("briefs: replay skip type=%u block=%llu rec=%u ret=%d\n",
+						rec_type, (unsigned long long)cur, i,
+						apply_ret);
 				} else {
 					pr_err("briefs: replay FAILED for record type=%u: %d\n",
 					       rec_type, apply_ret);
@@ -2239,13 +2301,20 @@ static int walk_journal(struct briefs_journal *j, struct super_block *sb,
  * briefs_trie_page_init() zeroes a live page (generic/335: the re-derived
  * a/b trie reuses the mv target directory's root page; the later INODE_FULL
  * restore points the target at the zeroed/dismantled page -> cyclic sibling
- * chain, nlink reconcile aborts, directory lost).  Blocks marked in
+ * chain, nlink reconcile abort, directory lost).  Blocks marked in
  * replay_trie_excluded (reachable from any JRN_INODE_FULL dir_trie_root in
  * the window, walked at crash-time content between the passes) are therefore
  * skipped here and freed to the pool consumer; if only excluded blocks
  * remain, the pool returns -ENOENT and briefs_trie_page_init() falls back
  * to briefs_alloc_block(), which pass-1's reservations guarantee cannot
  * alias anything -- so no referenced block is ever clobbered.
+ *
+ * The directory whose restore pins one of those blocks does NOT need the
+ * pop either: briefs_trie_create_root() adopts its pinned page (free-slot
+ * claim, no zeroing) when the re-derivation rebuilds an empty trie, so the
+ * rebuilt root lands exactly where the window's INODE_FULL restore will
+ * re-point dir_trie_root (generic/392) without any zeroing that could hit
+ * nodes re-derivation packed onto the same page (generic/336).
  */
 int briefs_journal_replay_pop_trie_block(struct briefs_journal *j, u64 *rel)
 {
@@ -2524,6 +2593,7 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	INIT_LIST_HEAD(&j->replay_trie_blocks);
 	INIT_LIST_HEAD(&j->replay_trie_roots);
 	xa_init(&j->replay_trie_excluded);
+	hash_init(j->replay_pin_map);
 	hash_init(j->replay_xattr_final);
 	hash_init(j->replay_xattr_next);
 	hash_init(j->replay_nlink_hash);
@@ -2559,8 +2629,11 @@ int briefs_journal_replay(struct briefs_journal *j) {
 	 * in-window-allocated block can only be referenced via a trie mutation
 	 * (whose directory necessarily has a snapshot in the window).  Skipped
 	 * blocks free the pool to the fallback allocator instead of being
-	 * zeroed over a live trie (generic/335 family).  Walk failures abort
-	 * marking for that trie only (corrupt content surfaces in pass-2 anyway).
+	 * zeroed over a live trie (generic/335 family); a directory whose
+	 * restore pins a marked block gets it via ADOPTION in
+	 * briefs_trie_create_root(), not via a pop (generic/392).  Walk
+	 * failures abort marking for that trie only (corrupt content
+	 * surfaces in pass-2 anyway).
 	 */
 	{
 		struct briefs_replay_trie_root *r, *rtmp;
@@ -2712,7 +2785,7 @@ replay_done:
 		list_del(&r->list);
 		kfree(r);
 	}
-	/* The excluded-block set holds no allocations of its own. */
+	/* The owner map holds no allocations of its own. */
 	xa_destroy(&j->replay_trie_excluded);
 	/* Free the pass-1 xattr replay maps (blocks stay as pass-1 left them). */
 	{
@@ -2735,6 +2808,16 @@ replay_done:
 		hash_for_each_safe(j->replay_xattr_live, bkt, tmp, l, node) {
 			hash_del(&l->node);
 			kfree(l);
+		}
+
+		/* Free the pass-1 pin-map entries. */
+		{
+			struct briefs_replay_pin *p;
+
+			hash_for_each_safe(j->replay_pin_map, bkt, tmp, p, node) {
+				hash_del(&p->node);
+				kfree(p);
+			}
 		}
 
 		/* Free the pass-3 nlink-reconciliation map entries. */

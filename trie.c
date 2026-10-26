@@ -428,8 +428,34 @@ static int trie_store_name(struct super_block *sb, u64 ref,
  */
 int briefs_trie_create_root(struct super_block *sb, struct briefs_inode *di)
 {
+	struct briefs_journal *j = briefs_sb(sb)->journal;
 	u64 root_ref;
 	int ret;
+
+	/*
+	 * Replay re-derivation: the window's final JRN_INODE_FULL for this
+	 * directory pins where its restore will re-point dir_trie_root.
+	 * When the pin names a page, ADOPT it -- claim the pinned slot and
+	 * build the new root node in place, no zeroing -- so the rebuilt
+	 * trie lands exactly at the pinned ref (generic/392) without
+	 * destroying nodes earlier replay records packed onto that page
+	 * (generic/336; a pop-and-zero would).  Falls back to the normal
+	 * page_init path whenever the page cannot serve.
+	 */
+	if (j && j->in_replay) {
+		u64 pin = briefs_journal_replay_pin_get(j, di->inode_number);
+		bool adopted = false;
+
+		if (pin) {
+			ret = briefs_trie_adopt_root(sb, pin, &adopted);
+			if (ret)
+				return ret;
+			if (adopted) {
+				di->dir_trie_root = pin;
+				return 0;
+			}
+		}
+	}
 
 	ret = briefs_trie_page_init(sb, 0, 0, NODE_TYPE_INTERM, &root_ref, 0);
 	if (ret)
@@ -462,7 +488,7 @@ int briefs_trie_create_root(struct super_block *sb, struct briefs_inode *di)
  *
  * Returns 0 (with *@visited_out set) or -ENOMEM.  Shared by the two
  * replay-only trie scans: briefs_trie_seed_pool() (partial-page pool seeding)
- * and briefs_trie_mark_referenced_blocks() (excluded-block marking).
+ * and briefs_trie_mark_referenced_blocks() (owner-map marking).
  */
 typedef int (*trie_walk_visit_fn)(struct super_block *sb, u64 ref,
 				  struct briefs_trie_page *page,
