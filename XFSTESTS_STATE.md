@@ -5,7 +5,70 @@ measured by fresh full-suite and targeted runs on the VM.
 
 ## Overview
 
-**Current state (2026-10-05, branch `io_uring-perf` at `bd2c269`
+**Current state (2026-10-27, `master` at `d3f73e3`, merged and
+pushed):** full-suite proof of the MERGED tree is complete on BOTH
+kernel generations.  The branch history since the 10-05 gate was a
+three-bug saga that started when the 10-13 closing gate of the
+fsync-checkpoint campaign froze the VM for 3.5 days at generic/273 —
+root-caused (serial-console capture + auto virsh dump) as an
+unbounded journal recursion (checkpoint -> sync -> write_record ->
+ring_room -> checkpoint) blowing the kernel stack guard page under
+273's 200-thread cp; fixed by `5f70cf0` (the checkpoint retires
+BEFORE its pending-records sync; the pre-retire re-sync is gone).
+That reorder regressed generic/052 (clean-unmount journal
+cleanliness — the checkpoint's own post-retire sync commits evict-era
+records one block past the retire), fixed by `331f7a5` (put_super
+re-checkpoints until the persisted window is empty).  The reordered
+gate then surfaced generic/392: the 335 fix's exclusion kept a
+directory's own restore-pinned root page out of the replay pool, the
+re-derivation built one page over, and the window's INODE_FULL restore
+left `dir_trie_root` aimed at stale content -> cyclic trie -> fsynced
+file lost.  Fixed by `d00b7b6` (adopt-don't-zero: pass-1 pin map ino
+-> final root, NULL-wins, plus `briefs_trie_adopt_root`, which claims
+the pinned slot on the crash-time page without zeroing it).  Any
+pop-and-zero design is refuted for this bug class: packed-node trie
+pages are shared across directories, and re-derivation itself creates
+that sharing by placing nodes on other directories' pages — the
+first pop-based fix attempt broke generic/336 exactly that way.
+Also landed: replay's swallowed -EINVAL/-ENOENT skips now print at
+pr_info (the observability hole that let the 392 family hide).
+
+**Latest full-suite runs (both fresh, zero hangs):**
+
+* **6.12.111 closing gate** (module `d00b7b6`):
+  `tests/xfstests/runs/run-20261026-fullgate-kernel.txt` — 445 PASS /
+  3 FAIL / 343 NR / 2 SK.  The FAILs: 311 (accepted), 563
+  (config-dependent, below), and 464 — flake-class: 4/5 solo runs
+  clean, the fifth a self-resolving 1200s timeout with zero D-state
+  at capture, plus a gate-leg FAIL whose signature was heap
+  corruption in the test's own helper processes; 464 is the
+  historical wedge test behind the 4ef6ccb trie_iter_grow fix.
+  455 PASS->NR was environmental: the log-writes loop device was not
+  re-attached after the crash-battery reboots (per-boot gotcha).
+  Mid-run the VM's virtio-net died silently at test 522 (kernel
+  alive, NFS hard-mounts wedged the run; cause unknown, one
+  occurrence); the gate resumed in the same LOG_DIR after
+  destroy+up, and 522 was solo-verified PASS
+  (`run-20261027-002250`).
+
+* **7.3.0-rc4-lockdep+ gate** (merged master, full 793 fresh, the
+  first target-generation proof):
+  `tests/xfstests/runs/run-20261027-183149-kernel.txt` — **450 PASS /
+  1 FAIL / 340 NR / 2 SK, and ZERO lockdep findings suite-wide.**
+  Every transition vs the 6.12 gate accounted: **563 FAIL->PASS**
+  (cgroup writeback ON for >= 7.2 via `BRIEFS_HAS_CGROUPWB_FIX` —
+  the first suite proof on the merged tree; 563 is
+  config-dependent, passing on 7.3-rc4-lockdep+ and the custom
+  6.12.101-lockdep kernel but failing on the stock 6.12.111 VM
+  environment), **464 FAIL->PASS** (the flake did not fire), and
+  **777/786/787 NR->PASS** (version-gated probes — connectable
+  file handles and setdeleg exist on 7.3, matching every earlier
+  7.3 round).  **311 is the lone remaining failure on BOTH kernel
+  generations.**  The perf-write fsync shapes were re-run on the
+  final series and hold parity (`cbbcb2f`: 1.12x seq_fsync, 1.02x
+  seq_osync, 0.95x ld_shape, checkpoint cadence 3/166/165/8).
+
+**Prior state (2026-10-05, branch `io_uring-perf` at `bd2c269`
 (+ round-archive commits), unpushed):** the 6.12 validation gate for
 the generic/455 journal-durability fix (`2d9bd51`) and the generic/051
 lockdep fix (`bd2c269`) is complete — both fixes are now validated on

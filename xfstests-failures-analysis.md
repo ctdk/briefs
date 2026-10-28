@@ -383,3 +383,77 @@ validated at full-suite level on 7.3; its 6.12-round failure was the
 open-by-handle test; the 6.12-round NR reason is unrecorded (the old
 logs were purged before the reason was captured) — recorded as an
 improvement, environmental on the 6.12 side.
+
+---
+
+## 2026-10-26/27 rounds (merged master, both kernel bookends)
+
+### generic/392 — new FAIL: re-derived trie built off its restore-pinned page (REAL, FIXED)
+
+In-suite failure: an fsynced 4 MiB file vanishes at the first
+post-replay stat (the third iteration — the first `fdatasync` one —
+of the punch/fsync/fdatasync shutdown matrix).  Deterministic; passed
+both 10-07 gate rounds and never ran in the wedged 10-13 gate, so its
+regression window spanned the whole 320/388 + fsync-checkpoint series
+(bisect pinned `2494bd7`, the 335-family replay-pool exclusion).
+Root cause: the exclusion keeps a directory's own restore-pinned root
+page out of the pool; the re-derivation (after a del emptied the
+trie) rebuilds via the `alloc_block_high` fallback one page over, and
+the window's later `JRN_INODE_FULL` restore re-points `dir_trie_root`
+at the OLD page — whose on-disk content still chains into the block
+the rebuild zeroed — so the root trie walks a stale sibling chain into
+a freed slot: cyclic trie, fsck "slot marked free", b/c unreachable,
+fsynced file lost at lookup.
+
+**Verdict:** REAL, design flaw in the exclusion's interaction with
+the restores.  **Fixed by `d00b7b6`** (adopt-don't-zero): pass-1 now
+also builds a pin map (ino -> the directory's FINAL `dir_trie_root`,
+last-wins with NULL finals winning), and `briefs_trie_create_root()`
+ADOPTS the pinned page during replay — claims the pinned slot with
+the normal free-slots/live-count discipline and builds the root node
+in place, zeroing nothing — so the rebuild lands exactly where the
+restore will point.  Adoption fails soft (unreadable page, bad
+magic/version, slot not free) and falls back to the normal
+`briefs_trie_page_init` path.
+
+### generic/336 — how NOT to fix 392 (pop-and-zero refuted)
+
+The first fix attempt served a directory's "own" pool blocks by
+bypassing the exclusion for them.  It fixed 392 and kept
+335/764/792/066 green but broke generic/336 deterministically: trie
+pages are shared across directories (the packed-node design fills any
+page with room, and the hint tag is preferential, not exclusive), and
+the RE-DERIVATION ITSELF creates that sharing by placing one
+directory's rebuilt nodes on another directory's page — the mv
+target's page also held the root directory's freshly re-derived leaf,
+and the own-pop's `page_init` zero destroyed it (fsck: root trie walk
+aborts at a freed slot, two directories unreachable).  Any
+pop-and-zero design is refuted for this bug class; the committed fix
+(above) adopts instead.
+
+### generic/464 — new in-suite FAIL: flake-class (triaged, recurrence-watch)
+
+Gate-leg failure signature: `malloc(): unaligned tcache chunk
+detected` plus segfaults in the test's own writer helper processes —
+userspace heap corruption in the helpers, not a kernel splat.  Follow-up:
+4/5 solo runs PASS clean; the fifth hung at the 1200s timeout and
+self-resolved with ZERO D-state tasks at capture time (the
+self-resolving stall family).  464 is the historical wedge test
+behind the `4ef6ccb` trie_iter_grow double-free fix.  Passed the
+7.3-rc4 gate.
+
+**Verdict:** FLAKE-CLASS — no deterministic BrieFS bug demonstrated;
+deeper triage only if it recurs.  1-in-5-ish hang plus the odd
+helper-side heap corruption, both under the same sync_range/writeback
+stress shape.
+
+### generic/563 — per-kernel status clarified
+
+563's outcome is config/environment-dependent, not module-version
+dependent: PASS on 7.3.0-rc4-lockdep+ (cgwb ON for >= 7.2 via
+`BRIEFS_HAS_CGROUPWB_FIX`) and on the custom 6.12.101-lockdep kernel
+(flag ON there too), FAIL on the stock 6.12.111 VM environment —
+in every 6.12.111 gate since 10-05 and again in the 10-26 closing
+gate.  The accepted-FAIL bookkeeping keeps it listed for 6.12.111
+rounds only; it is a PASS in every 7.3 round including the merged
+master gate (450/1).
